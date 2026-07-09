@@ -1,0 +1,14 @@
+[package]
+name = "pg-ha-proxy"
+version = "0.1.0"
+edition = "2024"
+description = "TCP load balancer proxy (replaces HAProxy)"
+
+[dependencies]
+pg-ha-core = { path = "../pg-ha-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+futures = "0.3"

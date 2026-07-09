@@ -1,0 +1,18 @@
+[package]
+name = "pg-ha-ctl"
+version = "0.1.0"
+edition = "2024"
+description = "CLI tool for pg-ha cluster management"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+
+[[bin]]
+name = "pg-ha-ctl"
+path = "src/main.rs"

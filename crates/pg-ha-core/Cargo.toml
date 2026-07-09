@@ -1,0 +1,18 @@
+[package]
+name = "pg-ha-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core HA logic: state machine, leader election, PostgreSQL lifecycle"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio-postgres = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }

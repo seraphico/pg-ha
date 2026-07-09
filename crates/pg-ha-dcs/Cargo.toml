@@ -1,0 +1,19 @@
+[package]
+name = "pg-ha-dcs"
+version = "0.1.0"
+edition = "2024"
+description = "Distributed Configuration Store: built-in Raft consensus via openraft"
+
+[dependencies]
+pg-ha-core = { path = "../pg-ha-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+openraft = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }

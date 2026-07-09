@@ -1,0 +1,18 @@
+[package]
+name = "pg-ha-api"
+version = "0.1.0"
+edition = "2024"
+description = "REST API for health checks and cluster management"
+
+[dependencies]
+pg-ha-core = { path = "../pg-ha-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,78 @@
+# 3-node pg-ha cluster for testing
+# Each node runs pg-ha which manages its own PostgreSQL instance
+
+services:
+  node1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: pg-ha-node1
+    hostname: node1
+    environment:
+      PG_HA_NAME: node1
+      PG_HA_SCOPE: test-cluster
+      POSTGRES_PASSWORD: secret
+      PG_HA_RAFT_SELF: "node1:2380"
+      PG_HA_RAFT_PARTNERS: "node2:2380,node3:2380"
+    ports:
+      - "5432:5432"   # PostgreSQL
+      - "8008:8008"   # REST API
+      - "6432:6432"   # Proxy RW
+      - "6433:6433"   # Proxy RO
+    volumes:
+      - node1-raft:/var/lib/pg-ha/raft
+    networks:
+      - pg-ha-net
+
+  node2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: pg-ha-node2
+    hostname: node2
+    environment:
+      PG_HA_NAME: node2
+      PG_HA_SCOPE: test-cluster
+      POSTGRES_PASSWORD: secret
+      PG_HA_RAFT_SELF: "node2:2380"
+      PG_HA_RAFT_PARTNERS: "node1:2380,node3:2380"
+    ports:
+      - "5433:5432"
+      - "8009:8008"
+      - "6434:6432"
+      - "6435:6433"
+    volumes:
+      - node2-raft:/var/lib/pg-ha/raft
+    networks:
+      - pg-ha-net
+
+  node3:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: pg-ha-node3
+    hostname: node3
+    environment:
+      PG_HA_NAME: node3
+      PG_HA_SCOPE: test-cluster
+      POSTGRES_PASSWORD: secret
+      PG_HA_RAFT_SELF: "node3:2380"
+      PG_HA_RAFT_PARTNERS: "node1:2380,node2:2380"
+    ports:
+      - "5434:5432"
+      - "8010:8008"
+      - "6436:6432"
+      - "6437:6433"
+    volumes:
+      - node3-raft:/var/lib/pg-ha/raft
+    networks:
+      - pg-ha-net
+
+networks:
+  pg-ha-net:
+    driver: bridge
+
+volumes:
+  node1-raft:
+  node2-raft:
+  node3-raft:

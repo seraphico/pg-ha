@@ -1,0 +1,43 @@
+name: node1
+scope: test-cluster
+namespace: service
+loop_wait: 5
+ttl: 15
+retry_timeout: 5
+
+postgresql:
+  data_dir: /tmp/pg-ha-test-data
+  bin_dir: /usr/local/bin
+  listen: 127.0.0.1
+  port: 5432
+  superuser:
+    username: postgres
+    password: secret
+    dbname: postgres
+  replication:
+    username: postgres
+    password: secret
+    dbname: postgres
+  parameters: {}
+
+restapi:
+  listen: 127.0.0.1
+  port: 8008
+
+raft:
+  self_addr: "127.0.0.1:2380"
+  partner_addrs:
+    - "127.0.0.1:2381"
+
+proxy:
+  rw_listen: 127.0.0.1
+  rw_port: 6432
+  ro_listen: 127.0.0.1
+  ro_port: 6433
+
+watchdog:
+  mode: "off"
+
+tags:
+  nofailover: false
+  noloadbalance: false
