@@ -39,15 +39,22 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --workspace --target ${{ matrix.target }}
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Package
         shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../pg-ha-${{ github.ref_name }}-${{ matrix.target }}.tar.gz pg-ha pg-ha-ctl
+          RELEASE_DIR=target/${{ matrix.target }}/release
+          BINARIES=""
+          for bin in pg-ha pg-ha-ctl; do
+            if [ -f "$RELEASE_DIR/$bin" ]; then
+              BINARIES="$BINARIES $bin"
+            fi
+          done
+          cd $RELEASE_DIR
+          tar czf ../../../pg-ha-${{ github.ref_name }}-${{ matrix.target }}.tar.gz $BINARIES
           cd ../../..
 
       - name: Upload artifact
