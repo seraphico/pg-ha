@@ -1,11 +1,13 @@
-# 3-node pg-ha cluster for testing
-# Each node runs pg-ha which manages its own PostgreSQL instance
+# 3-node pg-ha cluster for local development / testing
+# RUST_TARGET is set by the Makefile for Mac Intel / Mac ARM / Linux amd64.
 
 services:
   node1:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
     container_name: pg-ha-node1
     hostname: node1
     environment:
@@ -21,6 +23,7 @@ services:
       - "6433:6433"   # Proxy RO
     volumes:
       - node1-raft:/var/lib/pg-ha/raft
+      - node1-pgdata:/var/lib/postgresql/data
     networks:
       - pg-ha-net
 
@@ -28,6 +31,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
     container_name: pg-ha-node2
     hostname: node2
     environment:
@@ -43,6 +48,7 @@ services:
       - "6435:6433"
     volumes:
       - node2-raft:/var/lib/pg-ha/raft
+      - node2-pgdata:/var/lib/postgresql/data
     networks:
       - pg-ha-net
 
@@ -50,6 +56,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
     container_name: pg-ha-node3
     hostname: node3
     environment:
@@ -65,6 +73,7 @@ services:
       - "6437:6433"
     volumes:
       - node3-raft:/var/lib/pg-ha/raft
+      - node3-pgdata:/var/lib/postgresql/data
     networks:
       - pg-ha-net
 
@@ -76,3 +85,6 @@ volumes:
   node1-raft:
   node2-raft:
   node3-raft:
+  node1-pgdata:
+  node2-pgdata:
+  node3-pgdata:
