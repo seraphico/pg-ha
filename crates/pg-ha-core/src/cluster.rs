@@ -256,8 +256,9 @@ pub struct Failover {
     #[serde(default)]
     pub leader: Option<String>,
 
-    /// Target candidate for failover/switchover
-    #[serde(default)]
+    /// Target candidate for failover/switchover.
+    /// Accepts both `candidate` (native) and `member` (Patroni-compatible) JSON keys.
+    #[serde(default, alias = "member")]
     pub candidate: Option<String>,
 
     /// Scheduled time (ISO 8601) for the operation
@@ -285,6 +286,22 @@ pub struct HistoryEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_failover_deserializes_member_alias() {
+        let native: Failover = serde_json::from_str(
+            r#"{"leader":"node1","candidate":"node2"}"#,
+        )
+        .unwrap();
+        assert_eq!(native.candidate.as_deref(), Some("node2"));
+
+        let patroni: Failover = serde_json::from_str(
+            r#"{"leader":"node1","member":"node3"}"#,
+        )
+        .unwrap();
+        assert_eq!(patroni.candidate.as_deref(), Some("node3"));
+        assert!(patroni.is_switchover());
+    }
 
     #[test]
     fn test_cluster_is_unlocked() {
