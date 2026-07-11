@@ -63,6 +63,9 @@ pub struct PgBackend {
     pub name: String,
     pub is_primary: bool,
     pub is_healthy: bool,
+    /// REST API base URL for health checks (e.g. `http://node1:8008`).
+    /// Prefer hostname form so Docker DNS / multi-node clusters work.
+    pub api_url: String,
 }
 
 /// Internal tracked state per backend for health checking
@@ -169,14 +172,23 @@ impl PgProxy {
         }
         // If health checker is active, it manages upstream state — don't override
 
-        // Register new backends for health checking
+        // Register / refresh backends for health checking
         let mut health = self.health_state.write().await;
         for backend in &backends {
-            if !health.contains_key(&backend.name) {
+            let api_url = if backend.api_url.is_empty() {
+                // Last resort: derive from resolved PG address (IPs break Docker hostnames)
+                format!("http://{}:8008", backend.addr.ip())
+            } else {
+                backend.api_url.clone()
+            };
+
+            if let Some(existing) = health.get_mut(&backend.name) {
+                existing.addr = backend.addr;
+                if existing.api_url != api_url {
+                    existing.api_url = api_url;
+                }
+            } else {
                 let (shutdown_tx, _) = watch::channel(false);
-                // Derive API URL from the backend addr (same host, port 8008)
-                let host = backend.addr.ip();
-                let api_url = format!("http://{}:8008", host);
                 health.insert(
                     backend.name.clone(),
                     BackendHealth {
@@ -395,6 +407,7 @@ async fn run_health_checker(
                     name: backend.name.clone(),
                     is_primary,
                     is_healthy: is_primary || is_replica,
+                    api_url: backend.api_url.clone(),
                 });
             }
             let mut state = upstream.write().await;
@@ -604,12 +617,14 @@ mod tests {
                     name: "node1".into(),
                     is_primary: true,
                     is_healthy: true,
+                    api_url: "http://node1:8008".into(),
                 },
                 PgBackend {
                     addr: "10.0.0.2:5432".parse().unwrap(),
                     name: "node2".into(),
                     is_primary: false,
                     is_healthy: true,
+                    api_url: "http://node2:8008".into(),
                 },
             ],
         };
@@ -626,6 +641,7 @@ mod tests {
                 name: "node2".into(),
                 is_primary: false,
                 is_healthy: true,
+                api_url: "http://node2:8008".into(),
             }],
         };
         assert!(state.primary().is_none());
@@ -640,12 +656,14 @@ mod tests {
                     name: "node1".into(),
                     is_primary: true,
                     is_healthy: false,
+                    api_url: "http://node1:8008".into(),
                 },
                 PgBackend {
                     addr: "10.0.0.2:5432".parse().unwrap(),
                     name: "node2".into(),
                     is_primary: false,
                     is_healthy: false,
+                    api_url: "http://node2:8008".into(),
                 },
             ],
         };
@@ -662,12 +680,14 @@ mod tests {
                     name: "node2".into(),
                     is_primary: false,
                     is_healthy: true,
+                    api_url: "http://node2:8008".into(),
                 },
                 PgBackend {
                     addr: "10.0.0.3:5432".parse().unwrap(),
                     name: "node3".into(),
                     is_primary: false,
                     is_healthy: true,
+                    api_url: "http://node3:8008".into(),
                 },
             ],
         };
