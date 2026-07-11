@@ -82,7 +82,7 @@ impl Ha {
         info!(candidate = ?candidate, "Initiating switchover");
         let failover_value = serde_json::json!({
             "leader": self.config.name,
-            "member": candidate,
+            "candidate": candidate,
         });
         let _ = self.dcs.set_failover_value(&failover_value.to_string()).await;
 
@@ -136,7 +136,7 @@ impl Ha {
 
         info!(candidate = ?candidate, "Initiating manual failover");
         let failover_value = serde_json::json!({
-            "member": candidate,
+            "candidate": candidate,
         });
         let _ = self.dcs.set_failover_value(&failover_value.to_string()).await;
 
