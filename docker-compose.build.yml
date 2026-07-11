@@ -1,0 +1,31 @@
+# Linux binary builder — used by `make build` when zigbuild/cross are unavailable.
+# Platform / target come from the Makefile (Mac Intel / Mac ARM / Linux amd64).
+#
+# Binaries land on the host at:
+#   target/${RUST_TARGET}/release/{pg-ha,pg-ha-ctl}
+
+services:
+  builder:
+    image: rust:1.88-bookworm
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    working_dir: /app
+    volumes:
+      - .:/app
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+    environment:
+      CARGO_TERM_COLOR: always
+    command:
+      - cargo
+      - build
+      - --release
+      - --target
+      - ${RUST_TARGET:-x86_64-unknown-linux-gnu}
+      - -p
+      - pg-ha
+      - -p
+      - pg-ha-ctl
+
+volumes:
+  cargo-registry:
+  cargo-git:
