@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -224,17 +224,32 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }).await;
 
-                // Update proxy backends from cluster state
-                let backends: Vec<PgBackend> = ha.cluster().members.iter().map(|m| {
-                    // Parse addr from conn_url (simplified)
-                    let addr = parse_pg_addr(&m.conn_url).unwrap_or_else(|| "127.0.0.1:5432".parse().unwrap());
-                    PgBackend {
+                // Update proxy backends from cluster state (resolve Docker DNS hostnames)
+                let mut backends: Vec<PgBackend> = Vec::new();
+                for m in &ha.cluster().members {
+                    let Some(addr) = resolve_pg_addr(&m.conn_url).await else {
+                        warn!(
+                            member = %m.name,
+                            conn_url = %m.conn_url,
+                            "Skipping proxy backend: failed to resolve conn_url"
+                        );
+                        continue;
+                    };
+                    let api_url = if m.api_url.is_empty() {
+                        api_url_from_conn_url(&m.conn_url, config.restapi.port).unwrap_or_else(|| {
+                            format!("http://{}:{}", addr.ip(), config.restapi.port)
+                        })
+                    } else {
+                        m.api_url.clone()
+                    };
+                    backends.push(PgBackend {
                         addr,
                         name: m.name.clone(),
                         is_primary: m.role == MemberRole::Primary,
                         is_healthy: m.state == MemberState::Running,
-                    }
-                }).collect();
+                        api_url,
+                    });
+                }
                 proxy_clone.update_backends(backends).await;
             }
         } => {}
@@ -294,22 +309,35 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parse a PostgreSQL connection URL to extract host:port as SocketAddr
-fn parse_pg_addr(conn_url: &str) -> Option<SocketAddr> {
-    if conn_url.contains("host=") {
-        let host = conn_url
-            .split_whitespace()
-            .find(|s| s.starts_with("host="))
-            .and_then(|s| s.strip_prefix("host="))?;
-        let port = conn_url
-            .split_whitespace()
-            .find(|s| s.starts_with("port="))
-            .and_then(|s| s.strip_prefix("port="))
-            .unwrap_or("5432");
-        format!("{host}:{port}").parse().ok()
-    } else {
-        None
+/// Extract host/port from a libpq-style conn_url (`host=node1 port=5432 ...`).
+fn parse_pg_host_port(conn_url: &str) -> Option<(String, u16)> {
+    if !conn_url.contains("host=") {
+        return None;
     }
+    let host = conn_url
+        .split_whitespace()
+        .find(|s| s.starts_with("host="))
+        .and_then(|s| s.strip_prefix("host="))?
+        .to_string();
+    let port = conn_url
+        .split_whitespace()
+        .find(|s| s.starts_with("port="))
+        .and_then(|s| s.strip_prefix("port="))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5432);
+    Some((host, port))
+}
+
+/// Resolve a PostgreSQL conn_url to a SocketAddr (supports Docker DNS hostnames).
+async fn resolve_pg_addr(conn_url: &str) -> Option<SocketAddr> {
+    let (host, port) = parse_pg_host_port(conn_url)?;
+    resolve_addr(&format!("{host}:{port}")).await
+}
+
+/// Build REST health-check base URL from conn_url host (prefer hostname over raw IP).
+fn api_url_from_conn_url(conn_url: &str, api_port: u16) -> Option<String> {
+    let (host, _) = parse_pg_host_port(conn_url)?;
+    Some(format!("http://{host}:{api_port}"))
 }
 
 /// Resolve a host:port string to a SocketAddr (supports DNS names)
