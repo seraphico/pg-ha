@@ -104,22 +104,36 @@ build() {
 
     log_section "Building pg-ha"
 
-    log_info "Building release binary (x86_64-unknown-linux-gnu)..."
+    # Match Docker host arch: Apple Silicon / linux arm64 → aarch64
+    local rust_target docker_platform
+    case "$(uname -m)" in
+        arm64|aarch64)
+            rust_target="aarch64-unknown-linux-gnu"
+            docker_platform="linux/arm64"
+            ;;
+        *)
+            rust_target="x86_64-unknown-linux-gnu"
+            docker_platform="linux/amd64"
+            ;;
+    esac
+
+    log_info "Building release binary ($rust_target)..."
     cd "$PROJECT_ROOT"
 
     # Cross-compile for Linux (docker image target)
     if command -v cargo-zigbuild > /dev/null 2>&1; then
-        cargo zigbuild --release --target x86_64-unknown-linux-gnu
+        cargo zigbuild --release --target "$rust_target"
     elif command -v cross > /dev/null 2>&1; then
-        cross build --release --target x86_64-unknown-linux-gnu
+        cross build --release --target "$rust_target"
     else
-        log_warn "Neither cargo-zigbuild nor cross found, trying native cargo build..."
-        log_warn "This will only work if you're on Linux x86_64"
-        cargo build --release --target x86_64-unknown-linux-gnu
+        log_warn "Neither cargo-zigbuild nor cross found, trying Docker-native cargo build..."
+        docker run --rm --platform "$docker_platform" \
+            -v "$PROJECT_ROOT":/app -w /app rust:1.88-bookworm \
+            cargo build --release --target "$rust_target" -p pg-ha -p pg-ha-ctl
     fi
 
     log_info "Building docker images..."
-    $COMPOSE_CMD build
+    $COMPOSE_CMD build --build-arg "RUST_TARGET=$rust_target"
 
     log_pass "Build complete"
 }
