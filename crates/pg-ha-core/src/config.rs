@@ -358,16 +358,19 @@ impl Config {
     /// Load configuration from a YAML file
     pub fn from_file(path: &Path) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| {
-            crate::Error::Config(format!("Cannot read config file '{}': {}", path.display(), e))
+            crate::Error::Config(format!(
+                "Cannot read config file '{}': {}",
+                path.display(),
+                e
+            ))
         })?;
         Self::from_yaml(&content)
     }
 
     /// Parse configuration from a YAML string
     pub fn from_yaml(yaml: &str) -> crate::Result<Self> {
-        let config: Self = serde_yaml::from_str(yaml).map_err(|e| {
-            crate::Error::Config(format!("Invalid YAML: {e}"))
-        })?;
+        let config: Self = serde_yaml::from_str(yaml)
+            .map_err(|e| crate::Error::Config(format!("Invalid YAML: {e}")))?;
         config.validate()?;
         Ok(config)
     }
@@ -384,28 +387,33 @@ impl Config {
             self.scope = val;
         }
         if let Ok(val) = std::env::var(format!("{ENV_PREFIX}LOOP_WAIT"))
-            && let Ok(v) = val.parse() {
-                self.loop_wait = v;
-            }
+            && let Ok(v) = val.parse()
+        {
+            self.loop_wait = v;
+        }
         if let Ok(val) = std::env::var(format!("{ENV_PREFIX}TTL"))
-            && let Ok(v) = val.parse() {
-                self.ttl = v;
-            }
+            && let Ok(v) = val.parse()
+        {
+            self.ttl = v;
+        }
         if let Ok(val) = std::env::var(format!("{ENV_PREFIX}RETRY_TIMEOUT"))
-            && let Ok(v) = val.parse() {
-                self.retry_timeout = v;
-            }
+            && let Ok(v) = val.parse()
+        {
+            self.retry_timeout = v;
+        }
         if let Ok(val) = std::env::var(format!("{ENV_PREFIX}POSTGRESQL__PORT"))
-            && let Ok(v) = val.parse() {
-                self.postgresql.port = v;
-            }
+            && let Ok(v) = val.parse()
+        {
+            self.postgresql.port = v;
+        }
         if let Ok(val) = std::env::var(format!("{ENV_PREFIX}POSTGRESQL__LISTEN")) {
             self.postgresql.listen = val;
         }
         if let Ok(val) = std::env::var(format!("{ENV_PREFIX}RESTAPI__PORT"))
-            && let Ok(v) = val.parse() {
-                self.restapi.port = v;
-            }
+            && let Ok(v) = val.parse()
+        {
+            self.restapi.port = v;
+        }
         if let Ok(val) = std::env::var(format!("{ENV_PREFIX}RAFT__SELF_ADDR")) {
             self.raft.self_addr = val;
         }
@@ -414,10 +422,14 @@ impl Config {
     /// Validate configuration values
     pub fn validate(&self) -> crate::Result<()> {
         if self.name.is_empty() {
-            return Err(crate::Error::Config("'name' is required and cannot be empty".into()));
+            return Err(crate::Error::Config(
+                "'name' is required and cannot be empty".into(),
+            ));
         }
         if self.scope.is_empty() {
-            return Err(crate::Error::Config("'scope' is required and cannot be empty".into()));
+            return Err(crate::Error::Config(
+                "'scope' is required and cannot be empty".into(),
+            ));
         }
         if self.ttl <= self.loop_wait {
             return Err(crate::Error::Config(format!(
@@ -495,9 +507,10 @@ impl Config {
             bootstrap: Some(BootstrapConfig {
                 initdb: vec![
                     InitdbOption::Flag("data-checksums".to_string()),
-                    InitdbOption::KeyValue(HashMap::from([
-                        ("encoding".to_string(), "UTF8".to_string()),
-                    ])),
+                    InitdbOption::KeyValue(HashMap::from([(
+                        "encoding".to_string(),
+                        "UTF8".to_string(),
+                    )])),
                 ],
                 dcs: HashMap::from([
                     ("loop_wait".into(), serde_json::json!(10)),
@@ -584,7 +597,11 @@ proxy:
     fn test_sample_config_is_valid_yaml() {
         let sample = Config::sample();
         let parsed: Result<Config, _> = serde_yaml::from_str(&sample);
-        assert!(parsed.is_ok(), "Sample config should be valid YAML: {:?}", parsed.err());
+        assert!(
+            parsed.is_ok(),
+            "Sample config should be valid YAML: {:?}",
+            parsed.err()
+        );
     }
 
     #[test]

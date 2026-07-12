@@ -2,8 +2,8 @@
 //!
 //! Implemented by pg-ha-dcs (Raft) but could also be implemented for etcd/consul/zk.
 
-use crate::cluster::{Cluster, Leader};
 use crate::Result;
+use crate::cluster::{Cluster, Leader};
 
 /// Abstract DCS interface.
 ///

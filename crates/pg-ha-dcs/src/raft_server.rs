@@ -8,7 +8,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use openraft::BasicNode;
 
 use crate::store::{NodeId, Raft, TypeConfig};

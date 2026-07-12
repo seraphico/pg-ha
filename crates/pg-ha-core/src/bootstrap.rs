@@ -102,7 +102,9 @@ impl<'a> Bootstrap<'a> {
 
         // Execute post-bootstrap SQL if configured
         if !bootstrap_config.post_bootstrap_sql.is_empty()
-            && let Err(e) = self.run_post_bootstrap_sql(&bootstrap_config.post_bootstrap_sql).await
+            && let Err(e) = self
+                .run_post_bootstrap_sql(&bootstrap_config.post_bootstrap_sql)
+                .await
         {
             warn!("Post-bootstrap SQL failed (non-fatal): {e}");
             // Not fatal — cluster is still usable
@@ -111,7 +113,8 @@ impl<'a> Bootstrap<'a> {
         // Write DCS config if bootstrap.dcs is set
         if !bootstrap_config.dcs.is_empty() {
             let dcs_value = serde_json::to_string(&bootstrap_config.dcs).unwrap_or_default();
-            if !dcs_value.is_empty() && dcs_value != "{}"
+            if !dcs_value.is_empty()
+                && dcs_value != "{}"
                 && let Err(e) = self.dcs.set_config_value(&dcs_value).await
             {
                 warn!("Failed to write bootstrap DCS config: {e}");
@@ -162,9 +165,7 @@ impl<'a> Bootstrap<'a> {
     pub fn select_clone_source<'b>(cluster: &'b Cluster, exclude_name: &str) -> Option<&'b Member> {
         // First, try members with clonefrom tag
         let clonefrom_member = cluster.members.iter().find(|m| {
-            m.name != exclude_name
-                && !Self::has_noclone_tag(m)
-                && Self::has_clonefrom_tag(m)
+            m.name != exclude_name && !Self::has_noclone_tag(m) && Self::has_clonefrom_tag(m)
         });
         if clonefrom_member.is_some() {
             return clonefrom_member;
@@ -200,7 +201,12 @@ impl<'a> Bootstrap<'a> {
     async fn run_custom_bootstrap(&self, command: &str) -> Result<()> {
         info!(command, "Running custom bootstrap command");
 
-        let data_dir = self.config.postgresql.data_dir.to_string_lossy().to_string();
+        let data_dir = self
+            .config
+            .postgresql
+            .data_dir
+            .to_string_lossy()
+            .to_string();
 
         let output = Command::new("sh")
             .args(["-c", command])
@@ -232,10 +238,9 @@ impl<'a> Bootstrap<'a> {
         info!(count = statements.len(), "Running post-bootstrap SQL");
 
         let connstr = self.postgresql.connection_string();
-        let (client, connection) =
-            tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| Error::Postgres(format!("Post-bootstrap SQL connect failed: {e}")))?;
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Post-bootstrap SQL connect failed: {e}")))?;
 
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -274,7 +279,14 @@ impl<'a> Bootstrap<'a> {
         managed_block.push_str("hot_standby = on\n");
 
         // Apply any additional parameters from config (skip ones we already set)
-        let builtin_keys = ["listen_addresses", "port", "wal_level", "max_wal_senders", "max_replication_slots", "hot_standby"];
+        let builtin_keys = [
+            "listen_addresses",
+            "port",
+            "wal_level",
+            "max_wal_senders",
+            "max_replication_slots",
+            "hot_standby",
+        ];
         for (key, value) in &self.config.postgresql.parameters {
             if builtin_keys.contains(&key.as_str()) {
                 continue; // Already set above, skip duplicates
@@ -293,7 +305,11 @@ impl<'a> Bootstrap<'a> {
         let existing = std::fs::read_to_string(&pg_conf_path).unwrap_or_default();
         let cleaned: String = if existing.contains("# pg-ha managed settings") {
             // Remove everything from "# pg-ha managed settings" to end
-            existing.split("# pg-ha managed settings").next().unwrap_or("").to_string()
+            existing
+                .split("# pg-ha managed settings")
+                .next()
+                .unwrap_or("")
+                .to_string()
         } else {
             existing
         };
@@ -337,7 +353,13 @@ impl<'a> Bootstrap<'a> {
         // The source_connstr is in libpq format: "host=X port=Y dbname=Z user=W password=P"
         // We need to ensure it has the replication user
         let repl_user = &self.config.postgresql.replication.username;
-        let repl_pass = self.config.postgresql.replication.password.as_deref().unwrap_or("");
+        let repl_pass = self
+            .config
+            .postgresql
+            .replication
+            .password
+            .as_deref()
+            .unwrap_or("");
 
         // Parse host and port from source_connstr
         let mut host = "127.0.0.1".to_string();
@@ -395,9 +417,7 @@ impl<'a> Bootstrap<'a> {
             .iter()
             .flat_map(|opt| match opt {
                 InitdbOption::Flag(f) => vec![f.clone()],
-                InitdbOption::KeyValue(kv) => {
-                    kv.iter().map(|(k, v)| format!("{k}={v}")).collect()
-                }
+                InitdbOption::KeyValue(kv) => kv.iter().map(|(k, v)| format!("{k}={v}")).collect(),
             })
             .collect()
     }
@@ -464,9 +484,7 @@ mod tests {
 
     #[test]
     fn test_parse_initdb_options_flags() {
-        let options = vec![
-            InitdbOption::Flag("data-checksums".to_string()),
-        ];
+        let options = vec![InitdbOption::Flag("data-checksums".to_string())];
         let result = Bootstrap::parse_initdb_options(&options);
         assert_eq!(result, vec!["data-checksums"]);
     }
@@ -474,12 +492,14 @@ mod tests {
     #[test]
     fn test_parse_initdb_options_key_values() {
         let options = vec![
-            InitdbOption::KeyValue(HashMap::from([
-                ("encoding".to_string(), "UTF8".to_string()),
-            ])),
-            InitdbOption::KeyValue(HashMap::from([
-                ("locale".to_string(), "en_US.UTF-8".to_string()),
-            ])),
+            InitdbOption::KeyValue(HashMap::from([(
+                "encoding".to_string(),
+                "UTF8".to_string(),
+            )])),
+            InitdbOption::KeyValue(HashMap::from([(
+                "locale".to_string(),
+                "en_US.UTF-8".to_string(),
+            )])),
         ];
         let result = Bootstrap::parse_initdb_options(&options);
         assert!(result.contains(&"encoding=UTF8".to_string()));
@@ -490,12 +510,14 @@ mod tests {
     fn test_parse_initdb_options_mixed() {
         let options = vec![
             InitdbOption::Flag("data-checksums".to_string()),
-            InitdbOption::KeyValue(HashMap::from([
-                ("encoding".to_string(), "UTF8".to_string()),
-            ])),
-            InitdbOption::KeyValue(HashMap::from([
-                ("wal-segsize".to_string(), "64".to_string()),
-            ])),
+            InitdbOption::KeyValue(HashMap::from([(
+                "encoding".to_string(),
+                "UTF8".to_string(),
+            )])),
+            InitdbOption::KeyValue(HashMap::from([(
+                "wal-segsize".to_string(),
+                "64".to_string(),
+            )])),
         ];
         let result = Bootstrap::parse_initdb_options(&options);
         assert_eq!(result.len(), 3);
@@ -600,12 +622,10 @@ mod tests {
     fn test_select_clone_source_no_suitable_source() {
         let cluster = Cluster {
             leader: None,
-            members: vec![
-                make_member(
-                    "node1",
-                    HashMap::from([("noclone".to_string(), serde_json::json!(true))]),
-                ),
-            ],
+            members: vec![make_member(
+                "node1",
+                HashMap::from([("noclone".to_string(), serde_json::json!(true))]),
+            )],
             ..Default::default()
         };
 

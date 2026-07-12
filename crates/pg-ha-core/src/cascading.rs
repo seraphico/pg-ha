@@ -133,10 +133,7 @@ impl CascadeManager {
     /// - Members with replicatefrom tag point to that source (if healthy) or primary
     /// - Other replicas point to the primary
     pub fn build_cascade_topology(cluster: &Cluster) -> Vec<CascadeNode> {
-        let primary_name = cluster
-            .leader
-            .as_ref()
-            .map(|l| l.name.as_str());
+        let primary_name = cluster.leader.as_ref().map(|l| l.name.as_str());
 
         cluster
             .members
@@ -218,7 +215,12 @@ mod tests {
     use crate::cluster::{Leader, Member, MemberRole, MemberState};
     use std::collections::HashMap;
 
-    fn make_member(name: &str, state: MemberState, role: MemberRole, tags: HashMap<String, serde_json::Value>) -> Member {
+    fn make_member(
+        name: &str,
+        state: MemberState,
+        role: MemberRole,
+        tags: HashMap<String, serde_json::Value>,
+    ) -> Member {
         Member {
             name: name.to_string(),
             conn_url: format!("host={name} port=5432 dbname=postgres user=postgres"),
@@ -239,8 +241,18 @@ mod tests {
                 version: 1,
             }),
             members: vec![
-                make_member("node1", MemberState::Running, MemberRole::Primary, HashMap::new()),
-                make_member("node2", MemberState::Running, MemberRole::Replica, HashMap::new()),
+                make_member(
+                    "node1",
+                    MemberState::Running,
+                    MemberRole::Primary,
+                    HashMap::new(),
+                ),
+                make_member(
+                    "node2",
+                    MemberState::Running,
+                    MemberRole::Replica,
+                    HashMap::new(),
+                ),
                 make_member(
                     "node3",
                     MemberState::Running,
@@ -309,8 +321,18 @@ mod tests {
         let cluster = Cluster {
             leader: None,
             members: vec![
-                make_member("node1", MemberState::Running, MemberRole::Replica, HashMap::new()),
-                make_member("node2", MemberState::Running, MemberRole::Replica, HashMap::new()),
+                make_member(
+                    "node1",
+                    MemberState::Running,
+                    MemberRole::Replica,
+                    HashMap::new(),
+                ),
+                make_member(
+                    "node2",
+                    MemberState::Running,
+                    MemberRole::Replica,
+                    HashMap::new(),
+                ),
             ],
             ..Default::default()
         };
@@ -322,14 +344,15 @@ mod tests {
 
     #[test]
     fn test_build_primary_conninfo() {
-        let member = make_member("node2", MemberState::Running, MemberRole::Replica, HashMap::new());
-
-        let conninfo = CascadeManager::build_primary_conninfo(
-            &member,
-            "replicator",
-            Some("secret"),
-            "node3",
+        let member = make_member(
+            "node2",
+            MemberState::Running,
+            MemberRole::Replica,
+            HashMap::new(),
         );
+
+        let conninfo =
+            CascadeManager::build_primary_conninfo(&member, "replicator", Some("secret"), "node3");
 
         assert!(conninfo.contains("host=node2"));
         assert!(conninfo.contains("port=5432"));
@@ -340,14 +363,14 @@ mod tests {
 
     #[test]
     fn test_build_primary_conninfo_no_password() {
-        let member = make_member("node1", MemberState::Running, MemberRole::Primary, HashMap::new());
-
-        let conninfo = CascadeManager::build_primary_conninfo(
-            &member,
-            "replicator",
-            None,
-            "node2",
+        let member = make_member(
+            "node1",
+            MemberState::Running,
+            MemberRole::Primary,
+            HashMap::new(),
         );
+
+        let conninfo = CascadeManager::build_primary_conninfo(&member, "replicator", None, "node2");
 
         assert!(conninfo.contains("host=node1"));
         assert!(conninfo.contains("port=5432"));
@@ -366,13 +389,17 @@ mod tests {
     fn test_is_cascade_source_healthy_stopped() {
         let mut cluster = make_cluster_3_nodes();
         cluster.members[1].state = MemberState::Stopped;
-        assert!(!CascadeManager::is_cascade_source_healthy("node2", &cluster));
+        assert!(!CascadeManager::is_cascade_source_healthy(
+            "node2", &cluster
+        ));
     }
 
     #[test]
     fn test_is_cascade_source_healthy_not_found() {
         let cluster = make_cluster_3_nodes();
-        assert!(!CascadeManager::is_cascade_source_healthy("node99", &cluster));
+        assert!(!CascadeManager::is_cascade_source_healthy(
+            "node99", &cluster
+        ));
     }
 
     #[test]
@@ -418,7 +445,7 @@ mod tests {
     #[test]
     fn test_parse_host_port_from_conn_url() {
         let (host, port) = CascadeManager::parse_host_port_from_conn_url(
-            "host=10.0.0.5 port=5433 dbname=postgres user=postgres"
+            "host=10.0.0.5 port=5433 dbname=postgres user=postgres",
         );
         assert_eq!(host, "10.0.0.5");
         assert_eq!(port, 5433);

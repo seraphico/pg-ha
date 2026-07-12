@@ -213,10 +213,14 @@ pub fn detect_changes(old: &GlobalConfig, new: &GlobalConfig) -> ConfigChanges {
         if changed {
             match classify_pg_param(name) {
                 PgParamClassification::NeedsReload => {
-                    changes.pg_reload_params.insert(name.clone(), new_val.clone());
+                    changes
+                        .pg_reload_params
+                        .insert(name.clone(), new_val.clone());
                 }
                 PgParamClassification::NeedsRestart => {
-                    changes.pg_restart_params.insert(name.clone(), new_val.clone());
+                    changes
+                        .pg_restart_params
+                        .insert(name.clone(), new_val.clone());
                 }
             }
         }
@@ -301,8 +305,8 @@ pub fn patch_config(
     patch: &serde_json::Value,
 ) -> Result<GlobalConfig, String> {
     // Serialize base to a JSON Value
-    let mut base_value = serde_json::to_value(base)
-        .map_err(|e| format!("Failed to serialize base config: {e}"))?;
+    let mut base_value =
+        serde_json::to_value(base).map_err(|e| format!("Failed to serialize base config: {e}"))?;
 
     // Apply patch using recursive merge
     merge_json_patch(&mut base_value, patch);

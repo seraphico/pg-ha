@@ -53,7 +53,11 @@ impl StandbyClusterConfig {
     /// Build a primary_conninfo string for connecting to the remote primary.
     ///
     /// This is used to configure PostgreSQL recovery to stream from the remote source.
-    pub fn primary_conninfo(&self, replication_user: &str, replication_password: Option<&str>) -> String {
+    pub fn primary_conninfo(
+        &self,
+        replication_user: &str,
+        replication_password: Option<&str>,
+    ) -> String {
         let mut conninfo = format!(
             "host={} port={} user={} application_name=standby_cluster",
             self.host, self.port, replication_user
@@ -65,7 +69,11 @@ impl StandbyClusterConfig {
     }
 
     /// Build a connection string for pg_basebackup from the remote primary.
-    pub fn basebackup_connstr(&self, replication_user: &str, replication_password: Option<&str>) -> String {
+    pub fn basebackup_connstr(
+        &self,
+        replication_user: &str,
+        replication_password: Option<&str>,
+    ) -> String {
         let mut connstr = format!(
             "host={} port={} user={} dbname=postgres",
             self.host, self.port, replication_user
@@ -112,7 +120,8 @@ impl StandbyCluster {
         replication_user: &str,
         replication_password: Option<&str>,
     ) -> Result<bool> {
-        let _expected_conninfo = standby_config.primary_conninfo(replication_user, replication_password);
+        let _expected_conninfo =
+            standby_config.primary_conninfo(replication_user, replication_password);
 
         // In a real implementation, we would read the current recovery config
         // and compare it to the expected conninfo. For now, we verify the
@@ -151,7 +160,9 @@ impl StandbyCluster {
         postgresql: &mut Postgresql,
         current_config: &GlobalConfig,
     ) -> Result<()> {
-        info!("Initiating cascade promote: removing standby_cluster config and promoting to primary");
+        info!(
+            "Initiating cascade promote: removing standby_cluster config and promoting to primary"
+        );
 
         // Step 1: Remove standby_cluster from dynamic config
         let mut new_config = current_config.clone();
@@ -206,7 +217,10 @@ mod tests {
         assert_eq!(config.host, "remote-primary.example.com");
         assert_eq!(config.port, 5433);
         assert_eq!(config.primary_slot_name, Some("standby_slot1".to_string()));
-        assert_eq!(config.restore_command, Some("cp /archive/%f %p".to_string()));
+        assert_eq!(
+            config.restore_command,
+            Some("cp /archive/%f %p".to_string())
+        );
         assert_eq!(config.create_replica_methods, vec!["basebackup"]);
     }
 
@@ -322,11 +336,8 @@ mod tests {
             create_replica_methods: vec!["basebackup".to_string()],
         };
 
-        let connstr = StandbyCluster::clone_source_connstr(
-            &standby_config,
-            "replicator",
-            Some("replpass"),
-        );
+        let connstr =
+            StandbyCluster::clone_source_connstr(&standby_config, "replicator", Some("replpass"));
         assert!(connstr.contains("host=remote-primary.dc1.com"));
         assert!(connstr.contains("port=5433"));
         assert!(connstr.contains("user=replicator"));
@@ -354,7 +365,10 @@ mod tests {
         let standby = config.standby_cluster.unwrap();
         assert_eq!(standby.host, "primary.dc1.example.com");
         assert_eq!(standby.port, 5432);
-        assert_eq!(standby.primary_slot_name, Some("dc2_replication_slot".to_string()));
+        assert_eq!(
+            standby.primary_slot_name,
+            Some("dc2_replication_slot".to_string())
+        );
         assert!(standby.restore_command.unwrap().contains("wal-e"));
     }
 
