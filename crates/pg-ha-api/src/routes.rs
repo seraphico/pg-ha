@@ -138,6 +138,11 @@ async fn basic_auth_middleware(
                         .map(|(u, p)| u == expected_user && p == expected_pass)
                 })
                 .unwrap_or(false)
+        } else if let Some(token) = auth_value.strip_prefix("Bearer ") {
+            use base64::Engine;
+            let expected_token = base64::engine::general_purpose::STANDARD
+                .encode(format!("{expected_user}:{expected_pass}"));
+            token.trim() == expected_token
         } else {
             false
         }

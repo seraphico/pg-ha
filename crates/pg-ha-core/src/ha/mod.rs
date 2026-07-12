@@ -732,6 +732,7 @@ mod tests {
                 partner_addrs: vec!["127.0.0.2:2380".to_string()],
                 data_dir: None,
                 node_id: None,
+                tls: None,
             },
             proxy: ProxyConfig {
                 rw_listen: "0.0.0.0".to_string(),
@@ -742,6 +743,8 @@ mod tests {
             watchdog: WatchdogConfig::default(),
             tags: Tags::default(),
             bootstrap: None,
+            shutdown: ShutdownConfig::default(),
+            log_format: LogFormat::default(),
         }
     }
 
