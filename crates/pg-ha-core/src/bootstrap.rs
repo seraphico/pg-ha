@@ -243,8 +243,10 @@ impl<'a> Bootstrap<'a> {
             .map_err(|e| Error::Postgres(format!("Post-bootstrap SQL connect failed: {e}")))?;
 
         tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                warn!("Post-bootstrap SQL connection closed: {e}");
+            match tokio::time::timeout(std::time::Duration::from_secs(30), connection).await {
+                Ok(Err(e)) => warn!("Post-bootstrap SQL connection closed: {e}"),
+                Err(_) => warn!("Post-bootstrap SQL connection task timed out, cancelling"),
+                Ok(Ok(())) => {}
             }
         });
 
@@ -668,5 +670,62 @@ mod tests {
         assert!(config.post_init.is_empty());
         assert!(config.custom_command.is_none());
         assert!(config.post_bootstrap_sql.is_empty());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Bug Condition Exploration: Bootstrap SQL connection timeout (Defect 1.3)
+    //
+    // **Property 1: Bug Condition** - Bootstrap connection task leaks without timeout
+    // **Validates: Requirements 2.3**
+    //
+    // The `run_post_bootstrap_sql` method spawns a tokio-postgres connection task
+    // without `tokio::time::timeout`, unlike all other connection spawns in
+    // `postgresql.rs` which use `PG_CONNECTION_TIMEOUT`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Property 1: Bug Condition** - Bootstrap connection lacks timeout
+    ///
+    /// **Validates: Requirements 2.3**
+    ///
+    /// Verifies that `run_post_bootstrap_sql` wraps the connection spawn with
+    /// `tokio::time::timeout`. On unfixed code, the spawn has no timeout —
+    /// if PG becomes unresponsive, the task leaks forever.
+    #[test]
+    fn test_bug_condition_bootstrap_connection_has_timeout() {
+        let source = include_str!("bootstrap.rs");
+
+        // Find run_post_bootstrap_sql function body
+        let fn_start = source
+            .find("async fn run_post_bootstrap_sql")
+            .expect("run_post_bootstrap_sql not found");
+        let fn_body = &source[fn_start..];
+
+        // Extract function body (first set of balanced braces)
+        let mut brace_count = 0;
+        let mut fn_end = 0;
+        let mut found_first = false;
+        for (i, ch) in fn_body.char_indices() {
+            if ch == '{' {
+                brace_count += 1;
+                found_first = true;
+            } else if ch == '}' {
+                brace_count -= 1;
+                if found_first && brace_count == 0 {
+                    fn_end = i + 1;
+                    break;
+                }
+            }
+        }
+        let body = &fn_body[..fn_end];
+
+        // The fix: connection spawn must contain `tokio::time::timeout`
+        // The bug: bare `connection.await` without timeout wrapper
+        assert!(
+            body.contains("tokio::time::timeout") || body.contains("time::timeout"),
+            "BUG DETECTED: run_post_bootstrap_sql spawns connection task without timeout.\n\
+             All other connection spawns in postgresql.rs use PG_CONNECTION_TIMEOUT.\n\
+             If PG becomes unresponsive during bootstrap, this task leaks forever.\n\
+             Fix: wrap connection with tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection)"
+        );
     }
 }
