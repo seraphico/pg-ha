@@ -54,14 +54,18 @@ impl Cluster {
     pub fn get_clone_member(&self, exclude_name: &str) -> Option<&Member> {
         // Prefer members with clonefrom tag
         let clone_source = self.members.iter().find(|m| {
-            m.name != exclude_name && m.tags.get("clonefrom").and_then(|v| v.as_bool()) == Some(true)
+            m.name != exclude_name
+                && m.tags.get("clonefrom").and_then(|v| v.as_bool()) == Some(true)
         });
         if clone_source.is_some() {
             return clone_source;
         }
         // Fallback to leader
         if let Some(leader) = &self.leader {
-            return self.members.iter().find(|m| m.name == leader.name && m.name != exclude_name);
+            return self
+                .members
+                .iter()
+                .find(|m| m.name == leader.name && m.name != exclude_name);
         }
         None
     }
@@ -227,7 +231,12 @@ impl SyncState {
     pub fn sync_standby_names(&self) -> Vec<&str> {
         self.sync_standby
             .as_deref()
-            .map(|s| s.split(',').map(|n| n.trim()).filter(|n| !n.is_empty()).collect())
+            .map(|s| {
+                s.split(',')
+                    .map(|n| n.trim())
+                    .filter(|n| !n.is_empty())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -289,16 +298,12 @@ mod tests {
 
     #[test]
     fn test_failover_deserializes_member_alias() {
-        let native: Failover = serde_json::from_str(
-            r#"{"leader":"node1","candidate":"node2"}"#,
-        )
-        .unwrap();
+        let native: Failover =
+            serde_json::from_str(r#"{"leader":"node1","candidate":"node2"}"#).unwrap();
         assert_eq!(native.candidate.as_deref(), Some("node2"));
 
-        let patroni: Failover = serde_json::from_str(
-            r#"{"leader":"node1","member":"node3"}"#,
-        )
-        .unwrap();
+        let patroni: Failover =
+            serde_json::from_str(r#"{"leader":"node1","member":"node3"}"#).unwrap();
         assert_eq!(patroni.candidate.as_deref(), Some("node3"));
         assert!(patroni.is_switchover());
     }

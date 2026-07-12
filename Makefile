@@ -52,7 +52,23 @@ COMPOSE_DEV   := $(COMPOSE) -f docker-compose.yml
 
 BIN_DIR := target/$(RUST_TARGET)/release
 
-.PHONY: all build docker-build up down stop restart status logs help clean print-env
+.PHONY: all build docker-build up down stop restart status logs help clean print-env fmt check lint test
+
+## fmt: format all Rust source code
+fmt:
+	cargo fmt
+
+## check: run cargo check (fast type/borrow checking without codegen)
+check:
+	cargo check --workspace
+
+## lint: run clippy lints
+lint:
+	cargo clippy --workspace -- -D warnings
+
+## test: run all workspace tests
+test:
+	cargo test --workspace
 
 ## all: compile Linux binaries and start the Docker development cluster
 all: up

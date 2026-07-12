@@ -11,7 +11,10 @@ impl Ha {
     /// Update member info in DCS (heartbeat)
     pub(super) async fn touch_member(&self) -> Result<()> {
         // Use the raft self_addr host for conn_url (it's the reachable address)
-        let reachable_host = self.config.raft.self_addr
+        let reachable_host = self
+            .config
+            .raft
+            .self_addr
             .split(':')
             .next()
             .unwrap_or("127.0.0.1");
@@ -60,7 +63,11 @@ impl Ha {
 
     /// Check if standby.signal file exists in the data directory.
     pub(super) fn has_standby_signal(&self) -> bool {
-        self.config.postgresql.data_dir.join("standby.signal").exists()
+        self.config
+            .postgresql
+            .data_dir
+            .join("standby.signal")
+            .exists()
     }
 
     /// Check if this node recently rejoined/reconfigured and should not be disturbed.
@@ -74,10 +81,11 @@ impl Ha {
         let auto_conf_path = self.config.postgresql.data_dir.join("postgresql.auto.conf");
         if let Ok(metadata) = std::fs::metadata(&auto_conf_path)
             && let Ok(modified) = metadata.modified()
-                && let Ok(elapsed) = modified.elapsed() {
-                    // Don't reconfigure within retry_timeout of the last config write
-                    return elapsed.as_secs() < self.config.retry_timeout;
-                }
+            && let Ok(elapsed) = modified.elapsed()
+        {
+            // Don't reconfigure within retry_timeout of the last config write
+            return elapsed.as_secs() < self.config.retry_timeout;
+        }
         false
     }
 

@@ -12,3 +12,7 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 futures = "0.3"
+
+[dev-dependencies]
+proptest = "1"
+tokio = { workspace = true, features = ["test-util"] }

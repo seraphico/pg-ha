@@ -57,10 +57,7 @@ async fn main() -> anyhow::Result<()> {
                 .json()
                 .await?;
             println!("+ Cluster: {}", resp["scope"].as_str().unwrap_or("?"));
-            println!(
-                "  {:<10} {:<10} {:<10}",
-                "Name", "Role", "State"
-            );
+            println!("  {:<10} {:<10} {:<10}", "Name", "Role", "State");
             println!(
                 "  {:<10} {:<10} {:<10}",
                 resp["name"].as_str().unwrap_or("?"),
@@ -77,7 +74,11 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             let status = resp.status();
             let body: Value = resp.json().await?;
-            println!("[{}] {}", status.as_u16(), body["message"].as_str().unwrap_or(""));
+            println!(
+                "[{}] {}",
+                status.as_u16(),
+                body["message"].as_str().unwrap_or("")
+            );
         }
         Commands::Failover { candidate } => {
             let body = serde_json::json!({ "candidate": candidate });
@@ -88,7 +89,11 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             let status = resp.status();
             let body: Value = resp.json().await?;
-            println!("[{}] {}", status.as_u16(), body["message"].as_str().unwrap_or(""));
+            println!(
+                "[{}] {}",
+                status.as_u16(),
+                body["message"].as_str().unwrap_or("")
+            );
         }
         Commands::Restart => {
             let resp = client
@@ -97,7 +102,11 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             let status = resp.status();
             let body: Value = resp.json().await?;
-            println!("[{}] {}", status.as_u16(), body["message"].as_str().unwrap_or(""));
+            println!(
+                "[{}] {}",
+                status.as_u16(),
+                body["message"].as_str().unwrap_or("")
+            );
         }
         Commands::Reinitialize => {
             let resp = client
@@ -106,7 +115,11 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
             let status = resp.status();
             let body: Value = resp.json().await?;
-            println!("[{}] {}", status.as_u16(), body["message"].as_str().unwrap_or(""));
+            println!(
+                "[{}] {}",
+                status.as_u16(),
+                body["message"].as_str().unwrap_or("")
+            );
         }
         Commands::Pause => {
             let body = serde_json::json!({ "pause": true });
