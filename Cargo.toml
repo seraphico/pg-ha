@@ -31,6 +31,8 @@ pingora-core = "0.8"
 pingora-proxy = "0.8"
 pingora-load-balancing = "0.8"
 axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-postgres = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"] }
@@ -51,6 +53,8 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
+axum-server = { workspace = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

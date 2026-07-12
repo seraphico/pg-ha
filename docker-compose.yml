@@ -16,6 +16,11 @@ services:
       POSTGRES_PASSWORD: secret
       PG_HA_RAFT_SELF: "node1:2380"
       PG_HA_RAFT_PARTNERS: "node2:2380,node3:2380"
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
+      PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
+      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
+      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
     ports:
       - "5432:5432"   # PostgreSQL
       - "8008:8008"   # REST API
@@ -24,6 +29,7 @@ services:
     volumes:
       - node1-raft:/var/lib/pg-ha/raft
       - node1-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
     networks:
       - pg-ha-net
 
@@ -41,6 +47,11 @@ services:
       POSTGRES_PASSWORD: secret
       PG_HA_RAFT_SELF: "node2:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node3:2380"
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
+      PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
+      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
+      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
     ports:
       - "5433:5432"
       - "8009:8008"
@@ -49,6 +60,7 @@ services:
     volumes:
       - node2-raft:/var/lib/pg-ha/raft
       - node2-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
     networks:
       - pg-ha-net
 
@@ -66,6 +78,11 @@ services:
       POSTGRES_PASSWORD: secret
       PG_HA_RAFT_SELF: "node3:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node2:2380"
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
+      PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
+      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
+      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
     ports:
       - "5434:5432"
       - "8010:8008"
@@ -74,6 +91,7 @@ services:
     volumes:
       - node3-raft:/var/lib/pg-ha/raft
       - node3-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
     networks:
       - pg-ha-net
 

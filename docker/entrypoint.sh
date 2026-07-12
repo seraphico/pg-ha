@@ -82,6 +82,17 @@ raft:
   data_dir: "${RAFT_DATA_DIR}"
   partner_addrs:
 $(echo -e "$PARTNER_YAML")
+$(if [ -n "$PG_HA_RAFT_TLS_CERT" ]; then
+cat << TLSEOF
+  tls:
+    cert: ${PG_HA_RAFT_TLS_CERT}
+    key: ${PG_HA_RAFT_TLS_KEY}
+    ca_cert: ${PG_HA_RAFT_TLS_CA_CERT}
+    client_cert: ${PG_HA_RAFT_TLS_CLIENT_CERT}
+    client_key: ${PG_HA_RAFT_TLS_CLIENT_KEY}
+    require_client_cert: false
+TLSEOF
+fi)
 
 proxy:
   rw_listen: 0.0.0.0
