@@ -181,9 +181,9 @@ flowchart LR
         DISK3[持久化文件]
     end
 
-    R1 <-->|HTTP :2380| R2
-    R2 <-->|HTTP :2380| R3
-    R1 <-->|HTTP :2380| R3
+    R1 <-->|HTTPS :2380 TLS| R2
+    R2 <-->|HTTPS :2380 TLS| R3
+    R1 <-->|HTTPS :2380 TLS| R3
 
     R1 --> SM1
     R2 --> SM2
@@ -239,3 +239,230 @@ pg-ha (binary)
 │   └── proxy.rs        RW/RO 路由 + 主动健康检查
 └── pg-ha-ctl       CLI 工具 (clap + reqwest)
 ```
+
+
+## TLS 加密通信
+
+Raft RPC 层使用 TLS 加密所有节点间通信，防止集群共识数据在网络上被窃取或篡改。REST API 端口保持 HTTP，仅在内部网络暴露。
+
+```mermaid
+flowchart TB
+    subgraph External["外部网络"]
+        CLIENT[Client]
+    end
+
+    subgraph InternalNet["内部集群网络"]
+        subgraph Node1["Node 1"]
+            API1[REST API :8008 HTTP]
+            RAFT1[Raft RPC :2380 HTTPS/TLS]
+        end
+        subgraph Node2["Node 2"]
+            API2[REST API :8008 HTTP]
+            RAFT2[Raft RPC :2380 HTTPS/TLS]
+        end
+        subgraph Node3["Node 3"]
+            API3[REST API :8008 HTTP]
+            RAFT3[Raft RPC :2380 HTTPS/TLS]
+        end
+    end
+
+    RAFT1 <-->|mTLS 双向认证| RAFT2
+    RAFT2 <-->|mTLS 双向认证| RAFT3
+    RAFT1 <-->|mTLS 双向认证| RAFT3
+
+    CLIENT -->|HTTP 内网| API1
+    CLIENT -->|HTTP 内网| API2
+    CLIENT -->|HTTP 内网| API3
+```
+
+**TLS 配置要点：**
+
+| 组件 | 端口 | 协议 | 说明 |
+|------|------|------|------|
+| Raft RPC | 2380 | HTTPS (TLS 1.2+) | 节点间共识通信，支持 mTLS |
+| REST API | 8008 | HTTP | 内网管理端点，依赖网络隔离 |
+| PostgreSQL | 5432 | TCP | PG 原生协议，可独立配置 `ssl` |
+| Proxy RW/RO | 6432/6433 | TCP | 透传 PG 连接 |
+
+- Raft RPC 启用 TLS 后，所有 `AppendEntries`、`RequestVote`、`InstallSnapshot` RPC 均通过加密通道传输
+- mTLS（双向 TLS）可选启用：每个节点同时验证对端证书，防止未授权节点加入集群
+- REST API 保持 HTTP 是因为它仅在内部网络暴露，由 Basic Auth 保护管理端点
+
+## 认证与安全
+
+```mermaid
+flowchart LR
+    subgraph Endpoints["REST API 端点"]
+        direction TB
+        OPEN[开放端点 无需认证]
+        PROTECTED[保护端点 需要认证]
+    end
+
+    subgraph OpenEndpoints["健康检查 - 负载均衡器使用"]
+        GET_PRIMARY["GET /primary"]
+        GET_REPLICA["GET /replica"]
+        GET_HEALTH["GET /health"]
+        GET_LIVENESS["GET /liveness"]
+        GET_CLUSTER["GET /cluster"]
+        GET_METRICS["GET /metrics"]
+    end
+
+    subgraph ProtectedEndpoints["管理操作 - Basic Auth"]
+        POST_SWITCHOVER["POST /switchover"]
+        POST_FAILOVER["POST /failover"]
+        POST_RESTART["POST /restart"]
+        POST_REINIT["POST /reinitialize"]
+        CONFIG["GET/PUT/PATCH /config"]
+    end
+
+    OPEN --> OpenEndpoints
+    PROTECTED --> ProtectedEndpoints
+```
+
+**认证机制：**
+
+- **Basic Auth**：配置 `restapi.username` 和 `restapi.password` 后自动启用
+- 认证未配置时，所有端点开放（适用于完全隔离的内网环境）
+- 健康检查端点始终开放，供负载均衡器和 TCP Proxy 健康探测使用
+- 管理端点（switchover、failover、config 变更等）受 Basic Auth 保护
+
+```yaml
+# 配置示例
+restapi:
+  listen: 0.0.0.0
+  port: 8008
+  username: admin      # 设置后启用 Basic Auth
+  password: s3cr3t     # 管理端点需要此凭证
+```
+
+**请求示例：**
+
+```bash
+# 健康检查（无需认证）
+curl http://localhost:8008/health
+curl http://localhost:8008/primary
+curl http://localhost:8008/replica
+
+# 管理操作（需要 Basic Auth）
+curl -u admin:s3cr3t -X POST http://localhost:8008/switchover \
+  -H 'Content-Type: application/json' \
+  -d '{"leader": "node1", "candidate": "node2"}'
+
+# 未认证会返回 401
+curl -X POST http://localhost:8008/failover
+# → {"error": "Unauthorized"}
+```
+
+## 优雅关停流程
+
+pg-ha 收到 `SIGTERM` 或 `SIGINT` 信号后，执行分阶段优雅关停，确保数据安全和快速故障转移。
+
+```mermaid
+sequenceDiagram
+    participant OS as 操作系统
+    participant PGHA as pg-ha Agent
+    participant PG as PostgreSQL
+    participant DCS as Raft DCS
+    participant OTHER as 其他节点
+
+    OS->>PGHA: SIGTERM / SIGINT
+
+    Note over PGHA: Phase 1: 信号接收
+    PGHA->>PGHA: 停止 HA 循环 (tokio::select! 退出)
+
+    Note over PGHA: Phase 2: Leader 特殊处理
+    alt 当前节点是 Leader
+        PGHA->>PG: CHECKPOINT (刷盘)
+        PG-->>PGHA: OK
+        PGHA->>DCS: delete_leader(lock) 释放 Leader Lock
+        DCS-->>PGHA: OK
+        Note over DCS: Leader Lock 立即释放
+    end
+
+    Note over PGHA: Phase 3: 停止 PostgreSQL
+    PGHA->>PG: pg_ctl stop -m fast
+    PG->>PG: 断开客户端连接
+    PG->>PG: 完成 WAL 刷盘
+    PG-->>PGHA: 退出
+
+    Note over PGHA: Phase 4: 进程退出
+    PGHA->>OS: exit(0)
+
+    Note over OTHER: 故障转移触发
+    OTHER->>DCS: get_cluster() → unlocked
+    OTHER->>OTHER: is_healthiest_node()?
+    OTHER->>DCS: attempt_to_acquire_leader()
+    OTHER->>OTHER: pg_ctl promote
+    Note over OTHER: 新 Primary 就绪
+```
+
+**关键设计决策：**
+
+1. **Leader 主动释放锁**：不等待 TTL 过期，立即释放 Leader Lock，使其他节点能在秒级内完成故障转移
+2. **CHECKPOINT 在释放锁之前**：确保所有已提交事务的 WAL 已刷盘，避免数据丢失
+3. **fast 模式停止 PG**：立即断开客户端连接，但允许正在进行的 WAL 写入完成
+4. **信号处理的 tokio::select!**：与 HA 循环、API 服务器、Proxy 并行监听，任一退出触发关停
+
+**时间线：**
+
+| 阶段 | 耗时 | 说明 |
+|------|------|------|
+| Phase 1 | < 1ms | 信号接收，select! 退出 |
+| Phase 2 | 1-5s | CHECKPOINT + 释放锁 |
+| Phase 3 | 1-3s | pg_ctl stop fast |
+| Phase 4 | 即时 | exit(0) |
+| 故障转移 | 1-2s | 其他节点检测到 unlocked 并 promote |
+| **总计** | **3-10s** | 从信号到新 Primary 就绪 |
+
+## 日志系统
+
+pg-ha 使用 `tracing` + `tracing-subscriber` 提供 text/json 双模式日志输出。
+
+**日志模式切换：**
+
+| 环境变量 | 值 | 效果 |
+|---------|---|------|
+| `PG_HA_LOG_FORMAT` | `text`（默认） | 人类可读的彩色日志 |
+| `PG_HA_LOG_FORMAT` | `json` | 结构化 JSON 日志（生产推荐） |
+| `RUST_LOG` | tracing 过滤表达式 | 控制日志级别和模块过滤 |
+
+**Text 模式示例（默认）：**
+
+```
+2024-01-15T10:30:00.123Z  INFO pg_ha: Starting pg-ha agent name="node1" scope="prod-cluster"
+2024-01-15T10:30:02.456Z  INFO pg_ha_dcs: Raft cluster bootstrapped with 3 members
+2024-01-15T10:30:05.789Z  INFO pg_ha_core::ha: run_cycle completed role=Primary leader=true
+```
+
+**JSON 模式示例（`PG_HA_LOG_FORMAT=json`）：**
+
+```json
+{"timestamp":"2024-01-15T10:30:00.123Z","level":"INFO","target":"pg_ha","message":"Starting pg-ha agent","name":"node1","scope":"prod-cluster"}
+{"timestamp":"2024-01-15T10:30:02.456Z","level":"INFO","target":"pg_ha_dcs","message":"Raft cluster bootstrapped with 3 members"}
+{"timestamp":"2024-01-15T10:30:05.789Z","level":"INFO","target":"pg_ha_core::ha","message":"run_cycle completed","role":"Primary","leader":true}
+```
+
+**RUST_LOG 环境变量控制：**
+
+```bash
+# 默认级别（内置）
+RUST_LOG="pg_ha=info,openraft::replication=off"
+
+# 调试 HA 决策循环
+RUST_LOG="pg_ha_core::ha=debug,pg_ha=info"
+
+# 调试 Raft 共识
+RUST_LOG="pg_ha_dcs=debug,openraft=debug,pg_ha=info"
+
+# 调试网络通信
+RUST_LOG="pg_ha_dcs::network=trace,pg_ha=info"
+
+# 全部 trace（大量输出，仅调试用）
+RUST_LOG="trace"
+```
+
+**日志格式优先级：**
+
+1. 环境变量 `PG_HA_LOG_FORMAT` 覆盖默认值
+2. `RUST_LOG` 环境变量覆盖内置的过滤表达式
+3. 内置默认：`pg_ha=info` + `openraft::replication=off`（抑制高频复制日志）
