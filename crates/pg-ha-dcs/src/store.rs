@@ -212,7 +212,7 @@ impl MemStore {
 
     // ─────────────────── Persistence helpers ───────────────────
 
-    fn persist_hard_state(&self, inner: &MemStoreInner) {
+    async fn persist_hard_state(&self, inner: &MemStoreInner) {
         if let Some(dir) = &self.data_dir {
             let hs = PersistedHardState {
                 vote: inner.vote,
@@ -226,15 +226,23 @@ impl MemStore {
                     return;
                 }
             };
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!("Failed to persist hard_state: {e}");
-                }
-            });
+            let result = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&path)?;
+                file.write_all(json.as_bytes())?;
+                file.sync_all()?;
+                Ok::<(), std::io::Error>(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Failed to persist hard_state: {e}"),
+                Err(e) => warn!("persist_hard_state task panicked: {e}"),
+            }
         }
     }
 
-    fn persist_log(&self, inner: &MemStoreInner) {
+    async fn persist_log(&self, inner: &MemStoreInner) {
         if let Some(dir) = &self.data_dir {
             let pl = PersistedLog {
                 last_purged: inner.last_purged,
@@ -248,15 +256,23 @@ impl MemStore {
                     return;
                 }
             };
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!("Failed to persist log entries: {e}");
-                }
-            });
+            let result = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&path)?;
+                file.write_all(json.as_bytes())?;
+                file.sync_all()?;
+                Ok::<(), std::io::Error>(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Failed to persist log entries: {e}"),
+                Err(e) => warn!("persist_log task panicked: {e}"),
+            }
         }
     }
 
-    fn persist_state_machine(&self, inner: &MemStoreInner) {
+    async fn persist_state_machine(&self, inner: &MemStoreInner) {
         if let Some(dir) = &self.data_dir {
             let path = dir.join("state_machine.json");
             let json = match serde_json::to_string_pretty(&inner.state_machine) {
@@ -266,15 +282,23 @@ impl MemStore {
                     return;
                 }
             };
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!("Failed to persist state machine: {e}");
-                }
-            });
+            let result = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&path)?;
+                file.write_all(json.as_bytes())?;
+                file.sync_all()?;
+                Ok::<(), std::io::Error>(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Failed to persist state machine: {e}"),
+                Err(e) => warn!("persist_state_machine task panicked: {e}"),
+            }
         }
     }
 
-    fn persist_membership(&self, inner: &MemStoreInner) {
+    async fn persist_membership(&self, inner: &MemStoreInner) {
         if let Some(dir) = &self.data_dir {
             let pm = PersistedMembership {
                 last_applied_log: inner.last_applied_log,
@@ -288,11 +312,19 @@ impl MemStore {
                     return;
                 }
             };
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!("Failed to persist membership: {e}");
-                }
-            });
+            let result = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&path)?;
+                file.write_all(json.as_bytes())?;
+                file.sync_all()?;
+                Ok::<(), std::io::Error>(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Failed to persist membership: {e}"),
+                Err(e) => warn!("persist_membership task panicked: {e}"),
+            }
         }
     }
 }
@@ -365,7 +397,7 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.write().await;
         inner.vote = Some(*vote);
-        self.persist_hard_state(&inner);
+        self.persist_hard_state(&inner).await;
         Ok(())
     }
 
@@ -379,7 +411,7 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     ) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.write().await;
         inner.committed = committed;
-        self.persist_hard_state(&inner);
+        self.persist_hard_state(&inner).await;
         Ok(())
     }
 
@@ -395,7 +427,7 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         for entry in entries {
             inner.log.insert(entry.log_id.index, entry);
         }
-        self.persist_log(&inner);
+        self.persist_log(&inner).await;
         Ok(())
     }
 
@@ -408,7 +440,7 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         for key in keys {
             inner.log.remove(&key);
         }
-        self.persist_log(&inner);
+        self.persist_log(&inner).await;
         Ok(())
     }
 
@@ -419,7 +451,7 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
             inner.log.remove(&key);
         }
         inner.last_purged = Some(log_id);
-        self.persist_log(&inner);
+        self.persist_log(&inner).await;
         Ok(())
     }
 
@@ -461,8 +493,8 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         }
 
         // Persist state machine and membership after applying entries
-        self.persist_state_machine(&inner);
-        self.persist_membership(&inner);
+        self.persist_state_machine(&inner).await;
+        self.persist_membership(&inner).await;
         Ok(results)
     }
 
@@ -500,9 +532,9 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         });
 
         // Persist everything after snapshot install
-        self.persist_state_machine(&inner);
-        self.persist_membership(&inner);
-        self.persist_hard_state(&inner);
+        self.persist_state_machine(&inner).await;
+        self.persist_membership(&inner).await;
+        self.persist_hard_state(&inner).await;
         Ok(())
     }
 
@@ -583,8 +615,8 @@ mod tests {
 
             // Verify std::fs::write is inside spawn_blocking (not at top level)
             assert!(
-                method_body.contains("std::fs::write"),
-                "Method `{}` should use std::fs::write (inside spawn_blocking)",
+                method_body.contains("write_all") && method_body.contains("sync_all"),
+                "Method `{}` should use write_all + sync_all (inside spawn_blocking)",
                 method_name
             );
         }
@@ -639,13 +671,16 @@ mod tests {
                 method_name
             );
 
-            // The method should NOT have a bare std::fs::write outside of spawn_blocking
-            // Verify by checking that spawn_blocking appears BEFORE std::fs::write in the body
+            // The method should NOT have bare file I/O outside of spawn_blocking
+            // Verify by checking that spawn_blocking appears BEFORE file operations
             let spawn_pos = method_body.find("spawn_blocking").unwrap();
-            let write_pos = method_body.find("std::fs::write").unwrap();
+            let write_pos = method_body
+                .find("write_all")
+                .or_else(|| method_body.find("std::fs::write"))
+                .unwrap();
             assert!(
                 spawn_pos < write_pos,
-                "In method `{}`, std::fs::write should be inside spawn_blocking closure",
+                "In method `{}`, file I/O should be inside spawn_blocking closure",
                 method_name
             );
         }
@@ -684,22 +719,21 @@ mod tests {
         // Call all four persist methods and measure total time
         let inner = store.inner.read().await;
         let start = Instant::now();
-        store.persist_log(&inner);
-        store.persist_hard_state(&inner);
-        store.persist_state_machine(&inner);
-        store.persist_membership(&inner);
+        store.persist_log(&inner).await;
+        store.persist_hard_state(&inner).await;
+        store.persist_state_machine(&inner).await;
+        store.persist_membership(&inner).await;
         let total_duration = start.elapsed();
         drop(inner);
 
-        // With spawn_blocking fire-and-forget, all four calls should return
-        // almost instantly (just spawning tasks). If synchronous, this would
-        // take measurable time for the actual disk I/O.
+        // With the durability fix, persist_* methods now AWAIT completion (including fsync).
+        // This means they take real disk I/O time, but they don't block the tokio
+        // runtime thread — they use spawn_blocking to offload to the blocking pool.
+        // On a fast local SSD, 4 persists with fsync should still complete within 2s.
         assert!(
-            total_duration < Duration::from_millis(10),
-            "All four persist_* calls took {:?} to return. \
-             Expected <10ms with spawn_blocking (fire-and-forget pattern). \
-             Counterexample: persist_log with 100 entries blocks tokio worker thread \
-             taking >5ms of synchronous disk I/O.",
+            total_duration < Duration::from_secs(2),
+            "All four persist_* calls took {:?} — expected < 2s on local SSD. \
+             The calls are awaited (durable) but offloaded via spawn_blocking.",
             total_duration
         );
 
@@ -822,12 +856,10 @@ mod tests {
                     let mut inner = store.inner.write().await;
                     inner.vote = vote;
                     inner.committed = committed;
-                    store.persist_hard_state(&inner);
+                    store.persist_hard_state(&inner).await;
                 }
 
                 // Wait briefly for spawn_blocking to complete
-                tokio::task::yield_now().await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
                 // Reload from disk
                 let reloaded = MemStore::new_persistent(tmp_dir);
@@ -865,12 +897,10 @@ mod tests {
                     for entry in &entries {
                         inner.log.insert(entry.log_id.index, entry.clone());
                     }
-                    store.persist_log(&inner);
+                    store.persist_log(&inner).await;
                 }
 
                 // Wait for spawn_blocking
-                tokio::task::yield_now().await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
                 // Reload from disk
                 let reloaded = MemStore::new_persistent(tmp_dir);
@@ -919,12 +949,10 @@ mod tests {
                         };
                         inner.state_machine.apply(&req, (idx + 1) as u64);
                     }
-                    store.persist_state_machine(&inner);
+                    store.persist_state_machine(&inner).await;
                 }
 
                 // Wait for spawn_blocking
-                tokio::task::yield_now().await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
                 // Reload from disk
                 let reloaded = MemStore::new_persistent(tmp_dir);
@@ -986,12 +1014,10 @@ mod tests {
                     let mut inner = store.inner.write().await;
                     inner.last_applied_log = last_applied_log;
                     inner.last_membership = stored_membership.clone();
-                    store.persist_membership(&inner);
+                    store.persist_membership(&inner).await;
                 }
 
                 // Wait for spawn_blocking
-                tokio::task::yield_now().await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
                 // Reload from disk
                 let reloaded = MemStore::new_persistent(tmp_dir);
@@ -1047,15 +1073,13 @@ mod tests {
                     ));
 
                     // Persist all state
-                    store.persist_hard_state(&inner);
-                    store.persist_log(&inner);
-                    store.persist_state_machine(&inner);
-                    store.persist_membership(&inner);
+                    store.persist_hard_state(&inner).await;
+                    store.persist_log(&inner).await;
+                    store.persist_state_machine(&inner).await;
+                    store.persist_membership(&inner).await;
                 }
 
                 // Wait for all spawn_blocking tasks
-                tokio::task::yield_now().await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
                 // Reload everything from disk
                 let reloaded = MemStore::new_persistent(tmp_dir);
