@@ -17,7 +17,7 @@ use pg_ha_core::dcs::DcsAdapter;
 use pg_ha_core::error::{Error, Result};
 
 use crate::network::NetworkFactory;
-use crate::state_machine::{Request, Response};
+use crate::state_machine::{current_millis, Request, Response};
 use crate::store::{MemStore, NodeId, TypeConfig};
 
 /// DCS adapter built on top of embedded Raft
@@ -153,6 +153,7 @@ impl RaftDcs {
                     prev_exist: None,
                     prev_value: None,
                     prev_version: None,
+                    now: current_millis(),
                 };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(3),
@@ -359,6 +360,7 @@ impl DcsAdapter for RaftDcs {
             prev_exist: Some(false), // Only succeed if key does NOT exist
             prev_value: None,
             prev_version: None,
+            now: current_millis(),
         };
 
         match self.propose(request).await? {
@@ -382,6 +384,7 @@ impl DcsAdapter for RaftDcs {
             prev_exist: None,
             prev_value: Some(self.node_name.clone()),
             prev_version: None,
+            now: current_millis(),
         };
 
         match self.propose(request).await? {
@@ -421,6 +424,7 @@ impl DcsAdapter for RaftDcs {
             prev_exist: None,
             prev_value: None,
             prev_version: None,
+            now: current_millis(),
         };
 
         match self.propose(request).await? {
@@ -438,6 +442,7 @@ impl DcsAdapter for RaftDcs {
             prev_exist: Some(false),
             prev_value: None,
             prev_version: None,
+            now: current_millis(),
         };
 
         match self.propose(request).await? {
@@ -457,6 +462,7 @@ impl DcsAdapter for RaftDcs {
             prev_exist: None,
             prev_value: None,
             prev_version: None,
+            now: current_millis(),
         };
         match self.propose(request).await? {
             Response::Ok { .. } => Ok(true),
@@ -472,6 +478,7 @@ impl DcsAdapter for RaftDcs {
             prev_exist: None,
             prev_value: None,
             prev_version: None,
+            now: current_millis(),
         };
         match self.propose(request).await? {
             Response::Ok { .. } => Ok(true),
