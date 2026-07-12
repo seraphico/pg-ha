@@ -300,6 +300,19 @@ impl KvStateMachine {
     }
 }
 
+/// Check if a key entry has expired based on its `expire_at` timestamp.
+///
+/// **NOTE: Best-effort, node-local check.** This uses `current_millis()` (wall-clock
+/// time) which may differ slightly across nodes due to clock skew. In a multi-node
+/// Raft cluster, different nodes may briefly disagree on whether a key is expired.
+///
+/// This is acceptable for the pg-ha use case because:
+/// - HA decisions are based on the DCS leader lock (TTL typically 30s), not on
+///   individual key reads. Clock skew under NTP is typically < 100ms.
+/// - Authoritative, deterministic expiry is performed via `ExpireKeys` proposals
+///   driven by the Raft leader, which use a leader-provided `now` timestamp.
+/// - This local check only serves to avoid returning obviously-stale data on the
+///   read path (e.g., `get_cluster()`, `get_config_value()`).
 fn is_expired(entry: &KvEntry) -> bool {
     entry.expire_at.is_some_and(|exp| exp <= current_millis())
 }
