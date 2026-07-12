@@ -114,15 +114,25 @@ async fn main() -> anyhow::Result<()> {
 
     // ─── Initialize Raft RPC server (must start BEFORE bootstrap) ───
     let raft_router = pg_ha_dcs::raft_router(dcs.raft().clone());
-    let raft_addr: SocketAddr = resolve_addr(&config.raft.self_addr)
-        .await
-        .expect("Cannot resolve Raft RPC address");
+    let raft_addr: SocketAddr = match resolve_addr(&config.raft.self_addr).await {
+        Some(addr) => addr,
+        None => {
+            error!(addr = %config.raft.self_addr, "Cannot resolve Raft RPC address");
+            anyhow::bail!(
+                "Failed to resolve Raft RPC address '{}'. Check DNS or use IP:port format.",
+                config.raft.self_addr
+            );
+        }
+    };
 
     // Start Raft RPC server in background immediately
     let raft_listener = tokio::net::TcpListener::bind(raft_addr).await?;
     info!(%raft_addr, "Raft RPC listening");
     tokio::spawn(async move {
-        axum::serve(raft_listener, raft_router).await.unwrap();
+        if let Err(e) = axum::serve(raft_listener, raft_router).await {
+            error!("Raft RPC server fatal error: {e}");
+            std::process::exit(1);
+        }
     });
 
     // ─── Bootstrap Raft cluster ───
@@ -172,15 +182,15 @@ async fn main() -> anyhow::Result<()> {
     let api_router = pg_ha_api::build_router_with_commands(app_state.clone(), Some(cmd_tx), auth_config);
     let api_addr: SocketAddr = format!("{}:{}", config.restapi.listen, config.restapi.port)
         .parse()
-        .expect("Invalid REST API address");
+        .map_err(|e| anyhow::anyhow!("Invalid REST API address '{}:{}': {e}", config.restapi.listen, config.restapi.port))?;
 
     // ─── Initialize TCP Proxy ───
     let rw_addr: SocketAddr = format!("{}:{}", config.proxy.rw_listen, config.proxy.rw_port)
         .parse()
-        .expect("Invalid proxy RW address");
+        .map_err(|e| anyhow::anyhow!("Invalid proxy RW address: {e}"))?;
     let ro_addr: SocketAddr = format!("{}:{}", config.proxy.ro_listen, config.proxy.ro_port)
         .parse()
-        .expect("Invalid proxy RO address");
+        .map_err(|e| anyhow::anyhow!("Invalid proxy RO address: {e}"))?;
     let proxy = Arc::new(PgProxy::new(rw_addr, ro_addr));
 
     // ─── Initialize Raft RPC server ───
@@ -256,9 +266,18 @@ async fn main() -> anyhow::Result<()> {
 
         // REST API server
         _ = async {
-            let listener = tokio::net::TcpListener::bind(api_addr).await.unwrap();
+            let listener = match tokio::net::TcpListener::bind(api_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(%api_addr, "Failed to bind REST API: {e}");
+                    std::process::exit(1);
+                }
+            };
             info!(%api_addr, "REST API listening");
-            axum::serve(listener, api_router).await.unwrap();
+            if let Err(e) = axum::serve(listener, api_router).await {
+                error!("REST API server fatal error: {e}");
+                std::process::exit(1);
+            }
         } => {}
 
         // TCP Proxy
