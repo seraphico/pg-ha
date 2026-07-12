@@ -20,8 +20,22 @@ use crate::store::{NodeId, TypeConfig};
 // ─────────────────── Network Factory ───────────────────
 
 /// Creates network connections to other Raft nodes
-#[derive(Debug, Clone, Default)]
-pub struct NetworkFactory;
+#[derive(Debug, Clone)]
+pub struct NetworkFactory {
+    client: reqwest::Client,
+}
+
+impl Default for NetworkFactory {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .pool_max_idle_per_host(5)
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     type Network = NetworkConnection;
@@ -34,7 +48,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
         };
         NetworkConnection {
             target_addr: addr,
-            client: reqwest::Client::new(),
+            client: self.client.clone(),
         }
     }
 }

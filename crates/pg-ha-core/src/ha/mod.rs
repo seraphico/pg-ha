@@ -57,7 +57,6 @@ pub struct Ha {
     cluster: Cluster,
     is_leader: bool,
     is_paused: bool,
-    recovering: bool,
 
     // ─── Dynamic configuration ───
     dynamic_config_state: DynamicConfigState,
@@ -83,7 +82,6 @@ impl Ha {
             cluster: Cluster::empty(),
             is_leader: false,
             is_paused: false,
-            recovering: false,
             dynamic_config_state: DynamicConfigState::new(),
             cmd_rx,
             pending_switchover: None,
@@ -363,7 +361,6 @@ impl Ha {
         match self.postgresql.start().await {
             Ok(()) => {
                 self.start_fail_count = 0;
-                self.recovering = true;
                 CycleResult::Follower("started PostgreSQL, recovering".into())
             }
             Err(e) => {

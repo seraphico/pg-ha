@@ -42,6 +42,9 @@ pub struct RaftDcs {
 
     /// Notification channel for waking up watchers
     notify: Arc<Notify>,
+
+    /// Shared HTTP client for forwarding requests to the Raft leader
+    http_client: reqwest::Client,
 }
 
 impl RaftDcs {
@@ -81,13 +84,19 @@ impl RaftDcs {
                 Arc::new(MemStore::new())
             }
         };
-        let network = NetworkFactory;
+        let network = NetworkFactory::default();
 
         let (log_store, state_machine) = Adaptor::new(store.clone());
         let raft = Raft::new(node_id, config, network, log_store, state_machine).await?;
         let raft = Arc::new(raft);
 
         let base_path = format!("/{namespace}/{scope}/");
+
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(3)
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
 
         Ok(Self {
             raft,
@@ -97,6 +106,7 @@ impl RaftDcs {
             ttl,
             loop_wait,
             notify: Arc::new(Notify::new()),
+            http_client,
         })
     }
 
@@ -268,9 +278,8 @@ impl RaftDcs {
         };
 
         // POST the request to leader's /raft/client-write endpoint
-        let client = reqwest::Client::new();
         let url = format!("{leader_addr}/raft/client-write");
-        let resp = client
+        let resp = self.http_client
             .post(&url)
             .json(request)
             .send()
