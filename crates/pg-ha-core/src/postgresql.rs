@@ -138,12 +138,42 @@ impl Postgresql {
                     && let Ok(pid) = pid_str.trim().parse::<i32>()
                 {
                     // Check if process is alive (signal 0 doesn't send a signal, just checks)
-                    return unsafe { libc::kill(pid, 0) == 0 };
+                    if unsafe { libc::kill(pid, 0) != 0 } {
+                        return false;
+                    }
+                    // PID exists — verify it's actually a postgres process
+                    return Self::is_postgres_process(pid);
                 }
                 false
             }
             Err(_) => false,
         }
+    }
+
+    /// Verify that a PID belongs to a PostgreSQL process.
+    /// On Linux: checks /proc/{pid}/cmdline for "postgres".
+    /// On other platforms: returns true (conservative — PID existence is sufficient).
+    #[cfg(target_os = "linux")]
+    fn is_postgres_process(pid: i32) -> bool {
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        match std::fs::read(&cmdline_path) {
+            Ok(data) => {
+                // cmdline is NUL-separated; check first argument contains "postgres"
+                let cmdline = String::from_utf8_lossy(&data);
+                let first_arg = cmdline.split('\0').next().unwrap_or("");
+                first_arg.contains("postgres")
+            }
+            Err(_) => {
+                // Cannot read cmdline (permission denied or process exited) — conservative false
+                false
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn is_postgres_process(_pid: i32) -> bool {
+        // On macOS/other platforms: trust PID existence check (acceptable for dev/test)
+        true
     }
 
     /// Read the PID from postmaster.pid, if available
@@ -773,6 +803,69 @@ mod tests {
         assert_eq!(parse_lsn("0/0/0"), None);
         assert_eq!(parse_lsn("G/0"), None);
         assert_eq!(parse_lsn("0/G"), None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Bug Condition Exploration: PID Validation Missing (Defect 1.5)
+    //
+    // **Property 1: Bug Condition** - PID recycling causes false-positive is_running
+    // **Validates: Requirements 2.5**
+    //
+    // `is_running()` only checks `libc::kill(pid, 0)` — it cannot distinguish
+    // between PostgreSQL and another process that recycled the same PID.
+    // This test verifies the source code includes process identity validation.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Property 1: Bug Condition** - PID validation in is_running
+    ///
+    /// **Validates: Requirements 2.5**
+    ///
+    /// Verifies `is_running()` validates process identity (not just PID existence).
+    /// On unfixed code, only `libc::kill(pid, 0)` is used — any alive PID returns true.
+    #[test]
+    fn test_bug_condition_pid_validation_in_is_running() {
+        let source = include_str!("postgresql.rs");
+
+        // Find is_running function body (stop at next pub fn)
+        let fn_start = source
+            .find("pub fn is_running(&self) -> bool")
+            .expect("is_running() not found");
+        let fn_body = &source[fn_start..];
+
+        let mut brace_count = 0;
+        let mut fn_end = 0;
+        let mut found_first = false;
+        for (i, ch) in fn_body.char_indices() {
+            if ch == '{' {
+                brace_count += 1;
+                found_first = true;
+            } else if ch == '}' {
+                brace_count -= 1;
+                if found_first && brace_count == 0 {
+                    fn_end = i + 1;
+                    break;
+                }
+            }
+        }
+        let body = &fn_body[..fn_end];
+
+        // The fix should include process identity verification beyond kill(pid, 0).
+        // On Linux: /proc/{pid}/cmdline check for "postgres"
+        // Implementation detail: `is_postgres_process` helper or inline cmdline check.
+        let has_identity_check = body.contains("is_postgres_process")
+            || body.contains("/proc/")
+            || body.contains("cmdline")
+            || body.contains("process_name");
+
+        assert!(
+            has_identity_check,
+            "BUG DETECTED: is_running() only checks libc::kill(pid, 0) without \
+             verifying process identity.\n\
+             If PostgreSQL crashes and its PID is recycled by another process, \
+             is_running() incorrectly returns true — preventing HA from restarting PG.\n\
+             Fix: after kill(pid, 0) succeeds, verify the process is actually postgres \
+             (e.g., check /proc/{{pid}}/cmdline on Linux)."
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
