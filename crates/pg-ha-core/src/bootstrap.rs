@@ -389,7 +389,7 @@ impl<'a> Bootstrap<'a> {
         }
 
         info!(
-            primary_conninfo = %primary_conninfo,
+            primary_conninfo = %crate::postgresql::redact_connstr(&primary_conninfo),
             "Configured as streaming standby"
         );
     }
