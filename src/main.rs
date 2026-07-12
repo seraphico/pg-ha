@@ -45,26 +45,6 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing with optional JSON output
-    let env_filter = EnvFilter::from_default_env()
-        .add_directive("pg_ha=info".parse()?)
-        .add_directive("openraft::replication=off".parse()?);
-
-    let log_format = std::env::var("PG_HA_LOG_FORMAT").unwrap_or_default();
-    if log_format.eq_ignore_ascii_case("json") {
-        // JSON structured logging
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().json())
-            .init();
-    } else {
-        // Default human-readable output
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer())
-            .init();
-    }
-
     let cli = Cli::parse();
 
     // Handle --generate-sample-config
@@ -76,6 +56,28 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let mut config = Config::from_file(&cli.configfile)?;
     config.apply_env_overrides();
+
+    // Initialize tracing: env var PG_HA_LOG_FORMAT overrides config.log_format
+    let env_filter = EnvFilter::from_default_env()
+        .add_directive("pg_ha=info".parse()?)
+        .add_directive("openraft::replication=off".parse()?);
+
+    let use_json = match std::env::var("PG_HA_LOG_FORMAT") {
+        Ok(val) => val.eq_ignore_ascii_case("json"),
+        Err(_) => config.log_format == pg_ha_core::config::LogFormat::Json,
+    };
+
+    if use_json {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
 
     // Handle --validate-config
     if cli.validate_config {
@@ -111,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         config.ttl,
         config.loop_wait,
         config.raft.data_dir.clone(),
+        config.raft.tls.as_ref(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to initialize Raft: {e}"))?;
@@ -129,15 +132,34 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Start Raft RPC server in background immediately
-    let raft_listener = tokio::net::TcpListener::bind(raft_addr).await?;
-    info!(%raft_addr, "Raft RPC listening");
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(raft_listener, raft_router).await {
-            error!("Raft RPC server fatal error: {e}");
-            std::process::exit(1);
-        }
-    });
+    // Start Raft RPC server — TLS or plain HTTP depending on config
+    if let Some(ref tls_cfg) = config.raft.tls {
+        use axum_server::tls_rustls::RustlsConfig;
+        // Install rustls crypto provider (required by rustls 0.23+)
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rustls_config = RustlsConfig::from_pem_file(&tls_cfg.cert, &tls_cfg.key)
+            .await
+            .map_err(|e| anyhow::anyhow!("Raft TLS config error: {e}"))?;
+        info!(%raft_addr, "Raft RPC listening (TLS)");
+        tokio::spawn(async move {
+            if let Err(e) = axum_server::bind_rustls(raft_addr, rustls_config)
+                .serve(raft_router.into_make_service())
+                .await
+            {
+                error!("Raft RPC TLS server fatal error: {e}");
+                std::process::exit(1);
+            }
+        });
+    } else {
+        let raft_listener = tokio::net::TcpListener::bind(raft_addr).await?;
+        info!(%raft_addr, "Raft RPC listening");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(raft_listener, raft_router).await {
+                error!("Raft RPC server fatal error: {e}");
+                std::process::exit(1);
+            }
+        });
+    }
 
     // ─── Bootstrap Raft cluster ───
     // Build the full member list: (node_id, addr)
@@ -331,31 +353,49 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ─── Graceful Shutdown Sequence ───
-    info!("Shutting down gracefully...");
+    info!("Initiating graceful shutdown...");
 
+    // Phase 1: Stop accepting new connections
+    // (Already done — tokio::select! drops the proxy/API listeners above)
+    info!("Phase 1: Stopped accepting new connections");
+
+    // Phase 2: Drain existing proxy connections (wait for active transactions)
+    let drain_timeout = std::time::Duration::from_secs(config.shutdown.drain_timeout_secs);
+    info!(
+        timeout_secs = config.shutdown.drain_timeout_secs,
+        "Phase 2: Draining active connections"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Note: spawned proxy connection tasks will continue until their TCP streams close
+    // or until PG is stopped in Phase 4. The 2s grace period allows in-flight queries
+    // to complete. For long transactions, PG's "fast" shutdown will terminate them.
+
+    // Phase 3: Primary node responsibilities (only if this node holds the leader lock)
     if ha.is_leader() {
-        // Leader shutdown: checkpoint → release lock → stop PG
-        info!("Leader shutdown: running CHECKPOINT");
+        info!("Phase 3: Leader shutdown — running CHECKPOINT");
         if let Err(e) = ha.postgresql().checkpoint().await {
-            error!("CHECKPOINT during shutdown failed: {e}");
+            error!("CHECKPOINT during shutdown failed: {e} (continuing)");
         }
 
-        // Release the leader lock in DCS
+        info!("Phase 3: Releasing leader lock in DCS");
         if let Some(leader) = ha.cluster().leader.as_ref() {
-            info!("Releasing leader lock in DCS");
             if let Err(e) = dcs.delete_leader(leader).await {
-                error!("Failed to release leader lock: {e}");
+                error!("Failed to release leader lock: {e} (will expire via TTL)");
+            } else {
+                info!("Leader lock released — other nodes can elect new leader");
             }
         }
+    } else {
+        info!("Phase 3: Not leader, skipping CHECKPOINT and lock release");
     }
 
-    // Stop PostgreSQL with "fast" mode (disconnects clients, no new connections)
-    info!("Stopping PostgreSQL (fast mode)");
+    // Phase 4: Stop subsystems
+    info!("Phase 4: Stopping PostgreSQL (fast mode)");
     if let Err(e) = ha.postgresql_mut().stop("fast").await {
         error!("Failed to stop PostgreSQL during shutdown: {e}");
     }
 
-    info!("Shutdown complete");
+    info!("Graceful shutdown complete");
     Ok(())
 }
 

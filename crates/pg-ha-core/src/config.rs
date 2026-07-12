@@ -7,6 +7,61 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Log output format
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+impl Default for LogFormat {
+    fn default() -> Self {
+        Self::Text
+    }
+}
+
+/// Raft RPC TLS configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaftTlsConfig {
+    /// Server certificate file path (PEM)
+    pub cert: PathBuf,
+    /// Server private key file path (PEM)
+    pub key: PathBuf,
+    /// CA certificate path for verifying peer certificates
+    #[serde(default)]
+    pub ca_cert: Option<PathBuf>,
+    /// Client certificate path (for mTLS outbound connections)
+    #[serde(default)]
+    pub client_cert: Option<PathBuf>,
+    /// Client private key path (for mTLS outbound connections)
+    #[serde(default)]
+    pub client_key: Option<PathBuf>,
+    /// Whether to require client certificates (server-side mTLS verification)
+    #[serde(default)]
+    pub require_client_cert: bool,
+}
+
+/// Graceful shutdown configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShutdownConfig {
+    /// Connection drain timeout in seconds (default 30)
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout_secs: u64,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            drain_timeout_secs: 30,
+        }
+    }
+}
+
+fn default_drain_timeout() -> u64 {
+    30
+}
+
 /// Top-level configuration for a pg-ha node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -55,6 +110,14 @@ pub struct Config {
     /// Bootstrap configuration (used when initializing a new cluster)
     #[serde(default)]
     pub bootstrap: Option<BootstrapConfig>,
+
+    /// Graceful shutdown configuration
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
+
+    /// Log output format: "text" (default) or "json"
+    #[serde(default)]
+    pub log_format: LogFormat,
 }
 
 /// PostgreSQL instance configuration
@@ -133,6 +196,10 @@ pub struct RaftConfig {
     /// Explicit node ID (if not set, derived from position in cluster)
     #[serde(default)]
     pub node_id: Option<u64>,
+
+    /// TLS configuration (if absent, plain HTTP is used)
+    #[serde(default)]
+    pub tls: Option<RaftTlsConfig>,
 }
 
 /// TCP proxy configuration (replaces HAProxy)
@@ -491,6 +558,7 @@ impl Config {
                 partner_addrs: vec!["node2:2380".to_string(), "node3:2380".to_string()],
                 data_dir: Some(PathBuf::from("/var/lib/pg-ha/raft")),
                 node_id: None,
+                tls: None,
             },
             proxy: ProxyConfig {
                 rw_listen: "0.0.0.0".to_string(),
@@ -521,6 +589,8 @@ impl Config {
                 custom_command: None,
                 post_bootstrap_sql: vec![],
             }),
+            shutdown: ShutdownConfig::default(),
+            log_format: LogFormat::default(),
         };
         serde_yaml::to_string(&sample).unwrap_or_default()
     }

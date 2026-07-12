@@ -25,3 +25,7 @@ Thumbs.db
 
 # Proptest regression files
 **/proptest-regressions/
+
+# TLS certificates (local dev only — do not commit private keys)
+docker/tls/*.key
+docker/tls/*.srl
