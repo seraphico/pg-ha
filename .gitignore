@@ -19,4 +19,9 @@ Thumbs.db
 # Environment
 .env
 *.env.local
+
+# Kiro specs (local dev tooling)
 .kiro/
+
+# Proptest regression files
+**/proptest-regressions/
