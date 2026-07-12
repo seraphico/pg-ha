@@ -114,7 +114,7 @@ bootstrap:
 EOF
 
 echo "=== pg-ha config ==="
-cat /etc/pg-ha.yml
+sed 's/password: .*/password: ***/' /etc/pg-ha.yml
 echo "===================="
 
 # Run pg-ha as postgres user (needs access to PG data dir)
