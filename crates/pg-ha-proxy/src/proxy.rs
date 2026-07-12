@@ -398,9 +398,9 @@ async fn run_health_checker(
             let health = health_state.read().await;
             let mut new_backends: Vec<PgBackend> = Vec::new();
             for backend in health.values() {
-                // A backend is "primary" only if RW healthy AND NOT RO healthy
-                // (a node can't be both primary and replica simultaneously)
-                let is_primary = backend.rw_healthy && !backend.ro_healthy;
+                // Primary: passes RW health check (regardless of RO result —
+                // a primary can serve reads too)
+                let is_primary = backend.rw_healthy;
                 let is_replica = backend.ro_healthy && !backend.rw_healthy;
                 new_backends.push(PgBackend {
                     addr: backend.addr,
