@@ -38,6 +38,10 @@ pub enum Request {
         prev_value: Option<String>,
         /// CAS: only succeed if current version equals this
         prev_version: Option<u64>,
+        /// Deterministic timestamp (millis since epoch), filled by Raft leader at proposal time.
+        /// Defaults to 0 for backward compatibility with existing log entries.
+        #[serde(default)]
+        now: u64,
     },
     /// Delete a key with optional CAS and recursive mode
     Delete {
@@ -86,7 +90,8 @@ impl KvStateMachine {
                 prev_exist,
                 prev_value,
                 prev_version,
-            } => self.apply_set(key, value, *ttl, *prev_exist, prev_value.as_deref(), *prev_version),
+                now,
+            } => self.apply_set(key, value, *ttl, *prev_exist, prev_value.as_deref(), *prev_version, *now),
             Request::Delete {
                 key,
                 prev_value,
@@ -104,12 +109,16 @@ impl KvStateMachine {
         prev_exist: Option<bool>,
         prev_value: Option<&str>,
         prev_version: Option<u64>,
+        now: u64,
     ) -> Response {
+        // Backward compat: if now == 0 (old log entries without the field), fall back to wall-clock
+        let now = if now == 0 { current_millis() } else { now };
+
         let existing = self.data.get(key);
 
-        // Treat expired entries as non-existent for CAS purposes
+        // Treat expired entries as non-existent for CAS purposes (deterministic: uses request's now)
         let effectively_exists = existing.is_some_and(|e| {
-            e.expire_at.is_none_or(|exp| exp > current_millis())
+            e.expire_at.is_none_or(|exp| exp > now)
         });
         let effective_existing = if effectively_exists { existing } else { None };
 
@@ -135,24 +144,25 @@ impl KvStateMachine {
             }
         }
 
-        // All CAS checks passed — apply the write
-        let now = existing.map(|e| e.updated_at).unwrap_or_else(current_millis);
-        let created_at = existing.map(|e| e.created_at).unwrap_or(now);
-        let updated_at = current_millis();
+        // All CAS checks passed — apply the write using deterministic timestamp
+        let created_at = existing
+            .filter(|_| effectively_exists)
+            .map(|e| e.created_at)
+            .unwrap_or(now);
+        let updated_at = now;
         let version = self.last_applied_log;
 
         let entry = KvEntry {
             value: value.to_string(),
             created_at,
             updated_at,
-            expire_at: ttl.map(|t| updated_at + t * 1000),
+            expire_at: ttl.map(|t| now + t * 1000),
             version,
         };
 
         self.data.insert(key.to_string(), entry);
         Response::Ok { version }
     }
-
     fn apply_delete(&mut self, key: &str, prev_value: Option<&str>, recursive: bool) -> Response {
         if recursive {
             let keys_to_remove: Vec<String> = self
@@ -287,7 +297,7 @@ fn is_expired(entry: &KvEntry) -> bool {
         .is_some_and(|exp| exp <= current_millis())
 }
 
-fn current_millis() -> u64 {
+pub fn current_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -298,6 +308,9 @@ fn current_millis() -> u64 {
 mod tests {
     use super::*;
 
+    /// A reasonable test timestamp (approx 2023-11-14)
+    const TEST_NOW: u64 = 1_700_000_000_000;
+
     fn make_set(key: &str, value: &str) -> Request {
         Request::Set {
             key: key.to_string(),
@@ -306,6 +319,7 @@ mod tests {
             prev_exist: None,
             prev_value: None,
             prev_version: None,
+            now: TEST_NOW,
         }
     }
 
@@ -317,6 +331,7 @@ mod tests {
             prev_exist: None,
             prev_value: None,
             prev_version: None,
+            now: TEST_NOW,
         }
     }
 
@@ -328,6 +343,7 @@ mod tests {
             prev_exist: Some(prev_exist),
             prev_value: None,
             prev_version: None,
+            now: TEST_NOW,
         }
     }
 
@@ -339,6 +355,7 @@ mod tests {
             prev_exist: None,
             prev_value: Some(prev_value.to_string()),
             prev_version: None,
+            now: TEST_NOW,
         }
     }
 
@@ -509,6 +526,7 @@ mod tests {
             prev_exist: None,
             prev_value: None,
             prev_version: Some(5), // matches version set at log_index=5
+            now: TEST_NOW,
         };
         let resp = sm.apply(&req, 6);
         assert_eq!(resp, Response::Ok { version: 6 });
@@ -525,6 +543,7 @@ mod tests {
             prev_exist: None,
             prev_value: None,
             prev_version: Some(99), // wrong version
+            now: TEST_NOW,
         };
         let resp = sm.apply(&req, 6);
         assert_eq!(resp, Response::NotChanged);
@@ -535,14 +554,23 @@ mod tests {
     #[test]
     fn test_ttl_sets_expire_at() {
         let mut sm = KvStateMachine::new();
-        sm.apply(&make_set_with_ttl("/leader", "node1", 30), 1);
+        // Use a future timestamp so the entry won't appear expired via get()
+        let future_now = current_millis() + 1_000_000;
+        let req = Request::Set {
+            key: "/leader".to_string(),
+            value: "node1".to_string(),
+            ttl: Some(30),
+            prev_exist: None,
+            prev_value: None,
+            prev_version: None,
+            now: future_now,
+        };
+        sm.apply(&req, 1);
         let entry = sm.get("/leader").unwrap();
         assert!(entry.expire_at.is_some());
-        // expire_at should be roughly now + 30 seconds
+        // expire_at should be exactly future_now + 30 * 1000
         let expire = entry.expire_at.unwrap();
-        let now = current_millis();
-        assert!(expire > now);
-        assert!(expire <= now + 31_000);
+        assert_eq!(expire, future_now + 30_000);
     }
 
     #[test]
