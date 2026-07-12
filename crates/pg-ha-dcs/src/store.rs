@@ -216,10 +216,15 @@ impl MemStore {
                 committed: inner.committed,
             };
             let path = dir.join("hard_state.json");
-            if let Ok(json) = serde_json::to_string(&hs)
-                && let Err(e) = std::fs::write(&path, json) {
-                    warn!("Failed to persist hard_state: {e}");
+            let json = match serde_json::to_string(&hs) {
+                Ok(j) => j,
+                Err(e) => { warn!("Failed to serialize hard_state: {e}"); return; }
+            };
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("Failed to persist hard_state: {e}");
                 }
+            });
         }
     }
 
@@ -230,17 +235,30 @@ impl MemStore {
                 entries: inner.log.values().cloned().collect(),
             };
             let path = dir.join("log_entries.json");
-            if let Ok(json) = serde_json::to_string(&pl)
-                && let Err(e) = std::fs::write(&path, json) {
-                    warn!("Failed to persist log entries: {e}");
+            let json = match serde_json::to_string(&pl) {
+                Ok(j) => j,
+                Err(e) => { warn!("Failed to serialize log entries: {e}"); return; }
+            };
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("Failed to persist log entries: {e}");
                 }
+            });
         }
     }
 
     fn persist_state_machine(&self, inner: &MemStoreInner) {
         if let Some(dir) = &self.data_dir {
             let path = dir.join("state_machine.json");
-            inner.state_machine.save_to_disk(&path);
+            let json = match serde_json::to_string_pretty(&inner.state_machine) {
+                Ok(j) => j,
+                Err(e) => { warn!("Failed to serialize state machine: {e}"); return; }
+            };
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("Failed to persist state machine: {e}");
+                }
+            });
         }
     }
 
@@ -251,10 +269,15 @@ impl MemStore {
                 last_membership: inner.last_membership.clone(),
             };
             let path = dir.join("membership.json");
-            if let Ok(json) = serde_json::to_string(&pm)
-                && let Err(e) = std::fs::write(&path, json) {
-                    warn!("Failed to persist membership: {e}");
+            let json = match serde_json::to_string(&pm) {
+                Ok(j) => j,
+                Err(e) => { warn!("Failed to serialize membership: {e}"); return; }
+            };
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("Failed to persist membership: {e}");
                 }
+            });
         }
     }
 }
