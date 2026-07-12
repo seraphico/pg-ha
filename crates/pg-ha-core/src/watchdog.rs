@@ -58,7 +58,9 @@ impl Watchdog {
     /// Pet (keepalive) the watchdog. Must be called every HA loop cycle
     /// while this node is the primary.
     pub fn keepalive(&self) {
-        if !self.is_active {}
+        if !self.is_active {
+            return;
+        }
 
         #[cfg(target_os = "linux")]
         {
@@ -224,5 +226,63 @@ mod tests {
         };
         let mut wd = Watchdog::new(config);
         wd.disarm(); // Should not panic
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Bug Condition Exploration: Watchdog keepalive empty-if (Defect 1.4)
+    //
+    // **Property 1: Bug Condition** - Watchdog keepalive executes when inactive
+    // **Validates: Requirements 2.4**
+    //
+    // The `keepalive()` method has `if !self.is_active {}` (empty block).
+    // It should be `if !self.is_active { return; }` to short-circuit.
+    // This test verifies the fix is in place by asserting the source code
+    // contains the early return pattern.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Property 1: Bug Condition** - Watchdog keepalive early return
+    ///
+    /// **Validates: Requirements 2.4**
+    ///
+    /// Verifies that `keepalive()` returns early when `is_active == false`.
+    /// On unfixed code, `if !self.is_active {}` is an empty block with no return,
+    /// allowing execution to fall through to platform-specific write logic.
+    #[test]
+    fn test_bug_condition_watchdog_keepalive_returns_early_when_inactive() {
+        let source = include_str!("watchdog.rs");
+
+        // Find the keepalive function body
+        let keepalive_start = source
+            .find("pub fn keepalive(&self)")
+            .expect("keepalive() method not found");
+        let keepalive_body = &source[keepalive_start..];
+
+        // Extract just the function body (first {} block)
+        let mut brace_count = 0;
+        let mut fn_end = 0;
+        let mut found_first = false;
+        for (i, ch) in keepalive_body.char_indices() {
+            if ch == '{' {
+                brace_count += 1;
+                found_first = true;
+            } else if ch == '}' {
+                brace_count -= 1;
+                if found_first && brace_count == 0 {
+                    fn_end = i + 1;
+                    break;
+                }
+            }
+        }
+        let fn_body = &keepalive_body[..fn_end];
+
+        // The fix: `if !self.is_active { return; }` must be present.
+        // The bug: `if !self.is_active {}` (empty block, no return).
+        assert!(
+            fn_body.contains("if !self.is_active") && fn_body.contains("return"),
+            "BUG DETECTED: keepalive() has `if !self.is_active {{}}` without `return;`.\n\
+             On Linux, this allows execution to fall through to keepalive_linux() \n\
+             which writes to self.fd even when watchdog is not active.\n\
+             Fix: change `if !self.is_active {{}}` to `if !self.is_active {{ return; }}`"
+        );
     }
 }

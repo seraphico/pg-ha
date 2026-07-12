@@ -177,7 +177,7 @@ impl Ha {
         }
 
         // Step 3: Write standby.signal + primary_conninfo
-        self.write_standby_config_for_rejoin(&leader_connstr);
+        self.write_standby_config_for_rejoin(&leader_connstr).await;
 
         // Step 4: Start PostgreSQL in standby mode
         match self.postgresql.start().await {
@@ -221,14 +221,23 @@ impl Ha {
             self.config.name
         );
 
-        // Write updated postgresql.auto.conf
+        // Write updated postgresql.auto.conf (offload to blocking thread)
         let auto_conf_path = self.config.postgresql.data_dir.join("postgresql.auto.conf");
         let content = format!(
             "# pg-ha managed standby configuration\nprimary_conninfo = '{primary_conninfo}'\nrecovery_target_timeline = 'latest'\n"
         );
-        if let Err(e) = std::fs::write(&auto_conf_path, &content) {
-            error!("Failed to write postgresql.auto.conf: {e}");
-            return;
+        let write_result =
+            tokio::task::spawn_blocking(move || std::fs::write(&auto_conf_path, &content)).await;
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                error!("Failed to write postgresql.auto.conf: {e}");
+                return;
+            }
+            Err(e) => {
+                error!("reconfigure_replica spawn_blocking failed: {e}");
+                return;
+            }
         }
 
         info!(
@@ -247,14 +256,8 @@ impl Ha {
     }
 
     /// Write standby.signal and primary_conninfo for a node rejoining as replica.
-    pub(super) fn write_standby_config_for_rejoin(&self, leader_connstr: &str) {
-        let data_dir = &self.config.postgresql.data_dir;
-
-        // Create standby.signal
-        let standby_signal = data_dir.join("standby.signal");
-        if let Err(e) = std::fs::write(&standby_signal, "") {
-            warn!("Failed to create standby.signal: {e}");
-        }
+    pub(super) async fn write_standby_config_for_rejoin(&self, leader_connstr: &str) {
+        let data_dir = self.config.postgresql.data_dir.clone();
 
         // Parse host/port from leader connection string
         let mut host = "127.0.0.1".to_string();
@@ -267,28 +270,45 @@ impl Ha {
             }
         }
 
-        let repl_user = &self.config.postgresql.replication.username;
+        let repl_user = self.config.postgresql.replication.username.clone();
         let repl_pass = self
             .config
             .postgresql
             .replication
             .password
-            .as_deref()
-            .unwrap_or("");
+            .clone()
+            .unwrap_or_default();
+        let app_name = self.config.name.clone();
         let primary_conninfo = format!(
-            "host={host} port={port} user={repl_user} password={repl_pass} application_name={}",
-            self.config.name
+            "host={host} port={port} user={repl_user} password={repl_pass} application_name={app_name}",
         );
 
-        // Write to postgresql.auto.conf
-        let auto_conf_path = data_dir.join("postgresql.auto.conf");
-        let auto_conf_content = format!(
-            "# pg-ha managed standby configuration (rejoin)\nprimary_conninfo = '{primary_conninfo}'\nrecovery_target_timeline = 'latest'\n"
-        );
-        if let Err(e) = std::fs::write(&auto_conf_path, auto_conf_content) {
-            warn!("Failed to write postgresql.auto.conf: {e}");
+        let host_log = host.clone();
+        let port_log = port.clone();
+
+        // Offload filesystem writes to blocking thread pool
+        let write_result = tokio::task::spawn_blocking(move || {
+            // Create standby.signal
+            let standby_signal = data_dir.join("standby.signal");
+            if let Err(e) = std::fs::write(&standby_signal, "") {
+                tracing::warn!("Failed to create standby.signal: {e}");
+            }
+
+            // Write to postgresql.auto.conf
+            let auto_conf_path = data_dir.join("postgresql.auto.conf");
+            let auto_conf_content = format!(
+                "# pg-ha managed standby configuration (rejoin)\nprimary_conninfo = '{primary_conninfo}'\nrecovery_target_timeline = 'latest'\n"
+            );
+            if let Err(e) = std::fs::write(&auto_conf_path, auto_conf_content) {
+                tracing::warn!("Failed to write postgresql.auto.conf: {e}");
+            }
+        })
+        .await;
+
+        if let Err(e) = write_result {
+            warn!("write_standby_config_for_rejoin spawn_blocking failed: {e}");
         }
 
-        info!("Wrote standby configuration for rejoin (host={host}, port={port})");
+        info!(host = %host_log, port = %port_log, "Wrote standby configuration for rejoin");
     }
 }
