@@ -557,15 +557,20 @@ async fn handle_connection(
     let backend_to_client = io::copy(&mut backend_read, &mut client_write);
 
     if shutdown_on_down {
-        // Monitor for shutdown signal (backend marked down)
+        // Monitor for shutdown signal while piping bidirectionally.
+        // Use tokio::join! inside select! to ensure both copy directions complete
+        // (preventing data truncation on half-close), while still allowing
+        // forced termination when the backend is marked DOWN.
         tokio::select! {
-            result = client_to_backend => {
-                if let Err(e) = result {
+            result = async {
+                let (c2b, b2c) = tokio::join!(client_to_backend, backend_to_client);
+                (c2b, b2c)
+            } => {
+                let (c2b, b2c) = result;
+                if let Err(e) = c2b {
                     debug!(%client_addr, "Client→Backend closed: {e}");
                 }
-            }
-            result = backend_to_client => {
-                if let Err(e) = result {
+                if let Err(e) = b2c {
                     debug!(%client_addr, "Backend→Client closed: {e}");
                 }
             }
@@ -586,18 +591,15 @@ async fn handle_connection(
             }
         }
     } else {
-        // No shutdown monitoring — just pipe until done
-        tokio::select! {
-            result = client_to_backend => {
-                if let Err(e) = result {
-                    debug!(%client_addr, "Client→Backend closed: {e}");
-                }
-            }
-            result = backend_to_client => {
-                if let Err(e) = result {
-                    debug!(%client_addr, "Backend→Client closed: {e}");
-                }
-            }
+        // No shutdown monitoring — wait for both directions to complete.
+        // tokio::join! ensures half-close is handled correctly: when one direction
+        // finishes (peer sends FIN), the other continues until it also completes.
+        let (c2b, b2c) = tokio::join!(client_to_backend, backend_to_client);
+        if let Err(e) = c2b {
+            debug!(%client_addr, "Client→Backend closed: {e}");
+        }
+        if let Err(e) = b2c {
+            debug!(%client_addr, "Backend→Client closed: {e}");
         }
     }
 
