@@ -7,8 +7,13 @@ use crate::cluster::MemberRole;
 use crate::config::PostgresqlConfig;
 use crate::error::{Error, Result};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
+
+/// Timeout for spawned PG connection futures.
+/// If PG is unresponsive, the task will be cancelled after this duration.
+const PG_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Manages a local PostgreSQL instance lifecycle
 pub struct Postgresql {
@@ -411,10 +416,12 @@ impl Postgresql {
                 .await
                 .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
 
-        // Spawn the connection task
+        // Spawn the connection task with timeout to prevent task leak if PG is unresponsive
         tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                debug!("Health check connection closed: {e}");
+            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
+                Ok(Err(e)) => debug!("Health check connection closed: {e}"),
+                Err(_) => warn!("Health check connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Ok(Ok(())) => {}
             }
         });
 
@@ -435,8 +442,10 @@ impl Postgresql {
                 .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
 
         tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                debug!("Connection closed: {e}");
+            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
+                Ok(Err(e)) => debug!("Connection closed: {e}"),
+                Err(_) => warn!("PG connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Ok(Ok(())) => {}
             }
         });
 
@@ -463,8 +472,10 @@ impl Postgresql {
                 .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
 
         tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                debug!("Connection closed: {e}");
+            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
+                Ok(Err(e)) => debug!("Connection closed: {e}"),
+                Err(_) => warn!("PG connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Ok(Ok(())) => {}
             }
         });
 
@@ -575,8 +586,10 @@ impl Postgresql {
                 .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
 
         tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                debug!("Connection closed: {e}");
+            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
+                Ok(Err(e)) => debug!("Connection closed: {e}"),
+                Err(_) => warn!("PG connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Ok(Ok(())) => {}
             }
         });
 
