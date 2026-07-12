@@ -1,20 +1,20 @@
 //! REST API routes for health checks and management.
 
 use axum::{
+    Json, Router,
     extract::{Query, Request, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     middleware::Next,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use crate::state::AppState;
 use pg_ha_core::commands::{CommandResponse, CommandStatus, ManagementCommand};
 use pg_ha_core::dynamic_config::{GlobalConfig, patch_config};
-use crate::state::AppState;
 
 /// Sender for management commands to the HA loop
 pub type CommandSender = mpsc::Sender<(ManagementCommand, mpsc::Sender<CommandResponse>)>;
@@ -43,12 +43,27 @@ pub struct RouterState {
 
 /// Build the full API router (without command channel, for tests)
 pub fn build_router(state: AppState) -> Router {
-    build_router_with_commands(state, None, AuthConfig { username: None, password: None })
+    build_router_with_commands(
+        state,
+        None,
+        AuthConfig {
+            username: None,
+            password: None,
+        },
+    )
 }
 
 /// Build the full API router with command channel and auth config
-pub fn build_router_with_commands(state: AppState, cmd_tx: Option<CommandSender>, auth: AuthConfig) -> Router {
-    let router_state = RouterState { app: state, cmd_tx, auth };
+pub fn build_router_with_commands(
+    state: AppState,
+    cmd_tx: Option<CommandSender>,
+    auth: AuthConfig,
+) -> Router {
+    let router_state = RouterState {
+        app: state,
+        cmd_tx,
+        auth,
+    };
 
     // Health check endpoints (open, no auth) — used by load balancers
     let health_routes = Router::new()
@@ -70,19 +85,23 @@ pub fn build_router_with_commands(state: AppState, cmd_tx: Option<CommandSender>
 
     // Management endpoints (protected by Basic Auth if configured)
     let mgmt_routes = Router::new()
-        .route("/switchover", post(post_switchover).delete(delete_switchover))
+        .route(
+            "/switchover",
+            post(post_switchover).delete(delete_switchover),
+        )
         .route("/failover", post(post_failover))
         .route("/restart", post(post_restart))
         .route("/reinitialize", post(post_reinitialize))
-        .route("/config", get(get_config).put(put_config).patch(patch_config_endpoint))
+        .route(
+            "/config",
+            get(get_config).put(put_config).patch(patch_config_endpoint),
+        )
         .layer(axum::middleware::from_fn_with_state(
             router_state.clone(),
             basic_auth_middleware,
         ));
 
-    health_routes
-        .merge(mgmt_routes)
-        .with_state(router_state)
+    health_routes.merge(mgmt_routes).with_state(router_state)
 }
 
 /// Basic Auth middleware — checks credentials on protected management endpoints.
@@ -113,7 +132,11 @@ async fn basic_auth_middleware(
                 .decode(encoded.trim())
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
-                .and_then(|decoded| decoded.split_once(':').map(|(u, p)| u == expected_user && p == expected_pass))
+                .and_then(|decoded| {
+                    decoded
+                        .split_once(':')
+                        .map(|(u, p)| u == expected_user && p == expected_pass)
+                })
                 .unwrap_or(false)
         } else {
             false
@@ -145,17 +168,23 @@ struct ReplicaQuery {
 async fn health_primary(State(state): State<RouterState>) -> impl IntoResponse {
     let s: tokio::sync::RwLockReadGuard<'_, crate::state::NodeState> = state.app.read().await;
     if s.is_primary_with_lock() {
-        (StatusCode::OK, Json(json!({
-            "state": "running",
-            "role": "primary",
-            "timeline": s.timeline,
-            "wal_position": s.wal_position,
-        })))
+        (
+            StatusCode::OK,
+            Json(json!({
+                "state": "running",
+                "role": "primary",
+                "timeline": s.timeline,
+                "wal_position": s.wal_position,
+            })),
+        )
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-            "state": format!("{:?}", s.state),
-            "role": format!("{:?}", s.role),
-        })))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "state": format!("{:?}", s.state),
+                "role": format!("{:?}", s.role),
+            })),
+        )
     }
 }
 
@@ -168,38 +197,51 @@ async fn health_replica(
     let s = state.app.read().await;
 
     if !s.is_healthy_replica() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-            "state": format!("{:?}", s.state),
-            "role": format!("{:?}", s.role),
-        })));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "state": format!("{:?}", s.state),
+                "role": format!("{:?}", s.role),
+            })),
+        );
     }
 
     if s.is_noloadbalance() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-            "role": "replica",
-            "reason": "noloadbalance",
-        })));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "role": "replica",
+                "reason": "noloadbalance",
+            })),
+        );
     }
 
     // Check lag threshold if specified
     if let Some(max_lag) = params.lag
         && let Some(lag) = s.replication_lag
-            && lag > max_lag {
-                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-                    "role": "replica",
-                    "lag": lag,
-                    "max_lag": max_lag,
-                    "reason": "lag exceeds threshold",
-                })));
-            }
+        && lag > max_lag
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "role": "replica",
+                "lag": lag,
+                "max_lag": max_lag,
+                "reason": "lag exceeds threshold",
+            })),
+        );
+    }
 
-    (StatusCode::OK, Json(json!({
-        "state": "running",
-        "role": "replica",
-        "timeline": s.timeline,
-        "wal_position": s.wal_position,
-        "lag": s.replication_lag,
-    })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "state": "running",
+            "role": "replica",
+            "timeline": s.timeline,
+            "wal_position": s.wal_position,
+            "lag": s.replication_lag,
+        })),
+    )
 }
 
 /// GET /health
@@ -207,15 +249,21 @@ async fn health_replica(
 async fn health_check(State(state): State<RouterState>) -> impl IntoResponse {
     let s = state.app.read().await;
     if s.state == pg_ha_core::cluster::MemberState::Running {
-        (StatusCode::OK, Json(json!({
-            "state": "running",
-            "role": format!("{:?}", s.role),
-        })))
+        (
+            StatusCode::OK,
+            Json(json!({
+                "state": "running",
+                "role": format!("{:?}", s.role),
+            })),
+        )
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-            "state": format!("{:?}", s.state),
-            "role": format!("{:?}", s.role),
-        })))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "state": format!("{:?}", s.state),
+                "role": format!("{:?}", s.role),
+            })),
+        )
     }
 }
 
@@ -237,7 +285,11 @@ async fn health_standby_leader(State(state): State<RouterState>) -> impl IntoRes
     if s.is_standby_leader() {
         (StatusCode::OK, Json(json!({"role": "standby_leader"}))).into_response()
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"role": format!("{:?}", s.role)}))).into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"role": format!("{:?}", s.role)})),
+        )
+            .into_response()
     }
 }
 
@@ -246,11 +298,19 @@ async fn health_standby_leader(State(state): State<RouterState>) -> impl IntoRes
 async fn health_sync(State(state): State<RouterState>) -> impl IntoResponse {
     let s = state.app.read().await;
     // TODO: check actual sync state from cluster sync_state
-    let is_sync = s.tags.get("sync_state").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_sync = s
+        .tags
+        .get("sync_state")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if s.is_healthy_replica() && is_sync {
         (StatusCode::OK, Json(json!({"role": "sync_standby"}))).into_response()
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"role": format!("{:?}", s.role)}))).into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"role": format!("{:?}", s.role)})),
+        )
+            .into_response()
     }
 }
 
@@ -258,11 +318,19 @@ async fn health_sync(State(state): State<RouterState>) -> impl IntoResponse {
 /// Returns 200 if this node is an asynchronous standby.
 async fn health_async(State(state): State<RouterState>) -> impl IntoResponse {
     let s = state.app.read().await;
-    let is_sync = s.tags.get("sync_state").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_sync = s
+        .tags
+        .get("sync_state")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if s.is_healthy_replica() && !is_sync {
         (StatusCode::OK, Json(json!({"role": "async_standby"}))).into_response()
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"role": format!("{:?}", s.role)}))).into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"role": format!("{:?}", s.role)})),
+        )
+            .into_response()
     }
 }
 
@@ -295,7 +363,8 @@ async fn get_cluster(State(state): State<RouterState>) -> impl IntoResponse {
                 return Json(json!({
                     "scope": s.scope,
                     "members": topology,
-                })).into_response();
+                }))
+                .into_response();
             }
             Err(_) => {
                 // Fall through to empty response
@@ -306,7 +375,8 @@ async fn get_cluster(State(state): State<RouterState>) -> impl IntoResponse {
     Json(json!({
         "scope": s.scope,
         "members": [],
-    })).into_response()
+    }))
+    .into_response()
 }
 
 // ─────────────────── Management Endpoints ───────────────────
@@ -352,7 +422,11 @@ async fn send_command(state: RouterState, cmd: ManagementCommand) -> impl IntoRe
                 CommandStatus::Rejected => StatusCode::CONFLICT,
                 CommandStatus::Error => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            (status_code, Json(json!({"status": resp.status, "message": resp.message}))).into_response()
+            (
+                status_code,
+                Json(json!({"status": resp.status, "message": resp.message})),
+            )
+                .into_response()
         }
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -476,7 +550,11 @@ async fn put_config(
     // Serialize and write to DCS
     let value = serde_json::to_string(&config).unwrap_or_default();
     match dcs.set_config_value(&value).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::to_value(&config).unwrap_or(json!({})))).into_response(),
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&config).unwrap_or(json!({}))),
+        )
+            .into_response(),
         Ok(false) => (
             StatusCode::CONFLICT,
             Json(json!({"error": "Failed to write config to DCS"})),
@@ -535,7 +613,11 @@ async fn patch_config_endpoint(
     // Write back to DCS
     let value = serde_json::to_string(&patched).unwrap_or_default();
     match dcs.set_config_value(&value).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::to_value(&patched).unwrap_or(json!({})))).into_response(),
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&patched).unwrap_or(json!({}))),
+        )
+            .into_response(),
         Ok(false) => (
             StatusCode::CONFLICT,
             Json(json!({"error": "Failed to write config to DCS"})),
@@ -622,26 +704,30 @@ mod tests {
     }
 
     async fn set_primary(state: &AppState) {
-        state.update(|s| {
-            s.role = MemberRole::Primary;
-            s.state = MemberState::Running;
-            s.is_leader = true;
-            s.timeline = Some(1);
-            s.wal_position = Some(12345);
-            s.last_loop_at = Some(std::time::Instant::now());
-        }).await;
+        state
+            .update(|s| {
+                s.role = MemberRole::Primary;
+                s.state = MemberState::Running;
+                s.is_leader = true;
+                s.timeline = Some(1);
+                s.wal_position = Some(12345);
+                s.last_loop_at = Some(std::time::Instant::now());
+            })
+            .await;
     }
 
     async fn set_replica(state: &AppState) {
-        state.update(|s| {
-            s.role = MemberRole::Replica;
-            s.state = MemberState::Running;
-            s.is_leader = false;
-            s.timeline = Some(1);
-            s.wal_position = Some(12300);
-            s.replication_lag = Some(45);
-            s.last_loop_at = Some(std::time::Instant::now());
-        }).await;
+        state
+            .update(|s| {
+                s.role = MemberRole::Replica;
+                s.state = MemberState::Running;
+                s.is_leader = false;
+                s.timeline = Some(1);
+                s.wal_position = Some(12300);
+                s.replication_lag = Some(45);
+                s.last_loop_at = Some(std::time::Instant::now());
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -651,7 +737,12 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/primary").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/primary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -664,7 +755,12 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/primary").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/primary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -677,7 +773,12 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/replica").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/replica")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -690,7 +791,12 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/replica").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/replica")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -703,7 +809,12 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/replica?lag=100").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/replica?lag=100")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK); // lag=45 < 100
@@ -716,7 +827,12 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/replica?lag=10").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/replica?lag=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE); // lag=45 > 10
@@ -729,7 +845,12 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -742,7 +863,12 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -751,11 +877,18 @@ mod tests {
     #[tokio::test]
     async fn test_liveness_returns_200_when_recent() {
         let state = test_state();
-        state.update(|s| s.last_loop_at = Some(std::time::Instant::now())).await;
+        state
+            .update(|s| s.last_loop_at = Some(std::time::Instant::now()))
+            .await;
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/liveness").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/liveness")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -768,7 +901,12 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/liveness").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/liveness")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -777,16 +915,24 @@ mod tests {
     #[tokio::test]
     async fn test_noloadbalance_excludes_from_replica() {
         let state = test_state();
-        state.update(|s| {
-            s.role = MemberRole::Replica;
-            s.state = MemberState::Running;
-            s.tags.insert("noloadbalance".into(), serde_json::json!(true));
-            s.last_loop_at = Some(std::time::Instant::now());
-        }).await;
+        state
+            .update(|s| {
+                s.role = MemberRole::Replica;
+                s.state = MemberState::Running;
+                s.tags
+                    .insert("noloadbalance".into(), serde_json::json!(true));
+                s.last_loop_at = Some(std::time::Instant::now());
+            })
+            .await;
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/replica").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/replica")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -795,26 +941,41 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_returns_prometheus_format() {
         let state = test_state();
-        state.update(|s| {
-            s.role = MemberRole::Primary;
-            s.state = MemberState::Running;
-            s.timeline = Some(3);
-            s.replication_lag = Some(0);
-            s.pending_restart = false;
-            s.is_paused = false;
-            s.failsafe_active = false;
-            s.dcs_last_seen = Some(std::time::Instant::now());
-        }).await;
+        state
+            .update(|s| {
+                s.role = MemberRole::Primary;
+                s.state = MemberState::Running;
+                s.timeline = Some(3);
+                s.replication_lag = Some(0);
+                s.pending_restart = false;
+                s.is_paused = false;
+                s.failsafe_active = false;
+                s.dcs_last_seen = Some(std::time::Instant::now());
+            })
+            .await;
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert!(ct.contains("text/plain"), "Expected text/plain content type");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/plain"),
+            "Expected text/plain content type"
+        );
 
         let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
@@ -831,19 +992,26 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_with_replica_state() {
         let state = test_state();
-        state.update(|s| {
-            s.role = MemberRole::Replica;
-            s.state = MemberState::Running;
-            s.timeline = Some(1);
-            s.replication_lag = Some(1024);
-            s.pending_restart = true;
-            s.is_paused = true;
-            s.failsafe_active = true;
-        }).await;
+        state
+            .update(|s| {
+                s.role = MemberRole::Replica;
+                s.state = MemberState::Running;
+                s.timeline = Some(1);
+                s.replication_lag = Some(1024);
+                s.pending_restart = true;
+                s.is_paused = true;
+                s.failsafe_active = true;
+            })
+            .await;
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -863,7 +1031,12 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(Request::builder().uri("/history").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -891,7 +1064,12 @@ mod tests {
 
         let app = build_router(state);
         let resp = app
-            .oneshot(Request::builder().uri("/history").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

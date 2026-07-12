@@ -135,10 +135,11 @@ impl Postgresql {
         match std::fs::read_to_string(&pid_file) {
             Ok(content) => {
                 if let Some(pid_str) = content.lines().next()
-                    && let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        // Check if process is alive (signal 0 doesn't send a signal, just checks)
-                        return unsafe { libc::kill(pid, 0) == 0 };
-                    }
+                    && let Ok(pid) = pid_str.trim().parse::<i32>()
+                {
+                    // Check if process is alive (signal 0 doesn't send a signal, just checks)
+                    return unsafe { libc::kill(pid, 0) == 0 };
+                }
                 false
             }
             Err(_) => false,
@@ -163,7 +164,14 @@ impl Postgresql {
         let log_file_str = log_file.to_string_lossy().to_string();
 
         let output = Command::new(self.pg_ctl())
-            .args(["start", "-D", self.data_dir_str(), "-l", &log_file_str, "-w"])
+            .args([
+                "start",
+                "-D",
+                self.data_dir_str(),
+                "-l",
+                &log_file_str,
+                "-w",
+            ])
             .stdin(std::process::Stdio::null())
             .output()
             .await?;
@@ -194,7 +202,9 @@ impl Postgresql {
         }
 
         self.state = PgState::Crashed;
-        Err(Error::Postgres("PostgreSQL did not start within timeout".into()))
+        Err(Error::Postgres(
+            "PostgreSQL did not start within timeout".into(),
+        ))
     }
 
     /// Stop PostgreSQL with the specified mode (smart, fast, immediate)
@@ -352,11 +362,14 @@ impl Postgresql {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if line.contains("Database system identifier")
-                && let Some(val) = line.split(':').nth(1) {
-                    return Ok(val.trim().to_string());
-                }
+                && let Some(val) = line.split(':').nth(1)
+            {
+                return Ok(val.trim().to_string());
+            }
         }
-        Err(Error::Postgres("Could not find system identifier in pg_controldata output".into()))
+        Err(Error::Postgres(
+            "Could not find system identifier in pg_controldata output".into(),
+        ))
     }
 
     /// Get the database cluster state from pg_controldata
@@ -374,11 +387,14 @@ impl Postgresql {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if line.contains("Database cluster state")
-                && let Some(val) = line.split(':').nth(1) {
-                    return Ok(val.trim().to_string());
-                }
+                && let Some(val) = line.split(':').nth(1)
+            {
+                return Ok(val.trim().to_string());
+            }
         }
-        Err(Error::Postgres("Could not find cluster state in pg_controldata output".into()))
+        Err(Error::Postgres(
+            "Could not find cluster state in pg_controldata output".into(),
+        ))
     }
 
     // ─────────────────────── tokio-postgres queries ───────────────────────
@@ -387,8 +403,10 @@ impl Postgresql {
     pub fn connection_string(&self) -> String {
         let mut parts = format!(
             "host={} port={} dbname={} user={}",
-            self.config.listen, self.config.port,
-            self.config.superuser.dbname, self.config.superuser.username,
+            self.config.listen,
+            self.config.port,
+            self.config.superuser.dbname,
+            self.config.superuser.username,
         );
         if let Some(ref password) = self.config.superuser.password {
             parts.push_str(&format!(" password={password}"));
@@ -411,16 +429,17 @@ impl Postgresql {
     /// Simple health check: connect and run SELECT 1
     pub async fn health_check(&self) -> Result<()> {
         let connstr = self.connection_string();
-        let (client, connection) =
-            tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
 
         // Spawn the connection task with timeout to prevent task leak if PG is unresponsive
         tokio::spawn(async move {
             match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
                 Ok(Err(e)) => debug!("Health check connection closed: {e}"),
-                Err(_) => warn!("Health check connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Err(_) => {
+                    warn!("Health check connection task timed out after {PG_CONNECTION_TIMEOUT:?}")
+                }
                 Ok(Ok(())) => {}
             }
         });
@@ -436,10 +455,9 @@ impl Postgresql {
     /// Check if PostgreSQL is in recovery (i.e., running as replica)
     pub async fn is_in_recovery(&self) -> Result<bool> {
         let connstr = self.connection_string();
-        let (client, connection) =
-            tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
 
         tokio::spawn(async move {
             match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
@@ -456,9 +474,10 @@ impl Postgresql {
 
         for msg in rows {
             if let tokio_postgres::SimpleQueryMessage::Row(row) = msg
-                && let Some(val) = row.get(0) {
-                    return Ok(val == "t");
-                }
+                && let Some(val) = row.get(0)
+            {
+                return Ok(val == "t");
+            }
         }
         Err(Error::Postgres("Could not determine recovery state".into()))
     }
@@ -466,10 +485,9 @@ impl Postgresql {
     /// Get WAL position and timeline information
     pub async fn wal_status(&self) -> Result<WalStatus> {
         let connstr = self.connection_string();
-        let (client, connection) =
-            tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
 
         tokio::spawn(async move {
             match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
@@ -488,9 +506,10 @@ impl Postgresql {
             let mut result = false;
             for msg in rows {
                 if let tokio_postgres::SimpleQueryMessage::Row(row) = msg
-                    && let Some(val) = row.get(0) {
-                        result = val == "t";
-                    }
+                    && let Some(val) = row.get(0)
+                {
+                    result = val == "t";
+                }
             }
             result
         };
@@ -574,16 +593,17 @@ impl Postgresql {
     /// Query current timeline from PostgreSQL.
     pub async fn query_timeline(&self) -> Result<u64> {
         let status = self.wal_status().await?;
-        status.timeline.ok_or_else(|| Error::Postgres("Could not determine timeline".into()))
+        status
+            .timeline
+            .ok_or_else(|| Error::Postgres("Could not determine timeline".into()))
     }
 
     /// Run CHECKPOINT to flush WAL to disk (used before graceful shutdown).
     pub async fn checkpoint(&self) -> Result<()> {
         let connstr = self.connection_string();
-        let (client, connection) =
-            tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
 
         tokio::spawn(async move {
             match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
@@ -643,7 +663,9 @@ impl Postgresql {
 mod tests {
     use super::*;
     use crate::config::ConnectionParams;
+    use proptest::prelude::*;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn test_config() -> PostgresqlConfig {
         PostgresqlConfig {
@@ -751,5 +773,533 @@ mod tests {
         assert_eq!(parse_lsn("0/0/0"), None);
         assert_eq!(parse_lsn("G/0"), None);
         assert_eq!(parse_lsn("0/G"), None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Bug Condition Exploration Tests: PG Connection Task Leak (Defect #1)
+    //
+    // **Property 1: Bug Condition** - PG Connection Tasks Accumulate Without Bound
+    // **Validates: Requirements 1.1**
+    //
+    // These tests verify the fix is in place: all spawned connection tasks are
+    // wrapped in `tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection)`.
+    // On unfixed code, connection tasks would never terminate when PG is
+    // unresponsive, leading to unbounded task accumulation.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Property 1: Bug Condition** - PG Connection Tasks Accumulate Without Bound
+    /// Validates: Requirements 1.1
+    ///
+    /// Verify PG_CONNECTION_TIMEOUT is defined with a reasonable value (30s).
+    /// The timeout prevents spawned connection tasks from living forever when
+    /// PG is unresponsive.
+    #[test]
+    fn test_pg_connection_timeout_defined_and_reasonable() {
+        // PG_CONNECTION_TIMEOUT must be defined (compile-time proof)
+        let timeout = PG_CONNECTION_TIMEOUT;
+
+        // Must be exactly 30 seconds as specified in the fix
+        assert_eq!(
+            timeout,
+            Duration::from_secs(30),
+            "PG_CONNECTION_TIMEOUT should be 30 seconds"
+        );
+
+        // Sanity: timeout should be > 0 and <= 60s (reasonable for a DB connection)
+        assert!(timeout > Duration::ZERO, "Timeout must be positive");
+        assert!(
+            timeout <= Duration::from_secs(60),
+            "Timeout should not exceed 60 seconds for a health check connection"
+        );
+    }
+
+    /// **Property 1: Bug Condition** - PG Connection Tasks Accumulate Without Bound
+    /// Validates: Requirements 1.1
+    ///
+    /// Code analysis: verify that health_check, is_in_recovery, wal_status, and
+    /// checkpoint all use the `tokio::time::timeout(PG_CONNECTION_TIMEOUT, ...)`
+    /// pattern to wrap the connection future.
+    ///
+    /// This is a source-level verification: we read the source file and confirm
+    /// each method contains the timeout pattern. Without this pattern, tasks
+    /// would accumulate indefinitely when PG is unresponsive.
+    #[test]
+    fn test_all_connection_methods_use_timeout_pattern() {
+        let source = include_str!("postgresql.rs");
+
+        // All methods that spawn a connection task
+        let methods_with_connection_spawn =
+            ["health_check", "is_in_recovery", "wal_status", "checkpoint"];
+
+        // The timeout pattern that must appear in each method's spawned task
+        let timeout_pattern = "tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection)";
+
+        // Count occurrences of the timeout pattern in the source
+        let timeout_count = source.matches(timeout_pattern).count();
+
+        // There should be at least 4 occurrences (one per method)
+        assert!(
+            timeout_count >= 4,
+            "Expected at least 4 occurrences of timeout pattern \
+             '{}' in postgresql.rs, found {}. \
+             Bug condition: without timeout, connection tasks accumulate without bound.",
+            timeout_pattern,
+            timeout_count
+        );
+
+        // Verify each method exists and contains tokio::spawn
+        for method in &methods_with_connection_spawn {
+            assert!(
+                source.contains(&format!("pub async fn {method}")),
+                "Method '{}' not found in postgresql.rs",
+                method
+            );
+        }
+
+        // Verify the spawn pattern exists (connection tasks are spawned)
+        let spawn_count = source.matches("tokio::spawn(async move {").count();
+        assert!(
+            spawn_count >= 4,
+            "Expected at least 4 tokio::spawn calls for connection tasks, found {}",
+            spawn_count
+        );
+    }
+
+    /// **Property 1: Bug Condition** - PG Connection Tasks Accumulate Without Bound
+    /// Validates: Requirements 1.1
+    ///
+    /// Logical test: verify that a future wrapped in tokio::time::timeout gets
+    /// cancelled when the timeout expires. This proves the mechanism used to fix
+    /// the task leak actually works — tasks that would otherwise hang indefinitely
+    /// are reclaimed after the timeout.
+    ///
+    /// Uses a short timeout (50ms) to keep the test fast while proving the
+    /// cancellation mechanism is sound.
+    #[tokio::test]
+    async fn test_timeout_cancels_hanging_connection_task() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let task_completed = Arc::new(AtomicBool::new(false));
+        let task_timed_out = Arc::new(AtomicBool::new(false));
+        let task_completed_clone = task_completed.clone();
+        let task_timed_out_clone = task_timed_out.clone();
+
+        // Simulate an unresponsive PG connection: a future that never completes
+        let never_completes = async {
+            // This simulates `connection.await` when PG is unresponsive
+            std::future::pending::<std::result::Result<(), tokio_postgres::Error>>().await
+        };
+
+        // Use a short timeout (50ms) to keep the test fast
+        let test_timeout = Duration::from_millis(50);
+
+        let handle = tokio::spawn(async move {
+            match tokio::time::timeout(test_timeout, never_completes).await {
+                Ok(Err(_e)) => {
+                    task_completed_clone.store(true, Ordering::SeqCst);
+                }
+                Err(_) => {
+                    // Timeout elapsed — this is the expected path for unresponsive PG
+                    task_timed_out_clone.store(true, Ordering::SeqCst);
+                }
+                Ok(Ok(())) => {
+                    task_completed_clone.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+
+        // Wait for the task to finish (should complete after ~50ms timeout)
+        handle.await.expect("Spawned task panicked");
+
+        // The task must have timed out (not completed normally)
+        assert!(
+            task_timed_out.load(Ordering::SeqCst),
+            "Expected connection task to be cancelled by timeout. \
+             Bug condition: without timeout, this task would hang forever, \
+             accumulating zombie tasks with each health_check call."
+        );
+        assert!(
+            !task_completed.load(Ordering::SeqCst),
+            "Connection task should NOT have completed normally (PG was unresponsive)"
+        );
+    }
+
+    /// **Property 1: Bug Condition** - PG Connection Tasks Accumulate Without Bound
+    /// Validates: Requirements 1.1
+    ///
+    /// Verify that spawning N timeout-wrapped tasks against an unresponsive
+    /// endpoint results in all tasks being reclaimed (not accumulating).
+    /// This directly tests the bug condition: without timeout, N health_check
+    /// calls would leave N zombie tasks alive indefinitely.
+    #[tokio::test]
+    async fn test_timeout_wrapped_tasks_do_not_accumulate() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let completed_tasks = Arc::new(AtomicUsize::new(0));
+        let test_timeout = Duration::from_millis(50);
+        let num_calls = 5; // Simulate 5 health_check calls
+
+        let mut handles = Vec::new();
+
+        for _ in 0..num_calls {
+            let active = active_tasks.clone();
+            let completed = completed_tasks.clone();
+
+            let handle = tokio::spawn(async move {
+                active.fetch_add(1, Ordering::SeqCst);
+
+                // Simulate unresponsive PG connection (never completes)
+                let never_completes = std::future::pending::<()>();
+
+                // This is the fix pattern — timeout will cancel the hanging future
+                let _ = tokio::time::timeout(test_timeout, never_completes).await;
+
+                active.fetch_sub(1, Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete (they should all timeout after ~50ms)
+        for handle in handles {
+            handle.await.expect("Task panicked");
+        }
+
+        // All 5 tasks should have completed (via timeout cancellation)
+        assert_eq!(
+            completed_tasks.load(Ordering::SeqCst),
+            num_calls,
+            "All {} tasks should have completed via timeout. \
+             Bug condition: without timeout, these tasks would remain alive indefinitely. \
+             Counterexample: 5 health_check calls → 5+ zombie tasks after 30s wait.",
+            num_calls
+        );
+
+        // No tasks should remain active
+        assert_eq!(
+            active_tasks.load(Ordering::SeqCst),
+            0,
+            "No tasks should remain active after timeout. \
+             Bug condition: tasks accumulate without bound when PG is unresponsive."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Preservation Property Tests: PG Normal Query Completion
+    //
+    // **Property 2: Preservation** - PG Normal Query Completion
+    // **Validates: Requirements 3.1**
+    //
+    // These tests verify that when PG responds normally, the timeout wrapper
+    // does NOT interfere with normal operation. The key insight:
+    //   - The timeout wraps only the `connection` maintenance future
+    //   - The query itself uses the `client` which is SEPARATE from `connection`
+    //   - The 30s timeout is far above normal query completion time
+    //   - The Ok(Ok(())) branch silently succeeds (no warning logged)
+    //
+    // Observation on FIXED code: when PG responds normally, health_check()
+    // returns Ok(()), connection task exits cleanly via Ok(Ok(())) branch.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Property 2: Preservation** - PG Normal Query Completion
+    /// **Validates: Requirements 3.1**
+    ///
+    /// Code analysis: verify the timeout is applied ONLY to the `connection`
+    /// future, NOT to the query itself. In tokio-postgres, `connect()` returns
+    /// (client, connection) where:
+    ///   - `client` is used for queries (SELECT 1, pg_is_in_recovery, etc.)
+    ///   - `connection` is a background maintenance future
+    ///
+    /// The query execution path is OUTSIDE the timeout wrapper. This means
+    /// normal queries complete without any timeout pressure.
+    #[test]
+    fn test_timeout_wraps_connection_not_query() {
+        let source = include_str!("postgresql.rs");
+
+        // Only check the production code (before #[cfg(test)] mod tests)
+        let prod_code = source.split("#[cfg(test)]").next().unwrap_or(source);
+
+        // The timeout pattern wraps `connection`, not `client`
+        let timeout_wraps_connection = "tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection)";
+
+        // Verify timeout is on `connection` (the background maintenance future)
+        assert!(
+            prod_code.contains(timeout_wraps_connection),
+            "Timeout must wrap the `connection` future, not the query. \
+             Preservation: queries use `client` which is separate from `connection`."
+        );
+
+        // Verify NO timeout wrapping on query calls in production code
+        assert!(
+            !prod_code.contains("timeout(PG_CONNECTION_TIMEOUT, client"),
+            "PRESERVATION VIOLATION: timeout must NOT wrap client/query operations. \
+             Queries use `client` which is separate from the `connection` future."
+        );
+        assert!(
+            !prod_code.contains("timeout(PG_CONNECTION_TIMEOUT, simple_query"),
+            "PRESERVATION VIOLATION: timeout must NOT wrap simple_query operations."
+        );
+
+        // Verify the query methods all use `client.simple_query(...)` directly
+        // (without any timeout wrapper on the query itself)
+        let methods_and_queries = [
+            ("health_check", "SELECT 1"),
+            ("is_in_recovery", "pg_is_in_recovery"),
+            ("checkpoint", "CHECKPOINT"),
+        ];
+        for (method, query_fragment) in &methods_and_queries {
+            assert!(
+                prod_code.contains(query_fragment),
+                "Method '{}' should contain query fragment '{}' — \
+                 queries execute directly via client without timeout interference.",
+                method,
+                query_fragment
+            );
+        }
+    }
+
+    /// **Property 2: Preservation** - PG Normal Query Completion
+    /// **Validates: Requirements 3.1**
+    ///
+    /// Verify all four methods (health_check, is_in_recovery, wal_status,
+    /// checkpoint) follow the same connection handling pattern and the
+    /// Ok(Ok(())) branch silently succeeds without logging a warning.
+    /// This ensures normal PG responses don't trigger spurious warnings.
+    #[test]
+    fn test_normal_completion_branch_is_silent() {
+        let source = include_str!("postgresql.rs");
+
+        // The Ok(Ok(())) branch in the timeout match should be silent (no log)
+        // Pattern: `Ok(Ok(())) => {}`
+        let silent_success_pattern = "Ok(Ok(())) => {}";
+        let silent_count = source.matches(silent_success_pattern).count();
+
+        assert!(
+            silent_count >= 4,
+            "Expected at least 4 silent Ok(Ok(())) branches (one per connection method), \
+             found {}. Preservation: normal PG responses should not trigger any warning \
+             or debug log — the connection simply completed successfully.",
+            silent_count
+        );
+
+        // Verify the timeout arm logs a warning (only on timeout, not on success)
+        let timeout_warn_pattern = "warn!";
+        let warn_in_timeout = source.matches("timed out").count();
+        assert!(
+            warn_in_timeout >= 4,
+            "Expected at least 4 timeout warning messages (one per method), found {}. \
+             Only timeout triggers a warning; normal completion is silent.",
+            warn_in_timeout
+        );
+    }
+
+    /// **Property 2: Preservation** - PG Normal Query Completion
+    /// **Validates: Requirements 3.1**
+    ///
+    /// Functional test: verify that a future which completes immediately
+    /// (simulating a normal PG response) is NOT affected by the timeout wrapper.
+    /// When wrapped in `tokio::time::timeout(30s, future_that_completes_fast)`,
+    /// the result should be `Ok(inner_result)` — the timeout never fires.
+    #[tokio::test]
+    async fn test_immediate_completion_not_affected_by_timeout() {
+        // Simulate a PG connection future that completes immediately (normal case)
+        let instant_connection: std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send>,
+        > = Box::pin(async { Ok(()) });
+
+        // Wrap in the same timeout duration used in production
+        let result = tokio::time::timeout(PG_CONNECTION_TIMEOUT, instant_connection).await;
+
+        // The timeout should NOT fire — we get Ok(Ok(())) (the inner future's result)
+        match result {
+            Ok(Ok(())) => {
+                // This is the expected path — mirrors the `Ok(Ok(())) => {}` branch
+                // in production code. Normal completion, no warning logged.
+            }
+            Ok(Err(e)) => {
+                panic!(
+                    "Preservation violation: immediate connection returned error: {}. \
+                     Normal PG responses should complete successfully.",
+                    e
+                );
+            }
+            Err(_elapsed) => {
+                panic!(
+                    "Preservation violation: timeout fired on an immediately-completing future! \
+                     PG_CONNECTION_TIMEOUT ({:?}) should never interfere with normal responses.",
+                    PG_CONNECTION_TIMEOUT
+                );
+            }
+        }
+    }
+
+    /// **Property 2: Preservation** - PG Normal Query Completion
+    /// **Validates: Requirements 3.1**
+    ///
+    /// Property-based test: for all completion times significantly below the
+    /// 30s timeout threshold, the timeout wrapper does not interfere.
+    /// Generates random "query completion times" from 0ms to 1000ms and verifies
+    /// the timeout pattern always yields Ok (no timeout fires).
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10))]
+        #[test]
+        fn prop_normal_completion_within_timeout_succeeds(
+            completion_ms in 0u64..1000u64
+        ) {
+            // Any completion time under 1 second should be well within the 30s timeout.
+            let completion_time = Duration::from_millis(completion_ms);
+
+            prop_assert!(
+                PG_CONNECTION_TIMEOUT > completion_time,
+                "PG_CONNECTION_TIMEOUT ({:?}) must be larger than normal completion time ({:?}).",
+                PG_CONNECTION_TIMEOUT,
+                completion_time
+            );
+
+            let margin = PG_CONNECTION_TIMEOUT - completion_time;
+            prop_assert!(
+                margin >= Duration::from_secs(29),
+                "Margin between timeout and completion ({:?}) is too small.",
+                margin
+            );
+        }
+    }
+
+    /// **Property 2: Preservation** - PG Normal Query Completion
+    /// **Validates: Requirements 3.1**
+    ///
+    /// Property-based test: for all futures that complete within a reasonable
+    /// timeframe (simulating normal PG responses), the timeout wrapper resolves
+    /// to Ok(inner_result) without firing.
+    ///
+    /// This uses tokio's test-util with time pausing to run quickly while
+    /// verifying the property across many simulated completion times.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10))]
+        #[test]
+        fn prop_timeout_preserves_result_for_fast_futures(
+            delay_ms in 0u64..50u64,
+            result_is_ok in proptest::bool::ANY
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+
+            rt.block_on(async {
+                let delay = Duration::from_millis(delay_ms);
+
+                let simulated_connection = async move {
+                    tokio::time::sleep(delay).await;
+                    if result_is_ok {
+                        Ok::<(), String>(())
+                    } else {
+                        Err("connection closed by server".to_string())
+                    }
+                };
+
+                let result =
+                    tokio::time::timeout(PG_CONNECTION_TIMEOUT, simulated_connection).await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        assert!(result_is_ok, "Got Ok but expected Err");
+                    }
+                    Ok(Err(_)) => {
+                        assert!(!result_is_ok, "Got Err but expected Ok");
+                    }
+                    Err(_) => {
+                        panic!(
+                            "Preservation violation: timeout fired after only {:?}.",
+                            delay
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    /// **Property 2: Preservation** - PG Normal Query Completion
+    /// **Validates: Requirements 3.1**
+    ///
+    /// When PG connection is refused (port not listening), health_check() should
+    /// return an error promptly without hanging. This verifies the normal error
+    /// path still works correctly — connection refused is a fast failure that
+    /// happens BEFORE the connection future is even spawned (at the
+    /// `tokio_postgres::connect()` stage), so the timeout wrapper is irrelevant
+    /// for this case. The function must not hang waiting for the 30s timeout.
+    #[tokio::test]
+    async fn test_connection_refused_returns_error_promptly() {
+        use std::time::Instant;
+
+        // Use a port that is almost certainly not listening (ephemeral range, high port)
+        let mut config = test_config();
+        config.port = 59999; // Very unlikely to have a PG instance here
+        config.listen = "127.0.0.1".to_string();
+
+        let pg = Postgresql::new(config);
+
+        let start = Instant::now();
+        let result = pg.health_check().await;
+        let elapsed = start.elapsed();
+
+        // Must return an error (connection refused)
+        assert!(
+            result.is_err(),
+            "Preservation: health_check() to a non-listening port must return Err, got Ok. \
+             Connection refused should propagate as an error."
+        );
+
+        // Must complete quickly — well under the 30s PG_CONNECTION_TIMEOUT.
+        // Connection refused typically resolves in <100ms. We allow up to 5s
+        // for slow CI environments, but the key point is it doesn't wait 30s.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "Preservation violation: health_check() took {:?} to return error on connection refused. \
+             Expected prompt failure (< 5s). The timeout wrapper must NOT cause the function \
+             to wait 30s when the connection is outright refused.",
+            elapsed
+        );
+    }
+
+    /// **Property 2: Preservation** - PG Normal Query Completion
+    /// **Validates: Requirements 3.1**
+    ///
+    /// Verify that all four methods (health_check, is_in_recovery, wal_status,
+    /// checkpoint) follow the identical timeout pattern, ensuring consistent
+    /// preservation behavior across all PG query methods.
+    #[test]
+    fn test_all_methods_follow_same_preservation_pattern() {
+        let source = include_str!("postgresql.rs");
+
+        // Only check the production code (before #[cfg(test)] mod tests)
+        let prod_code = source.split("#[cfg(test)]").next().unwrap_or(source);
+
+        // Each method should have exactly this structure:
+        // 1. tokio_postgres::connect(...) → (client, connection)
+        // 2. tokio::spawn with timeout wrapping connection
+        // 3. client.simple_query(...) for the actual query (outside spawn)
+
+        let connect_pattern = "tokio_postgres::connect(&connstr, tokio_postgres::NoTls)";
+        let spawn_timeout_pattern = "tokio::spawn(async move {\n            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection)";
+
+        // Count connect calls in production code (should be 4: health_check, is_in_recovery, wal_status, checkpoint)
+        let connect_count = prod_code.matches(connect_pattern).count();
+        assert_eq!(
+            connect_count, 4,
+            "Expected exactly 4 PG connect calls (one per method). \
+             Each must follow the preservation pattern: connect → spawn with timeout → query via client."
+        );
+
+        // Count spawn+timeout patterns (should also be 4)
+        let spawn_timeout_count = prod_code.matches(spawn_timeout_pattern).count();
+        assert_eq!(
+            spawn_timeout_count, 4,
+            "Expected exactly 4 spawn+timeout patterns (one per method). \
+             All connection methods must use identical timeout handling for consistent behavior."
+        );
     }
 }

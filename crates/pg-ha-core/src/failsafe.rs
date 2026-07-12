@@ -67,8 +67,7 @@ impl Failsafe {
 
     /// Whether the failsafe check passed recently (within TTL)
     pub fn is_active(&self) -> bool {
-        self.last_success
-            .is_some_and(|t| t.elapsed() < self.ttl)
+        self.last_success.is_some_and(|t| t.elapsed() < self.ttl)
     }
 
     /// Check the failsafe topology: ping all known members via POST /failsafe.

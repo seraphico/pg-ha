@@ -16,11 +16,8 @@ impl Ha {
     pub(super) async fn follow_upstream(&mut self, lock_owner: &str) -> CycleResult {
         let replicatefrom = self.config.tags.replicatefrom.as_deref();
 
-        let upstream = CascadeManager::select_upstream(
-            &self.config.name,
-            replicatefrom,
-            &self.cluster,
-        );
+        let upstream =
+            CascadeManager::select_upstream(&self.config.name, replicatefrom, &self.cluster);
 
         let upstream_name = match upstream {
             Some(m) => m.name.clone(),
@@ -29,13 +26,14 @@ impl Ha {
 
         // If replicatefrom is set but the source is unhealthy, log the fallback
         if let Some(source) = replicatefrom
-            && !CascadeManager::is_cascade_source_healthy(source, &self.cluster) {
-                warn!(
-                    source = source,
-                    fallback = %upstream_name,
-                    "cascade source failed, redirecting to primary"
-                );
-            }
+            && !CascadeManager::is_cascade_source_healthy(source, &self.cluster)
+        {
+            warn!(
+                source = source,
+                fallback = %upstream_name,
+                "cascade source failed, redirecting to primary"
+            );
+        }
 
         // ─── Key check: is this node running as primary but NOT holding the lock? ───
         // This happens when an old primary restarts after failover.
@@ -71,9 +69,12 @@ impl Ha {
             let current_upstream = self.read_current_upstream();
 
             // Get the expected host from the upstream member's conn_url
-            let expected_host = self.cluster.get_member(&expected_upstream)
+            let expected_host = self
+                .cluster
+                .get_member(&expected_upstream)
                 .map(|m| {
-                    m.conn_url.split_whitespace()
+                    m.conn_url
+                        .split_whitespace()
                         .find(|p| p.starts_with("host="))
                         .and_then(|p| p.strip_prefix("host="))
                         .unwrap_or("")
@@ -92,7 +93,9 @@ impl Ha {
                     expected_upstream = %expected_host,
                     "Upstream changed and PG not streaming — reconfiguring replica"
                 );
-                let conn_url = self.cluster.get_member(&expected_upstream)
+                let conn_url = self
+                    .cluster
+                    .get_member(&expected_upstream)
                     .map(|m| m.conn_url.clone());
                 if let Some(url) = conn_url {
                     self.reconfigure_replica(&url).await;
@@ -124,9 +127,13 @@ impl Ha {
         let leader_connstr = match leader_member {
             Some(m) => m.conn_url.clone(),
             None => {
-                warn!("Cannot rejoin: leader '{}' not found in cluster members", leader_name);
+                warn!(
+                    "Cannot rejoin: leader '{}' not found in cluster members",
+                    leader_name
+                );
                 return CycleResult::Error(format!(
-                    "Cannot rejoin: leader '{}' not found", leader_name
+                    "Cannot rejoin: leader '{}' not found",
+                    leader_name
                 ));
             }
         };
@@ -183,9 +190,7 @@ impl Ha {
                     leader_name
                 ))
             }
-            Err(e) => {
-                CycleResult::Error(format!("Failed to start PostgreSQL after rejoin: {e}"))
-            }
+            Err(e) => CycleResult::Error(format!("Failed to start PostgreSQL after rejoin: {e}")),
         }
     }
 
@@ -204,7 +209,13 @@ impl Ha {
         }
 
         let repl_user = &self.config.postgresql.replication.username;
-        let repl_pass = self.config.postgresql.replication.password.as_deref().unwrap_or("");
+        let repl_pass = self
+            .config
+            .postgresql
+            .replication
+            .password
+            .as_deref()
+            .unwrap_or("");
         let primary_conninfo = format!(
             "host={host} port={port} user={repl_user} password={repl_pass} application_name={}",
             self.config.name
@@ -257,7 +268,13 @@ impl Ha {
         }
 
         let repl_user = &self.config.postgresql.replication.username;
-        let repl_pass = self.config.postgresql.replication.password.as_deref().unwrap_or("");
+        let repl_pass = self
+            .config
+            .postgresql
+            .replication
+            .password
+            .as_deref()
+            .unwrap_or("");
         let primary_conninfo = format!(
             "host={host} port={port} user={repl_user} password={repl_pass} application_name={}",
             self.config.name
