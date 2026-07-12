@@ -7,17 +7,19 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use openraft::{BasicNode, Config as RaftConfig, Raft};
 use openraft::storage::Adaptor;
+use openraft::{BasicNode, Config as RaftConfig, Raft};
 use tokio::sync::Notify;
 use tracing::{debug, error, info};
 
-use pg_ha_core::cluster::{Cluster, ClusterConfig, Failover, Leader, Member, MemberRole, MemberState};
+use pg_ha_core::cluster::{
+    Cluster, ClusterConfig, Failover, Leader, Member, MemberRole, MemberState,
+};
 use pg_ha_core::dcs::DcsAdapter;
 use pg_ha_core::error::{Error, Result};
 
 use crate::network::NetworkFactory;
-use crate::state_machine::{current_millis, Request, Response};
+use crate::state_machine::{Request, Response, current_millis};
 use crate::store::{MemStore, NodeId, TypeConfig};
 
 /// DCS adapter built on top of embedded Raft
@@ -168,7 +170,9 @@ impl RaftDcs {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(3),
                     self.raft.client_write(test_req),
-                ).await {
+                )
+                .await
+                {
                     Ok(Ok(_)) => return Ok(()),
                     _ => {
                         // Leader reported but can't write — election not complete
@@ -259,7 +263,8 @@ impl RaftDcs {
         // Get leader's address from Raft membership
         let leader_node = {
             let metrics = self.raft.metrics().borrow().clone();
-            metrics.membership_config
+            metrics
+                .membership_config
                 .membership()
                 .nodes()
                 .find(|(id, _)| **id == leader_id)
@@ -279,7 +284,8 @@ impl RaftDcs {
 
         // POST the request to leader's /raft/client-write endpoint
         let url = format!("{leader_addr}/raft/client-write");
-        let resp = self.http_client
+        let resp = self
+            .http_client
             .post(&url)
             .json(request)
             .send()
@@ -342,12 +348,21 @@ impl DcsAdapter for RaftDcs {
             .map(|e| e.value.clone());
 
         // Read failover key
-        let failover = self.store.get(&self.failover_path()).await
+        let failover = self
+            .store
+            .get(&self.failover_path())
+            .await
             .and_then(|e| serde_json::from_str::<Failover>(&e.value).ok());
 
         // Read config key
-        let config = self.store.get(&self.config_path()).await
-            .map(|e| ClusterConfig { version: e.version, data: serde_json::from_str(&e.value).unwrap_or_default() });
+        let config = self
+            .store
+            .get(&self.config_path())
+            .await
+            .map(|e| ClusterConfig {
+                version: e.version,
+                data: serde_json::from_str(&e.value).unwrap_or_default(),
+            });
 
         Ok(Cluster {
             leader,
@@ -356,7 +371,7 @@ impl DcsAdapter for RaftDcs {
             config,
             sync_state: None, // TODO: read /sync key
             failover,
-            failsafe: None,  // TODO: read /failsafe key
+            failsafe: None, // TODO: read /failsafe key
             history: Vec::new(),
         })
     }
@@ -496,7 +511,11 @@ impl DcsAdapter for RaftDcs {
     }
 
     async fn get_config_value(&self) -> Result<Option<String>> {
-        Ok(self.store.get(&self.config_path()).await.map(|e| e.value.clone()))
+        Ok(self
+            .store
+            .get(&self.config_path())
+            .await
+            .map(|e| e.value.clone()))
     }
 
     fn ttl(&self) -> u64 {

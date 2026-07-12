@@ -13,8 +13,13 @@ impl Ha {
     pub(super) async fn process_commands(&mut self) {
         while let Ok((cmd, reply_tx)) = self.cmd_rx.try_recv() {
             let response = match cmd {
-                ManagementCommand::Switchover { leader, candidate, scheduled_at } => {
-                    self.handle_switchover_command(leader, candidate, scheduled_at).await
+                ManagementCommand::Switchover {
+                    leader,
+                    candidate,
+                    scheduled_at,
+                } => {
+                    self.handle_switchover_command(leader, candidate, scheduled_at)
+                        .await
                 }
                 ManagementCommand::Failover { candidate } => {
                     self.handle_failover_command(candidate).await
@@ -23,12 +28,8 @@ impl Ha {
                     self.pending_switchover = None;
                     CommandResponse::accepted("Scheduled switchover cancelled")
                 }
-                ManagementCommand::Restart => {
-                    self.handle_restart_command().await
-                }
-                ManagementCommand::Reinitialize => {
-                    self.handle_reinitialize_command().await
-                }
+                ManagementCommand::Restart => self.handle_restart_command().await,
+                ManagementCommand::Reinitialize => self.handle_reinitialize_command().await,
             };
             let _ = reply_tx.send(response).await;
         }
@@ -47,22 +48,31 @@ impl Ha {
 
         // Validate leader name if specified
         if let Some(ref expected_leader) = leader
-            && expected_leader != &self.config.name {
-                return CommandResponse::rejected(format!(
-                    "Leader mismatch: expected '{}', actual '{}'",
-                    expected_leader, self.config.name
-                ));
-            }
+            && expected_leader != &self.config.name
+        {
+            return CommandResponse::rejected(format!(
+                "Leader mismatch: expected '{}', actual '{}'",
+                expected_leader, self.config.name
+            ));
+        }
 
         // Validate candidate exists and is eligible
         if let Some(ref cand) = candidate {
             match self.cluster.get_member(cand) {
-                None => return CommandResponse::rejected(format!("Candidate '{}' not found", cand)),
+                None => {
+                    return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
+                }
                 Some(m) if m.is_nofailover() => {
-                    return CommandResponse::rejected(format!("Candidate '{}' has nofailover tag", cand));
+                    return CommandResponse::rejected(format!(
+                        "Candidate '{}' has nofailover tag",
+                        cand
+                    ));
                 }
                 Some(m) if m.state != crate::cluster::MemberState::Running => {
-                    return CommandResponse::rejected(format!("Candidate '{}' is not running", cand));
+                    return CommandResponse::rejected(format!(
+                        "Candidate '{}' is not running",
+                        cand
+                    ));
                 }
                 _ => {}
             }
@@ -84,7 +94,10 @@ impl Ha {
             "leader": self.config.name,
             "candidate": candidate,
         });
-        let _ = self.dcs.set_failover_value(&failover_value.to_string()).await;
+        let _ = self
+            .dcs
+            .set_failover_value(&failover_value.to_string())
+            .await;
 
         // Release leader lock — this triggers election
         if let Some(leader) = &self.cluster.leader.clone() {
@@ -104,25 +117,36 @@ impl Ha {
         // Write primary_conninfo pointing to the candidate (new primary)
         // so when PG restarts it streams from the correct source
         if let Some(ref cand_name) = candidate
-            && let Some(cand_member) = self.cluster.get_member(cand_name) {
-                let mut host = "127.0.0.1".to_string();
-                let mut port = "5432".to_string();
-                for part in cand_member.conn_url.split_whitespace() {
-                    if let Some(val) = part.strip_prefix("host=") { host = val.to_string(); }
-                    if let Some(val) = part.strip_prefix("port=") { port = val.to_string(); }
+            && let Some(cand_member) = self.cluster.get_member(cand_name)
+        {
+            let mut host = "127.0.0.1".to_string();
+            let mut port = "5432".to_string();
+            for part in cand_member.conn_url.split_whitespace() {
+                if let Some(val) = part.strip_prefix("host=") {
+                    host = val.to_string();
                 }
-                let repl_user = &self.config.postgresql.replication.username;
-                let repl_pass = self.config.postgresql.replication.password.as_deref().unwrap_or("");
-                let conninfo = format!(
-                    "host={host} port={port} user={repl_user} password={repl_pass} application_name={}",
-                    self.config.name
-                );
-                let auto_conf = self.config.postgresql.data_dir.join("postgresql.auto.conf");
-                let content = format!(
-                    "# pg-ha managed (switchover demotion)\nprimary_conninfo = '{conninfo}'\nrecovery_target_timeline = 'latest'\n"
-                );
-                let _ = std::fs::write(&auto_conf, content);
+                if let Some(val) = part.strip_prefix("port=") {
+                    port = val.to_string();
+                }
             }
+            let repl_user = &self.config.postgresql.replication.username;
+            let repl_pass = self
+                .config
+                .postgresql
+                .replication
+                .password
+                .as_deref()
+                .unwrap_or("");
+            let conninfo = format!(
+                "host={host} port={port} user={repl_user} password={repl_pass} application_name={}",
+                self.config.name
+            );
+            let auto_conf = self.config.postgresql.data_dir.join("postgresql.auto.conf");
+            let content = format!(
+                "# pg-ha managed (switchover demotion)\nprimary_conninfo = '{conninfo}'\nrecovery_target_timeline = 'latest'\n"
+            );
+            let _ = std::fs::write(&auto_conf, content);
+        }
 
         CommandResponse::accepted("Switchover initiated, leader lock released")
     }
@@ -130,15 +154,19 @@ impl Ha {
     async fn handle_failover_command(&mut self, candidate: Option<String>) -> CommandResponse {
         // Failover can be initiated from any node — it writes /failover key
         if let Some(ref cand) = candidate
-            && self.cluster.get_member(cand).is_none() {
-                return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
-            }
+            && self.cluster.get_member(cand).is_none()
+        {
+            return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
+        }
 
         info!(candidate = ?candidate, "Initiating manual failover");
         let failover_value = serde_json::json!({
             "candidate": candidate,
         });
-        let _ = self.dcs.set_failover_value(&failover_value.to_string()).await;
+        let _ = self
+            .dcs
+            .set_failover_value(&failover_value.to_string())
+            .await;
 
         CommandResponse::accepted("Failover request submitted")
     }

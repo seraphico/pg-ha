@@ -45,11 +45,7 @@ impl SyncManager {
     ///
     /// Returns None if sync mode is Off.
     /// Returns Some("") if strict mode and no eligible standbys (blocks writes).
-    pub fn compute_sync_standby_names(
-        &self,
-        members: &[Member],
-        my_name: &str,
-    ) -> Option<String> {
+    pub fn compute_sync_standby_names(&self, members: &[Member], my_name: &str) -> Option<String> {
         if self.mode == SyncMode::Off {
             return None;
         }
@@ -67,8 +63,7 @@ impl SyncManager {
                 // Filter by lag if configured
                 if let Some(_max_lag) = self.max_lag_on_syncnode {
                     // If we don't know the lag, include them (benefit of doubt)
-                    m.wal_position.is_none()
-                        || m.wal_position.is_some_and(|_| true) // TODO: compute actual lag
+                    m.wal_position.is_none() || m.wal_position.is_some_and(|_| true) // TODO: compute actual lag
                 } else {
                     true
                 }
@@ -77,9 +72,7 @@ impl SyncManager {
             .collect();
 
         // Sort by sync_priority (higher first), then name
-        candidates.sort_by(|a, b| {
-            b.1.cmp(&a.1).then_with(|| a.0.name.cmp(&b.0.name))
-        });
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.name.cmp(&b.0.name)));
 
         let names: Vec<&str> = candidates.iter().map(|(m, _)| m.name.as_str()).collect();
 
@@ -97,12 +90,8 @@ impl SyncManager {
         let name_list = selected.join(",");
 
         match self.mode {
-            SyncMode::Priority => {
-                Some(format!("FIRST {} ({})", self.sync_node_count, name_list))
-            }
-            SyncMode::Quorum => {
-                Some(format!("ANY {} ({})", self.sync_node_count, name_list))
-            }
+            SyncMode::Priority => Some(format!("FIRST {} ({})", self.sync_node_count, name_list)),
+            SyncMode::Quorum => Some(format!("ANY {} ({})", self.sync_node_count, name_list)),
             SyncMode::Off => None,
         }
     }

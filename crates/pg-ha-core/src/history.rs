@@ -97,8 +97,7 @@ impl History {
 
     /// Deserialize from JSON string (from DCS)
     pub fn from_json(json: &str) -> Self {
-        let entries: Vec<HistoryEntry> =
-            serde_json::from_str(json).unwrap_or_default();
+        let entries: Vec<HistoryEntry> = serde_json::from_str(json).unwrap_or_default();
         Self { entries }
     }
 }
@@ -137,10 +136,7 @@ mod tests {
 
         assert_eq!(history.entries().len(), MAX_HISTORY_ENTRIES);
         // Oldest entries should have been evicted; first entry should be #50
-        assert_eq!(
-            history.entries()[0].new_leader.as_deref(),
-            Some("node50")
-        );
+        assert_eq!(history.entries()[0].new_leader.as_deref(), Some("node50"));
     }
 
     #[test]
@@ -157,7 +153,10 @@ mod tests {
         let restored = History::from_json(&json);
 
         assert_eq!(restored.entries().len(), 1);
-        assert_eq!(restored.entries()[0].event_type, HistoryEventType::Switchover);
+        assert_eq!(
+            restored.entries()[0].event_type,
+            HistoryEventType::Switchover
+        );
         assert_eq!(restored.entries()[0].reason, "planned maintenance");
     }
 
