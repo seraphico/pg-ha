@@ -9,9 +9,7 @@ impl Ha {
     /// Cluster has no leader — run election
     pub(super) async fn process_unhealthy_cluster(&mut self) -> CycleResult {
         if self.is_paused {
-            return CycleResult::Follower(
-                "no action in pause mode (cluster has no leader)".into(),
-            );
+            return CycleResult::Follower("no action in pause mode (cluster has no leader)".into());
         }
 
         // ─── Stale primary detection ───
@@ -24,7 +22,10 @@ impl Ha {
             && !self.cluster.members.is_empty()
         {
             // Prefer the leader member, then any primary-role member, then any running member
-            let source_member = self.cluster.leader.as_ref()
+            let source_member = self
+                .cluster
+                .leader
+                .as_ref()
                 .and_then(|l| self.cluster.get_member(&l.name))
                 .filter(|m| m.state == crate::cluster::MemberState::Running)
                 .or_else(|| {
@@ -56,13 +57,19 @@ impl Ha {
 
         // Check if there's a pending switchover/failover request with a designated candidate.
         // If so, only the candidate should attempt to acquire the lock.
-        let designated_candidate = self.cluster.failover.as_ref()
+        let designated_candidate = self
+            .cluster
+            .failover
+            .as_ref()
             .and_then(|f| f.candidate.as_deref());
 
         let should_attempt = if let Some(candidate) = designated_candidate {
             // A candidate is designated — only that node should attempt
             if candidate == self.config.name {
-                info!(candidate, "This node is the designated switchover candidate — attempting lock acquisition");
+                info!(
+                    candidate,
+                    "This node is the designated switchover candidate — attempting lock acquisition"
+                );
                 true
             } else {
                 // We're not the candidate — defer
@@ -83,9 +90,7 @@ impl Ha {
                 }
                 Ok(false) => {
                     self.is_leader = false;
-                    CycleResult::Follower(
-                        "failed to acquire lock, following new leader".into(),
-                    )
+                    CycleResult::Follower("failed to acquire lock, following new leader".into())
                 }
                 Err(e) => CycleResult::Error(format!("Leader acquisition error: {e}")),
             }
@@ -97,9 +102,7 @@ impl Ha {
                     designated_candidate.unwrap_or("unknown")
                 ))
             } else {
-                CycleResult::Follower(
-                    "not the healthiest node, waiting for election".into(),
-                )
+                CycleResult::Follower("not the healthiest node, waiting for election".into())
             }
         }
     }
