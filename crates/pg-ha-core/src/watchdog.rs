@@ -58,8 +58,7 @@ impl Watchdog {
     /// Pet (keepalive) the watchdog. Must be called every HA loop cycle
     /// while this node is the primary.
     pub fn keepalive(&self) {
-        if !self.is_active {
-        }
+        if !self.is_active {}
 
         #[cfg(target_os = "linux")]
         {

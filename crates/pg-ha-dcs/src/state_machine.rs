@@ -91,7 +91,15 @@ impl KvStateMachine {
                 prev_value,
                 prev_version,
                 now,
-            } => self.apply_set(key, value, *ttl, *prev_exist, prev_value.as_deref(), *prev_version, *now),
+            } => self.apply_set(
+                key,
+                value,
+                *ttl,
+                *prev_exist,
+                prev_value.as_deref(),
+                *prev_version,
+                *now,
+            ),
             Request::Delete {
                 key,
                 prev_value,
@@ -117,16 +125,15 @@ impl KvStateMachine {
         let existing = self.data.get(key);
 
         // Treat expired entries as non-existent for CAS purposes (deterministic: uses request's now)
-        let effectively_exists = existing.is_some_and(|e| {
-            e.expire_at.is_none_or(|exp| exp > now)
-        });
+        let effectively_exists = existing.is_some_and(|e| e.expire_at.is_none_or(|exp| exp > now));
         let effective_existing = if effectively_exists { existing } else { None };
 
         // CAS check: prev_exist
         if let Some(should_exist) = prev_exist
-            && should_exist != effectively_exists {
-                return Response::NotChanged;
-            }
+            && should_exist != effectively_exists
+        {
+            return Response::NotChanged;
+        }
 
         // CAS check: prev_value
         if let Some(expected_val) = prev_value {
@@ -197,9 +204,8 @@ impl KvStateMachine {
     }
 
     fn apply_expire(&mut self, now: u64) -> Response {
-        self.data.retain(|_, entry| {
-            entry.expire_at.is_none_or(|exp| exp > now)
-        });
+        self.data
+            .retain(|_, entry| entry.expire_at.is_none_or(|exp| exp > now));
         Response::Ok {
             version: self.last_applied_log,
         }
@@ -277,7 +283,10 @@ impl KvStateMachine {
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::info!("No persisted state machine at {} — starting fresh", path.display());
+                tracing::info!(
+                    "No persisted state machine at {} — starting fresh",
+                    path.display()
+                );
                 Self::default()
             }
             Err(e) => {
@@ -292,9 +301,7 @@ impl KvStateMachine {
 }
 
 fn is_expired(entry: &KvEntry) -> bool {
-    entry
-        .expire_at
-        .is_some_and(|exp| exp <= current_millis())
+    entry.expire_at.is_some_and(|exp| exp <= current_millis())
 }
 
 pub fn current_millis() -> u64 {
