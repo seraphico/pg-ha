@@ -8,12 +8,14 @@ services:
       dockerfile: docker/Dockerfile
       args:
         RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
+        PG_VERSION: ${PG_VERSION:-16}
     container_name: pg-ha-node1
     hostname: node1
     environment:
       PG_HA_NAME: node1
       PG_HA_SCOPE: test-cluster
       POSTGRES_PASSWORD: secret
+      PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node1:2380"
       PG_HA_RAFT_PARTNERS: "node2:2380,node3:2380"
     ports:
@@ -33,12 +35,14 @@ services:
       dockerfile: docker/Dockerfile
       args:
         RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
+        PG_VERSION: ${PG_VERSION:-16}
     container_name: pg-ha-node2
     hostname: node2
     environment:
       PG_HA_NAME: node2
       PG_HA_SCOPE: test-cluster
       POSTGRES_PASSWORD: secret
+      PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node2:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node3:2380"
     ports:
@@ -58,12 +62,14 @@ services:
       dockerfile: docker/Dockerfile
       args:
         RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
+        PG_VERSION: ${PG_VERSION:-16}
     container_name: pg-ha-node3
     hostname: node3
     environment:
       PG_HA_NAME: node3
       PG_HA_SCOPE: test-cluster
       POSTGRES_PASSWORD: secret
+      PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node3:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node2:2380"
     ports:
