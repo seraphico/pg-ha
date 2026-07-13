@@ -11,6 +11,23 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
+/// Redact password from a libpq-style connection string for safe logging.
+/// Replaces `password=xxx` with `password=***`.
+pub fn redact_connstr(connstr: &str) -> String {
+    let mut result = String::with_capacity(connstr.len());
+    let mut remaining = connstr;
+    while let Some(pos) = remaining.find("password=") {
+        result.push_str(&remaining[..pos]);
+        result.push_str("password=***");
+        let after_key = &remaining[pos + 9..]; // skip "password="
+        // Skip the password value (until next space or end)
+        let end = after_key.find(' ').unwrap_or(after_key.len());
+        remaining = &after_key[end..];
+    }
+    result.push_str(remaining);
+    result
+}
+
 /// Timeout for spawned PG connection futures.
 /// If PG is unresponsive, the task will be cancelled after this duration.
 const PG_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -325,7 +342,7 @@ impl Postgresql {
 
     /// Clone from another node using pg_basebackup
     pub async fn basebackup(&self, source_connstr: &str) -> Result<()> {
-        info!(source = source_connstr, "Running pg_basebackup");
+        info!(source = %redact_connstr(source_connstr), "Running pg_basebackup");
 
         let output = Command::new(self.pg_basebackup_bin())
             .args([
@@ -352,7 +369,7 @@ impl Postgresql {
 
     /// Run pg_rewind to resync a diverged former primary
     pub async fn rewind(&self, source_connstr: &str) -> Result<()> {
-        info!(source = source_connstr, "Running pg_rewind");
+        info!(source = %redact_connstr(source_connstr), "Running pg_rewind");
 
         let output = Command::new(self.pg_rewind_bin())
             .args([

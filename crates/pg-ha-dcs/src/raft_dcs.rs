@@ -47,6 +47,9 @@ pub struct RaftDcs {
 
     /// Shared HTTP client for forwarding requests to the Raft leader
     http_client: reqwest::Client,
+
+    /// Whether TLS is enabled for Raft RPC
+    tls_enabled: bool,
 }
 
 impl RaftDcs {
@@ -59,6 +62,7 @@ impl RaftDcs {
     /// `ttl`: leader lock TTL in seconds
     /// `loop_wait`: HA loop interval in seconds
     /// `data_dir`: optional directory for persisting Raft state to disk
+    /// `tls`: optional TLS configuration for Raft RPC connections
     pub async fn new(
         node_id: NodeId,
         node_name: String,
@@ -67,6 +71,7 @@ impl RaftDcs {
         ttl: u64,
         loop_wait: u64,
         data_dir: Option<PathBuf>,
+        tls: Option<&pg_ha_core::config::RaftTlsConfig>,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let config = RaftConfig {
             heartbeat_interval: 500,
@@ -86,7 +91,10 @@ impl RaftDcs {
                 Arc::new(MemStore::new())
             }
         };
-        let network = NetworkFactory::default();
+        let network = match tls {
+            Some(tls_cfg) => NetworkFactory::with_tls(tls_cfg)?,
+            None => NetworkFactory::default(),
+        };
 
         let (log_store, state_machine) = Adaptor::new(store.clone());
         let raft = Raft::new(node_id, config, network, log_store, state_machine).await?;
@@ -94,11 +102,43 @@ impl RaftDcs {
 
         let base_path = format!("/{namespace}/{scope}/");
 
-        let http_client = reqwest::Client::builder()
-            .pool_max_idle_per_host(3)
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
+        // Build HTTP client for forward_to_leader — must use same TLS config as NetworkFactory
+        let (http_client, tls_enabled) = match tls {
+            Some(tls_cfg) => {
+                let mut builder = reqwest::Client::builder()
+                    .pool_max_idle_per_host(3)
+                    .timeout(std::time::Duration::from_secs(10));
+                if let Some(ref ca_path) = tls_cfg.ca_cert {
+                    if let Ok(ca_pem) = std::fs::read(ca_path) {
+                        if let Ok(cert) = reqwest::tls::Certificate::from_pem(&ca_pem) {
+                            builder = builder.add_root_certificate(cert);
+                        }
+                    }
+                }
+                if let (Some(cert_path), Some(key_path)) =
+                    (&tls_cfg.client_cert, &tls_cfg.client_key)
+                {
+                    if let (Ok(cert_pem), Ok(key_pem)) =
+                        (std::fs::read(cert_path), std::fs::read(key_path))
+                    {
+                        let mut identity_pem = cert_pem;
+                        identity_pem.extend_from_slice(&key_pem);
+                        if let Ok(identity) = reqwest::tls::Identity::from_pem(&identity_pem) {
+                            builder = builder.identity(identity);
+                        }
+                    }
+                }
+                (builder.build().unwrap_or_default(), true)
+            }
+            None => {
+                let client = reqwest::Client::builder()
+                    .pool_max_idle_per_host(3)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_default();
+                (client, false)
+            }
+        };
 
         Ok(Self {
             raft,
@@ -109,6 +149,7 @@ impl RaftDcs {
             loop_wait,
             notify: Arc::new(Notify::new()),
             http_client,
+            tls_enabled,
         })
     }
 
@@ -275,6 +316,8 @@ impl RaftDcs {
             Some(node) => {
                 if node.addr.starts_with("http") {
                     node.addr
+                } else if self.tls_enabled {
+                    format!("https://{}", node.addr)
                 } else {
                     format!("http://{}", node.addr)
                 }

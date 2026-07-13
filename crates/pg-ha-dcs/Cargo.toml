@@ -16,6 +16,7 @@ async-trait = { workspace = true }
 openraft = { workspace = true }
 reqwest = { workspace = true }
 axum = { workspace = true }
+axum-server = { workspace = true }
 futures-util = { workspace = true }
 
 [dev-dependencies]
