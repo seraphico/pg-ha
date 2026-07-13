@@ -4,7 +4,7 @@
 
 | 组件 | 最低版本 | 说明 |
 |------|---------|------|
-| PostgreSQL | 16+ | 需要 `pg_ctl`、`pg_basebackup`、`pg_rewind` |
+| PostgreSQL | 14+ | 需要 `pg_ctl`、`pg_basebackup`、`pg_rewind`（Docker 支持 14-18） |
 | Rust | 1.77+ (nightly) | 编译需要 `let-else` 等 nightly 特性 |
 | Docker | 24.0+ | 容器化部署 |
 | Docker Compose | v2.20+ | 多节点编排 |
@@ -32,8 +32,12 @@
 # 克隆项目
 git clone <repo-url> pg-ha && cd pg-ha
 
-# 启动三节点集群（自动编译 + 构建镜像 + 启动）
+# 启动三节点集群（自动编译 + 构建镜像 + 启动，默认 PG 16）
 make up
+
+# 使用其他 PostgreSQL 版本（支持 14-18）
+make up PG_VERSION=17
+make up PG_VERSION=18
 
 # 验证集群状态
 curl -s http://localhost:8008/cluster | jq .
@@ -379,6 +383,24 @@ sudo chmod 644 /etc/pg-ha/tls/*.crt
 ---
 
 ## Docker 部署
+
+### PostgreSQL 版本选择
+
+Docker 镜像支持 PostgreSQL 14-18，通过 `PG_VERSION` 构建参数控制：
+
+```bash
+# 默认使用 PG 16
+make up
+
+# 使用 PG 18
+make up PG_VERSION=18
+
+# 也可直接用 docker compose
+PG_VERSION=17 docker compose build
+docker compose up -d
+```
+
+entrypoint 会自动检测容器内的 PostgreSQL 版本，正确设置 `bin_dir` 和 `data_dir`，无需手动修改配置。
 
 ### 生产 docker-compose 配置
 

@@ -1,11 +1,12 @@
 # pg-ha local development
 #
-#   make          # build Linux binaries + start 3-node Docker cluster
-#   make build    # Linux binaries only
-#   make up       # build images + start cluster
-#   make down     # wipe cluster (Raft + PGDATA volumes)
-#   make stop     # stop containers, keep data (power-off simulation)
-#   make restart  # restart containers, keep volumes
+#   make                    # build Linux binaries + start 3-node Docker cluster (PG 16)
+#   make PG_VERSION=18      # same but with PostgreSQL 18
+#   make build              # Linux binaries only
+#   make up                 # build images + start cluster
+#   make down               # wipe cluster (Raft + PGDATA volumes)
+#   make stop               # stop containers, keep data (power-off simulation)
+#   make restart            # restart containers, keep volumes
 #
 # Detected hosts:
 #   Mac ARM  (arm64)     → aarch64-unknown-linux-gnu / linux/arm64
@@ -46,6 +47,10 @@ endif
 export RUST_TARGET
 export DOCKER_PLATFORM
 
+# PostgreSQL version for Docker image (default: 16, supports 14-18)
+PG_VERSION ?= 16
+export PG_VERSION
+
 COMPOSE       ?= docker compose
 COMPOSE_BUILD := $(COMPOSE) -f docker-compose.build.yml
 COMPOSE_DEV   := $(COMPOSE) -f docker-compose.yml
@@ -73,7 +78,7 @@ test:
 ## all: compile Linux binaries and start the Docker development cluster
 all: up
 	@echo ""
-	@echo "Dev environment ready ($(UNAME_S)/$(UNAME_M) → $(RUST_TARGET))"
+	@echo "Dev environment ready ($(UNAME_S)/$(UNAME_M) → $(RUST_TARGET), PG $(PG_VERSION))"
 	@echo "  Cluster API : http://localhost:8008/cluster"
 	@echo "  Postgres    : localhost:5432  (user=postgres password=secret)"
 	@echo "  Proxy RW/RO : localhost:6432 / 6433"
@@ -103,8 +108,8 @@ build:
 
 ## docker-build: build cluster images (depends on Linux binaries)
 docker-build: build
-	@echo "==> Building cluster images (RUST_TARGET=$(RUST_TARGET))"
-	$(COMPOSE_DEV) build
+	@echo "==> Building cluster images (RUST_TARGET=$(RUST_TARGET), PG_VERSION=$(PG_VERSION))"
+	$(COMPOSE_DEV) build --build-arg PG_VERSION=$(PG_VERSION)
 
 ## up: build binaries + images and start the 3-node cluster
 up: docker-build
@@ -142,8 +147,22 @@ print-env:
 	@echo "OS=$(UNAME_S) ARCH=$(UNAME_M)"
 	@echo "RUST_TARGET=$(RUST_TARGET)"
 	@echo "DOCKER_PLATFORM=$(DOCKER_PLATFORM)"
+	@echo "PG_VERSION=$(PG_VERSION)"
 	@echo "BIN_DIR=$(BIN_DIR)"
 
-## help: list targets
+## help: show this help message
 help:
-	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## //' | column -t -s ':'
+	@echo "pg-ha development toolchain"
+	@echo ""
+	@echo "Usage: make [target] [PG_VERSION=16|17|18] [RUST_TARGET=...]"
+	@echo ""
+	@echo "Targets:"
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /' | column -t -s ':'
+	@echo ""
+	@echo "Examples:"
+	@echo "  make                     Build + start 3-node cluster (PG 16)"
+	@echo "  make up PG_VERSION=18    Start cluster with PostgreSQL 18"
+	@echo "  make build               Compile Linux binaries only"
+	@echo "  make down                Stop cluster and wipe all data"
+	@echo "  make logs                Follow cluster logs"
+	@echo "  make test                Run all workspace tests"
