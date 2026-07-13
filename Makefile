@@ -150,6 +150,19 @@ print-env:
 	@echo "PG_VERSION=$(PG_VERSION)"
 	@echo "BIN_DIR=$(BIN_DIR)"
 
-## help: list targets
+## help: show this help message
 help:
-	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## //' | column -t -s ':'
+	@echo "pg-ha development toolchain"
+	@echo ""
+	@echo "Usage: make [target] [PG_VERSION=16|17|18] [RUST_TARGET=...]"
+	@echo ""
+	@echo "Targets:"
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /' | column -t -s ':'
+	@echo ""
+	@echo "Examples:"
+	@echo "  make                     Build + start 3-node cluster (PG 16)"
+	@echo "  make up PG_VERSION=18    Start cluster with PostgreSQL 18"
+	@echo "  make build               Compile Linux binaries only"
+	@echo "  make down                Stop cluster and wipe all data"
+	@echo "  make logs                Follow cluster logs"
+	@echo "  make test                Run all workspace tests"
