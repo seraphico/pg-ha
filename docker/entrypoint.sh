@@ -6,8 +6,12 @@ set -e
 
 NODE_NAME=${PG_HA_NAME:-$(hostname)}
 SCOPE=${PG_HA_SCOPE:-pg-ha-cluster}
-PG_DATA=${PGDATA:-/var/lib/postgresql/data}
-PG_BIN=/usr/lib/postgresql/16/bin
+
+# Auto-detect PostgreSQL version and paths from the official postgres Docker image
+# The image sets PG_MAJOR and places binaries under /usr/lib/postgresql/<ver>/bin
+PG_MAJOR=${PG_MAJOR:-$(ls /usr/lib/postgresql/ 2>/dev/null | sort -V | tail -1)}
+PG_BIN=${PG_HA_BIN_DIR:-/usr/lib/postgresql/${PG_MAJOR}/bin}
+PG_DATA=${PGDATA:-/var/lib/postgresql/${PG_MAJOR}/data}
 PG_PORT=${PG_PORT:-5432}
 PG_USER=${POSTGRES_USER:-postgres}
 PG_PASSWORD=${POSTGRES_PASSWORD:-secret}
