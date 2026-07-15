@@ -227,11 +227,7 @@ impl MemStore {
                 }
             };
             let result = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                let mut file = std::fs::File::create(&path)?;
-                file.write_all(json.as_bytes())?;
-                file.sync_all()?;
-                Ok::<(), std::io::Error>(())
+                Self::atomic_write_json(&path, json.as_bytes())
             })
             .await;
             match result {
@@ -257,11 +253,7 @@ impl MemStore {
                 }
             };
             let result = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                let mut file = std::fs::File::create(&path)?;
-                file.write_all(json.as_bytes())?;
-                file.sync_all()?;
-                Ok::<(), std::io::Error>(())
+                Self::atomic_write_json(&path, json.as_bytes())
             })
             .await;
             match result {
@@ -283,11 +275,7 @@ impl MemStore {
                 }
             };
             let result = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                let mut file = std::fs::File::create(&path)?;
-                file.write_all(json.as_bytes())?;
-                file.sync_all()?;
-                Ok::<(), std::io::Error>(())
+                Self::atomic_write_json(&path, json.as_bytes())
             })
             .await;
             match result {
@@ -313,11 +301,7 @@ impl MemStore {
                 }
             };
             let result = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                let mut file = std::fs::File::create(&path)?;
-                file.write_all(json.as_bytes())?;
-                file.sync_all()?;
-                Ok::<(), std::io::Error>(())
+                Self::atomic_write_json(&path, json.as_bytes())
             })
             .await;
             match result {
@@ -326,6 +310,36 @@ impl MemStore {
                 Err(e) => warn!("persist_membership task panicked: {e}"),
             }
         }
+    }
+
+    /// Atomically write bytes via temp file + fsync + rename.
+    fn atomic_write_json(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad path")
+            })?;
+
+        let temp_path = dir.join(format!("{file_name}.{}.tmp", std::process::id()));
+        // 1) Write to temporary file
+        {
+            let mut file = std::fs::File::create(&temp_path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        // 2) Atomically rename temporary file to target file
+        std::fs::rename(&temp_path, path)?;
+
+        // 3) Sync directory so the rename itself is durable
+        if let Ok(dir_file) = std::fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+
+        Ok(())
     }
 }
 
@@ -613,10 +627,10 @@ mod tests {
                 method_name
             );
 
-            // Verify std::fs::write is inside spawn_blocking (not at top level)
+            // Verify atomic persist helper is used inside spawn_blocking
             assert!(
-                method_body.contains("write_all") && method_body.contains("sync_all"),
-                "Method `{}` should use write_all + sync_all (inside spawn_blocking)",
+                method_body.contains("atomic_write_json"),
+                "Method `{}` should call atomic_write_json (inside spawn_blocking)",
                 method_name
             );
         }
@@ -672,12 +686,13 @@ mod tests {
             );
 
             // The method should NOT have bare file I/O outside of spawn_blocking
-            // Verify by checking that spawn_blocking appears BEFORE file operations
+            // Verify by checking that spawn_blocking appears BEFORE atomic_write_json
             let spawn_pos = method_body.find("spawn_blocking").unwrap();
             let write_pos = method_body
-                .find("write_all")
+                .find("atomic_write_json")
+                .or_else(|| method_body.find("write_all"))
                 .or_else(|| method_body.find("std::fs::write"))
-                .unwrap();
+                .expect("persist method should perform file I/O");
             assert!(
                 spawn_pos < write_pos,
                 "In method `{}`, file I/O should be inside spawn_blocking closure",
