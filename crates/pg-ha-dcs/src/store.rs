@@ -320,9 +320,7 @@ impl MemStore {
         let file_name = path
             .file_name()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad path")
-            })?;
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad path"))?;
 
         let temp_path = dir.join(format!("{file_name}.{}.tmp", std::process::id()));
         // 1) Write to temporary file

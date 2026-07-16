@@ -177,8 +177,8 @@ async fn main() -> anyhow::Result<()> {
     // Small staggered dely on node_id to reduce simultaneous attempts
     let stagger = std::time::Duration::from_millis(500 * node_id);
     tokio::time::sleep(stagger).await;
-    
-    let mut bootstrapped  = false;
+
+    let mut bootstrapped = false;
     loop {
         match dcs.wait_for_leader(2).await {
             Ok(()) => {
@@ -205,7 +205,6 @@ async fn main() -> anyhow::Result<()> {
                     bootstrapped = true;
                 }
             }
-
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }

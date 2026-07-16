@@ -187,10 +187,18 @@ impl RaftDcs {
 
     /// Check if a Raft client_write error is a ForwardToLeader redirect.
     /// This indicates the cluster has a known leader - the node is just not it.
-    fn is_forward_to_leader(err: &openraft::error::RaftError<NodeId, openraft::error::ClientWriteError<NodeId, BasicNode>>) -> bool {
-        matches!(err, openraft::error::RaftError::APIError(
-            openraft::error::ClientWriteError::ForwardToLeader(_)
-        ))
+    fn is_forward_to_leader(
+        err: &openraft::error::RaftError<
+            NodeId,
+            openraft::error::ClientWriteError<NodeId, BasicNode>,
+        >,
+    ) -> bool {
+        matches!(
+            err,
+            openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(_)
+            )
+        )
     }
 
     /// Wait until the Raft cluster has a leader (blocking with timeout)
