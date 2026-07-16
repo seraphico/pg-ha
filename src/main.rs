@@ -169,28 +169,45 @@ async fn main() -> anyhow::Result<()> {
         .map(|(i, addr)| ((i + 1) as u64, addr.clone()))
         .collect();
 
-    // Only the node with the lowest ID attempts bootstrap.
-    // Others will receive the membership via Raft RPC from the bootstrapper.
-    if node_id == 1 {
-        // Small delay to let other nodes' RPC servers start
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        match dcs.bootstrap_cluster(&members).await {
-            Ok(()) => info!("Raft cluster bootstrapped with {} members", members.len()),
-            Err(e) => {
-                // Not fatal — cluster may already be initialized
-                tracing::debug!("Bootstrap attempt: {e} (cluster may already exist)");
-            }
-        }
-    }
-
-    // Wait for Raft to elect a leader (all nodes wait)
     info!("Waiting for Raft leader election...");
-    match dcs.wait_for_leader(30).await {
-        Ok(()) => info!("Raft cluster ready"),
-        Err(e) => {
-            error!("Raft cluster not ready after 30s: {e}");
-            // Continue anyway — HA loop will handle DCS errors
+
+    let bootstrap_timeout = std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + bootstrap_timeout;
+
+    // Small staggered dely on node_id to reduce simultaneous attempts
+    let stagger = std::time::Duration::from_millis(500 * node_id);
+    tokio::time::sleep(stagger).await;
+    
+    let mut bootstrapped  = false;
+    loop {
+        match dcs.wait_for_leader(2).await {
+            Ok(()) => {
+                info!("Raft cluster ready");
+                break;
+            }
+            Err(_) => {}
         }
+
+        if tokio::time::Instant::now() >= deadline {
+            error!("Raft cluster not ready after {bootstrap_timeout:?}");
+            break;
+        }
+
+        if !bootstrapped {
+            match dcs.bootstrap_cluster(&members).await {
+                Ok(()) => {
+                    info!("Raft cluster bootstrapped with {} member", members.len());
+                    bootstrapped = true;
+                }
+                Err(e) => {
+                    tracing::debug!("Bootstrap attempts: {e} (expected if cluster exists)");
+                    // Ignored: likely already bootstrapped
+                    bootstrapped = true;
+                }
+            }
+
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 
     // ─── Initialize PostgreSQL manager ───
@@ -365,7 +382,7 @@ async fn main() -> anyhow::Result<()> {
         timeout_secs = config.shutdown.drain_timeout_secs,
         "Phase 2: Draining active connections"
     );
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(drain_timeout).await;
     // Note: spawned proxy connection tasks will continue until their TCP streams close
     // or until PG is stopped in Phase 4. The 2s grace period allows in-flight queries
     // to complete. For long transactions, PG's "fast" shutdown will terminate them.

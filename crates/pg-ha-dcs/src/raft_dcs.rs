@@ -185,6 +185,14 @@ impl RaftDcs {
         metrics.current_leader.is_some() || metrics.last_log_index.is_some()
     }
 
+    /// Check if a Raft client_write error is a ForwardToLeader redirect.
+    /// This indicates the cluster has a known leader - the node is just not it.
+    fn is_forward_to_leader(err: &openraft::error::RaftError<NodeId, openraft::error::ClientWriteError<NodeId, BasicNode>>) -> bool {
+        matches!(err, openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(_)
+        ))
+    }
+
     /// Wait until the Raft cluster has a leader (blocking with timeout)
     pub async fn wait_for_leader(&self, timeout_secs: u64) -> Result<()> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
@@ -215,6 +223,9 @@ impl RaftDcs {
                 .await
                 {
                     Ok(Ok(_)) => return Ok(()),
+                    Ok(Err(ref e)) if Self::is_forward_to_leader(e) => {
+                        return Ok(());
+                    }
                     _ => {
                         // Leader reported but can't write — election not complete
                     }
