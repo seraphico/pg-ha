@@ -669,6 +669,35 @@ impl Postgresql {
         Ok(())
     }
 
+    /// Persist synchronous_standby_names via ALTER SYSTEM and reload.
+    pub async fn set_synchronous_standby_names(&self, value: &str) -> Result<()> {
+        let connstr = self.connection_string();
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
+
+        tokio::spawn(async move {
+            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
+                Ok(Err(e)) => debug!("Connection closed: {e}"),
+                Err(_) => warn!("PG connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Ok(Ok(())) => {}
+            }
+        });
+
+        let escaped = value.replace('\'', "''");
+        let sql = format!("ALTER SYSTEM SET synchronous_standby_names TO '{escaped}'");
+
+        client.simple_query(&sql).await.map_err(|e| {
+            Error::Postgres(format!(
+                "ALTER SYSTEM SET synchronous_standby_names failed: {e}"
+            ))
+        })?;
+
+        self.reload().await?;
+        info!(%value, "Updated synchronous_standby_names");
+        Ok(())
+    }
+
     // ─────────────────────── State accessors ───────────────────────
 
     pub fn role(&self) -> &MemberRole {
