@@ -14,13 +14,14 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::bootstrap::{Bootstrap, BootstrapResult};
-use crate::cluster::{Cluster, MemberRole};
+use crate::cluster::{Cluster, MemberRole, SyncState};
 use crate::commands::{CommandResponse, ManagementCommand};
 use crate::config::Config;
 use crate::dcs::DcsAdapter;
 use crate::dynamic_config::{DynamicConfigState, GlobalConfig};
 use crate::postgresql::Postgresql;
 use crate::standby_cluster::StandbyCluster;
+use crate::sync::{SyncManager, SyncMode};
 
 mod commands;
 mod election;
@@ -70,6 +71,10 @@ pub struct Ha {
 
     // ─── Start failure tracking ───
     start_fail_count: u32,
+
+    /// Last successfully applied `synchronous_standby_names` value.
+    /// Used to skip redundant ALTER SYSTEM + reload every HA cycle.
+    applied_sync_standby_names: Option<String>,
 }
 
 /// Sender half for submitting commands to the HA engine
@@ -94,6 +99,7 @@ impl Ha {
             cmd_rx,
             pending_switchover: None,
             start_fail_count: 0,
+            applied_sync_standby_names: None,
         };
         (ha, cmd_tx)
     }
@@ -223,6 +229,7 @@ impl Ha {
         if self.postgresql.is_primary() {
             // Touch member to update heartbeat
             let _ = self.touch_member().await;
+            self.enforce_synchronous_replication().await;
             CycleResult::Leader(format!(
                 "no action. I am ({}), the leader with the lock",
                 self.config.name
@@ -237,6 +244,7 @@ impl Ha {
                     Ok(()) => {
                         self.postgresql.set_role(MemberRole::Primary);
                         let _ = self.touch_member().await;
+                        self.enforce_synchronous_replication().await;
                         info!("PostgreSQL promoted to primary successfully");
                         CycleResult::Leader(format!(
                             "promoted to primary. I am ({}), the leader with the lock",
@@ -252,6 +260,7 @@ impl Ha {
                 // PG is running as a standalone primary (e.g., just bootstrapped via initdb)
                 self.postgresql.set_role(MemberRole::Primary);
                 let _ = self.touch_member().await;
+                self.enforce_synchronous_replication().await;
                 CycleResult::Leader(format!(
                     "no action. I am ({}), the leader with the lock",
                     self.config.name
@@ -263,6 +272,79 @@ impl Ha {
         }
     }
 
+    /// Apply synchronous replication settings when this node is the primary.
+    ///
+    /// Skips PG reload / DCS write when the desired value is unchanged.
+    async fn enforce_synchronous_replication(&mut self) {
+        let cfg = &self.dynamic_config_state.last_config;
+        let enabled = cfg.synchronous_mode.unwrap_or(false);
+        let strict = cfg.synchronous_mode_strict.unwrap_or(false);
+        let count = cfg.synchronous_node_count.unwrap_or(1) as usize;
+
+        let desired = if !enabled {
+            String::new()
+        } else {
+            let manager = SyncManager::new(SyncMode::Priority, count, strict);
+            match manager.compute_sync_standby_names(&self.cluster.members, &self.config.name) {
+                Some(v) => v,
+                None => return,
+            }
+        };
+
+        if self.applied_sync_standby_names.as_deref() == Some(desired.as_str()) {
+            return;
+        }
+
+        if let Err(e) = self
+            .postgresql
+            .set_synchronous_standby_names(&desired)
+            .await
+        {
+            warn!("Failed to set synchronous_standby_names: {e}");
+            return;
+        }
+
+        let sync_standby = Self::extract_names_from_sync_value(&desired);
+        let state = SyncState {
+            leader: self.config.name.clone(),
+            sync_standby,
+            quorum: if enabled { count as u32 } else { 0 },
+        };
+
+        match serde_json::to_string(&state) {
+            Ok(json) => {
+                if let Err(e) = self.dcs.set_sync_value(&json).await {
+                    warn!("Failed to write /sync: {e}");
+                    return;
+                }
+            }
+            Err(e) => {
+                warn!("Failed to serialize SyncState: {e}");
+                return;
+            }
+        }
+
+        self.applied_sync_standby_names = Some(desired);
+    }
+
+    /// "FIRST 1 (node2,node3)" → Some("node2,node3")
+    /// "" / "*" → None / Some("*")
+    fn extract_names_from_sync_value(pg_value: &str) -> Option<String> {
+        if pg_value.is_empty() {
+            return None;
+        }
+        if pg_value == "*" {
+            return Some("*".into());
+        }
+        let start = pg_value.find('(')? + 1;
+        let end = pg_value.rfind(')')?;
+        let names = pg_value[start..end].trim();
+        if names.is_empty() {
+            None
+        } else {
+            Some(names.to_string())
+        }
+    }
     /// Enforce standby leader role: hold leader lock but replicate from remote.
     ///
     /// In standby cluster mode, the leader does NOT promote to primary.
