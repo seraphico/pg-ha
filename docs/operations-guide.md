@@ -69,6 +69,22 @@ curl -s http://localhost:8008/replica?lag=1048576 | jq .
 # lag 超过 1MB 时返回 503
 ```
 
+### 同步 / 异步备库检查
+
+启用同步复制后，可用以下端点区分同步备库与异步备库（依据 DCS `/sync` 名单）：
+
+```bash
+# 同步备库：健康 Replica 且在 /sync.sync_standby 名单中 → 200
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8008/sync
+# 别名: /synchronous
+
+# 异步备库：健康 Replica 且不在同步名单中 → 200
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8008/async
+# 别名: /asynchronous
+```
+
+未启用同步复制、或 `/sync` 为空时：所有健康 Replica 对 `/async` 返回 200，对 `/sync` 返回 503。Primary 对两者都返回 503。
+
 ### 健康检查
 
 ```bash
@@ -247,6 +263,20 @@ curl -u admin:secret -X PATCH http://localhost:8008/config \
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
   -d '{"pause": false}'
+
+# 启用同步复制（默认关闭）
+curl -u admin:secret -X PATCH http://localhost:8008/config \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "synchronous_mode": true,
+    "synchronous_mode_strict": false,
+    "synchronous_node_count": 1
+  }'
+
+# 关闭同步复制
+curl -u admin:secret -X PATCH http://localhost:8008/config \
+  -H 'Content-Type: application/json' \
+  -d '{"synchronous_mode": false}'
 ```
 
 ### 全量替换 (PUT)
@@ -274,6 +304,7 @@ curl -u admin:secret -X PUT http://localhost:8008/config \
 | 参数类型 | 生效方式 | 示例 |
 |---------|---------|------|
 | HA 参数 | 下一 cycle 立即应用 | `loop_wait`, `ttl`, `pause` |
+| 同步复制参数 | Primary 下一 cycle：改 PG + 写 DCS `/sync` | `synchronous_mode`, `synchronous_mode_strict`, `synchronous_node_count` |
 | PG reload 参数 | 自动执行 `pg_ctl reload` | `work_mem`, `effective_cache_size` |
 | PG restart 参数 | 设置 `pending_restart` 标志 | `max_connections`, `shared_buffers` |
 
@@ -282,6 +313,67 @@ curl -u admin:secret -X PUT http://localhost:8008/config \
 ```bash
 curl -u admin:secret -X POST http://localhost:8008/restart
 ```
+
+---
+
+## 同步复制
+
+同步复制默认关闭。开启后，持有 Leader Lock 的 Primary 会：
+
+1. 根据成员状态与节点标签（`nosync`、`sync_priority`）选出同步备库
+2. 设置 PostgreSQL `synchronous_standby_names`（`ALTER SYSTEM` + reload）
+3. 将结果写入 DCS `/sync`（供 `/sync`、`/async` 健康检查读取）
+
+目标值未变化时不会重复 reload。
+
+### 相关动态配置
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `synchronous_mode` | bool | `false` | 是否启用同步复制 |
+| `synchronous_mode_strict` | bool | `false` | 无可用同步备库时是否强制阻塞写（设为 `*`） |
+| `synchronous_node_count` | u32 | `1` | 需要的同步备库数量 |
+
+节点标签：
+
+| 标签 | 说明 |
+|------|------|
+| `nosync: true` | 该节点不参与同步备库选举 |
+| `sync_priority` | 同步备库优先级，数值越大越优先 |
+
+### 开启与验证
+
+```bash
+# 1. 开启同步复制
+curl -u admin:secret -X PATCH http://localhost:8008/config \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "synchronous_mode": true,
+    "synchronous_mode_strict": false,
+    "synchronous_node_count": 1
+  }'
+
+# 2. 等待一个 HA cycle（默认 loop_wait，Docker 示例多为 5s）后检查 Primary
+docker exec <primary-container> \
+  psql -U postgres -Atc "SHOW synchronous_standby_names;"
+# 示例: FIRST 1 (node1)
+
+# 3. 确认实际复制状态
+docker exec <primary-container> \
+  psql -U postgres -c \
+  "SELECT application_name, state, sync_state FROM pg_stat_replication;"
+# sync_state = sync / async
+
+# 4. 用健康检查交叉验证
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8008/sync
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8009/sync
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8010/sync
+```
+
+### 当前范围与限制
+
+- 已实现：动态开启/关闭、自动写 `synchronous_standby_names`、发布 `/sync`、`/sync` `/async` 健康检查
+- 尚未实现：故障切换时强制优先同步备库 / quorum 约束（后续版本）
 
 ---
 

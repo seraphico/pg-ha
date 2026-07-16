@@ -203,12 +203,39 @@ flowchart LR
 │   ├── node2       → {conn_url, api_url, state, role}  (TTL)
 │   └── node3       → {conn_url, api_url, state, role}  (TTL)
 ├── initialize      → "system_id"          (原子创建, 初始化竞争)
-├── config          → {loop_wait, ttl, postgresql: {parameters: {...}}}
+├── config          → {loop_wait, ttl, synchronous_mode, postgresql: {...}}
 ├── failover        → {leader, candidate}  (switchover 请求)
-├── sync            → {leader, sync_standby}
+├── sync            → {leader, sync_standby, quorum}
 ├── failsafe        → {node1: api_url, ...}
 └── history         → [{timestamp, event_type, old_leader, new_leader}]
 ```
+
+## 同步复制数据流
+
+```mermaid
+flowchart LR
+    CFG["DCS /config\nsynchronous_mode"]
+    HA[Primary HA cycle]
+    SM[SyncManager]
+    PG["PostgreSQL\nsynchronous_standby_names"]
+    SYNC["DCS /sync"]
+    API["/sync /async health"]
+
+    CFG --> HA
+    HA --> SM
+    SM --> PG
+    SM --> SYNC
+    SYNC --> API
+```
+
+Primary 在持有 Leader Lock 时读取动态配置：
+
+- `synchronous_mode=false`（默认）：清空 `synchronous_standby_names`，写空 `/sync`
+- `synchronous_mode=true`：按 `sync_priority` / `nosync` 选出同步备库，设置 `FIRST N (...)`，并写入 `/sync`
+
+目标值未变化时跳过重复 `ALTER SYSTEM` + reload。`/sync`、`/async` 健康检查读取 `/sync.sync_standby` 判断节点角色。
+
+当前范围：同步复制配置与状态发布已实现；故障切换时强制优先同步备库 / quorum 约束尚未实现。
 
 ## 模块依赖关系
 
@@ -301,6 +328,8 @@ flowchart LR
     subgraph OpenEndpoints["健康检查 - 负载均衡器使用"]
         GET_PRIMARY["GET /primary"]
         GET_REPLICA["GET /replica"]
+        GET_SYNC["GET /sync"]
+        GET_ASYNC["GET /async"]
         GET_HEALTH["GET /health"]
         GET_LIVENESS["GET /liveness"]
         GET_CLUSTER["GET /cluster"]
