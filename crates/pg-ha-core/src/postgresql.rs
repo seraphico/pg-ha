@@ -699,8 +699,16 @@ impl Postgresql {
     pub fn remove_data_directory(&self) -> Result<()> {
         let path = &self.config.data_dir;
         if path.exists() {
-            std::fs::remove_dir_all(path)?;
-            info!(path = %path.display(), "Removed data directory");
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let entry_path = entry.path();
+                if entry_path.is_dir() {
+                    std::fs::remove_dir_all(&entry_path)?;
+                } else {
+                    std::fs::remove_file(&entry_path)?;
+                }
+            }
+            info!(path = %path.display(), "Removed data directory contents");
         }
         Ok(())
     }
