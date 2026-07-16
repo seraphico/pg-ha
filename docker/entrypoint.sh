@@ -74,6 +74,7 @@ postgresql:
     max_replication_slots: "10"
     hot_standby: "on"
     listen_addresses: "'*'"
+    wal_keep_size: "512MB"  
 
 restapi:
   listen: 0.0.0.0

@@ -58,6 +58,9 @@ pub struct Ha {
     is_leader: bool,
     is_paused: bool,
 
+    // --- Failsafe ---
+    failsafe: crate::failsafe::Failsafe,
+
     // ─── Dynamic configuration ───
     dynamic_config_state: DynamicConfigState,
 
@@ -86,6 +89,7 @@ impl Ha {
             cluster: Cluster::empty(),
             is_leader: false,
             is_paused: false,
+            failsafe: crate::failsafe::Failsafe::new(30),
             dynamic_config_state: DynamicConfigState::new(),
             cmd_rx,
             pending_switchover: None,
@@ -111,6 +115,14 @@ impl Ha {
                     .and_then(|c| c.data.get("pause"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+
+                let failsafe_members: std::collections::HashMap<String, String> = self
+                    .cluster
+                    .members
+                    .iter()
+                    .map(|m| (m.name.clone(), m.api_url.clone()))
+                    .collect();
+                self.failsafe.update_members(failsafe_members);
             }
             Err(e) => {
                 error!("Failed to load cluster from DCS: {e}");
@@ -440,16 +452,41 @@ impl Ha {
     /// Handle DCS communication failure
     async fn handle_dcs_error(&mut self) -> CycleResult {
         if self.is_leader {
-            // Critical: If we can't reach DCS, our leader lock may expire and another
-            // node may become leader → split brain. We must demote to prevent this.
-            // TODO: In future, implement failsafe mode check (query replicas directly).
-            warn!("DCS unreachable while holding leader lock — demoting to prevent split-brain");
-            self.is_leader = false;
-            if let Err(e) = self.postgresql.stop("fast").await {
-                error!("Failed to stop PG during DCS error demotion: {e}");
+            // DCS unreachable while we hold the leader lock.
+            // Before demoting, check if replicas can still see us (failsafe mode).
+            let failsafe_result = self.failsafe.check_topology(&self.config.name).await;
+            match failsafe_result {
+                crate::failsafe::FailsafeResult::AllConfirmed => {
+                    warn!("DCS unreachable but failsafe check passed = continuing as primary");
+                    CycleResult::Error("DCS unreachable: failsafe active, staying primary".into())
+                }
+                crate::failsafe::FailsafeResult::Disabled => {
+                    warn!(
+                        "DCS unreachable while holding leader lock - demoting to prevent split-brain"
+                    );
+                    self.is_leader = false;
+                    if let Err(e) = self.postgresql.stop("fast").await {
+                        error!("Failed to stop PG during DCS error demotion: {e}");
+                    }
+                    self.postgresql.set_role(MemberRole::Replica);
+                    CycleResult::Error("DCS unreachable: demoted to prevent split-brain".into())
+                }
+
+                crate::failsafe::FailsafeResult::NotAllConfirmed { failed } => {
+                    warn!(
+                        ?failed,
+                        "DCS unreachable and failsafe check failed - demoting"
+                    );
+                    self.is_leader = false;
+                    if let Err(e) = self.postgresql.stop("fast").await {
+                        error!("Failed to stop PG during DCS error demotion:{e}");
+                    }
+                    self.postgresql.set_role(MemberRole::Replica);
+                    CycleResult::Error(format!(
+                        "DCS unreachable: failsafe failed ({failed:?}), demoted"
+                    ))
+                }
             }
-            self.postgresql.set_role(MemberRole::Replica);
-            CycleResult::Error("DCS unreachable: demoted to prevent split-brain".into())
         } else {
             CycleResult::Error("DCS unreachable".into())
         }
@@ -1074,5 +1111,41 @@ mod tests {
         };
         let renewed = dcs.update_leader(&leader).await.unwrap();
         assert!(renewed, "Lock renewal should succeed for lock owner");
+    }
+    #[tokio::test]
+    async fn test_handle_dcs_error_with_failsafe_disabled_demotes() {
+        let config = test_config("node1");
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        // Simulate: we think we're leader
+        ha.is_leader = true;
+        // failsafe is disabled by default (Failsafe::new sets enabled=false)
+
+        let result = ha.handle_dcs_error().await;
+        let msg = format!("{result}");
+
+        // Should demote because failsafe is disabled
+        assert!(!ha.is_leader());
+        assert!(msg.contains("demoted"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_dcs_error_with_failsafe_enabled_no_members_demotes() {
+        let config = test_config("node1");
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.is_leader = true;
+        ha.failsafe.set_enabled(true);
+        // No members updated → failsafe will return NotAllConfirmed
+
+        let result = ha.handle_dcs_error().await;
+        let msg = format!("{result}");
+
+        assert!(!ha.is_leader());
+        assert!(msg.contains("failsafe failed"));
     }
 }
