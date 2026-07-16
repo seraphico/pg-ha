@@ -401,12 +401,23 @@ impl<'a> Bootstrap<'a> {
         let data_dir = &self.config.postgresql.data_dir;
         if data_dir.exists() {
             info!(path = %data_dir.display(), "Cleaning up partial data directory after bootstrap failure");
-            if let Err(e) = std::fs::remove_dir_all(data_dir) {
-                error!(
-                    path = %data_dir.display(),
-                    error = %e,
-                    "Failed to clean up data directory"
-                );
+            match std::fs::read_dir(data_dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let result = if path.is_dir() {
+                            std::fs::remove_dir_all(&path)
+                        } else {
+                            std::fs::remove_file(&path)
+                        };
+                        if let Err(e) = result {
+                            error!(path = %path.display(), error = %e, "Failed to remove item during cleanup");
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(path = %data_dir.display(), error = %e, "Failed to read data directory for cleanup");
+                }
             }
         }
     }
