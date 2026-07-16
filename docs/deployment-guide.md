@@ -297,10 +297,15 @@ bootstrap:
     loop_wait: <u64>
     ttl: <u64>
     maximum_lag_on_failover: <u64>
+    synchronous_mode: <bool>       # 同步复制开关 (默认: false)
+    synchronous_mode_strict: <bool># 无同步备库时是否阻塞写 (默认: false)
+    synchronous_node_count: <u32>  # 同步备库数量 (默认: 1)
   post_init: [<string>]            # 初始化后执行的 SQL 脚本路径
   custom_command: <string>         # 自定义 bootstrap 命令 (替代 initdb)
   post_bootstrap_sql: [<string>]   # bootstrap 后执行的 SQL 语句
 ```
+
+同步复制相关标签：`tags.nosync`（排除同步备库）、`tags.sync_priority`（同步优先级）。运行时也可通过 `PATCH /config` 开关同步复制，详见 [运维指南](operations-guide.md#同步复制)。
 
 ### 环境变量覆盖
 
