@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info};
 
 use pg_ha_core::cluster::{
-    Cluster, ClusterConfig, Failover, Leader, Member, MemberRole, MemberState,
+    Cluster, ClusterConfig, Failover, Leader, Member, MemberRole, MemberState, SyncState,
 };
 use pg_ha_core::dcs::DcsAdapter;
 use pg_ha_core::error::{Error, Result};
@@ -273,13 +273,11 @@ impl RaftDcs {
     fn config_path(&self) -> String {
         format!("{}config", self.base_path)
     }
-
     #[allow(dead_code)]
     fn status_path(&self) -> String {
         format!("{}status", self.base_path)
     }
 
-    #[allow(dead_code)]
     fn sync_path(&self) -> String {
         format!("{}sync", self.base_path)
     }
@@ -416,6 +414,13 @@ impl DcsAdapter for RaftDcs {
             .await
             .and_then(|e| serde_json::from_str::<Failover>(&e.value).ok());
 
+        // Read sync key
+        let sync_state = self
+            .store
+            .get(&self.sync_path())
+            .await
+            .and_then(|e| serde_json::from_str::<SyncState>(&e.value).ok());
+
         // Read config key
         let config = self
             .store
@@ -431,7 +436,7 @@ impl DcsAdapter for RaftDcs {
             members,
             initialize,
             config,
-            sync_state: None, // TODO: read /sync key
+            sync_state,
             failover,
             failsafe: None, // TODO: read /failsafe key
             history: Vec::new(),
@@ -540,6 +545,21 @@ impl DcsAdapter for RaftDcs {
         }
     }
 
+    async fn set_sync_value(&self, value: &str) -> Result<bool> {
+        let request = Request::Set {
+            key: self.sync_path(),
+            value: value.to_string(),
+            ttl: None,
+            prev_exist: None,
+            prev_value: None,
+            prev_version: None,
+            now: current_millis(),
+        };
+        match self.propose(request).await? {
+            Response::Ok { .. } => Ok(true),
+            Response::NotChanged => Ok(false),
+        }
+    }
     async fn set_failover_value(&self, value: &str) -> Result<bool> {
         let request = Request::Set {
             key: self.failover_path(),
