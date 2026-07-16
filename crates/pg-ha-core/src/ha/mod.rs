@@ -717,6 +717,10 @@ mod tests {
             Ok(true)
         }
 
+        async fn set_sync_value(&self, _value: &str) -> Result<bool> {
+            Ok(true)
+        }
+
         async fn set_config_value(&self, _value: &str) -> Result<bool> {
             Ok(true)
         }

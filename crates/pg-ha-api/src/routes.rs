@@ -298,24 +298,33 @@ async fn health_standby_leader(State(state): State<RouterState>) -> impl IntoRes
     }
 }
 
+/// 从 DCS /sync 判断该节点是否是同步备库
+async fn is_sync_standby(state: &RouterState, node_name: &str) -> bool {
+    let Some(dcs) = state.app.dcs() else {
+        return false;
+    };
+    match dcs.get_cluster().await {
+        Ok(cluster) => cluster
+            .sync_state
+            .as_ref()
+            .is_some_and(|sync| sync.matches(node_name)),
+        Err(_) => false,
+    }
+}
+
 /// GET /synchronous, GET /sync
 /// Returns 200 if this node is a synchronous standby.
 async fn health_sync(State(state): State<RouterState>) -> impl IntoResponse {
     let s = state.app.read().await;
-    // TODO: check actual sync state from cluster sync_state
-    let is_sync = s
-        .tags
-        .get("sync_state")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if s.is_healthy_replica() && is_sync {
+    let name = s.name.clone();
+    let healthy = s.is_healthy_replica();
+    let role = format!("{:?}", s.role);
+    drop(s);
+    let is_sync = is_sync_standby(&state, &name).await;
+    if healthy && is_sync {
         (StatusCode::OK, Json(json!({"role": "sync_standby"}))).into_response()
     } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"role": format!("{:?}", s.role)})),
-        )
-            .into_response()
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"role": role}))).into_response()
     }
 }
 
@@ -323,19 +332,15 @@ async fn health_sync(State(state): State<RouterState>) -> impl IntoResponse {
 /// Returns 200 if this node is an asynchronous standby.
 async fn health_async(State(state): State<RouterState>) -> impl IntoResponse {
     let s = state.app.read().await;
-    let is_sync = s
-        .tags
-        .get("sync_state")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if s.is_healthy_replica() && !is_sync {
+    let name = s.name.clone();
+    let healthy = s.is_healthy_replica();
+    let role = format!("{:?}", s.role);
+    drop(s);
+    let is_sync = is_sync_standby(&state, &name).await;
+    if healthy && !is_sync {
         (StatusCode::OK, Json(json!({"role": "async_standby"}))).into_response()
     } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"role": format!("{:?}", s.role)})),
-        )
-            .into_response()
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"role": role}))).into_response()
     }
 }
 

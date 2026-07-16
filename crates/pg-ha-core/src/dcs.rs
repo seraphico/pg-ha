@@ -32,6 +32,9 @@ pub trait DcsAdapter: Send + Sync {
     /// Set failover/switchover request in DCS
     async fn set_failover_value(&self, value: &str) -> Result<bool>;
 
+    /// Write the synchronous replication state to the DCS /sync key.
+    async fn set_sync_value(&self, value: &str) -> Result<bool>;
+
     /// Write the dynamic configuration value to the DCS /config key.
     async fn set_config_value(&self, value: &str) -> Result<bool>;
 
