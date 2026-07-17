@@ -15,6 +15,7 @@ pub mod raft_dcs;
 pub mod raft_server;
 pub mod state_machine;
 pub mod store;
+pub mod wal;
 
 pub use network::NetworkFactory;
 pub use raft_dcs::RaftDcs;
