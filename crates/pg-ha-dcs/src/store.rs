@@ -10,7 +10,7 @@ use std::fmt;
 use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use openraft::TokioRuntime;
 use openraft::entry::RaftPayload;
@@ -24,6 +24,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::state_machine::{KvStateMachine, Request, Response};
+use crate::wal::{COMPACTION_THRESHOLD, PurgePayload, RecordType, TruncatePayload, WalWriter};
 
 // ─────────────────── Display impls required by openraft AppData ───────────────────
 
@@ -63,14 +64,6 @@ struct PersistedHardState {
     committed: Option<LogId<NodeId>>,
 }
 
-// ─────────────────── Persisted log entries ───────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PersistedLog {
-    last_purged: Option<LogId<NodeId>>,
-    entries: Vec<LogEntry>,
-}
-
 // ─────────────────── Persisted membership ───────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,11 +75,25 @@ struct PersistedMembership {
 // ─────────────────── Combined Storage ───────────────────
 
 /// Raft storage with optional disk persistence.
-/// When `data_dir` is set, state is persisted to JSON files after every mutation.
-#[derive(Debug, Clone)]
+///
+/// When `data_dir` is set:
+/// - Raft log → append-only [`WalWriter`] (`raft_log.wal`)
+/// - hard state / state machine / membership → JSON (atomic write)
+#[derive(Clone)]
 pub struct MemStore {
     inner: Arc<RwLock<MemStoreInner>>,
     data_dir: Option<PathBuf>,
+    /// Present when disk persistence is enabled.
+    wal: Option<Arc<Mutex<WalWriter>>>,
+}
+
+impl fmt::Debug for MemStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemStore")
+            .field("data_dir", &self.data_dir)
+            .field("wal", &self.wal.as_ref().map(|_| "WalWriter"))
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +123,7 @@ impl Default for MemStore {
         Self {
             inner: Arc::new(RwLock::new(MemStoreInner::default())),
             data_dir: None,
+            wal: None,
         }
     }
 }
@@ -151,23 +159,25 @@ impl MemStore {
         let sm_path = data_dir.join("state_machine.json");
         inner.state_machine = KvStateMachine::load_from_disk(&sm_path);
 
-        // Load log entries
-        let log_path = data_dir.join("log_entries.json");
-        if let Ok(json) = std::fs::read_to_string(&log_path) {
-            if let Ok(pl) = serde_json::from_str::<PersistedLog>(&json) {
+        // Load Raft log from WAL (append-only). Legacy log_entries.json is ignored.
+        let wal_path = data_dir.join("raft_log.wal");
+        let wal = match WalWriter::open(wal_path) {
+            Ok((writer, replayed)) => {
                 info!(
-                    "Loaded {} log entries from disk (last_purged={:?})",
-                    pl.entries.len(),
-                    pl.last_purged
+                    "Loaded {} log entries from WAL (last_purged={:?}, valid_len={})",
+                    replayed.log.len(),
+                    replayed.last_purged,
+                    replayed.valid_len
                 );
-                inner.last_purged = pl.last_purged;
-                for entry in pl.entries {
-                    inner.log.insert(entry.log_id.index, entry);
-                }
-            } else {
-                warn!("Failed to parse log_entries.json — starting with empty log");
+                inner.log = replayed.log;
+                inner.last_purged = replayed.last_purged;
+                Some(Arc::new(Mutex::new(writer)))
             }
-        }
+            Err(e) => {
+                warn!("Failed to open raft_log.wal — log persistence disabled: {e}");
+                None
+            }
+        };
 
         // Load membership
         let membership_path = data_dir.join("membership.json");
@@ -187,6 +197,7 @@ impl MemStore {
         Self {
             inner: Arc::new(RwLock::new(inner)),
             data_dir: Some(data_dir),
+            wal,
         }
     }
 
@@ -238,29 +249,124 @@ impl MemStore {
         }
     }
 
-    async fn persist_log(&self, inner: &MemStoreInner) {
-        if let Some(dir) = &self.data_dir {
-            let pl = PersistedLog {
-                last_purged: inner.last_purged,
-                entries: inner.log.values().cloned().collect(),
-            };
-            let path = dir.join("log_entries.json");
-            let json = match serde_json::to_string(&pl) {
-                Ok(j) => j,
-                Err(e) => {
-                    warn!("Failed to serialize log entries: {e}");
-                    return;
-                }
-            };
-            let result = tokio::task::spawn_blocking(move || {
-                Self::atomic_write_json(&path, json.as_bytes())
-            })
-            .await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("Failed to persist log entries: {e}"),
-                Err(e) => warn!("persist_log task panicked: {e}"),
+    /// Persist log mutations incrementally to the WAL.
+    ///
+    /// TODO: after repeated WAL write failures, surface `StorageError` so Raft can react
+    /// instead of only logging warnings.
+    async fn wal_append_entries(&self, entries: Vec<LogEntry>, inner: &MemStoreInner) {
+        let Some(wal) = self.wal.clone() else {
+            return;
+        };
+        let log = inner.log.clone();
+        let last_purged = inner.last_purged;
+
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut w = wal
+                .lock()
+                .map_err(|_| std::io::Error::other("WAL mutex poisoned"))?;
+            for entry in &entries {
+                let payload = bincode::serialize(entry)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                w.append_record_buffered(RecordType::Append, &payload)?;
             }
+            w.sync()?;
+            if w.file_size() > COMPACTION_THRESHOLD {
+                w.compact(&log, last_purged)?;
+            }
+            Ok(())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Failed to append to WAL: {e}"),
+            Err(e) => warn!("WAL append task panicked: {e}"),
+        }
+    }
+
+    /// TODO: after repeated WAL write failures, surface `StorageError` so Raft can react
+    /// instead of only logging warnings.
+    async fn wal_truncate_since(&self, since_index: u64, inner: &MemStoreInner) {
+        let Some(wal) = self.wal.clone() else {
+            return;
+        };
+        let log = inner.log.clone();
+        let last_purged = inner.last_purged;
+
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut w = wal
+                .lock()
+                .map_err(|_| std::io::Error::other("WAL mutex poisoned"))?;
+            let payload = bincode::serialize(&TruncatePayload { since_index })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            w.append_record(RecordType::Truncate, &payload)?;
+            if w.file_size() > COMPACTION_THRESHOLD {
+                w.compact(&log, last_purged)?;
+            }
+            Ok(())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Failed to write Truncate to WAL: {e}"),
+            Err(e) => warn!("WAL truncate task panicked: {e}"),
+        }
+    }
+
+    /// TODO: after repeated WAL write failures, surface `StorageError` so Raft can react
+    /// instead of only logging warnings.
+    async fn wal_purge_upto(&self, log_id: LogId<NodeId>, inner: &MemStoreInner) {
+        let Some(wal) = self.wal.clone() else {
+            return;
+        };
+        let log = inner.log.clone();
+        let last_purged = inner.last_purged;
+
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut w = wal
+                .lock()
+                .map_err(|_| std::io::Error::other("WAL mutex poisoned"))?;
+            let payload = bincode::serialize(&PurgePayload { log_id })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            w.append_record(RecordType::Purge, &payload)?;
+            if w.file_size() > COMPACTION_THRESHOLD {
+                w.compact(&log, last_purged)?;
+            }
+            Ok(())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Failed to write Purge to WAL: {e}"),
+            Err(e) => warn!("WAL purge task panicked: {e}"),
+        }
+    }
+
+    /// Compact/rewrite the WAL from the current in-memory log snapshot.
+    ///
+    /// Used by property tests that mutate memory then flush a consistent WAL image.
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn rewrite_wal(&self, inner: &MemStoreInner) {
+        let Some(wal) = self.wal.clone() else {
+            return;
+        };
+        let log = inner.log.clone();
+        let last_purged = inner.last_purged;
+
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut w = wal
+                .lock()
+                .map_err(|_| std::io::Error::other("WAL mutex poisoned"))?;
+            w.compact(&log, last_purged)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Failed to rewrite WAL: {e}"),
+            Err(e) => warn!("WAL rewrite task panicked: {e}"),
         }
     }
 
@@ -436,10 +542,12 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         I: IntoIterator<Item = LogEntry> + Send,
     {
         let mut inner = self.inner.write().await;
+        let mut appended = Vec::new();
         for entry in entries {
+            appended.push(entry.clone());
             inner.log.insert(entry.log_id.index, entry);
         }
-        self.persist_log(&inner).await;
+        self.wal_append_entries(appended, &inner).await;
         Ok(())
     }
 
@@ -452,7 +560,7 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         for key in keys {
             inner.log.remove(&key);
         }
-        self.persist_log(&inner).await;
+        self.wal_truncate_since(log_id.index, &inner).await;
         Ok(())
     }
 
@@ -463,7 +571,7 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
             inner.log.remove(&key);
         }
         inner.last_purged = Some(log_id);
-        self.persist_log(&inner).await;
+        self.wal_purge_upto(log_id, &inner).await;
         Ok(())
     }
 
@@ -574,29 +682,23 @@ mod tests {
     ///
     /// Bug Condition Exploration Test: Verify persist_* methods use spawn_blocking
     /// for disk I/O, ensuring they don't block the tokio runtime thread.
-    ///
-    /// This test reads the source code of store.rs and verifies that ALL persist_*
-    /// methods contain `spawn_blocking` calls, confirming the fix is in place.
     #[test]
     fn test_persist_methods_use_spawn_blocking() {
         let source = include_str!("store.rs");
 
-        // Find all persist_* method bodies and verify each uses spawn_blocking
-        let persist_methods = [
+        // JSON-backed helpers still use atomic_write_json inside spawn_blocking.
+        let json_persist_methods = [
             "persist_hard_state",
-            "persist_log",
             "persist_state_machine",
             "persist_membership",
         ];
 
-        for method_name in &persist_methods {
-            // Find the method definition
+        for method_name in &json_persist_methods {
             let search_pattern = format!("fn {}(", method_name);
             let method_start = source
                 .find(&search_pattern)
                 .unwrap_or_else(|| panic!("Method {} not found in source", method_name));
 
-            // Extract the method body (find matching braces)
             let method_source = &source[method_start..];
             let mut brace_count = 0;
             let mut method_end = 0;
@@ -615,37 +717,65 @@ mod tests {
             }
             let method_body = &method_source[..method_end];
 
-            // Verify spawn_blocking is used in the method body
             assert!(
                 method_body.contains("spawn_blocking"),
-                "Method `{}` does NOT use spawn_blocking for disk I/O. \
-                 This means synchronous std::fs::write blocks the tokio runtime thread. \
-                 Counterexample: {} with large data would block the async worker thread.",
-                method_name,
+                "Method `{}` does NOT use spawn_blocking for disk I/O.",
                 method_name
             );
-
-            // Verify atomic persist helper is used inside spawn_blocking
             assert!(
                 method_body.contains("atomic_write_json"),
                 "Method `{}` should call atomic_write_json (inside spawn_blocking)",
                 method_name
             );
         }
+
+        // Log persistence goes through WAL helpers.
+        for method_name in [
+            "wal_append_entries",
+            "wal_truncate_since",
+            "wal_purge_upto",
+            "rewrite_wal",
+        ] {
+            let search_pattern = format!("fn {}(", method_name);
+            assert!(
+                source.contains(&search_pattern),
+                "Expected WAL helper `{method_name}` to exist"
+            );
+            let method_start = source.find(&search_pattern).unwrap();
+            let method_source = &source[method_start..];
+            let mut brace_count = 0;
+            let mut method_end = 0;
+            let mut found_first_brace = false;
+            for (i, ch) in method_source.char_indices() {
+                if ch == '{' {
+                    brace_count += 1;
+                    found_first_brace = true;
+                } else if ch == '}' {
+                    brace_count -= 1;
+                    if found_first_brace && brace_count == 0 {
+                        method_end = i + 1;
+                        break;
+                    }
+                }
+            }
+            let method_body = &method_source[..method_end];
+            assert!(
+                method_body.contains("spawn_blocking"),
+                "WAL helper `{method_name}` must use spawn_blocking"
+            );
+        }
     }
 
     /// **Validates: Requirements 1.2**
     ///
-    /// Bug Condition Exploration Test: Verify persist_* methods are sync `fn` that
-    /// internally use spawn_blocking (fire-and-forget pattern for disk I/O).
-    /// This confirms the methods don't block the caller — they spawn the work and return.
+    /// Bug Condition Exploration Test: Verify JSON persist_* methods are async fn that
+    /// internally use spawn_blocking for disk I/O.
     #[test]
     fn test_persist_methods_are_non_blocking_fn() {
         let source = include_str!("store.rs");
 
         let persist_methods = [
             "persist_hard_state",
-            "persist_log",
             "persist_state_machine",
             "persist_membership",
         ];
@@ -656,7 +786,6 @@ mod tests {
                 .find(&search_pattern)
                 .unwrap_or_else(|| panic!("Method {} not found in source", method_name));
 
-            // Extract method body
             let method_source = &source[method_start..];
             let mut brace_count = 0;
             let mut method_end = 0;
@@ -675,21 +804,15 @@ mod tests {
             }
             let method_body = &method_source[..method_end];
 
-            // The method MUST use tokio::task::spawn_blocking
             assert!(
                 method_body.contains("tokio::task::spawn_blocking"),
-                "Method `{}` must use tokio::task::spawn_blocking to offload disk I/O. \
-                 Without it, std::fs::write would block the tokio worker thread.",
+                "Method `{}` must use tokio::task::spawn_blocking to offload disk I/O.",
                 method_name
             );
 
-            // The method should NOT have bare file I/O outside of spawn_blocking
-            // Verify by checking that spawn_blocking appears BEFORE atomic_write_json
             let spawn_pos = method_body.find("spawn_blocking").unwrap();
             let write_pos = method_body
                 .find("atomic_write_json")
-                .or_else(|| method_body.find("write_all"))
-                .or_else(|| method_body.find("std::fs::write"))
                 .expect("persist method should perform file I/O");
             assert!(
                 spawn_pos < write_pos,
@@ -732,7 +855,7 @@ mod tests {
         // Call all four persist methods and measure total time
         let inner = store.inner.read().await;
         let start = Instant::now();
-        store.persist_log(&inner).await;
+        store.rewrite_wal(&inner).await;
         store.persist_hard_state(&inner).await;
         store.persist_state_machine(&inner).await;
         store.persist_membership(&inner).await;
@@ -772,7 +895,7 @@ mod tests {
     ///
     /// Verifies that the persist → reload cycle preserves all Raft state data:
     /// - hard_state.json (vote + committed)
-    /// - log_entries.json (last_purged + entries)
+    /// - raft_log.wal (last_purged + entries)
     /// - state_machine.json (KvStateMachine)
     /// - membership.json (last_applied_log + last_membership)
 
@@ -886,7 +1009,7 @@ mod tests {
             })?;
         }
 
-        /// Property: log_entries.json round-trip preserves all log entries and last_purged
+        /// Property: raft_log.wal round-trip preserves all log entries and last_purged
         #[test]
         fn log_entries_roundtrip(
             entries in arb_log_entries(5),
@@ -902,7 +1025,7 @@ mod tests {
                     None
                 };
 
-                // Create store, insert entries, persist
+                // Create store, insert entries, rewrite WAL from memory snapshot
                 let store = MemStore::new_persistent(tmp_dir.clone());
                 {
                     let mut inner = store.inner.write().await;
@@ -910,10 +1033,8 @@ mod tests {
                     for entry in &entries {
                         inner.log.insert(entry.log_id.index, entry.clone());
                     }
-                    store.persist_log(&inner).await;
+                    store.rewrite_wal(&inner).await;
                 }
-
-                // Wait for spawn_blocking
 
                 // Reload from disk
                 let reloaded = MemStore::new_persistent(tmp_dir);
@@ -924,7 +1045,6 @@ mod tests {
                 prop_assert_eq!(reloaded_inner.log.len(), entries.len(),
                     "Number of log entries should be preserved");
 
-                // Verify each entry
                 for entry in &entries {
                     let reloaded_entry = reloaded_inner.log.get(&entry.log_id.index);
                     prop_assert!(reloaded_entry.is_some(),
@@ -1087,7 +1207,7 @@ mod tests {
 
                     // Persist all state
                     store.persist_hard_state(&inner).await;
-                    store.persist_log(&inner).await;
+                    store.rewrite_wal(&inner).await;
                     store.persist_state_machine(&inner).await;
                     store.persist_membership(&inner).await;
                 }
