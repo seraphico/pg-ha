@@ -18,7 +18,9 @@ reqwest = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
 futures-util = { workspace = true }
-
+crc32fast = "1"
+bincode = "1"
+ 
 [dev-dependencies]
 proptest = "1"
 tokio = { workspace = true, features = ["test-util"] }
