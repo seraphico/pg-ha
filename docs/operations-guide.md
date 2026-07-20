@@ -318,28 +318,116 @@ curl -u admin:secret -X POST http://localhost:8008/restart
 
 ## 同步复制
 
-同步复制默认关闭。开启后，持有 Leader Lock 的 Primary 会：
+### 原理
 
-1. 根据成员状态与节点标签（`nosync`、`sync_priority`）选出同步备库
-2. 设置 PostgreSQL `synchronous_standby_names`（`ALTER SYSTEM` + reload）
-3. 将结果写入 DCS `/sync`（供 `/sync`、`/async` 健康检查读取）
+PostgreSQL 的异步复制中，Primary COMMIT 后立即返回客户端成功，不等任何 Replica 确认。如果 Primary 此时崩溃，最近几秒的已确认事务可能丢失。
 
-目标值未变化时不会重复 reload。
+同步复制改变了这个行为：Primary 在 COMMIT 时，**必须等待至少 N 个同步备库确认收到 WAL** 后才返回客户端"成功"。这保证了——客户端收到"OK"的事务，数据至少存在于 2 个节点上。
 
-### 相关动态配置
+pg-ha 通过 PostgreSQL 的 `synchronous_standby_names` 参数控制哪些节点是同步备库。这个参数的值有两种形式：
 
-| 字段 | 类型 | 默认 | 说明 |
-|------|------|------|------|
-| `synchronous_mode` | bool | `false` | 是否启用同步复制 |
-| `synchronous_mode_strict` | bool | `false` | 无可用同步备库时是否强制阻塞写（设为 `*`） |
-| `synchronous_node_count` | u32 | `1` | 需要的同步备库数量 |
+```
+FIRST 1 (node2,node3)    -- Priority 模式：列表中第一个可用节点确认即可
+ANY 2 (node1,node2,node3) -- Quorum 模式：任意 2 个节点确认即可
+```
 
-节点标签：
+### 工作流程
 
-| 标签 | 说明 |
-|------|------|
-| `nosync: true` | 该节点不参与同步备库选举 |
-| `sync_priority` | 同步备库优先级，数值越大越优先 |
+pg-ha 在每个 HA cycle 中（仅 Primary 执行）：
+
+1. 从 DCS 读取动态配置（`synchronous_mode` 等参数）
+2. 获取所有集群成员的状态（Running/Crashed、角色、WAL position）
+3. 按筛选条件和优先级计算出 `synchronous_standby_names` 目标值
+4. 如果与上次不同 → `ALTER SYSTEM SET synchronous_standby_names = '...'` + `pg_ctl reload`
+5. 将当前 sync 状态写入 DCS `/sync` key（供健康检查 API 使用）
+
+**筛选条件**（同时满足才能成为 sync standby 候选）：
+- 不是 Primary 自己
+- 节点状态为 Running
+- 节点角色为 Replica
+- 没有 `nosync: true` 标签
+
+**排序规则**：
+- `sync_priority` 标签值越大越靠前
+- 优先级相同时按节点名字字母序
+
+### 场景分析
+
+#### 正常运行（3 节点，sync_node_count=1）
+
+```
+Primary: node1
+synchronous_standby_names = 'FIRST 1 (node2,node3)'
+pg_stat_replication:
+  node2 → sync    (第一优先，确认后 Primary 才返回 COMMIT)
+  node3 → async   (备选)
+```
+
+#### Sync standby 断开（node2 网络断开）
+
+pg-ha 检测到 node2 非 Running → 重新计算 → `'FIRST 1 (node3)'`
+PG 自动将 node3 提升为 sync。写入不中断。
+
+#### 所有 Replica 都挂了
+
+- `strict_mode = false`：设为空字符串 `''`，PG 退化为异步，写入不阻塞
+- `strict_mode = true`：设为 `'*'`，PG 阻塞所有 COMMIT，直到有 Replica 恢复
+
+#### 节点重新加入
+
+node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
+`'FIRST 1 (node2,node3)'`（node2 被自动加回列表）
+
+#### 手动 Switchover（Primary 从 node1 切到 node2）
+
+1. node1 demote 为 Replica → 不再调用 `enforce_synchronous_replication`
+2. node2 promote 为 Primary → 首个 cycle 计算新的 sync 列表
+3. 结果：`'FIRST 1 (node1,node3)'`（node1 现在是 Replica 候选）
+
+**无残留**：Replica 上的 `synchronous_standby_names` 被 PG 忽略（仅 Primary 读取此参数）。
+
+#### Failover（Primary 崩溃）
+
+1. Leader lock 超时，新选举产生 node2 为 Primary
+2. node2 promote 后首个 cycle 计算 sync 列表
+3. node1（已崩溃）被过滤掉 → `'FIRST 1 (node3)'`
+
+### 配置参数
+
+#### 动态配置（存储在 DCS `/config`，运行时通过 API 修改）
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `synchronous_mode` | bool | `false` | 是否启用同步复制。关闭时 `synchronous_standby_names` 被清空 |
+| `synchronous_mode_strict` | bool | `false` | 无可用 sync standby 时的行为：`false` = 退化为异步继续写入；`true` = 阻塞所有写入 |
+| `synchronous_node_count` | u32 | `1` | 需要多少个同步备库确认。`FIRST N` 或 `ANY N` 中的 N |
+
+**如何选择**：
+- 大多数场景用 `synchronous_mode: true, strict: false, count: 1` — 正常时同步保护，极端时不停服务
+- 金融/订单场景用 `strict: true` — 宁可停服务也不丢数据
+- 5 节点集群可考虑 `count: 2` — 数据存 3 份才确认
+
+#### 节点标签（在 `pg-ha.yml` 中配置）
+
+| 标签 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `nosync` | bool | `false` | 设为 `true` 时该节点永远不会成为 sync standby（适合跨机房灾备节点） |
+| `sync_priority` | u32 | `0` | 同步备库优先级，数值越大越优先被选为 sync standby |
+
+配置示例：
+```yaml
+# 节点 A：优先作为 sync standby
+tags:
+  sync_priority: 10
+
+# 节点 B：同机房，次优先
+tags:
+  sync_priority: 5
+
+# 节点 C：异地灾备，不参与同步
+tags:
+  nosync: true
+```
 
 ### 开启与验证
 
@@ -353,27 +441,49 @@ curl -u admin:secret -X PATCH http://localhost:8008/config \
     "synchronous_node_count": 1
   }'
 
-# 2. 等待一个 HA cycle（默认 loop_wait，Docker 示例多为 5s）后检查 Primary
+# 2. 等待一个 HA cycle（默认 loop_wait 秒）后检查 Primary
 docker exec <primary-container> \
   psql -U postgres -Atc "SHOW synchronous_standby_names;"
-# 示例: FIRST 1 (node1)
+# 示例: FIRST 1 (node2,node3)
 
 # 3. 确认实际复制状态
 docker exec <primary-container> \
   psql -U postgres -c \
   "SELECT application_name, state, sync_state FROM pg_stat_replication;"
-# sync_state = sync / async
+# sync_state = sync / async / potential
 
 # 4. 用健康检查交叉验证
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8008/sync
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8009/sync
-curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8010/sync
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8008/sync   # Primary → 503
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8009/sync   # sync standby → 200
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8010/async  # async standby → 200
+
+# 5. 关闭同步复制
+curl -u admin:secret -X PATCH http://localhost:8008/config \
+  -H 'Content-Type: application/json' \
+  -d '{"synchronous_mode": false}'
 ```
+
+### Bootstrap 预设
+
+在 `pg-ha.yml` 的 `bootstrap.dcs` 段可预设集群初始化时的同步配置：
+
+```yaml
+bootstrap:
+  dcs:
+    synchronous_mode: true
+    synchronous_mode_strict: false
+    synchronous_node_count: 1
+```
+
+此配置只在集群首次 bootstrap 时由第一个初始化成功的节点写入 DCS。之后所有修改必须通过 `PATCH /config` API。所有节点的 `pg-ha.yml` 都应包含相同的 `bootstrap.dcs` 段，因为无法预知哪个节点会先完成初始化。
 
 ### 当前范围与限制
 
-- 已实现：动态开启/关闭、自动写 `synchronous_standby_names`、发布 `/sync`、`/sync` `/async` 健康检查
-- 尚未实现：故障切换时强制优先同步备库 / quorum 约束（后续版本）
+- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（Priority 模式）、节点变动时自动更新、发布 DCS `/sync`、`/sync` `/async` 健康检查端点
+- 尚未实现：
+  - Failover 时强制优先选举 sync standby（当前选举只看 WAL position + failover_priority）
+  - Quorum 模式（`ANY N`）的动态配置入口（代码支持但 API 未暴露模式切换）
+  - `max_lag_on_syncnode` 过滤（配置项存在但 lag 计算为占位实现）
 
 ---
 
