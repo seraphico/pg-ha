@@ -190,7 +190,39 @@ impl Ha {
                     leader_name
                 ))
             }
-            Err(e) => CycleResult::Error(format!("Failed to start PostgreSQL after rejoin: {e}")),
+            Err(e) => {
+                // pg_rewind appeared to succeed but PG can't start (e.g., timeline
+                // history files missing, or checkpoint at exact fork point).
+                // Fallback: full clone via pg_basebackup.
+                warn!("PG failed to start after pg_rewind: {e} — falling back to pg_basebackup");
+                if let Err(re) = self.postgresql.remove_data_directory() {
+                    return CycleResult::Error(format!(
+                        "Rejoin fallback failed: start={e}, cleanup={re}"
+                    ));
+                }
+                match self.postgresql.basebackup(&leader_connstr).await {
+                    Ok(()) => {
+                        self.write_standby_config_for_rejoin(&leader_connstr).await;
+                        match self.postgresql.start().await {
+                            Ok(()) => {
+                                self.postgresql.set_role(MemberRole::Replica);
+                                let _ = self.touch_member().await;
+                                info!("Rejoined cluster via pg_basebackup fallback");
+                                CycleResult::Follower(format!(
+                                    "rejoined as replica via basebackup fallback, following ({})",
+                                    leader_name
+                                ))
+                            }
+                            Err(e2) => CycleResult::Error(format!(
+                                "Failed to start after basebackup fallback: {e2}"
+                            )),
+                        }
+                    }
+                    Err(be) => {
+                        CycleResult::Error(format!("Rejoin fallback basebackup failed: {be}"))
+                    }
+                }
+            }
         }
     }
 
@@ -244,6 +276,27 @@ impl Ha {
             host = %host, port = %port,
             "Updated primary_conninfo — restarting PostgreSQL to follow new upstream"
         );
+        // Befor restarting, check timeline compatibility.
+        // If the upstream is on a newer timeline that we can't follow,
+        // a simple restart won't work - we need pg_rewind or basebackup.
+        let local_tl = self.postgresql.controldata_timeline().await.unwrap_or(0);
+        if local_tl > 0 {
+            let upstream_tl = self
+                .cluster
+                .get_member(&host)
+                .and_then(|m| m.timeline)
+                .unwrap_or(0);
+
+            if upstream_tl > 0 && local_tl != upstream_tl {
+                info!(
+                    local_timeline = local_tl,
+                    upstream_timeline = upstream_tl,
+                    "Timeline mismatch — cannot restart, need rejoin via pg_rewind"
+                );
+                let _ = self.postgresql.stop("fast").await;
+                return;
+            }
+        }
 
         // Restart PG to pick up the new primary_conninfo
         if let Err(e) = self.postgresql.stop("fast").await {
