@@ -444,6 +444,32 @@ impl Postgresql {
         ))
     }
 
+    /// Get the latest checkpoint's TimeLineID from pg_controldata.
+    /// Works even when PostgreSQL is not running (reads data directory directly).
+    pub async fn controldata_timeline(&self) -> Result<u64> {
+        let output = Command::new(self.pg_controldata_bin())
+            .args(["-D", self.data_dir_str()])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Postgres(format!("pg_controldata failed: {stderr}")));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if line.contains("Latest checkpoint's TimeLineID")
+                && let Some(val) = line.split(':').nth(1)
+            {
+                if let Ok(tl) = val.trim().parse::<u64>() {
+                    return Ok(tl);
+                }
+            }
+        }
+        Err(Error::Postgres(
+            "Could not find TimeLineID in pg_controldata output".into(),
+        ))
+    }
     // ─────────────────────── tokio-postgres queries ───────────────────────
 
     /// Build a connection string for this PostgreSQL instance
