@@ -242,7 +242,7 @@ Primary 在持有 Leader Lock 时读取动态配置：
 ```
 pg-ha (binary)
 ├── pg-ha-core      HA 引擎 + PG 生命周期 + 配置 + 类型
-│   ├── ha.rs           决策循环 (run_cycle)
+│   ├── ha/             决策循环 (mod / election / commands / …)
 │   ├── postgresql.rs   pg_ctl start/stop/promote/rewind/reload
 │   ├── bootstrap.rs    initdb / clone / custom bootstrap
 │   ├── dynamic_config.rs  GlobalConfig + 变更检测 + patch
@@ -260,7 +260,7 @@ pg-ha (binary)
 │   ├── state_machine.rs KV + TTL + CAS
 │   └── raft_server.rs  HTTP RPC
 ├── pg-ha-api       REST API (axum)
-│   ├── routes.rs       健康检查 + 管理端点 + /metrics
+│   ├── routes/         健康检查 + 管理端点 + /metrics
 │   └── state.rs        共享状态 (AppState)
 ├── pg-ha-proxy     TCP 负载均衡
 │   └── proxy.rs        RW/RO 路由 + 主动健康检查
