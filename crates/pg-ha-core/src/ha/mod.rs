@@ -1047,6 +1047,165 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    fn running_member(name: &str, wal: u64) -> Member {
+        Member {
+            name: name.to_string(),
+            conn_url: String::new(),
+            api_url: String::new(),
+            state: MemberState::Running,
+            role: MemberRole::Replica,
+            wal_position: Some(wal),
+            timeline: Some(1),
+            tags: Default::default(),
+            version: None,
+        }
+    }
+
+    fn with_fake_running_pg(config: &Config, label: &str) -> (Postgresql, PathBuf) {
+        let data_dir = std::env::temp_dir().join(format!("pg-ha-test-{label}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&data_dir);
+        std::fs::write(
+            data_dir.join("postmaster.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        let mut pg_config = config.postgresql.clone();
+        pg_config.data_dir = data_dir.clone();
+        (Postgresql::new(pg_config), data_dir)
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_empty_sync_not_healthiest() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-empty");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![running_member("node2", 1000)],
+            sync_state: None,
+            ..Default::default()
+        };
+
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_star_sync_not_healthiest() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-star");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![running_member("node2", 1000)],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("*".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_listed_node_is_healthiest_despite_async_higher_wal() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-listed");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![
+                running_member("node2", 1000),
+                running_member("node3", 9999), // async — must be skipped
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        assert!(ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_unlisted_node_not_healthiest() {
+        let config = test_config("node3");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-unlisted");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![
+                running_member("node2", 1000), // listed, lower WAL
+                running_member("node3", 9999), // self, not listed
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_off_ignores_sync_state() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-off");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        // synchronous_mode false / default — WAL comparison only
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(false),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![
+                running_member("node2", 1000), // self, lower WAL
+                running_member("node3", 9999), // peer, higher WAL
+            ],
+            sync_state: None,
+            ..Default::default()
+        };
+
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     #[tokio::test]
     async fn test_healthy_cluster_follower() {
         let config = test_config("node2");

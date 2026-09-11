@@ -91,19 +91,32 @@ impl Ha {
             .and_then(|f| f.candidate.as_deref());
 
         let should_attempt = if let Some(candidate) = designated_candidate {
-            // A candidate is designated — only that node should attempt
             if candidate == self.config.name {
-                info!(
-                    candidate,
-                    "This node is the designated switchover candidate — attempting lock acquisition"
+                let allowed = sync_failover_allowed(
+                    &self.config.name,
+                    self.dynamic_config_state
+                        .last_config
+                        .synchronous_mode
+                        .unwrap_or(false),
+                    self.cluster.sync_state.as_ref(),
                 );
-                true
+                if allowed {
+                    info!(
+                        candidate,
+                        "This node is the designated switchover candidate — attempting lock acquisition"
+                    );
+                    true
+                } else {
+                    info!(
+                        candidate,
+                        "Designated candidate is not sync-eligible — not acquiring lock"
+                    );
+                    false
+                }
             } else {
-                // We're not the candidate — defer
                 false
             }
         } else {
-            // No designated candidate — normal election based on health
             self.is_healthiest_node()
         };
 
@@ -150,6 +163,19 @@ impl Ha {
             return false;
         }
 
+        let sync_mode = self
+            .dynamic_config_state
+            .last_config
+            .synchronous_mode
+            .unwrap_or(false);
+        if !sync_failover_allowed(
+            &self.config.name,
+            sync_mode,
+            self.cluster.sync_state.as_ref(),
+        ) {
+            return false;
+        }
+
         // Get our info from cluster membership (published via touch_member)
         let my_name = &self.config.name;
         let my_member = self.cluster.get_member(my_name);
@@ -167,6 +193,9 @@ impl Ha {
             }
             // Skip members not running
             if member.state != crate::cluster::MemberState::Running {
+                continue;
+            }
+            if !sync_failover_allowed(&member.name, sync_mode, self.cluster.sync_state.as_ref()) {
                 continue;
             }
 
