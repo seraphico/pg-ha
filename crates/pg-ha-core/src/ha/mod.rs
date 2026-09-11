@@ -24,7 +24,7 @@ use crate::standby_cluster::StandbyCluster;
 use crate::sync::{SyncManager, SyncMode};
 
 mod commands;
-mod election;
+pub(crate) mod election;
 mod follow;
 mod helpers;
 
@@ -713,6 +713,7 @@ impl Ha {
 mod tests {
     use super::*;
     use crate::cluster::{Failover, Leader, Member, MemberRole, MemberState};
+    use crate::commands::{CommandStatus, ManagementCommand};
     use crate::config::*;
     use crate::error::Result;
     use std::collections::HashMap;
@@ -723,6 +724,7 @@ mod tests {
     struct MockDcs {
         cluster: Mutex<Cluster>,
         leader_held_by: Mutex<Option<String>>,
+        last_failover_value: Mutex<Option<String>>,
     }
 
     impl MockDcs {
@@ -730,6 +732,7 @@ mod tests {
             Self {
                 cluster: Mutex::new(Cluster::empty()),
                 leader_held_by: Mutex::new(None),
+                last_failover_value: Mutex::new(None),
             }
         }
 
@@ -744,6 +747,7 @@ mod tests {
             Self {
                 cluster: Mutex::new(cluster),
                 leader_held_by: Mutex::new(Some(name.to_string())),
+                last_failover_value: Mutex::new(None),
             }
         }
 
@@ -795,7 +799,8 @@ mod tests {
             Ok(true)
         }
 
-        async fn set_failover_value(&self, _value: &str) -> Result<bool> {
+        async fn set_failover_value(&self, value: &str) -> Result<bool> {
+            *self.last_failover_value.lock().unwrap() = Some(value.to_string());
             Ok(true)
         }
 
@@ -1437,5 +1442,135 @@ mod tests {
 
         assert!(!ha.is_leader());
         assert!(msg.contains("failsafe failed"));
+    }
+
+    #[tokio::test]
+    async fn test_switchover_rejects_async_candidate_under_sync_mode() {
+        let config = test_config("node1");
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, cmd_tx) = Ha::new(config, dcs.clone(), pg);
+
+        ha.is_leader = true;
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: Some(Leader {
+                name: "node1".into(),
+                version: 1,
+            }),
+            members: vec![
+                running_member("node2", 1000),
+                running_member("node3", 1000),
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        cmd_tx
+            .send((
+                ManagementCommand::Switchover {
+                    leader: Some("node1".into()),
+                    candidate: Some("node3".into()),
+                    scheduled_at: None,
+                },
+                reply_tx,
+            ))
+            .await
+            .unwrap();
+        ha.process_commands().await;
+        let resp = reply_rx.recv().await.unwrap();
+        assert_eq!(resp.status, CommandStatus::Rejected);
+        assert!(resp.message.contains("not a synchronous standby"));
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        assert!(ha.is_leader());
+    }
+
+    #[tokio::test]
+    async fn test_failover_rejects_async_candidate_under_sync_mode() {
+        let config = test_config("node1");
+        let dcs = Arc::new(MockDcs::new());
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, cmd_tx) = Ha::new(config, dcs.clone(), pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            members: vec![
+                running_member("node2", 1000),
+                running_member("node3", 1000),
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        cmd_tx
+            .send((
+                ManagementCommand::Failover {
+                    candidate: Some("node3".into()),
+                },
+                reply_tx,
+            ))
+            .await
+            .unwrap();
+        ha.process_commands().await;
+        let resp = reply_rx.recv().await.unwrap();
+        assert_eq!(resp.status, CommandStatus::Rejected);
+        assert!(resp.message.contains("not a synchronous standby"));
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_failover_accepts_sync_candidate_under_sync_mode() {
+        let config = test_config("node1");
+        let dcs = Arc::new(MockDcs::new());
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, cmd_tx) = Ha::new(config, dcs.clone(), pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            members: vec![
+                running_member("node2", 1000),
+                running_member("node3", 1000),
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        cmd_tx
+            .send((
+                ManagementCommand::Failover {
+                    candidate: Some("node2".into()),
+                },
+                reply_tx,
+            ))
+            .await
+            .unwrap();
+        ha.process_commands().await;
+        let resp = reply_rx.recv().await.unwrap();
+        assert_eq!(resp.status, CommandStatus::Accepted);
+        assert!(dcs.last_failover_value.lock().unwrap().is_some());
     }
 }

@@ -6,6 +6,7 @@ use tracing::info;
 use crate::cluster::MemberRole;
 use crate::commands::{CommandResponse, ManagementCommand};
 
+use super::election::sync_failover_allowed;
 use super::Ha;
 
 impl Ha {
@@ -33,6 +34,20 @@ impl Ha {
             };
             let _ = reply_tx.send(response).await;
         }
+    }
+
+    fn reject_if_sync_ineligible_candidate(&self, candidate: &str) -> Option<CommandResponse> {
+        let sync_mode = self
+            .dynamic_config_state
+            .last_config
+            .synchronous_mode
+            .unwrap_or(false);
+        if sync_failover_allowed(candidate, sync_mode, self.cluster.sync_state.as_ref()) {
+            return None;
+        }
+        Some(CommandResponse::rejected(format!(
+            "Candidate '{candidate}' is not a synchronous standby (sync mode requires /sync membership)"
+        )))
     }
 
     async fn handle_switchover_command(
@@ -75,6 +90,9 @@ impl Ha {
                     ));
                 }
                 _ => {}
+            }
+            if let Some(resp) = self.reject_if_sync_ineligible_candidate(cand) {
+                return resp;
             }
         }
 
@@ -153,10 +171,13 @@ impl Ha {
 
     async fn handle_failover_command(&mut self, candidate: Option<String>) -> CommandResponse {
         // Failover can be initiated from any node — it writes /failover key
-        if let Some(ref cand) = candidate
-            && self.cluster.get_member(cand).is_none()
-        {
-            return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
+        if let Some(ref cand) = candidate {
+            if self.cluster.get_member(cand).is_none() {
+                return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
+            }
+            if let Some(resp) = self.reject_if_sync_ineligible_candidate(cand) {
+                return resp;
+            }
         }
 
         info!(candidate = ?candidate, "Initiating manual failover");
