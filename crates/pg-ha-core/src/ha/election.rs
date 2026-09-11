@@ -3,7 +3,34 @@
 
 use tracing::info;
 
+use crate::cluster::SyncState;
+
 use super::{CycleResult, Ha};
+
+/// Whether `name` may acquire the leader lock under current sync settings.
+///
+/// When sync mode is off, always true. When on, only names listed in
+/// `/sync.sync_standby` are allowed; missing/empty/`*` means nobody.
+pub(crate) fn sync_failover_allowed(
+    name: &str,
+    sync_mode_enabled: bool,
+    sync_state: Option<&SyncState>,
+) -> bool {
+    if !sync_mode_enabled {
+        return true;
+    }
+    let Some(state) = sync_state else {
+        return false;
+    };
+    let Some(raw) = state.sync_standby.as_deref() else {
+        return false;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return false;
+    }
+    state.matches(name)
+}
 
 impl Ha {
     /// Cluster has no leader — run election
@@ -166,5 +193,66 @@ impl Ha {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod sync_failover_tests {
+    use super::sync_failover_allowed;
+    use crate::cluster::SyncState;
+
+    fn sync(leader: &str, standbys: Option<&str>) -> SyncState {
+        SyncState {
+            leader: leader.to_string(),
+            sync_standby: standbys.map(|s| s.to_string()),
+            quorum: 1,
+        }
+    }
+
+    #[test]
+    fn sync_off_allows_anyone() {
+        assert!(sync_failover_allowed("node3", false, None));
+        assert!(sync_failover_allowed(
+            "node3",
+            false,
+            Some(&sync("node1", Some("node2")))
+        ));
+    }
+
+    #[test]
+    fn sync_on_missing_state_denies() {
+        assert!(!sync_failover_allowed("node2", true, None));
+    }
+
+    #[test]
+    fn sync_on_empty_standby_denies() {
+        assert!(!sync_failover_allowed(
+            "node2",
+            true,
+            Some(&sync("node1", None))
+        ));
+        assert!(!sync_failover_allowed(
+            "node2",
+            true,
+            Some(&sync("node1", Some("")))
+        ));
+    }
+
+    #[test]
+    fn sync_on_star_placeholder_denies_all() {
+        assert!(!sync_failover_allowed(
+            "node2",
+            true,
+            Some(&sync("node1", Some("*")))
+        ));
+        assert!(!sync_failover_allowed("*", true, Some(&sync("node1", Some("*")))));
+    }
+
+    #[test]
+    fn sync_on_listed_member_allowed() {
+        let state = sync("node1", Some("node2,node3"));
+        assert!(sync_failover_allowed("node2", true, Some(&state)));
+        assert!(sync_failover_allowed("NODE3", true, Some(&state))); // case-insensitive via matches
+        assert!(!sync_failover_allowed("node4", true, Some(&state)));
     }
 }
