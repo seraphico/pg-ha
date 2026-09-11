@@ -24,7 +24,7 @@ use crate::standby_cluster::StandbyCluster;
 use crate::sync::{SyncManager, SyncMode};
 
 mod commands;
-mod election;
+pub(crate) mod election;
 mod follow;
 mod helpers;
 
@@ -712,7 +712,8 @@ impl Ha {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::{Leader, Member, MemberRole, MemberState};
+    use crate::cluster::{Failover, Leader, Member, MemberRole, MemberState};
+    use crate::commands::{CommandStatus, ManagementCommand};
     use crate::config::*;
     use crate::error::Result;
     use std::collections::HashMap;
@@ -723,6 +724,7 @@ mod tests {
     struct MockDcs {
         cluster: Mutex<Cluster>,
         leader_held_by: Mutex<Option<String>>,
+        last_failover_value: Mutex<Option<String>>,
     }
 
     impl MockDcs {
@@ -730,6 +732,7 @@ mod tests {
             Self {
                 cluster: Mutex::new(Cluster::empty()),
                 leader_held_by: Mutex::new(None),
+                last_failover_value: Mutex::new(None),
             }
         }
 
@@ -744,6 +747,7 @@ mod tests {
             Self {
                 cluster: Mutex::new(cluster),
                 leader_held_by: Mutex::new(Some(name.to_string())),
+                last_failover_value: Mutex::new(None),
             }
         }
 
@@ -795,7 +799,8 @@ mod tests {
             Ok(true)
         }
 
-        async fn set_failover_value(&self, _value: &str) -> Result<bool> {
+        async fn set_failover_value(&self, value: &str) -> Result<bool> {
+            *self.last_failover_value.lock().unwrap() = Some(value.to_string());
             Ok(true)
         }
 
@@ -1047,6 +1052,210 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    fn running_member(name: &str, wal: u64) -> Member {
+        Member {
+            name: name.to_string(),
+            conn_url: String::new(),
+            api_url: String::new(),
+            state: MemberState::Running,
+            role: MemberRole::Replica,
+            wal_position: Some(wal),
+            timeline: Some(1),
+            tags: Default::default(),
+            version: None,
+        }
+    }
+
+    fn with_fake_running_pg(config: &Config, label: &str) -> (Postgresql, PathBuf) {
+        let data_dir = std::env::temp_dir().join(format!("pg-ha-test-{label}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&data_dir);
+        std::fs::write(
+            data_dir.join("postmaster.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        let mut pg_config = config.postgresql.clone();
+        pg_config.data_dir = data_dir.clone();
+        (Postgresql::new(pg_config), data_dir)
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_empty_sync_not_healthiest() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-empty");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![running_member("node2", 1000)],
+            sync_state: None,
+            ..Default::default()
+        };
+
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_star_sync_not_healthiest() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-star");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![running_member("node2", 1000)],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("*".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_listed_node_is_healthiest_despite_async_higher_wal() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-listed");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![
+                running_member("node2", 1000),
+                running_member("node3", 9999), // async — must be skipped
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        assert!(ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_unlisted_node_not_healthiest() {
+        let config = test_config("node3");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-unlisted");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![
+                running_member("node2", 1000), // listed, lower WAL
+                running_member("node3", 9999), // self, not listed
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_off_ignores_sync_state() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-off");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        // synchronous_mode false / default — WAL comparison only
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(false),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![
+                running_member("node2", 1000), // self, lower WAL
+                running_member("node3", 9999), // peer, higher WAL
+            ],
+            sync_state: None,
+            ..Default::default()
+        };
+
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_designated_candidate_not_sync_eligible() {
+        let mut config = test_config("node3");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-designated-ineligible");
+        config.postgresql.data_dir = data_dir.clone();
+        std::fs::write(data_dir.join("standby.signal"), "").unwrap();
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![
+                running_member("node2", 1000),
+                running_member("node3", 9999),
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            failover: Some(Failover {
+                leader: Some("node1".into()),
+                candidate: Some("node3".into()),
+                scheduled_at: None,
+            }),
+            ..Default::default()
+        };
+
+        let result = ha.process_unhealthy_cluster().await;
+        assert!(
+            matches!(
+                result,
+                CycleResult::Follower(ref msg)
+                    if msg == "designated candidate is not sync-eligible — not acquiring lock"
+            ),
+            "expected sync-ineligible follower message, got: {result}"
+        );
+        assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     #[tokio::test]
     async fn test_healthy_cluster_follower() {
         let config = test_config("node2");
@@ -1233,5 +1442,141 @@ mod tests {
 
         assert!(!ha.is_leader());
         assert!(msg.contains("failsafe failed"));
+    }
+
+    #[tokio::test]
+    async fn test_switchover_rejects_async_candidate_under_sync_mode() {
+        let config = test_config("node1");
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, cmd_tx) = Ha::new(config, dcs.clone(), pg);
+
+        ha.is_leader = true;
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: Some(Leader {
+                name: "node1".into(),
+                version: 1,
+            }),
+            members: vec![
+                running_member("node2", 1000),
+                running_member("node3", 1000),
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        cmd_tx
+            .send((
+                ManagementCommand::Switchover {
+                    leader: Some("node1".into()),
+                    candidate: Some("node3".into()),
+                    scheduled_at: None,
+                },
+                reply_tx,
+            ))
+            .await
+            .unwrap();
+        ha.process_commands().await;
+        let resp = reply_rx.recv().await.unwrap();
+        assert_eq!(resp.status, CommandStatus::Rejected);
+        assert_eq!(
+            resp.message,
+            "Candidate 'node3' is not a synchronous standby (sync mode requires /sync membership)"
+        );
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        assert!(ha.is_leader());
+    }
+
+    #[tokio::test]
+    async fn test_failover_rejects_async_candidate_under_sync_mode() {
+        let config = test_config("node1");
+        let dcs = Arc::new(MockDcs::new());
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, cmd_tx) = Ha::new(config, dcs.clone(), pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            members: vec![
+                running_member("node2", 1000),
+                running_member("node3", 1000),
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        cmd_tx
+            .send((
+                ManagementCommand::Failover {
+                    candidate: Some("node3".into()),
+                },
+                reply_tx,
+            ))
+            .await
+            .unwrap();
+        ha.process_commands().await;
+        let resp = reply_rx.recv().await.unwrap();
+        assert_eq!(resp.status, CommandStatus::Rejected);
+        assert_eq!(
+            resp.message,
+            "Candidate 'node3' is not a synchronous standby (sync mode requires /sync membership)"
+        );
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_failover_accepts_sync_candidate_under_sync_mode() {
+        let config = test_config("node1");
+        let dcs = Arc::new(MockDcs::new());
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, cmd_tx) = Ha::new(config, dcs.clone(), pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            members: vec![
+                running_member("node2", 1000),
+                running_member("node3", 1000),
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            ..Default::default()
+        };
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        cmd_tx
+            .send((
+                ManagementCommand::Failover {
+                    candidate: Some("node2".into()),
+                },
+                reply_tx,
+            ))
+            .await
+            .unwrap();
+        ha.process_commands().await;
+        let resp = reply_rx.recv().await.unwrap();
+        assert_eq!(resp.status, CommandStatus::Accepted);
+        assert!(dcs.last_failover_value.lock().unwrap().is_some());
     }
 }

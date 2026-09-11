@@ -136,13 +136,15 @@ pg_ha_is_paused 0
 
 Switchover 是计划内的主从切换，不丢数据。要求当前 Primary 健康且可达。
 
+> ⚠️ **同步复制**：若已启用 `synchronous_mode`，指定的 `candidate` 必须在当前 DCS `/sync.sync_standby` 名单中，否则返回 **409**（不 demote、不写 failover key）。可先用各节点的 `GET /sync`（200 = 在名单中的健康 Replica）确认候选。详见下文「同步复制」。
+
 ```bash
 # 指定 leader 和 candidate
 curl -u admin:secret -X POST http://localhost:8008/switchover \
   -H 'Content-Type: application/json' \
   -d '{"leader": "node1", "candidate": "node2"}'
 
-# 不指定 candidate（自动选择最健康的 Replica）
+# 不指定 candidate（自动选择最健康的 Replica；sync 开启时仍须落在 /sync 名单内才能晋升）
 curl -u admin:secret -X POST http://localhost:8008/switchover \
   -H 'Content-Type: application/json' \
   -d '{"leader": "node1"}'
@@ -152,6 +154,12 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
 
 ```json
 {"status": "Accepted", "message": "Switchover scheduled: node1 → node2"}
+```
+
+不合格候选（sync 开启且不在 `/sync`）示例：
+
+```json
+{"status": "rejected", "message": "Candidate 'node3' is not a synchronous standby (sync mode requires /sync membership)"}
 ```
 
 **取消已计划的 switchover：**
@@ -173,12 +181,13 @@ sequenceDiagram
 
     Admin->>API: POST /switchover {leader:node1, candidate:node2}
     API->>HA: ManagementCommand::Switchover
+    Note over HA: sync 开启时校验 candidate ∈ /sync<br/>不合格 → 409，停止
     HA->>PG1: CHECKPOINT
     HA->>DCS: write failover key {leader:node1, candidate:node2}
     HA->>DCS: release leader lock
     Note over DCS: Leader Lock 释放
     PG2->>DCS: get_cluster() → unlocked + failover key
-    PG2->>PG2: 我是指定 candidate → acquire lock
+    Note over PG2: 再校验自身 sync 资格后才抢锁
     PG2->>DCS: attempt_to_acquire_leader()
     PG2->>PG2: pg_ctl promote
     Note over PG2: 成为新 Primary
@@ -192,13 +201,15 @@ sequenceDiagram
 
 Failover 用于 Primary 不可达时的紧急切换。无需当前 Primary 参与。
 
+> ⚠️ **同步复制**：启用 `synchronous_mode` 时，指定的 `candidate` 同样必须属于 `/sync` 名单，否则 **409**。不指定 candidate 时写入选举请求后，仍只有名单内节点会抢锁；名单为空则可能长时间无主（保已确认事务）。详见「同步复制」。
+
 ```bash
 # 指定 candidate
 curl -u admin:secret -X POST http://localhost:8008/failover \
   -H 'Content-Type: application/json' \
   -d '{"candidate": "node2"}'
 
-# 不指定 candidate（选最健康节点）
+# 不指定 candidate（选最健康节点；sync 开启时仍受 /sync 约束）
 curl -u admin:secret -X POST http://localhost:8008/failover \
   -H 'Content-Type: application/json' \
   -d '{}'
@@ -210,7 +221,9 @@ curl -u admin:secret -X POST http://localhost:8008/failover \
 {"status": "Accepted", "message": "Failover initiated, candidate: node2"}
 ```
 
-> ⚠️ **注意**：Failover 可能导致少量数据丢失（未同步到 Replica 的 WAL）。如果 Primary 仍可达，请使用 Switchover。
+> ⚠️ **注意**：
+> - **未开 sync**：Failover 可能丢失尚未复制到副本的 WAL。Primary 仍可达时请优先 Switchover。
+> - **已开 sync**：切到 `/sync` 名单内节点时，已向客户端确认的提交应仍在新主上；若名单为空或候选不合格，系统宁可不切换，也不会为了可用性抬升异步副本。
 
 ---
 
@@ -402,6 +415,8 @@ node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
 | `synchronous_mode_strict` | bool | `false` | 无可用 sync standby 时的行为：`false` = 退化为异步继续写入；`true` = 阻塞所有写入 |
 | `synchronous_node_count` | u32 | `1` | 需要多少个同步备库确认。`FIRST N` 或 `ANY N` 中的 N |
 
+**Failover / Switchover：** 启用 `synchronous_mode` 后，只有当前 `/sync` 名单中的节点可以成为新主；指定不在名单中的 `candidate` 会返回 409。名单为空时不会自动晋升（保已确认事务）。
+
 **如何选择**：
 - 大多数场景用 `synchronous_mode: true, strict: false, count: 1` — 正常时同步保护，极端时不停服务
 - 金融/订单场景用 `strict: true` — 宁可停服务也不丢数据
@@ -479,9 +494,8 @@ bootstrap:
 
 ### 当前范围与限制
 
-- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（Priority 模式）、节点变动时自动更新、发布 DCS `/sync`、`/sync` `/async` 健康检查端点
+- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（Priority 模式）、节点变动时自动更新、发布 DCS `/sync`、`/sync` `/async` 健康检查端点、Failover / Switchover 时强制 `/sync` 成员资格（不在名单中的 candidate 返回 409；名单为空时不自动晋升）
 - 尚未实现：
-  - Failover 时强制优先选举 sync standby（当前选举只看 WAL position + failover_priority）
   - Quorum 模式（`ANY N`）的动态配置入口（代码支持但 API 未暴露模式切换）
   - `max_lag_on_syncnode` 过滤（配置项存在但 lag 计算为占位实现）
 

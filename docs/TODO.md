@@ -43,23 +43,19 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 
 ---
 
-### 2. 同步复制 Failover 约束
+### 2. 同步复制 Failover 约束 — ✅ 已完成（S5）
 
-**现状**：`sync.rs` 能计算 `synchronous_standby_names` 并通过 ALTER SYSTEM 设置，但选举逻辑（`ha/election.rs`）在 failover 时**不检查**候选节点是否为当前 sync standby。开启 `synchronous_mode` 后，failover 可能选出数据落后的节点导致已确认事务丢失。  
-**目标**：选举时强制要求候选节点是当前 sync standby 列表中的成员（或 lag 在 `maximum_lag_on_failover` 内）。  
-**实现方向**：
-- 在 `is_healthiest_node()` 中增加 sync standby 约束检查
-- DCS 中持久化当前 sync state（谁是 sync standby）
-- strict 模式下若无合格候选者则不 failover（保数据不保可用性）
+**已实现**：`synchronous_mode` 启用时，自动选举与指定 `candidate` 的 Failover/Switchover 均强制候选属于 DCS `/sync.sync_standby`；名单缺失、空或为 `*` 时不晋升；不合格候选返回 409，不 demote。权威来源仅为 DCS `/sync`（不重算名单）。`synchronous_mode_strict` 仍只影响写阻塞，不参与选举。
+
+**仍开放（非阻塞上线的同类项，可排期）**：
+- `max_lag_on_syncnode`：配置存在，但 `sync.rs` 中 lag 计算仍为占位（`TODO: compute actual lag`）
+- Quorum 模式（`ANY N`）的动态配置入口与选举约束接线
 
 **相关文件**：
-- `crates/pg-ha-core/src/ha/election.rs` — `is_healthiest_node()` 方法
+- `crates/pg-ha-core/src/ha/election.rs` — `sync_failover_allowed`、`is_healthiest_node`
+- `crates/pg-ha-core/src/ha/commands.rs` — switchover/failover 早拒
 - `crates/pg-ha-core/src/sync.rs` — `SyncManager`、`compute_sync_standby_names()`
-- `crates/pg-ha-core/src/cluster.rs` — `SyncState` 结构体
-- `crates/pg-ha-core/src/ha/mod.rs` — `run_cycle()` 中 sync state 的使用
-
-**代码中的 TODO**：
-- `sync.rs:67` — `// TODO: compute actual lag`（max_lag_on_syncnode 过滤不完整）
+- `docs/invariants.md` — S5（持有）
 
 ---
 
@@ -168,7 +164,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 
 | 位置 | 内容 | 关联任务 |
 |------|------|----------|
-| `crates/pg-ha-core/src/sync.rs:67` | `// TODO: compute actual lag` | #2 同步复制约束 |
+| `crates/pg-ha-core/src/sync.rs:67` | `// TODO: compute actual lag` | #2 剩余：`max_lag_on_syncnode` |
 | `crates/pg-ha-dcs/src/raft_dcs.rs:442` | `// TODO: read /failsafe key` | #4 Failsafe 持久化 |
 
 ---

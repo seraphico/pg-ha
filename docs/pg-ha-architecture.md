@@ -235,14 +235,14 @@ Primary 在持有 Leader Lock 时读取动态配置：
 
 目标值未变化时跳过重复 `ALTER SYSTEM` + reload。`/sync`、`/async` 健康检查读取 `/sync.sync_standby` 判断节点角色。
 
-当前范围：同步复制配置与状态发布已实现；故障切换时强制优先同步备库 / quorum 约束尚未实现。
+当前范围：同步复制配置与状态发布已实现；Failover / Switchover 在 `synchronous_mode` 启用时强制候选节点属于 DCS `/sync.sync_standby`（S5）。Quorum 模式下的选举/切换约束尚未实现。
 
 ## 模块依赖关系
 
 ```
 pg-ha (binary)
 ├── pg-ha-core      HA 引擎 + PG 生命周期 + 配置 + 类型
-│   ├── ha.rs           决策循环 (run_cycle)
+│   ├── ha/             决策循环 (mod / election / commands / …)
 │   ├── postgresql.rs   pg_ctl start/stop/promote/rewind/reload
 │   ├── bootstrap.rs    initdb / clone / custom bootstrap
 │   ├── dynamic_config.rs  GlobalConfig + 变更检测 + patch
@@ -260,7 +260,7 @@ pg-ha (binary)
 │   ├── state_machine.rs KV + TTL + CAS
 │   └── raft_server.rs  HTTP RPC
 ├── pg-ha-api       REST API (axum)
-│   ├── routes.rs       健康检查 + 管理端点 + /metrics
+│   ├── routes/         健康检查 + 管理端点 + /metrics
 │   └── state.rs        共享状态 (AppState)
 ├── pg-ha-proxy     TCP 负载均衡
 │   └── proxy.rs        RW/RO 路由 + 主动健康检查
