@@ -34,3 +34,6 @@ docker/tls/*.srl
 # Local agent / worktree scratch
 .worktrees/
 .superpowers/
+
+# Agent workflow artifacts (do not commit)
+docs/superpowers/
