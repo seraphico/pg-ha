@@ -29,3 +29,8 @@ Thumbs.db
 # TLS certificates (local dev only — do not commit private keys)
 docker/tls/*.key
 docker/tls/*.srl
+.aider*
+
+# Local agent / worktree scratch
+.worktrees/
+.superpowers/
