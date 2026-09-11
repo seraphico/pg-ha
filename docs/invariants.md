@@ -68,7 +68,7 @@
 | S2 | **Failover**：在 lock 过期或主库确认不可用后，仅合格候选参与选举；胜出者 promote 并写入 lock；完成后 L\* 与 H\* 成立。 | 持有 |
 | S3 | 切换完成后，`GET /cluster`、成员 role/state、以及 history 中的事件与真实拓扑一致。 | 持有 |
 | S4 | 旧 Primary 回归：不得形成双主；须走检测 → rewind / basebackup / rejoin 故事，最终成为指向当前 leader 的 Replica（或维护态）。 | 持有 |
-| S5 | 当 `synchronous_mode` 启用时，Failover 候选选择必须遵守同步语义（优先 / 强制 sync standby，或 strict 下无合格者则不切换），以免已确认事务在异步副本上「丢失」。 | **目标** |
+| S5 | 当 `synchronous_mode` 启用时，Failover / Switchover 候选必须属于 DCS `/sync.sync_standby`；`/sync` 缺失、空或为 `*` 时任何节点均不得晋升。`synchronous_mode_strict` 仅影响写阻塞，不参与选举。 | 持有 |
 
 **相关**：架构「Failover 时序」「选举流程」；运维「手动 Switchover / Failover」；架构同步复制章节「当前范围与限制」。
 
@@ -156,7 +156,7 @@
 
 | 项 | 相关 ID | 说明 |
 |----|---------|------|
-| 同步复制与 Failover 选举 | S5 | 写路径与 `/sync` 健康检查已闭合；选举未纳入 sync 约束 |
+| 同步复制与 Failover 选举 | S5 | 选举与命令路径均强制 `/sync` 成员资格 |
 | Failsafe 持久化 | P3 | 架构列出 `/failsafe`；实现仍有「未读 key」类缺口 |
 | Member `conn_url` 含密码 | R3 | 落盘与最小密钥面目标冲突，需先裁定再改 |
 | WAL 写失败仅告警 | P4 | 与「提交成功」语义未完全闭合 |

@@ -402,6 +402,8 @@ node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
 | `synchronous_mode_strict` | bool | `false` | 无可用 sync standby 时的行为：`false` = 退化为异步继续写入；`true` = 阻塞所有写入 |
 | `synchronous_node_count` | u32 | `1` | 需要多少个同步备库确认。`FIRST N` 或 `ANY N` 中的 N |
 
+**Failover / Switchover：** 启用 `synchronous_mode` 后，只有当前 `/sync` 名单中的节点可以成为新主；指定不在名单中的 `candidate` 会返回 409。名单为空时不会自动晋升（保已确认事务）。
+
 **如何选择**：
 - 大多数场景用 `synchronous_mode: true, strict: false, count: 1` — 正常时同步保护，极端时不停服务
 - 金融/订单场景用 `strict: true` — 宁可停服务也不丢数据
@@ -479,9 +481,8 @@ bootstrap:
 
 ### 当前范围与限制
 
-- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（Priority 模式）、节点变动时自动更新、发布 DCS `/sync`、`/sync` `/async` 健康检查端点
+- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（Priority 模式）、节点变动时自动更新、发布 DCS `/sync`、`/sync` `/async` 健康检查端点、Failover / Switchover 时强制 `/sync` 成员资格（不在名单中的 candidate 返回 409；名单为空时不自动晋升）
 - 尚未实现：
-  - Failover 时强制优先选举 sync standby（当前选举只看 WAL position + failover_priority）
   - Quorum 模式（`ANY N`）的动态配置入口（代码支持但 API 未暴露模式切换）
   - `max_lag_on_syncnode` 过滤（配置项存在但 lag 计算为占位实现）
 
