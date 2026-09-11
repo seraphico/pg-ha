@@ -1248,7 +1248,7 @@ mod tests {
             matches!(
                 result,
                 CycleResult::Follower(ref msg)
-                    if msg.contains("not sync-eligible") && msg.contains("not acquiring lock")
+                    if msg == "designated candidate is not sync-eligible — not acquiring lock"
             ),
             "expected sync-ineligible follower message, got: {result}"
         );
@@ -1488,7 +1488,10 @@ mod tests {
         ha.process_commands().await;
         let resp = reply_rx.recv().await.unwrap();
         assert_eq!(resp.status, CommandStatus::Rejected);
-        assert!(resp.message.contains("not a synchronous standby"));
+        assert_eq!(
+            resp.message,
+            "Candidate 'node3' is not a synchronous standby (sync mode requires /sync membership)"
+        );
         assert!(dcs.last_failover_value.lock().unwrap().is_none());
         assert!(ha.is_leader());
     }
@@ -1530,7 +1533,10 @@ mod tests {
         ha.process_commands().await;
         let resp = reply_rx.recv().await.unwrap();
         assert_eq!(resp.status, CommandStatus::Rejected);
-        assert!(resp.message.contains("not a synchronous standby"));
+        assert_eq!(
+            resp.message,
+            "Candidate 'node3' is not a synchronous standby (sync mode requires /sync membership)"
+        );
         assert!(dcs.last_failover_value.lock().unwrap().is_none());
     }
 

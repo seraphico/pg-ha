@@ -235,7 +235,7 @@ Primary 在持有 Leader Lock 时读取动态配置：
 
 目标值未变化时跳过重复 `ALTER SYSTEM` + reload。`/sync`、`/async` 健康检查读取 `/sync.sync_standby` 判断节点角色。
 
-当前范围：同步复制配置与状态发布已实现；故障切换时强制优先同步备库 / quorum 约束尚未实现。
+当前范围：同步复制配置与状态发布已实现；Failover / Switchover 在 `synchronous_mode` 启用时强制候选节点属于 DCS `/sync.sync_standby`（S5）。Quorum 模式下的选举/切换约束尚未实现。
 
 ## 模块依赖关系
 
