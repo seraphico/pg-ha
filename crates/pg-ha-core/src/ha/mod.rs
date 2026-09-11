@@ -712,7 +712,7 @@ impl Ha {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::{Leader, Member, MemberRole, MemberState};
+    use crate::cluster::{Failover, Leader, Member, MemberRole, MemberState};
     use crate::config::*;
     use crate::error::Result;
     use std::collections::HashMap;
@@ -1203,6 +1203,51 @@ mod tests {
         };
 
         assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_sync_mode_designated_candidate_not_sync_eligible() {
+        let mut config = test_config("node3");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "sync-designated-ineligible");
+        config.postgresql.data_dir = data_dir.clone();
+        std::fs::write(data_dir.join("standby.signal"), "").unwrap();
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![
+                running_member("node2", 1000),
+                running_member("node3", 9999),
+            ],
+            sync_state: Some(SyncState {
+                leader: "node1".into(),
+                sync_standby: Some("node2".into()),
+                quorum: 1,
+            }),
+            failover: Some(Failover {
+                leader: Some("node1".into()),
+                candidate: Some("node3".into()),
+                scheduled_at: None,
+            }),
+            ..Default::default()
+        };
+
+        let result = ha.process_unhealthy_cluster().await;
+        assert!(
+            matches!(
+                result,
+                CycleResult::Follower(ref msg)
+                    if msg.contains("not sync-eligible") && msg.contains("not acquiring lock")
+            ),
+            "expected sync-ineligible follower message, got: {result}"
+        );
+        assert!(!ha.is_leader());
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

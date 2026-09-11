@@ -136,13 +136,16 @@ impl Ha {
             }
         } else {
             self.is_leader = false;
-            if designated_candidate.is_some() {
-                CycleResult::Follower(format!(
-                    "deferring to designated candidate ({})",
-                    designated_candidate.unwrap_or("unknown")
-                ))
-            } else {
-                CycleResult::Follower("not the healthiest node, waiting for election".into())
+            match designated_candidate {
+                Some(candidate) if candidate == self.config.name => CycleResult::Follower(
+                    "designated candidate is not sync-eligible — not acquiring lock".into(),
+                ),
+                Some(candidate) => CycleResult::Follower(format!(
+                    "deferring to designated candidate ({candidate})"
+                )),
+                None => CycleResult::Follower(
+                    "not the healthiest node, waiting for election".into(),
+                ),
             }
         }
     }
