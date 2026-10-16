@@ -1,27 +1,34 @@
 # pg-ha TODO — 生产就绪路线图
 
+本文对照当前代码（2026-10）。已落地的项标为完成；仍开放的项按代码里的实际缺口描述，不沿用过时现状。
+
 ## 项目概述
 
 pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供与 Patroni 功能对等的能力，同时消除外部依赖（无需 etcd/ZooKeeper/Consul、无需 HAProxy）。
 
 **核心架构**：每个节点运行单个 `pg-ha` 二进制进程，内含：
+
 - **HA Engine** — 周期性决策循环，管理 failover 和 promotion
-- **Raft DCS** — 基于 openraft 的嵌入式共识，替代 etcd
-- **REST API** — axum 实现的健康检查和管理端点（端口 8008）
-- **TCP Proxy** — 读写分离代理（RW:6432, RO:6433），带主动健康检查
+- **Raft DCS** — 基于 openraft 0.9 的嵌入式共识，替代 etcd
+- **REST API** — axum 实现的健康检查和管理端点（默认端口 8008，明文 HTTP）
+- **TCP Proxy** — 读写分离代理（RW:6432, RO:6433），带主动 HTTP 健康检查、fall/rise 和每后端 `maxconn`
 
 **当前版本**：0.1.0  
-**代码结构**：Cargo workspace，核心 crate 包括 `pg-ha-core`（HA逻辑）、`pg-ha-dcs`（Raft）、`pg-ha-proxy`（代理）、`pg-ha-api`（REST）、`pg-ha-ctl`（CLI）
+**代码结构**：Cargo workspace，`edition = "2024"`。核心 crate：`pg-ha-core`（HA 逻辑）、`pg-ha-dcs`（Raft）、`pg-ha-proxy`（代理）、`pg-ha-api`（REST）、`pg-ha-ctl`（CLI）
 
 **已实现的关键能力**：
-- 自动 failover（3-10 秒）、手动 switchover
-- Failsafe 模式（DCS 临时不可用时防误降级）
-- TLS/mTLS Raft RPC 通信
-- Watchdog（Linux 防 zombie primary）
-- 优雅停机（CHECKPOINT + leader lock release）
-- Prometheus metrics、结构化 JSON 日志
-- Docker Compose 3 节点部署、systemd 服务文件
-- E2E 测试（12 个场景脚本）
+
+- 自动 failover、手动 switchover / failover（同步复制开启时强制候选属于 DCS `/sync`）
+- Raft RPC TLS（`raft.tls`；开发用 `docker-compose.yml` 已挂载证书）。服务端目前只使用 `cert`/`key`，`require_client_cert` 未接入
+- Raft 日志 append-only WAL（`raft_log.wal`，超过 4 MiB 压缩）+ `hard_state.json` / `state_machine.json` / `membership.json`
+- Watchdog（Linux `/dev/watchdog`，防 zombie primary）
+- 优雅停机：等待 `shutdown.drain_timeout_secs` → Leader 上 CHECKPOINT → 释放 leader lock → `pg_ctl stop -m fast`
+- Prometheus metrics、文本或 JSON 日志（`log_format` 或 `PG_HA_LOG_FORMAT`）
+- Docker Compose 3 节点开发集群、`make up` / `make test`
+- 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
+- Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
+
+**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Failsafe、REST TLS、`max_lag_on_syncnode` 见下文。
 
 ---
 
@@ -29,134 +36,140 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 
 ### 1. REST API TLS 支持
 
-**现状**：管理端点（switchover、failover、pause 等）仅支持 HTTP + Basic Auth，密码明文传输。  
-**目标**：内建 HTTPS 支持，或者至少在文档中明确要求前置 TLS 终结代理。  
+**现状**：管理端点（switchover、failover、restart、reinitialize、config）是 HTTP + 可选 Basic Auth。`src/main.rs` 对 REST 使用 `axum::serve` 明文监听。`axum-server` 的 `tls-rustls` 只用于 Raft RPC（配置了 `raft.tls` 时 `bind_rustls`）。  
+**目标**：REST 内建 HTTPS，或在部署文档中把「前置 TLS 终结」写成强制要求并给出可复制的反代示例。当前 [部署指南](deployment-guide.md) 只说明了 Raft 证书，没有 REST TLS。  
 **实现方向**：
-- `axum-server` 已在 workspace 依赖中且启用了 `tls-rustls` feature
-- 在 `restapi` 配置段增加可选的 `tls_cert` / `tls_key` 字段
-- 配置了 TLS 时使用 `axum_server::bind_rustls()`，否则退回 HTTP（开发模式）
+
+- 在 `restapi` 增加可选的 `tls_cert` / `tls_key`（及 CA）
+- 配置了 TLS 时用 `axum_server::bind_rustls()`，否则保持 HTTP（开发模式）
 
 **相关文件**：
-- `crates/pg-ha-api/src/lib.rs` — API 服务启动逻辑
-- `crates/pg-ha-core/src/config.rs` — `RestApiConfig` 结构体
-- `src/main.rs` — API server spawn 位置
+
+- `src/main.rs` — REST 与 Raft 的监听分支
+- `crates/pg-ha-core/src/config.rs` — `RestApiConfig`（尚无 TLS 字段）、`RaftTlsConfig`
+- `crates/pg-ha-api/src/lib.rs` — 路由组装，不含传输层
 
 ---
 
 ### 2. 同步复制 Failover 约束 — ✅ 已完成（S5）
 
-**已实现**：`synchronous_mode` 启用时，自动选举与指定 `candidate` 的 Failover/Switchover 均强制候选属于 DCS `/sync.sync_standby`；名单缺失、空或为 `*` 时不晋升；不合格候选返回 409，不 demote。权威来源仅为 DCS `/sync`（不重算名单）。`synchronous_mode_strict` 仍只影响写阻塞，不参与选举。
+**已实现**：`synchronous_mode` 启用时，自动选举与指定 `candidate` 的 Failover/Switchover 均强制候选属于 DCS `/sync.sync_standby`；名单缺失、空或为 `*` 时不晋升；不合格候选返回 409，`status` 为 `rejected`。权威来源仅为 DCS `/sync`。`synchronous_mode_strict` 只影响写阻塞，不参与选举。
 
-**仍开放（非阻塞上线的同类项，可排期）**：
-- `max_lag_on_syncnode`：配置存在，但 `sync.rs` 中 lag 计算仍为占位（`TODO: compute actual lag`）
-- Quorum 模式（`ANY N`）的动态配置入口与选举约束接线
+**仍开放**：
+
+- `max_lag_on_syncnode`：`SyncManager::set_max_lag` 存在，但 `compute_sync_standby_names` 在配置了阈值时仍把任意 `wal_position` 都算作合格（`sync.rs` 的 `TODO: compute actual lag`）。HA 循环也没有调用 `set_max_lag`
+- Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但 `enforce_synchronous_replication` 固定使用 `SyncMode::Priority`，动态配置没有模式开关
 
 **相关文件**：
-- `crates/pg-ha-core/src/ha/election.rs` — `sync_failover_allowed`、`is_healthiest_node`
+
+- `crates/pg-ha-core/src/ha/election.rs` — `sync_failover_allowed`
 - `crates/pg-ha-core/src/ha/commands.rs` — switchover/failover 早拒
-- `crates/pg-ha-core/src/sync.rs` — `SyncManager`、`compute_sync_standby_names()`
+- `crates/pg-ha-core/src/sync.rs` — `SyncManager`
+- `crates/pg-ha-core/src/ha/mod.rs` — `enforce_synchronous_replication`
 - `docs/invariants.md` — S5（持有）
 
 ---
 
 ## P1 — 高优先级改进
 
-### 3. Raft 持久化层优化
+### 3. Raft 日志增量持久化 — ✅ 写入路径已完成；失败处理仍开放
 
-**现状**：`crates/pg-ha-dcs/src/store.rs` 使用 JSON 文件持久化 Raft 状态。每次 `persist_log` 序列化整个 log BTreeMap 为 JSON → atomic write。日志量增长后性能会退化。  
-**目标**：改为增量 append-only 写入，仅序列化新增 entries。  
-**实现方向**：
-- 方案 A：使用 append-only binary log file + 定期 compaction
-- 方案 B：引入 `sled` 或 `rocksdb` 作为嵌入式 KV 存储
-- 保留 `atomic_write_json` 用于 `hard_state.json`（体积小、写入频率低）
+**已实现**：`data_dir` 存在时，Raft 日志走 append-only [`WalWriter`](../crates/pg-ha-dcs/src/wal.rs)（`raft_log.wal`，bincode 记录，超过 4 MiB 压缩）。`hard_state.json`、`state_machine.json`、`membership.json` 仍是原子 JSON 写。不再把整份 log `BTreeMap` 序列化成 `log_entries.json`。
+
+**仍开放**（对应不变量 P4，状态为「目标」）：`wal_append_entries` / `wal_truncate_since` / `wal_purge_upto` 在写失败时只 `warn!`，不向 openraft 返回 `StorageError`。磁盘失败时内存日志可能已经前进。
 
 **相关文件**：
-- `crates/pg-ha-dcs/src/store.rs` — `persist_log()`、`MemStore`
-- `crates/pg-ha-dcs/Cargo.toml` — 添加新的存储依赖
+
+- `crates/pg-ha-dcs/src/store.rs` — `wal_append_entries`、`wal_truncate_since`、`wal_purge_upto`
+- `crates/pg-ha-dcs/src/wal.rs` — `COMPACTION_THRESHOLD`
 
 ---
 
-### 4. Failsafe Key 持久化到 DCS
+### 4. Failsafe 未接通
 
-**现状**：`raft_dcs.rs:442` 有 `// TODO: read /failsafe key`。Failsafe 状态仅在内存中维护，节点重启后丢失。  
-**目标**：将 failsafe 启用状态和成员列表持久化到 DCS 的 `/failsafe` key。  
-**实现方向**：
-- Leader 每次 HA cycle 将 failsafe 成员列表写入 DCS
-- `get_cluster()` 时读取 `/failsafe` key 并反序列化
+**现状**（比「只缺 DCS 持久化」更靠前）：
+
+- `GlobalConfig.failsafe_mode` 能通过 `PATCH /config` 写入 DCS，但 `process_dynamic_config` 从不调用 `Failsafe::set_enabled`。默认 `enabled = false`，DCS 不可达时走 `FailsafeResult::Disabled` 并 demote
+- `Failsafe::check_topology` 会 `POST {api_url}/failsafe`，路由表里没有该端点
+- `raft_dcs.rs` 的 `get_cluster()` 仍是 `failsafe: None // TODO: read /failsafe key`，不读 `/failsafe`
+- `pg_ha_failsafe_active` 在 `main` 的状态更新里没有赋值，进程内保持初始值 `0`
+
+**目标**：`failsafe_mode` 真正开关内存状态；成员间有可响应的确认端点；启用状态与成员列表在重启后仍可从 DCS 恢复；指标反映 `Failsafe::is_active()`。
 
 **相关文件**：
-- `crates/pg-ha-dcs/src/raft_dcs.rs` — `get_cluster()` 方法，第 442 行附近
-- `crates/pg-ha-core/src/failsafe.rs` — `Failsafe` 结构体
+
+- `crates/pg-ha-core/src/failsafe.rs`
+- `crates/pg-ha-core/src/ha/mod.rs` — `handle_dcs_error`、`process_dynamic_config`
+- `crates/pg-ha-dcs/src/raft_dcs.rs` — `get_cluster()`
+- `crates/pg-ha-api/src/routes/mod.rs` — 尚无 `/failsafe`
+- `src/main.rs` — API 状态刷新
 
 ---
 
 ### 5. Proxy 连接池
 
-**现状**：`crates/pg-ha-proxy/src/proxy.rs` 是纯 TCP pipe（accept → connect → bidirectional copy）。每个客户端连接对应一个后端连接。  
-**目标**：支持连接复用（类似 PgBouncer transaction mode），降低后端连接数。  
-**优先级说明**：如果用户已在使用 PgBouncer，可以将此项降为 P2。
+**现状**：`crates/pg-ha-proxy` 在健康检查（GET `/primary`、GET `/replica`，fall/rise，标记 down 时断开已有会话，默认每后端 300 连接）之后，仍是 accept → connect → 双向拷贝。没有 PgBouncer 式的事务级连接复用。  
+**目标**：支持连接复用，降低后端连接数。若前面已经有 PgBouncer，可降为 P2。
 
 **相关文件**：
-- `crates/pg-ha-proxy/src/proxy.rs` — 核心代理逻辑
-- `crates/pg-ha-proxy/src/lib.rs` — `PgProxy` 公开接口
+
+- `crates/pg-ha-proxy/src/proxy.rs`
+- `crates/pg-ha-proxy/src/lib.rs`
 
 ---
 
 ## P2 — 中期改进
 
-### 6. CI/CD 集成测试
+### 6. CI 中的测试
 
-**现状**：E2E 测试是 shell 脚本（`tests/e2e/`），GitHub Actions 仅做 release 构建。无自动化回归测试。  
+**现状**：`.github/workflows/release.yml` 只在 `v*` tag 上做四平台 release 构建，不跑测试。本地有 `make test`（`cargo test --workspace`）。E2E 入口是 `tests/e2e/run_tests.sh`，默认 7 个套件：bootstrap、metrics、dynamic config、switchover、failover、network partition、pause。仓库里还有 `test_rejoin.sh`、`test_consistency.sh`、`test_ha_full.sh`、`test_db_connections.sh`、`quick_test.sh`，没有注册进 runner。Makefile 没有 `e2e` 目标。  
 **目标**：
-- CI 中运行 `cargo test`（含 proptest）
-- CI 中启动 docker-compose 并运行 E2E shell 脚本
-- 增加 TLS 路径的集成测试
 
-**相关文件**：
-- `.github/workflows/release.yml` — 现有 CI 配置
-- `tests/e2e/` — 所有 E2E 脚本
-- `Makefile` — `make test`、`make e2e` 目标
+- CI 中运行 `cargo test`（含 proptest）
+- CI 中启动 compose 并运行 `tests/e2e/run_tests.sh`
+- 增加 Raft TLS 路径的集成测试
 
 ---
 
 ### 7. TLS 证书自动轮换
 
-**现状**：证书手动生成和部署，无自动轮换机制。  
-**目标**：支持证书热重载（watch 文件变更 → reload TLS context），或集成 cert-manager/Vault。
+**现状**：证书手动生成后写入 `raft.tls` 路径，进程启动时加载一次，无热重载。  
+**目标**：watch 文件变更并重载 TLS，或由外部（cert-manager / Vault）轮换后重启进程的操作说明。
 
 ---
 
 ### 8. REST API 增强
 
-- 请求限流（rate limiting）— 防止管理端点被滥用
-- Audit log — 记录谁在什么时间执行了什么管理操作
-- CORS 配置（如果前端 dashboard 需要）
+- 请求限流
+- 管理操作审计日志（谁、何时、哪个端点）
+- CORS（若要做 dashboard）
+- `pg-ha-ctl` 发送 Basic Auth（当前 CLI 不带头，Docker 默认 `admin` / `secret` 时管理子命令会 401）
 
 ---
 
 ### 9. 备份/恢复集成
 
-**现状**：无内建备份功能。  
-**目标**：集成 pgBackRest 或 WAL-G，支持 PITR。至少提供 callback hook 让外部备份工具在 switchover/failover 时得到通知。
+**现状**：无内建备份。  
+**目标**：集成 pgBackRest 或 WAL-G，或在 switchover/failover 提供 callback hook。
 
 ---
 
 ## P3 — 长期规划
 
-### 10. 多区域 / Standby Cluster
+### 10. Standby cluster / 多区域
 
-**现状**：`crates/pg-ha-core/src/standby_cluster.rs` 已有框架代码，但未完整实现。  
-**目标**：支持跨区域级联复制集群（DR 场景）。
+**已有**：`StandbyClusterConfig`（`host`、`port`、`primary_slot_name`、`restore_command`、`create_replica_methods`）放在动态配置 `standby_cluster` 下。HA 循环在持锁节点上调用远端跟随；`Ha::cascade_promote` 能从 DCS 去掉该配置并 promote。  
+**未做**：没有 REST/CLI 触发 `cascade_promote`；运维文档此前未描述该配置。跨区域网络、槽位和归档的运行手册仍缺。
 
 ### 11. Web Dashboard
 
-提供集群可视化管理界面（拓扑图、实时监控、一键 switchover）。
+提供集群可视化管理界面。
 
 ### 12. 性能基准测试
 
-- 建立 failover 时间基准（当前 E2E 测试验证 < 30s，目标 < 5s）
-- Proxy 吞吐量/延迟基准
-- Raft 写入吞吐量基准
+- failover 耗时基准
+- Proxy 吞吐 / 延迟
+- Raft 写入吞吐（WAL 路径）
 
 ---
 
@@ -164,27 +177,27 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 
 | 位置 | 内容 | 关联任务 |
 |------|------|----------|
-| `crates/pg-ha-core/src/sync.rs:67` | `// TODO: compute actual lag` | #2 剩余：`max_lag_on_syncnode` |
-| `crates/pg-ha-dcs/src/raft_dcs.rs:442` | `// TODO: read /failsafe key` | #4 Failsafe 持久化 |
+| `crates/pg-ha-core/src/sync.rs`（lag 过滤） | `TODO: compute actual lag` | #2 剩余：`max_lag_on_syncnode` |
+| `crates/pg-ha-dcs/src/raft_dcs.rs`（`get_cluster`） | `TODO: read /failsafe key` | #4 |
+| `crates/pg-ha-dcs/src/store.rs`（三处 WAL 写） | 写失败应返回 `StorageError`，而不是只打日志 | #3 剩余 |
 
 ---
 
 ## 上下文提示
 
-1. **指定要做的 TODO 编号**（如 "实现 TODO #1 REST API TLS"）
+1. **指定要做的 TODO 编号**（如「实现 TODO #1 REST API TLS」）
 2. **关键入口文件**：
    - 总入口：`src/main.rs`
    - HA 循环：`crates/pg-ha-core/src/ha/mod.rs`
    - 配置定义：`crates/pg-ha-core/src/config.rs`
    - Raft DCS：`crates/pg-ha-dcs/src/raft_dcs.rs`
+   - Raft 存储：`crates/pg-ha-dcs/src/store.rs`、`crates/pg-ha-dcs/src/wal.rs`
 3. **构建和测试**：
-   - `cargo build` — 编译
-   - `cargo test` — 单元测试 + proptest
-   - `make up` — 启动 3 节点 Docker 集群
-   - `make e2e` — 运行 E2E 测试
-4. **注意事项**：
-   - 使用 Rust 2024 edition（`edition = "2024"`）
-   - 启用了 `let-else`、`if-let chains` 等 nightly 特性
-   - openraft 版本 0.9，API 与旧版差异较大
-   - 日志使用 `tracing` crate，统一用 `info!`/`warn!`/`error!`
-   - 错误处理用 `thiserror` 定义，函数返回 `Result<T>` 或 `anyhow::Result<T>`
+   - `cargo build` / `make build` — 本机或面向 Linux 容器的发布二进制（Mac 上走 `cargo-zigbuild`、`cross` 或 `docker-compose.build.yml`）
+   - `make test` — `cargo test --workspace`
+   - `make up` — 编译并启动 3 节点 Docker 集群（默认 PostgreSQL 16；`PG_VERSION` 传给官方 `postgres` 镜像）
+   - `./tests/e2e/run_tests.sh` — E2E（不是 `make e2e`）
+4. **工具链**：
+   - Rust **稳定版 1.88+**（`edition = "2024"`，代码使用已稳定的 if-let chains）。CI release 使用 `dtolnay/rust-toolchain@stable`
+   - openraft 0.9
+   - 日志用 `tracing`；错误用 `thiserror` / `anyhow`

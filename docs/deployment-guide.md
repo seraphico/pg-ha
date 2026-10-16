@@ -4,8 +4,8 @@
 
 | 组件 | 最低版本 | 说明 |
 |------|---------|------|
-| PostgreSQL | 14+ | 需要 `pg_ctl`、`pg_basebackup`、`pg_rewind`（Docker 支持 14-18） |
-| Rust | 1.77+ (nightly) | 编译需要 `let-else` 等 nightly 特性 |
+| PostgreSQL | 14+ | 需要 `pg_ctl`、`pg_basebackup`、`pg_rewind`。Docker 使用官方 `postgres` 镜像标签；`make up` 默认 16 |
+| Rust | 1.88+ 稳定版 | `edition = "2024"`，并使用已稳定的 if-let chains。不需要 nightly |
 | Docker | 24.0+ | 容器化部署 |
 | Docker Compose | v2.20+ | 多节点编排 |
 | 操作系统 | Linux (amd64/arm64) / macOS | 生产环境推荐 Linux |
@@ -20,7 +20,7 @@
 **网络要求：**
 
 - 集群节点间网络延迟 < 5ms（Raft 共识性能依赖低延迟）
-- 节点间以下端口互通：2380 (Raft)、8008 (API)、5432 (PG)
+- 节点间以下端口互通：2380（Raft RPC，配置了 `raft.tls` 时为 HTTPS）、8008（REST API，当前为 HTTP）、5432（PostgreSQL 复制）
 
 ---
 
@@ -32,19 +32,23 @@
 # 克隆项目
 git clone <repo-url> pg-ha && cd pg-ha
 
-# 启动三节点集群（自动编译 + 构建镜像 + 启动，默认 PG 16）
+# 启动三节点集群（编译 Linux 二进制 + 构建镜像 + 启动，默认 PG 16）
 make up
 
-# 使用其他 PostgreSQL 版本（支持 14-18）
+# 使用其他官方 postgres 镜像标签
 make up PG_VERSION=17
 make up PG_VERSION=18
 
-# 验证集群状态
+# 验证集群拓扑（成员名、角色、复制上游）
 curl -s http://localhost:8008/cluster | jq .
+
+# 查看本节点详情（角色、状态、timeline、lag）
+curl -s http://localhost:8008/patroni | jq .
 
 # 连接 PostgreSQL（通过 Proxy RW 端口）
 psql -h localhost -p 6432 -U postgres -d postgres
 # 密码: secret
+# 管理 API 的 Basic Auth 同样是 admin / secret（仅 /switchover、/config 等）
 
 # 查看集群日志
 make logs
@@ -84,15 +88,30 @@ sudo chown pgha:pgha /var/lib/pg-ha/raft /var/lib/postgresql/16/data
 
 ### 部署二进制
 
-```bash
-# 从 Release 页面下载或自行编译
-# 编译方式：
-cargo build --release --target x86_64-unknown-linux-gnu -p pg-ha -p pg-ha-ctl
+从 GitHub Release（`v*` tag 触发 `.github/workflows/release.yml`）下载对应平台的 `pg-ha-*.tar.gz`，或在本机编译。
 
-# 复制二进制
-sudo cp target/x86_64-unknown-linux-gnu/release/pg-ha /usr/local/bin/
-sudo cp target/x86_64-unknown-linux-gnu/release/pg-ha-ctl /usr/local/bin/
+Linux 上可以直接：
+
+```bash
+cargo build --release -p pg-ha -p pg-ha-ctl
+sudo cp target/release/pg-ha target/release/pg-ha-ctl /usr/local/bin/
 sudo chmod +x /usr/local/bin/pg-ha /usr/local/bin/pg-ha-ctl
+```
+
+要打出放进 Docker 镜像的 Linux 二进制，用仓库里的 `make build`。它按本机架构选择 `x86_64-unknown-linux-gnu` 或 `aarch64-unknown-linux-gnu`：本机已有 `cargo-zigbuild` 或 `cross` 时用它们，Linux 本机用 `cargo`，否则用 `docker-compose.build.yml` 里的 builder。产物在 `target/<target>/release/`。
+
+```bash
+make build
+# 二进制在 target/$RUST_TARGET/release/，RUST_TARGET 可用 `make print-env` 查看
+sudo cp target/x86_64-unknown-linux-gnu/release/pg-ha /usr/local/bin/   # 按 print-env 改目录
+sudo cp target/x86_64-unknown-linux-gnu/release/pg-ha-ctl /usr/local/bin/
+```
+
+校验配置或生成样例（不启动进程）：
+
+```bash
+pg-ha --validate-config /etc/pg-ha/pg-ha.yml
+pg-ha --generate-sample-config
 ```
 
 ### 配置文件
@@ -135,6 +154,7 @@ restapi:
   port: 8008
   username: admin
   password: "CHANGE_ME_api_password"
+  # REST 目前只有 HTTP。管理端口不要暴露到公网；需要加密时在前面放 TLS 终结。
 
 raft:
   self_addr: "10.0.1.1:2380"  # 每台不同: .1, .2, .3
@@ -142,6 +162,17 @@ raft:
     - "10.0.1.2:2380"         # 其他两台
     - "10.0.1.3:2380"
   data_dir: /var/lib/pg-ha/raft
+  tls:                              # 省略则 Raft RPC 为明文 HTTP
+    cert: /etc/pg-ha/tls/server.crt
+    key: /etc/pg-ha/tls/server.key
+    ca_cert: /etc/pg-ha/tls/ca.crt
+    client_cert: /etc/pg-ha/tls/client.crt
+    client_key: /etc/pg-ha/tls/client.key
+
+log_format: json                    # text（默认）或 json
+
+shutdown:
+  drain_timeout_secs: 30            # SIGTERM 后、CHECKPOINT 之前的等待秒数
 
 proxy:
   rw_listen: 0.0.0.0
@@ -181,7 +212,8 @@ Group=pgha
 ExecStart=/usr/local/bin/pg-ha /etc/pg-ha/pg-ha.yml
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=30s
+# drain_timeout_secs（默认 30）+ CHECKPOINT + pg_ctl stop，30 秒不够
+TimeoutStopSec=120s
 KillMode=mixed
 KillSignal=SIGTERM
 
@@ -252,16 +284,25 @@ postgresql:
 restapi:
   listen: <string>                 # API 监听地址 (默认: "0.0.0.0")
   port: <u16>                      # API 端口 (默认: 8008)
-  username: <string>               # Basic Auth 用户名 (可选, 设置后启用认证)
+  username: <string>               # Basic Auth 用户名 (可选, 设置后管理端点要求认证)
   password: <string>               # Basic Auth 密码 (可选)
+  # 没有 tls 字段。健康检查始终明文；管理端点在配置了 username 时要求 Basic Auth
 
 # ─── Raft DCS 配置 (必填) ───
 raft:
   self_addr: <string>              # 本节点 Raft RPC 地址 host:port (必填)
   partner_addrs:                   # 其他节点 Raft 地址列表 (必填, 至少1个)
     - <string>
-  data_dir: <path>                 # Raft 持久化目录 (可选)
-  node_id: <u64>                   # 显式节点 ID (可选, 默认从排序位置推导)
+  data_dir: <path>                 # 持久化目录 (可选)。设置后写入 raft_log.wal、
+                                   # hard_state.json、state_machine.json、membership.json
+  node_id: <u64>                   # 显式节点 ID (可选, 默认是地址排序后的位置 + 1)
+  tls:                             # 可选。存在则 Raft RPC 为 HTTPS
+    cert: <path>                   # 服务端证书 PEM (必填, 若启用 tls)
+    key: <path>                    # 服务端私钥 PEM
+    ca_cert: <path>                # 校验对端证书的 CA (可选)
+    client_cert: <path>            # 出站客户端证书 (可选)
+    client_key: <path>             # 出站客户端私钥 (可选)
+    require_client_cert: <bool>    # 配置里有该字段，启动代码尚未强制校验客户端证书
 
 # ─── TCP Proxy 配置 (必填) ───
 proxy:
@@ -269,6 +310,11 @@ proxy:
   rw_port: <u16>                   # RW Proxy 端口 (默认: 6432)
   ro_listen: <string>              # RO Proxy 监听地址 (默认: "0.0.0.0")
   ro_port: <u16>                   # RO Proxy 端口 (默认: 6433)
+
+# ─── 日志与停机 (可选) ───
+log_format: <string>               # "text"（默认）或 "json"。也可被 PG_HA_LOG_FORMAT 覆盖
+shutdown:
+  drain_timeout_secs: <u64>        # SIGTERM 后等待秒数，然后才 CHECKPOINT (默认: 30)
 
 # ─── Watchdog 配置 (可选) ───
 watchdog:
@@ -307,9 +353,9 @@ bootstrap:
 
 同步复制相关标签：`tags.nosync`（排除同步备库）、`tags.sync_priority`（同步优先级）。运行时也可通过 `PATCH /config` 开关同步复制，详见 [运维指南](operations-guide.md#同步复制)。
 
-### 环境变量覆盖
+### 环境变量
 
-所有配置项均可通过 `PG_HA_` 前缀的环境变量覆盖，嵌套字段用双下划线 `__` 分隔：
+二进制只覆盖下面这些字段（`Config::apply_env_overrides`，再加 `main` 里单独读取的日志格式）。没有列出的 `PG_HA_*` **不会**改 YAML。嵌套字段用双下划线 `__`。
 
 | 环境变量 | 覆盖字段 |
 |---------|---------|
@@ -322,8 +368,21 @@ bootstrap:
 | `PG_HA_POSTGRESQL__LISTEN` | `postgresql.listen` |
 | `PG_HA_RESTAPI__PORT` | `restapi.port` |
 | `PG_HA_RAFT__SELF_ADDR` | `raft.self_addr` |
-| `PG_HA_LOG_FORMAT` | 日志格式 (`text` / `json`) |
-| `RUST_LOG` | 日志级别过滤 |
+| `PG_HA_LOG_FORMAT` | 日志格式，优先于 YAML 的 `log_format`（`json` 为 JSON，其他值为文本） |
+| `RUST_LOG` | `tracing` 过滤指令。未设置时默认追加 `pg_ha=info`，并关闭 `openraft::replication` |
+
+Docker 入口 `docker/entrypoint.sh` 是另一层：它用下面这些变量**生成** `/etc/pg-ha.yml`，不是调用上表的覆盖逻辑。`PG_HA_RAFT_SELF` 和 `PG_HA_RAFT__SELF_ADDR` 不是同一个变量。
+
+| 入口变量 | 作用 |
+|---------|------|
+| `PG_HA_NAME` / `PG_HA_SCOPE` | 节点名、集群名（默认 hostname / `pg-ha-cluster`） |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` | 超级用户和复制用户（复制用户与超级用户相同） |
+| `PGDATA` / `PG_PORT` / `PG_HA_BIN_DIR` | 数据目录、端口、`bin_dir`（默认按镜像里的 `PG_MAJOR` 探测） |
+| `PG_HA_API_PORT` / `PG_HA_PROXY_RW_PORT` / `PG_HA_PROXY_RO_PORT` | API 与代理端口 |
+| `PG_HA_RAFT_SELF` / `PG_HA_RAFT_PARTNERS` | 本节点地址，以及逗号分隔的对端列表 |
+| `PG_HA_RAFT_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | 设置了 `PG_HA_RAFT_TLS_CERT` 就写入 `raft.tls` |
+
+开发集群 `docker-compose.yml` 会设置 Raft TLS，并把 `./docker/tls` 挂到 `/etc/pg-ha/tls`。入口生成的 HA 参数是 `loop_wait: 5`、`ttl: 15`，REST 认证为 `admin` / `secret`。
 
 ---
 
@@ -385,32 +444,39 @@ sudo chmod 600 /etc/pg-ha/tls/*.key
 sudo chmod 644 /etc/pg-ha/tls/*.crt
 ```
 
+把路径写进每台节点的 `raft.tls`（见上面的生产 YAML）。服务端用 `cert` + `key` 把 2380 换成 HTTPS；出站客户端用 `ca_cert` 校验对端，并在同时提供 `client_cert` / `client_key` 时带上客户端证书。
+
+`require_client_cert` 可以写在 YAML 里，但 `src/main.rs` 创建 Rustls 配置时没有读取它，服务端不会拒绝没有客户端证书的连接。不要把它当成已经生效的 mTLS。
+
+REST API（8008）不受 `raft.tls` 影响，始终是 HTTP。
+
 ---
 
 ## Docker 部署
 
 ### PostgreSQL 版本选择
 
-Docker 镜像支持 PostgreSQL 14-18，通过 `PG_VERSION` 构建参数控制：
+镜像是官方 `postgres:${PG_VERSION}`。`make up` 把 `PG_VERSION` 传给 compose，默认 **16**。`docker/Dockerfile` 在没收到该参数时自己的 `ARG` 默认是 19，正常走 `make up` 不会用到这个默认值。
 
 ```bash
-# 默认使用 PG 16
+# 默认 PostgreSQL 16
 make up
 
-# 使用 PG 18
+# 换官方镜像标签
 make up PG_VERSION=18
 
-# 也可直接用 docker compose
 PG_VERSION=17 docker compose build
 docker compose up -d
 ```
 
-entrypoint 会自动检测容器内的 PostgreSQL 版本，正确设置 `bin_dir` 和 `data_dir`，无需手动修改配置。
+entrypoint 按容器内的 `PG_MAJOR`（或 `PG_HA_BIN_DIR` / `PGDATA`）填写 `bin_dir` 和 `data_dir`。
 
-### 生产 docker-compose 配置
+仓库里的编排文件是 `docker-compose.yml`（开发集群，Raft TLS、scope `test-cluster`）。下面的生产示例不是仓库里的文件，需要另存后使用，并且应带上与开发集群相同的 TLS 变量，或改成挂载你自己的证书。
+
+### 生产 docker-compose 示例
 
 ```yaml
-# docker-compose.prod.yml
+# docker-compose.prod.yml（示例，仓库中没有这个文件）
 services:
   node1:
     image: pg-ha:latest
@@ -421,8 +487,14 @@ services:
       PG_HA_NAME: node1
       PG_HA_SCOPE: prod-cluster
       POSTGRES_PASSWORD: "${PG_PASSWORD}"
+      PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node1:2380"
       PG_HA_RAFT_PARTNERS: "node2:2380,node3:2380"
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
+      PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
+      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
+      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
       PG_HA_LOG_FORMAT: json
       RUST_LOG: "pg_ha=info"
     ports:
@@ -433,13 +505,9 @@ services:
     volumes:
       - node1-raft:/var/lib/pg-ha/raft
       - node1-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
     networks:
       - pg-ha-net
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-          cpus: "2.0"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8008/liveness"]
       interval: 5s
@@ -456,8 +524,14 @@ services:
       PG_HA_NAME: node2
       PG_HA_SCOPE: prod-cluster
       POSTGRES_PASSWORD: "${PG_PASSWORD}"
+      PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node2:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node3:2380"
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
+      PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
+      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
+      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
       PG_HA_LOG_FORMAT: json
       RUST_LOG: "pg_ha=info"
     ports:
@@ -468,13 +542,9 @@ services:
     volumes:
       - node2-raft:/var/lib/pg-ha/raft
       - node2-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
     networks:
       - pg-ha-net
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-          cpus: "2.0"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8008/liveness"]
       interval: 5s
@@ -491,8 +561,14 @@ services:
       PG_HA_NAME: node3
       PG_HA_SCOPE: prod-cluster
       POSTGRES_PASSWORD: "${PG_PASSWORD}"
+      PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node3:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node2:2380"
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
+      PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
+      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
+      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
       PG_HA_LOG_FORMAT: json
       RUST_LOG: "pg_ha=info"
     ports:
@@ -503,13 +579,9 @@ services:
     volumes:
       - node3-raft:/var/lib/pg-ha/raft
       - node3-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
     networks:
       - pg-ha-net
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-          cpus: "2.0"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8008/liveness"]
       interval: 5s
@@ -530,23 +602,17 @@ volumes:
   node3-pgdata:
 ```
 
-启动：
+启动前先 `make build` 再构建镜像（`docker/Dockerfile` 复制的是已经编好的 Linux 二进制，不会在镜像构建时编译 Rust）：
 
 ```bash
-# 设置密码环境变量
 export PG_PASSWORD="your-secure-password"
-
-# 构建镜像
 make build
 docker compose -f docker-compose.prod.yml build
-
-# 启动集群
 docker compose -f docker-compose.prod.yml up -d
-
-# 检查状态
-docker compose -f docker-compose.prod.yml ps
 curl -s http://localhost:8008/cluster | jq .
 ```
+
+开发集群直接 `make up`，不要套这份示例。`make down` 会删掉 Raft 和 PGDATA 卷。
 
 ---
 
@@ -555,8 +621,8 @@ curl -s http://localhost:8008/cluster | jq .
 | 端口 | 协议 | 方向 | 用途 |
 |------|------|------|------|
 | 5432 | TCP | 入站 | PostgreSQL 客户端连接（直连） |
-| 8008 | HTTP | 入站 | REST API（健康检查 + 管理） |
-| 2380 | HTTP(S) | 节点间 | Raft RPC（共识通信） |
+| 8008 | HTTP | 入站 | REST API（健康检查无需认证；管理端点在配置了 `restapi.username` 时要 Basic Auth）。当前没有内建 TLS |
+| 2380 | HTTP 或 HTTPS | 节点间 | Raft RPC。未配置 `raft.tls` 时为 HTTP，配置后为 HTTPS |
 | 6432 | TCP | 入站 | Proxy RW（路由到 Primary） |
 | 6433 | TCP | 入站 | Proxy RO（负载均衡到 Replica） |
 

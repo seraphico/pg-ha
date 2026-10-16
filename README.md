@@ -19,6 +19,7 @@ pg-ha is a Rust-based PostgreSQL HA solution providing complete feature parity w
 | [Architecture](docs/pg-ha-architecture.md) | System design, HA decision loop, Raft consensus, TLS, auth, graceful shutdown |
 | [Deployment Guide](docs/deployment-guide.md) | Quick start, production setup, config reference, TLS certificates, Docker/systemd |
 | [Operations Guide](docs/operations-guide.md) | Cluster management, switchover/failover, disaster recovery, debugging, monitoring |
+| [TODO](docs/TODO.md) | Production-readiness gaps tracked against the current code |
 
 ## Architecture
 
