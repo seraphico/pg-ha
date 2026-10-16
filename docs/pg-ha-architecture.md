@@ -168,7 +168,7 @@ flowchart LR
     subgraph Node1["Node 1"]
         R1[Raft Node]
         SM1[KV StateMachine]
-        DISK1[hard_state.json log_entries.json state_machine.json]
+        DISK1[raft_log.wal hard_state.json state_machine.json membership.json]
     end
     subgraph Node2["Node 2"]
         R2[Raft Node]

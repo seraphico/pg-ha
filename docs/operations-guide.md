@@ -5,46 +5,47 @@
 ### 集群总览
 
 ```bash
-# 查看集群所有成员及拓扑
+# 集群拓扑：每个成员的角色和复制上游（不是完整成员对象）
 curl -s http://localhost:8008/cluster | jq .
 ```
 
-响应示例：
+响应来自 `CascadeManager::build_cascade_topology`。角色是小写（`primary` / `replica` / `standby_leader`）。Primary 没有 `upstream`。带 `tags.replicatefrom` 的副本会多一个 `replicatefrom` 字段；上游不健康时 `upstream` 回退到当前 leader。
 
 ```json
 {
   "scope": "prod-cluster",
   "members": [
-    {
-      "name": "node1",
-      "role": "Primary",
-      "state": "Running",
-      "conn_url": "host=node1 port=5432",
-      "api_url": "http://node1:8008",
-      "timeline": 1,
-      "lag": 0
-    },
-    {
-      "name": "node2",
-      "role": "Replica",
-      "state": "Running",
-      "conn_url": "host=node2 port=5432",
-      "api_url": "http://node2:8008",
-      "timeline": 1,
-      "lag": 128
-    },
-    {
-      "name": "node3",
-      "role": "Replica",
-      "state": "Running",
-      "conn_url": "host=node3 port=5432",
-      "api_url": "http://node3:8008",
-      "timeline": 1,
-      "lag": 256
-    }
+    {"name": "node1", "role": "primary", "upstream": null},
+    {"name": "node2", "role": "replica", "upstream": "node1"},
+    {"name": "node3", "role": "replica", "upstream": "node1"}
   ]
 }
 ```
+
+节点自己的运行状态、timeline、WAL、lag、暂停和待重启标志在 **本节点** 的 `/patroni` 上，不在 `/cluster` 里：
+
+```bash
+curl -s http://localhost:8008/patroni | jq .
+```
+
+```json
+{
+  "state": "Running",
+  "role": "Primary",
+  "scope": "prod-cluster",
+  "name": "node1",
+  "timeline": 1,
+  "wal_position": 12345678,
+  "replication_lag": 0,
+  "paused": false,
+  "pending_restart": false,
+  "tags": {}
+}
+```
+
+`/patroni` 的 `role` / `state` 是 Rust Debug 写法（`Primary`、`Replica`、`Running`），和 `/cluster` 的小写角色不是同一套字符串。
+
+健康检查（`/primary`、`/replica`、`/health`、`/liveness`、`/sync`、`/async`、`/cluster`、`/patroni`、`/metrics`、`/history`）不要求认证。`/switchover`、`/failover`、`/restart`、`/reinitialize`、`/config` 在 YAML 里设置了 `restapi.username` 时要求 HTTP Basic Auth。Docker 入口默认用户名 `admin`、密码 `secret`。
 
 ### Primary 检查
 
@@ -110,6 +111,9 @@ curl -s http://localhost:8008/metrics
 # HELP pg_ha_node_role Current role of this node
 # TYPE pg_ha_node_role gauge
 pg_ha_node_role{role="primary"} 1
+# HELP pg_ha_pg_state Current PostgreSQL state (1 = active for the labeled state)
+# TYPE pg_ha_pg_state gauge
+pg_ha_pg_state{state="running"} 1
 # HELP pg_ha_replication_lag_bytes Replication lag in bytes
 # TYPE pg_ha_replication_lag_bytes gauge
 pg_ha_replication_lag_bytes 0
@@ -119,16 +123,18 @@ pg_ha_timeline 1
 # HELP pg_ha_dcs_last_seen_seconds Seconds since last successful DCS communication
 # TYPE pg_ha_dcs_last_seen_seconds gauge
 pg_ha_dcs_last_seen_seconds 2.345
-# HELP pg_ha_failsafe_active Whether failsafe mode is currently active
+# HELP pg_ha_failsafe_active Whether failsafe mode is currently active (1 = active)
 # TYPE pg_ha_failsafe_active gauge
 pg_ha_failsafe_active 0
-# HELP pg_ha_pending_restart Whether a PostgreSQL restart is pending
+# HELP pg_ha_pending_restart Whether a PostgreSQL restart is pending (1 = pending)
 # TYPE pg_ha_pending_restart gauge
 pg_ha_pending_restart 0
-# HELP pg_ha_is_paused Whether the cluster is in pause mode
+# HELP pg_ha_is_paused Whether the cluster is in pause mode (1 = paused)
 # TYPE pg_ha_is_paused gauge
 pg_ha_is_paused 0
 ```
+
+`pg_ha_failsafe_active` 会输出，但进程启动后没有代码更新它，数值保持 `0`。`failsafe_mode` 写入 DCS 也不会打开 Failsafe。不要按这个指标告警。见 [TODO #4](TODO.md)。
 
 ---
 
@@ -148,19 +154,26 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
 curl -u admin:secret -X POST http://localhost:8008/switchover \
   -H 'Content-Type: application/json' \
   -d '{"leader": "node1"}'
+
+# 计划执行：带 scheduled_at（ISO 8601）时只记在本进程内存里
+curl -u admin:secret -X POST http://localhost:8008/switchover \
+  -H 'Content-Type: application/json' \
+  -d '{"leader": "node1", "candidate": "node2", "scheduled_at": "2026-10-17T01:00:00Z"}'
 ```
 
-响应：
+立即 switchover 的响应：
 
 ```json
-{"status": "Accepted", "message": "Switchover scheduled: node1 → node2"}
+{"status": "accepted", "message": "Switchover initiated, leader lock released"}
 ```
 
-不合格候选（sync 开启且不在 `/sync`）示例：
+带 `scheduled_at` 时 HTTP 200，`message` 为 `Switchover scheduled`（请求留在本进程内存，重启即丢失）。`status` 一律小写：`accepted`、`rejected`、`error`。不合格候选（sync 开启且不在 `/sync`）返回 HTTP 409：
 
 ```json
 {"status": "rejected", "message": "Candidate 'node3' is not a synchronous standby (sync mode requires /sync membership)"}
 ```
+
+候选不存在、带 `nofailover` 或不在 Running，同样是 409。
 
 **取消已计划的 switchover：**
 
@@ -168,31 +181,33 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
 curl -u admin:secret -X DELETE http://localhost:8008/switchover
 ```
 
-**Switchover 流程：**
+**立即 Switchover 在发起节点上的动作**（没有先跑 CHECKPOINT；CHECKPOINT 只在进程收到 SIGTERM/SIGINT 的停机路径里）：
+
+1. 校验候选（含同步复制资格）
+2. 把 `{leader, candidate}` 写入 DCS `/failover`
+3. 删除本节点 leader lock
+4. `pg_ctl stop -m fast`，角色改为 Replica
+5. 写入 `standby.signal`，并把 `postgresql.auto.conf` 的 `primary_conninfo` 指到候选
 
 ```mermaid
 sequenceDiagram
     participant Admin as 运维人员
-    participant API as REST API (node1)
-    participant HA as HA Loop (node1)
-    participant PG1 as PG Primary (node1)
+    participant API as REST API
+    participant HA as HA Loop（当前主）
     participant DCS as Raft DCS
-    participant PG2 as PG Replica (node2)
+    participant New as 候选节点
 
-    Admin->>API: POST /switchover {leader:node1, candidate:node2}
+    Admin->>API: POST /switchover {leader, candidate}
     API->>HA: ManagementCommand::Switchover
-    Note over HA: sync 开启时校验 candidate ∈ /sync<br/>不合格 → 409，停止
-    HA->>PG1: CHECKPOINT
-    HA->>DCS: write failover key {leader:node1, candidate:node2}
-    HA->>DCS: release leader lock
-    Note over DCS: Leader Lock 释放
-    PG2->>DCS: get_cluster() → unlocked + failover key
-    Note over PG2: 再校验自身 sync 资格后才抢锁
-    PG2->>DCS: attempt_to_acquire_leader()
-    PG2->>PG2: pg_ctl promote
-    Note over PG2: 成为新 Primary
-    PG1->>DCS: get_cluster() → leader=node2
-    PG1->>PG1: rejoin_as_replica(node2)
+    Note over HA: sync 开启时 candidate 必须属于 /sync<br/>否则 409，不写 key、不 demote
+    HA->>DCS: 写入 /failover
+    HA->>DCS: 删除 leader lock
+    HA->>HA: pg_ctl stop -m fast，写 standby.signal
+    API-->>Admin: 200 accepted，leader lock released
+    New->>DCS: 读到未持锁 + failover key
+    Note over New: 再校验自身 sync 资格后才抢锁
+    New->>DCS: attempt_to_acquire_leader()
+    New->>New: pg_ctl promote
 ```
 
 ---
@@ -215,10 +230,10 @@ curl -u admin:secret -X POST http://localhost:8008/failover \
   -d '{}'
 ```
 
-响应：
+响应（HTTP 200）：
 
 ```json
-{"status": "Accepted", "message": "Failover initiated, candidate: node2"}
+{"status": "accepted", "message": "Failover request submitted"}
 ```
 
 > ⚠️ **注意**：
@@ -302,7 +317,6 @@ curl -u admin:secret -X PUT http://localhost:8008/config \
     "ttl": 30,
     "retry_timeout": 10,
     "maximum_lag_on_failover": 1048576,
-    "failsafe_mode": true,
     "postgresql": {
       "parameters": {
         "work_mem": "64MB",
@@ -319,7 +333,9 @@ curl -u admin:secret -X PUT http://localhost:8008/config \
 | HA 参数 | 下一 cycle 立即应用 | `loop_wait`, `ttl`, `pause` |
 | 同步复制参数 | Primary 下一 cycle：改 PG + 写 DCS `/sync` | `synchronous_mode`, `synchronous_mode_strict`, `synchronous_node_count` |
 | PG reload 参数 | 自动执行 `pg_ctl reload` | `work_mem`, `effective_cache_size` |
-| PG restart 参数 | 设置 `pending_restart` 标志 | `max_connections`, `shared_buffers` |
+| PG restart 参数 | 设置 `pending_restart` 标志，不自动重启 | `max_connections`, `shared_buffers`, `wal_level`, `max_wal_senders` |
+| `failsafe_mode` | 会写入 DCS `/config`，HA 循环不读取 | 见 [TODO #4](TODO.md) |
+| `standby_cluster` | 下一 cycle：持锁节点改为跟随远端 | 见下文「Standby cluster」 |
 
 对于需要 restart 的参数，需手动执行：
 
@@ -494,10 +510,32 @@ bootstrap:
 
 ### 当前范围与限制
 
-- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（Priority 模式）、节点变动时自动更新、发布 DCS `/sync`、`/sync` `/async` 健康检查端点、Failover / Switchover 时强制 `/sync` 成员资格（不在名单中的 candidate 返回 409；名单为空时不自动晋升）
+- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（HA 循环固定用 Priority / `FIRST N`）、节点变动时自动更新、发布 DCS `/sync`、`/sync` `/async` 健康检查、Failover / Switchover 时强制 `/sync` 成员资格
 - 尚未实现：
-  - Quorum 模式（`ANY N`）的动态配置入口（代码支持但 API 未暴露模式切换）
-  - `max_lag_on_syncnode` 过滤（配置项存在但 lag 计算为占位实现）
+  - Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但运行路径没有配置项把它选中
+  - `max_lag_on_syncnode`：`SyncManager` 留了过滤入口，lag 比较仍是占位，HA 循环也不调用 `set_max_lag`
+
+---
+
+## Standby cluster
+
+把下面的对象 PATCH 进 `/config` 后，持有 leader lock 的节点不再把自己提升成可写 Primary，而是作为 standby leader 从远端 PostgreSQL 拉 WAL。本地副本仍从这台 standby leader 复制。
+
+```bash
+curl -u admin:secret -X PATCH http://localhost:8008/config \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "standby_cluster": {
+      "host": "10.1.0.10",
+      "port": 5432,
+      "primary_slot_name": "pgha_dr"
+    }
+  }'
+```
+
+可选字段：`restore_command`、`create_replica_methods`。复制用户和密码用本节点 YAML 里的 `postgresql.replication`，不会写进这份动态配置。
+
+`Ha::cascade_promote` 能删掉 `standby_cluster` 并 promote，但没有对应的 REST 或 `pg-ha-ctl` 子命令。健康检查里有 `GET /standby-leader`（200 表示本节点是 standby leader）。
 
 ---
 
@@ -516,13 +554,14 @@ kill -SIGTERM $(pidof pg-ha)
 docker stop pg-ha-node1
 ```
 
-pg-ha 收到 SIGTERM 后自动执行：
-1. 停止 HA 循环
-2. 如果是 Leader：CHECKPOINT → 释放 Leader Lock
-3. `pg_ctl stop -m fast` 停止 PostgreSQL
-4. 进程退出
+pg-ha 收到 SIGTERM 或 SIGINT 后：
 
-其他节点会在 1-2 秒内检测到 Leader Lock 释放并完成故障转移。
+1. `tokio::select!` 结束，API 和 Proxy 不再 accept
+2. 等待 `shutdown.drain_timeout_secs`（默认 30 秒）。这只是 sleep，不会主动关掉已有 TCP
+3. 若本节点持有 leader lock：`CHECKPOINT`，然后删除 leader lock
+4. `pg_ctl stop -m fast`
+
+锁删除成功后，其他节点在各自下一个 HA cycle（不超过 `loop_wait`）里可以选举。删除失败则要等到 lock TTL。systemd 的 `TimeoutStopSec` 需要盖住 drain、CHECKPOINT 和 `pg_ctl stop`，示例见部署指南（120 秒）。
 
 ### 计划维护操作顺序
 
@@ -670,7 +709,9 @@ sudo systemctl stop pg-ha  # 所有节点
 sudo -u pgha /usr/lib/postgresql/16/bin/pg_controldata \
   /var/lib/postgresql/16/data | grep "Latest checkpoint"
 
-# 3. 清除 Raft 数据（所有节点）
+# 3. 清除 Raft 数据（所有节点的 data_dir，默认 /var/lib/pg-ha/raft）
+#    目录里是 raft_log.wal、hard_state.json、state_machine.json、membership.json
+#    没有 log_entries.json
 sudo rm -rf /var/lib/pg-ha/raft/*
 
 # 4. 启动节点（Raft 会重新 bootstrap）
@@ -755,13 +796,21 @@ journalctl -u pg-ha --no-pager | jq 'select(.message | contains("failover") or c
 
 ### pg-ha-ctl CLI 工具
 
-```bash
-# 查看集群状态
-pg-ha-ctl --url http://localhost:8008 cluster
+CLI 只访问 REST。参数是 `--endpoint`（默认 `http://127.0.0.1:8008`），不是 `--url`。它**不发送** Basic Auth。Docker 和管理 YAML 默认开了认证时，`switchover` / `failover` / `restart` / `reinitialize` / `pause` / `resume` 会 401。`list` 打的是免认证的 `/patroni`，而且只打印这一台节点，不是 `/cluster` 的全体成员。
 
-# 查看节点详情
-pg-ha-ctl --url http://localhost:8008 status
+```bash
+pg-ha-ctl --endpoint http://localhost:8008 list
+pg-ha-ctl --endpoint http://localhost:8008 switchover --leader node1 --candidate node2
+pg-ha-ctl --endpoint http://localhost:8008 failover --candidate node2
+pg-ha-ctl --endpoint http://localhost:8008 restart
+pg-ha-ctl --endpoint http://localhost:8008 reinitialize
+pg-ha-ctl --endpoint http://localhost:8008 pause
+pg-ha-ctl --endpoint http://localhost:8008 resume
 ```
+
+`reinitialize` 对应 `POST /reinitialize`：拒绝在 leader 上执行；在副本上会 `pg_ctl stop -m immediate` 并删掉数据目录，下一个 HA cycle 再 clone。成功响应的 `message` 是 `Node reinitialized, will clone on next cycle`。
+
+`GET /history` 返回进程内历史数组。HA 循环目前不写入事件，所以线上通常是 `[]`。不要把它当成 failover 审计日志。
 
 ---
 
@@ -771,13 +820,15 @@ pg-ha-ctl --url http://localhost:8008 status
 
 | 指标 | Prometheus 名称 | 说明 |
 |------|----------------|------|
-| 节点角色 | `pg_ha_node_role` | 监控意外的角色变化 |
+| 节点角色 | `pg_ha_node_role` | 标签 `role`，当前角色为 1 |
+| PostgreSQL 状态 | `pg_ha_pg_state` | 标签 `state`（如 `running`） |
 | 复制延迟 | `pg_ha_replication_lag_bytes` | 延迟过高说明性能问题 |
 | DCS 可达性 | `pg_ha_dcs_last_seen_seconds` | 超过 TTL 说明 Raft 异常 |
 | Timeline | `pg_ha_timeline` | 变化说明发生了 failover |
-| Failsafe 模式 | `pg_ha_failsafe_active` | 激活说明 DCS 不可达 |
-| 待重启 | `pg_ha_pending_restart` | 需要手动操作 |
+| 待重启 | `pg_ha_pending_restart` | 需要手动 `POST /restart` |
 | 暂停模式 | `pg_ha_is_paused` | 自动 failover 已禁用 |
+
+`pg_ha_failsafe_active` 有输出，但 agent 不更新，不能当告警条件。
 
 ### 告警阈值建议
 
@@ -811,15 +862,6 @@ groups:
           severity: critical
         annotations:
           summary: "pg-ha 无法与 Raft DCS 通信超过 15s"
-
-      # Failsafe 模式激活
-      - alert: PgHaFailsafeActive
-        expr: pg_ha_failsafe_active == 1
-        for: 10s
-        labels:
-          severity: critical
-        annotations:
-          summary: "pg-ha failsafe 模式已激活，集群可能处于脑裂风险"
 
       # 非预期 Timeline 变化（发生了 failover）
       - alert: PgHaTimelineChanged
@@ -856,8 +898,9 @@ groups:
 2. **复制延迟时间线**：`pg_ha_replication_lag_bytes` 按节点分组
 3. **DCS 延迟**：`pg_ha_dcs_last_seen_seconds` 按节点分组
 4. **Timeline 变化**：`pg_ha_timeline` 按节点分组，阶梯图
-5. **Failover 历史**：通过 `GET /history` 获取事件列表
-6. **节点健康状态**：`pg_ha_pg_state` 各节点的运行状态
+5. **节点健康状态**：`pg_ha_pg_state`
+
+`GET /history` 目前不会积累 failover 事件，不要做「切换历史」面板。
 
 ### Prometheus Scrape 配置
 
