@@ -1,10 +1,11 @@
 //! Election logic: unhealthy cluster processing, healthiest node determination,
 //! stale primary detection, and failover key / designated candidate handling.
 
-use tracing::info;
+use tracing::{error, info};
 
 use crate::cluster::SyncState;
 
+use super::identity::{ElectionStance, PgIdentity, election_stance};
 use super::{CycleResult, Ha};
 
 /// Whether `name` may acquire the leader lock under current sync settings.
@@ -39,12 +40,34 @@ impl Ha {
             return CycleResult::Follower("no action in pause mode (cluster has no leader)".into());
         }
 
+        // ─── May this node take part at all? (see `identity`) ───
+        let identity = self.pg_identity();
+        match election_stance(identity) {
+            ElectionStance::Participate => {}
+            ElectionStance::StandAside => {
+                error!(
+                    "PostgreSQL is in recovery pg-ha did not create; not taking part in the \
+                     election and not rewinding it. Operator action required"
+                );
+                let _ = self.touch_member().await;
+                return CycleResult::Error(
+                    "PostgreSQL in unmanaged recovery; not taking part in the election".into(),
+                );
+            }
+            ElectionStance::Wait => {
+                let _ = self.touch_member().await;
+                return CycleResult::Follower(format!(
+                    "PostgreSQL is {}; not taking part in the election this cycle",
+                    identity.describe()
+                ));
+            }
+        }
+
         // ─── Stale primary detection ───
-        // If PG is running without standby.signal AND we're not the healthiest node,
+        // If PG is observed as a primary AND we're not the healthiest node,
         // this is a former primary that restarted after failover. It needs to rejoin
         // as a replica even though we can't see the new leader in DCS yet.
-        if self.postgresql.is_running()
-            && !self.has_standby_signal()
+        if identity == PgIdentity::Primary
             && !self.is_healthiest_node()
             && !self.cluster.members.is_empty()
         {
@@ -143,9 +166,9 @@ impl Ha {
                 Some(candidate) => CycleResult::Follower(format!(
                     "deferring to designated candidate ({candidate})"
                 )),
-                None => CycleResult::Follower(
-                    "not the healthiest node, waiting for election".into(),
-                ),
+                None => {
+                    CycleResult::Follower("not the healthiest node, waiting for election".into())
+                }
             }
         }
     }
@@ -277,7 +300,11 @@ mod sync_failover_tests {
             true,
             Some(&sync("node1", Some("*")))
         ));
-        assert!(!sync_failover_allowed("*", true, Some(&sync("node1", Some("*")))));
+        assert!(!sync_failover_allowed(
+            "*",
+            true,
+            Some(&sync("node1", Some("*")))
+        ));
     }
 
     #[test]

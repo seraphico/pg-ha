@@ -27,6 +27,9 @@ mod commands;
 pub(crate) mod election;
 mod follow;
 mod helpers;
+pub(crate) mod identity;
+
+use identity::{LeaderAction, PgIdentity};
 
 /// Result of a single HA cycle, used for logging
 #[derive(Debug)]
@@ -158,6 +161,13 @@ impl Ha {
             return self.handle_postgres_not_running().await;
         }
 
+        // Step 4b: Observe what PostgreSQL is right now. Every decision below
+        // that depends on "am I a primary" uses this observation, never the
+        // remembered role (see `identity`).
+        self.postgresql.observe_recovery().await;
+        let role = identity::reconcile_role(self.postgresql.role().clone(), self.pg_identity());
+        self.postgresql.set_role(role);
+
         // Step 5: Main decision branch
         if self.cluster.is_unlocked() {
             self.process_unhealthy_cluster().await
@@ -226,38 +236,9 @@ impl Ha {
             return self.enforce_standby_leader_role().await;
         }
 
-        if self.postgresql.is_primary() {
-            // Touch member to update heartbeat
-            let _ = self.touch_member().await;
-            self.enforce_synchronous_replication().await;
-            CycleResult::Leader(format!(
-                "no action. I am ({}), the leader with the lock",
-                self.config.name
-            ))
-        } else if self.postgresql.is_running() {
-            // PG is running but we're not yet primary.
-            // Check if PG is in standby/recovery mode (standby.signal present) — need to promote.
-            if self.has_standby_signal() {
-                info!("Promoting PostgreSQL from standby to primary (won leader election)");
-
-                match self.postgresql.promote().await {
-                    Ok(()) => {
-                        self.postgresql.set_role(MemberRole::Primary);
-                        let _ = self.touch_member().await;
-                        self.enforce_synchronous_replication().await;
-                        info!("PostgreSQL promoted to primary successfully");
-                        CycleResult::Leader(format!(
-                            "promoted to primary. I am ({}), the leader with the lock",
-                            self.config.name
-                        ))
-                    }
-                    Err(e) => {
-                        error!("pg_ctl promote failed: {e}");
-                        CycleResult::Error(format!("Promote failed: {e}"))
-                    }
-                }
-            } else {
-                // PG is running as a standalone primary (e.g., just bootstrapped via initdb)
+        let identity = self.pg_identity();
+        match identity::leader_action(identity) {
+            LeaderAction::Hold => {
                 self.postgresql.set_role(MemberRole::Primary);
                 let _ = self.touch_member().await;
                 self.enforce_synchronous_replication().await;
@@ -266,10 +247,114 @@ impl Ha {
                     self.config.name
                 ))
             }
-        } else {
-            // PG not running — this shouldn't happen in enforce_primary_role
-            CycleResult::Error("PostgreSQL not running while trying to enforce primary role".into())
+            LeaderAction::Promote => self.promote_and_confirm().await,
+            LeaderAction::Relinquish => self.relinquish_unmanaged_recovery().await,
+            LeaderAction::Wait => {
+                let _ = self.touch_member().await;
+                CycleResult::Error(format!(
+                    "holding the leader lock but PostgreSQL is {}; not acting as primary this cycle",
+                    identity.describe()
+                ))
+            }
         }
+    }
+
+    /// Identity of the local PostgreSQL from this cycle's observation.
+    fn pg_identity(&self) -> PgIdentity {
+        PgIdentity::classify(
+            self.postgresql.observed_in_recovery(),
+            self.has_standby_signal(),
+        )
+    }
+
+    /// Member state to advertise in DCS and the REST API (see
+    /// [`identity::advertised_state`]).
+    pub fn advertised_state(&self) -> crate::cluster::MemberState {
+        identity::advertised_state(
+            self.postgresql.is_running(),
+            self.postgresql.state(),
+            self.pg_identity(),
+        )
+    }
+
+    /// Promote a standby pg-ha configured, then confirm by observation.
+    ///
+    /// `pg_ctl promote` succeeding is not enough to claim primary: the role
+    /// becomes `Primary` only after `pg_is_in_recovery()` returns false.
+    async fn promote_and_confirm(&mut self) -> CycleResult {
+        info!("Promoting PostgreSQL from standby to primary (holding the leader lock)");
+        if let Err(e) = self.postgresql.promote().await {
+            error!("pg_ctl promote failed: {e}");
+            return CycleResult::Error(format!("Promote failed: {e}"));
+        }
+
+        self.postgresql.observe_recovery().await;
+        let identity = self.pg_identity();
+        if identity != PgIdentity::Primary {
+            error!(
+                "pg_ctl promote reported success but PostgreSQL is {}",
+                identity.describe()
+            );
+            let _ = self.touch_member().await;
+            return CycleResult::Error(format!(
+                "promote reported success but PostgreSQL is {}; not acting as primary",
+                identity.describe()
+            ));
+        }
+
+        self.postgresql.set_role(MemberRole::Primary);
+        let _ = self.touch_member().await;
+        self.enforce_synchronous_replication().await;
+        info!("PostgreSQL promoted to primary and confirmed out of recovery");
+        CycleResult::Leader(format!(
+            "promoted to primary. I am ({}), the leader with the lock",
+            self.config.name
+        ))
+    }
+
+    /// The lock holder is in a recovery pg-ha did not create: give the lock
+    /// back so a node pg-ha manages can take over, and leave this node to the
+    /// operator. Never promote it: nothing proves it should become primary.
+    ///
+    /// In pause mode the lock is kept (W1: no automatic failover), but the
+    /// node still does not claim primary.
+    async fn relinquish_unmanaged_recovery(&mut self) -> CycleResult {
+        let cause = if self.has_recovery_signal() {
+            "recovery.signal present (archive or point-in-time recovery)"
+        } else {
+            "neither standby.signal nor recovery.signal present"
+        };
+
+        if self.is_paused {
+            warn!(
+                cause,
+                "Holding the leader lock while PostgreSQL is in recovery pg-ha did not create; \
+                 paused, so keeping the lock but not acting as primary"
+            );
+            let _ = self.touch_member().await;
+            return CycleResult::Error(format!(
+                "holding the leader lock in unmanaged recovery ({cause}); paused, not acting as primary"
+            ));
+        }
+
+        error!(
+            cause,
+            "Holding the leader lock while PostgreSQL is in recovery pg-ha did not create; \
+             releasing the lock. Operator action required: finish the recovery and promote \
+             manually, or recreate standby.signal to hand the node back to pg-ha"
+        );
+        if let Some(leader) = self.cluster.leader.clone() {
+            match self.dcs.delete_leader(&leader).await {
+                Ok(true) => info!("Released leader lock"),
+                Ok(false) => warn!("Leader lock was not ours to release"),
+                Err(e) => warn!("Failed to release leader lock, will retry next cycle: {e}"),
+            }
+        }
+        self.is_leader = false;
+        let _ = self.touch_member().await;
+        CycleResult::Error(format!(
+            "released leader lock: PostgreSQL in unmanaged recovery ({cause}); operator action required"
+        ))
     }
 
     /// Apply synchronous replication settings when this node is the primary.
@@ -361,9 +446,6 @@ impl Ha {
                 }
             };
 
-        // Ensure role is set to StandbyLeader
-        self.postgresql.set_role(MemberRole::StandbyLeader);
-
         // Verify PostgreSQL is replicating from the remote source
         let repl_user = &self.config.postgresql.replication.username.clone();
         let repl_pass = self.config.postgresql.replication.password.clone();
@@ -377,6 +459,8 @@ impl Ha {
 
         match follow_ok {
             Ok(true) => {
+                // Only a server observed in recovery is a standby leader.
+                self.postgresql.set_role(MemberRole::StandbyLeader);
                 let _ = self.touch_member().await;
                 CycleResult::Leader(format!(
                     "no action. I am ({}), the standby leader replicating from {}:{}",
@@ -481,7 +565,12 @@ impl Ha {
             let mut bootstrap = Bootstrap::new(&self.config, &mut self.postgresql, &self.dcs);
             match bootstrap.bootstrap_new_cluster().await {
                 BootstrapResult::InitializedAsPrimary => {
-                    self.postgresql.set_role(MemberRole::Primary);
+                    // A fresh initdb starts out of recovery; confirm before
+                    // recording the role, like every other path to Primary.
+                    self.postgresql.observe_recovery().await;
+                    if self.postgresql.is_observed_primary() {
+                        self.postgresql.set_role(MemberRole::Primary);
+                    }
                     match self.dcs.attempt_to_acquire_leader().await {
                         Ok(true) => {
                             self.is_leader = true;
@@ -1067,7 +1156,8 @@ mod tests {
     }
 
     fn with_fake_running_pg(config: &Config, label: &str) -> (Postgresql, PathBuf) {
-        let data_dir = std::env::temp_dir().join(format!("pg-ha-test-{label}-{}", std::process::id()));
+        let data_dir =
+            std::env::temp_dir().join(format!("pg-ha-test-{label}-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&data_dir);
         std::fs::write(
             data_dir.join("postmaster.pid"),
@@ -1219,6 +1309,9 @@ mod tests {
         config.postgresql.data_dir = data_dir.clone();
         std::fs::write(data_dir.join("standby.signal"), "").unwrap();
         let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+        // process_unhealthy_cluster is called directly, skipping run_cycle's
+        // observation step: record what a running standby would report.
+        ha.postgresql.set_observed_in_recovery(Some(true));
 
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
             synchronous_mode: Some(true),
@@ -1226,10 +1319,7 @@ mod tests {
         });
         ha.cluster = Cluster {
             leader: None,
-            members: vec![
-                running_member("node2", 1000),
-                running_member("node3", 9999),
-            ],
+            members: vec![running_member("node2", 1000), running_member("node3", 9999)],
             sync_state: Some(SyncState {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
@@ -1277,6 +1367,243 @@ mod tests {
         // PG is not running, so we'll try to start it or report it's down
         // The key assertion: we should NOT try to become leader
         assert!(!ha.is_leader());
+    }
+
+    // ─────────────────── Identity-driven decisions ───────────────────
+    // Each decision branch is driven by the recovery observation, never by
+    // the recorded role. The fake server listens on port 1, so no test can
+    // reach (or ALTER) a real local PostgreSQL.
+
+    fn identity_test_ha(
+        name: &str,
+        label: &str,
+        dcs: Arc<MockDcs>,
+        in_recovery: Option<bool>,
+        standby_signal: bool,
+    ) -> (Ha, PathBuf) {
+        let mut config = test_config(name);
+        config.postgresql.port = 1;
+        let (pg, data_dir) = with_fake_running_pg(&config, label);
+        config.postgresql.data_dir = data_dir.clone();
+        let _ = std::fs::remove_file(data_dir.join("standby.signal"));
+        if standby_signal {
+            std::fs::write(data_dir.join("standby.signal"), "").unwrap();
+        }
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+        ha.postgresql.set_observed_in_recovery(in_recovery);
+        (ha, data_dir)
+    }
+
+    fn leader_cluster(leader: &str, other: &str) -> Cluster {
+        Cluster {
+            leader: Some(Leader {
+                name: leader.to_string(),
+                version: 1,
+            }),
+            members: vec![running_member(leader, 100), running_member(other, 50)],
+            ..Default::default()
+        }
+    }
+
+    fn lock_held_by(dcs: &MockDcs) -> Option<String> {
+        dcs.leader_held_by.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn test_lock_holder_in_unmanaged_recovery_releases_lock() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "id-relinquish", dcs.clone(), Some(true), false);
+        ha.cluster = leader_cluster("test_node", "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("released leader lock")),
+            "got: {result}"
+        );
+        assert_eq!(lock_held_by(&dcs), None, "lock must be released");
+        assert!(!ha.is_leader());
+        assert_ne!(ha.postgresql().role(), &MemberRole::Primary);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_lock_holder_in_unmanaged_recovery_keeps_lock_when_paused() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "id-relinquish-paused",
+            dcs.clone(),
+            Some(true),
+            false,
+        );
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_paused = true;
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("paused")),
+            "got: {result}"
+        );
+        assert_eq!(
+            lock_held_by(&dcs).as_deref(),
+            Some("test_node"),
+            "W1: no automatic failover in pause mode"
+        );
+        assert_ne!(ha.postgresql().role(), &MemberRole::Primary);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_lock_holder_with_unobserved_state_does_not_claim_primary() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "id-leader-unknown", dcs.clone(), None, false);
+        ha.cluster = leader_cluster("test_node", "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("not acting as primary")),
+            "got: {result}"
+        );
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        assert_ne!(ha.postgresql().role(), &MemberRole::Primary);
+        assert_eq!(
+            ha.pg_identity(),
+            PgIdentity::Unknown {
+                has_standby_signal: false
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_lock_holder_observed_primary_holds() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "id-leader-hold",
+            dcs.clone(),
+            Some(false),
+            false,
+        );
+        ha.cluster = leader_cluster("test_node", "node2");
+        // Recorded role is stale (e.g. right after an agent restart).
+        ha.postgresql.set_role(MemberRole::Uninitialized);
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(matches!(result, CycleResult::Leader(_)), "got: {result}");
+        assert_eq!(ha.postgresql().role(), &MemberRole::Primary);
+        assert_eq!(ha.pg_identity(), PgIdentity::Primary);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_follower_in_unmanaged_recovery_is_left_alone() {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir) = identity_test_ha("node2", "id-follow-handoff", dcs, Some(true), false);
+        ha.cluster = leader_cluster("node1", "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("unmanaged recovery")),
+            "got: {result}"
+        );
+        // Not stopped or rewound: a stop would have invalidated the observation.
+        assert_eq!(ha.postgresql().observed_in_recovery(), Some(true));
+        assert!(
+            !dir.join("standby.signal").exists(),
+            "must not rewrite config"
+        );
+        assert_eq!(ha.pg_identity(), PgIdentity::UnmanagedRecovery);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_follower_unobserved_with_standby_signal_waits() {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir) = identity_test_ha("node2", "id-follow-wait", dcs, None, true);
+        ha.cluster = leader_cluster("node1", "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m.contains("waiting")),
+            "got: {result}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_follower_unobserved_without_standby_signal_is_fenced() {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir) = identity_test_ha("node2", "id-follow-fence", dcs, None, false);
+        ha.cluster = leader_cluster("node1", "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        // No pg_ctl in the test environment, so the stop itself may fail; what
+        // matters is that the fence (a stop, not a rewind) was chosen.
+        let fenced = match &result {
+            CycleResult::Follower(m) => m.starts_with("stopped PostgreSQL"),
+            CycleResult::Error(m) => m.starts_with("Fence stop failed"),
+            _ => false,
+        };
+        assert!(fenced, "got: {result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_unmanaged_recovery_stands_aside_in_election() {
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "id-elect-aside",
+            dcs.clone(),
+            Some(true),
+            false,
+        );
+        // Only member, so it would be the healthiest node.
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![running_member("test_node", 100)],
+            ..Default::default()
+        };
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("not taking part")),
+            "got: {result}"
+        );
+        assert_eq!(lock_held_by(&dcs), None, "must not acquire the lock");
+        assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_unobserved_node_skips_election() {
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir) = identity_test_ha("test_node", "id-elect-wait", dcs.clone(), None, true);
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![running_member("test_node", 100)],
+            ..Default::default()
+        };
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m.contains("not taking part")),
+            "got: {result}"
+        );
+        assert_eq!(lock_held_by(&dcs), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ─────────────────── Bug Condition Exploration Tests ───────────────────
@@ -1461,10 +1788,7 @@ mod tests {
                 name: "node1".into(),
                 version: 1,
             }),
-            members: vec![
-                running_member("node2", 1000),
-                running_member("node3", 1000),
-            ],
+            members: vec![running_member("node2", 1000), running_member("node3", 1000)],
             sync_state: Some(SyncState {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
@@ -1508,10 +1832,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
-            members: vec![
-                running_member("node2", 1000),
-                running_member("node3", 1000),
-            ],
+            members: vec![running_member("node2", 1000), running_member("node3", 1000)],
             sync_state: Some(SyncState {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
@@ -1552,10 +1873,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
-            members: vec![
-                running_member("node2", 1000),
-                running_member("node3", 1000),
-            ],
+            members: vec![running_member("node2", 1000), running_member("node3", 1000)],
             sync_state: Some(SyncState {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),

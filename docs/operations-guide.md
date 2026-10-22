@@ -744,6 +744,28 @@ sudo systemctl restart pg-ha
 curl -s http://localhost:8008/cluster | jq .
 ```
 
+### 场景 7：节点处于非 pg-ha 造成的恢复
+
+pg-ha 只 promote 它自己配置的备库（有 `standby.signal`）。PG 在 recovery 却没有 `standby.signal` 时，pg-ha 不 promote、不 rewind、不让它参选；如果它持有 leader lock，会释放锁让其他节点接管（pause 模式下保留锁，但 `/primary` 仍为 503）。规则见 [invariants.md](invariants.md) 1a 节。
+
+现象：
+
+- 日志 `ERROR ... in recovery pg-ha did not create ... Operator action required`，并注明 `recovery.signal present` 或 `neither standby.signal nor recovery.signal present`
+- 该节点 `state` 为 `unknown`，`/primary`、`/replica` 均为 503，`/health` 仍为 200
+
+处理：
+
+```bash
+# 情况 A：有 recovery.signal —— 有人在做归档 / PITR 恢复
+#   完成恢复后由运维决定：promote 后作为独立实例处理，或清空数据目录让 pg-ha 重新 clone
+# 情况 B：两个文件都没有 —— standby.signal 在运行中被删
+#   重新创建它，把节点交还 pg-ha；下一轮即恢复跟随
+sudo -u postgres touch /var/lib/postgresql/16/data/standby.signal
+
+# 确认
+curl -s http://localhost:8008/patroni | jq '{state, role, pg_in_recovery}'
+```
+
 ---
 
 ## 调试技巧
@@ -813,6 +835,8 @@ journalctl -u pg-ha --no-pager | jq 'select(.message | contains("failover") or c
 | `pg_rewind failed` | WAL 不可用或无 data-checksums | 检查 `wal_keep_size`，确认 initdb 使用了 `--data-checksums` |
 | `DCS write failed` | Raft 集群无 leader | 检查 Raft 节点数是否满足多数派 |
 | `Raft storage persistence failed` | Raft 数据目录磁盘满或 IO 错误，本节点 Raft 已停止 | 见「场景 6」，修复磁盘后重启 pg-ha |
+| `unmanaged recovery` / `operator action required` | PG 在 recovery 但没有 `standby.signal`（`recovery.signal` 归档恢复，或 `standby.signal` 被删） | 见「场景 7」 |
+| 成员 `state` 为 `unknown`，进程却在运行 | 本轮未能观测 `pg_is_in_recovery()`，或处于非 pg-ha 造成的恢复 | 看 `GET /patroni` 的 `pg_in_recovery` 与日志；连续多轮则检查 PG 是否卡住 |
 | `PostgreSQL failed to start` | 数据目录权限、端口冲突 | 检查权限 `chmod 0700 PGDATA`、端口 `ss -tlnp` |
 | API 返回 `401 Unauthorized` | Basic Auth 凭证错误 | 检查配置的 username/password |
 | Proxy 6432 连不上 | Primary 不健康或 HA 未就绪 | 检查 `/primary` 端点 |

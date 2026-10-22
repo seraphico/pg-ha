@@ -126,25 +126,31 @@ impl StandbyCluster {
         // In a real implementation, we would read the current recovery config
         // and compare it to the expected conninfo. For now, we verify the
         // postgresql is running in recovery mode (as a standby should be).
-        if postgresql.is_running() {
-            // The standby leader should always be in recovery mode
-            // (replicating from remote). If it's a primary, something is wrong.
-            if postgresql.is_primary() {
+        if !postgresql.is_running() {
+            // PostgreSQL is not running — cannot verify
+            return Ok(false);
+        }
+        // The standby leader must be in recovery (replicating from remote).
+        // Decided from the observed recovery state, not from the recorded role.
+        match postgresql.observed_in_recovery() {
+            Some(true) => {
+                info!(
+                    "Standby leader confirmed in recovery, following remote {}:{}",
+                    standby_config.host, standby_config.port
+                );
+                Ok(true)
+            }
+            Some(false) => {
                 warn!(
                     "Standby leader is running as primary — needs reconfiguration to follow remote at {}:{}",
                     standby_config.host, standby_config.port
                 );
-                return Ok(false);
+                Ok(false)
             }
-            // PostgreSQL is in recovery mode — configuration is likely correct
-            info!(
-                "Standby leader confirmed replicating from remote {}:{}",
-                standby_config.host, standby_config.port
-            );
-            Ok(true)
-        } else {
-            // PostgreSQL is not running — cannot verify
-            Ok(false)
+            None => {
+                warn!("Standby leader recovery state not observed this cycle — cannot verify");
+                Ok(false)
+            }
         }
     }
 
@@ -177,7 +183,13 @@ impl StandbyCluster {
         // Step 2: Promote PostgreSQL
         postgresql.promote().await?;
 
-        // Step 3: Update role
+        // Step 3: Confirm by observation, then record the role
+        if postgresql.observe_recovery().await != Some(false) {
+            return Err(crate::Error::Postgres(
+                "pg_ctl promote reported success but PostgreSQL was not observed out of recovery"
+                    .into(),
+            ));
+        }
         postgresql.set_role(MemberRole::Primary);
 
         info!("Cascade promote completed — node is now a full primary");

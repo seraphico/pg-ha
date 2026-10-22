@@ -46,7 +46,7 @@ impl Ha {
             "name": self.config.name,
             "conn_url": conn_url,
             "api_url": format!("http://{}:{}", reachable_host, self.config.restapi.port),
-            "state": format!("{}", self.postgresql.state()),
+            "state": self.advertised_state(),
             "role": format!("{}", self.postgresql.role()),
         });
 
@@ -67,6 +67,17 @@ impl Ha {
             .postgresql
             .data_dir
             .join("standby.signal")
+            .exists()
+    }
+
+    /// Check if recovery.signal exists (targeted archive / point-in-time
+    /// recovery). pg-ha never writes it; used only to explain why a server is
+    /// in recovery pg-ha did not create.
+    pub(super) fn has_recovery_signal(&self) -> bool {
+        self.config
+            .postgresql
+            .data_dir
+            .join("recovery.signal")
             .exists()
     }
 

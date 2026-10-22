@@ -289,11 +289,10 @@ async fn main() -> anyhow::Result<()> {
                 // Update shared API state
                 app_state_clone.update(|s| {
                     s.role = ha.postgresql().role().clone();
-                    s.state = if ha.postgresql().is_running() {
-                        MemberState::Running
-                    } else {
-                        MemberState::Stopped
-                    };
+                    // Same derivation as the state published to DCS.
+                    s.state = ha.advertised_state();
+                    s.pg_running = ha.postgresql().is_running();
+                    s.pg_in_recovery = ha.postgresql().observed_in_recovery();
                     s.is_leader = ha.is_leader();
                     s.is_paused = ha.is_paused();
                     s.pending_restart = ha.pending_restart();
