@@ -72,15 +72,17 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 
 ## P1 — 高优先级改进
 
-### 3. Raft 日志增量持久化 — ✅ 写入路径已完成；失败处理仍开放
+### 3. Raft 日志增量持久化 — ✅ 已完成（含失败处理）
 
 **已实现**：`data_dir` 存在时，Raft 日志走 append-only [`WalWriter`](../crates/pg-ha-dcs/src/wal.rs)（`raft_log.wal`，bincode 记录，超过 4 MiB 压缩）。`hard_state.json`、`state_machine.json`、`membership.json` 仍是原子 JSON 写。不再把整份 log `BTreeMap` 序列化成 `log_entries.json`。
 
-**仍开放**（对应不变量 P4，状态为「目标」）：`wal_append_entries` / `wal_truncate_since` / `wal_purge_upto` 在写失败时只 `warn!`，不向 openraft 返回 `StorageError`。磁盘失败时内存日志可能已经前进。
+**失败处理**（不变量 P4，已持有）：WAL 与 JSON 落盘失败时，存储 trait 方法返回 `StorageError`，openraft 停止该节点的 Raft，不再把未落盘的投票、commit、日志当成已持久化。降级语义与恢复方式见 [invariants.md](invariants.md) 第 6 节。
+
+**后续可选优化**：目前仍是先改内存再写盘（WAL 压缩需要完整内存日志）。改为严格的先写盘、成功后再改内存，需要调整压缩的输入，不影响 P4 的成立。
 
 **相关文件**：
 
-- `crates/pg-ha-dcs/src/store.rs` — `wal_append_entries`、`wal_truncate_since`、`wal_purge_upto`
+- `crates/pg-ha-dcs/src/store.rs` — 持久化 helper 与存储 trait 方法
 - `crates/pg-ha-dcs/src/wal.rs` — `COMPACTION_THRESHOLD`
 
 ---
@@ -179,7 +181,6 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 |------|------|----------|
 | `crates/pg-ha-core/src/sync.rs`（lag 过滤） | `TODO: compute actual lag` | #2 剩余：`max_lag_on_syncnode` |
 | `crates/pg-ha-dcs/src/raft_dcs.rs`（`get_cluster`） | `TODO: read /failsafe key` | #4 |
-| `crates/pg-ha-dcs/src/store.rs`（三处 WAL 写） | 写失败应返回 `StorageError`，而不是只打日志 | #3 剩余 |
 
 ---
 

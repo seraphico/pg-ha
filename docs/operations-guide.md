@@ -719,6 +719,31 @@ sudo rm -rf /var/lib/pg-ha/raft/*
 sudo systemctl start pg-ha
 ```
 
+### 场景 6：Raft 数据目录写失败（磁盘满 / IO 错误）
+
+Raft 数据落盘失败时，该节点的 Raft 会停止，不会继续把未落盘的状态当成已提交。进程本身不退出。
+
+现象：
+
+- 日志出现 `ERROR Raft storage persistence failed (<对象> <动作>): <错误>`
+- 该节点所有 DCS 写失败（日志里续锁、`touch_member` 报错）；`/cluster` 显示的是停止那一刻的旧视图
+- 如果该节点当时持有 leader lock，下一次续锁失败后会停掉 PostgreSQL，其他节点按正常 failover 接管
+- 集群剩余多数派不受影响
+
+```bash
+# 1. 确认原因
+df -h /var/lib/pg-ha/raft
+journalctl -u pg-ha | grep "Raft storage persistence failed"
+
+# 2. 释放空间或修复磁盘
+
+# 3. 重启该节点的 pg-ha（Raft 不会自行恢复）
+sudo systemctl restart pg-ha
+
+# 4. 确认重新加入
+curl -s http://localhost:8008/cluster | jq .
+```
+
 ---
 
 ## 调试技巧
@@ -787,6 +812,7 @@ journalctl -u pg-ha --no-pager | jq 'select(.message | contains("failover") or c
 | `Failed to acquire leader lock` | 已有其他节点持有 Lock | 正常行为，检查 /cluster 确认 |
 | `pg_rewind failed` | WAL 不可用或无 data-checksums | 检查 `wal_keep_size`，确认 initdb 使用了 `--data-checksums` |
 | `DCS write failed` | Raft 集群无 leader | 检查 Raft 节点数是否满足多数派 |
+| `Raft storage persistence failed` | Raft 数据目录磁盘满或 IO 错误，本节点 Raft 已停止 | 见「场景 6」，修复磁盘后重启 pg-ha |
 | `PostgreSQL failed to start` | 数据目录权限、端口冲突 | 检查权限 `chmod 0700 PGDATA`、端口 `ss -tlnp` |
 | API 返回 `401 Unauthorized` | Basic Auth 凭证错误 | 检查配置的 username/password |
 | Proxy 6432 连不上 | Primary 不健康或 HA 未就绪 | 检查 `/primary` 端点 |

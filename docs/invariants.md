@@ -109,9 +109,16 @@
 | P1 | 进程崩溃重启后，从本地磁盘恢复的 Raft 日志与状态机，须能重建与崩溃前**已提交**语义一致的集群视图（未提交日志可丢，符合 Raft）。 | 持有 |
 | P2 | 日志存储实现从全量 JSON 改为 append-only WAL 等优化时，必须保持 P1 与对外 HA 语义不变（M2）。 | 持有 |
 | P3 | Failsafe：文档中的 `/failsafe` 与「重启后是否仍生效」必须一致。 | **待裁定** |
-| P4 | 本地持久化（含 WAL）若失败，不得长期呈现「内存/Raft 已成功、磁盘未成功」且无 degraded 语义。 | **目标** |
+| P4 | 本地持久化（含 WAL）若失败，不得长期呈现「内存/Raft 已成功、磁盘未成功」且无 degraded 语义。 | 持有 |
 
-**相关**：架构 Raft / DCS；`raft_log.wal` 与 `hard_state.json` 等；代码中 failsafe / WAL 写失败 TODO。
+**P4 的 degraded 语义**（`crates/pg-ha-dcs/src/store.rs`）：
+
+- 存储 trait 方法（`save_vote`、`save_committed`、`append_to_log`、`delete_conflict_logs_since`、`purge_logs_upto`、`apply_to_state_machine`、`install_snapshot`）在落盘失败时返回 `StorageError`，不再返回 `Ok`。openraft 因此不会把这次写当成已持久化去推进 commit 或应答客户端。
+- openraft 收到 `StorageError` 后停止该节点的 Raft core（`Fatal`），之后所有 Raft 写都失败。进程不退出，日志有 `ERROR Raft storage persistence failed (...)`。
+- 对 HA 的后果：`get_cluster` 读本地状态机，会返回冻结的旧视图，但所有改变身份的动作（抢锁、续锁）都要经过 Raft 写，因此该节点既不能成为 leader，也不能保持 leader；若它正持锁，下一次续锁失败即按 L5 停库降级。集群其余多数派继续服务。
+- 恢复需要人工：修复磁盘后重启 pg-ha。内存先于磁盘更新这一顺序未变（WAL 压缩需要完整内存日志），但分歧不会被报告为已持久化。
+
+**相关**：架构 Raft / DCS；`raft_log.wal` 与 `hard_state.json` 等；代码中 failsafe TODO。
 
 ---
 
@@ -158,7 +165,6 @@
 |----|---------|------|
 | Failsafe 持久化 | P3 | 架构列出 `/failsafe`；实现仍有「未读 key」类缺口 |
 | Member `conn_url` 含密码 | R3 | 落盘与最小密钥面目标冲突，需先裁定再改 |
-| WAL 写失败仅告警 | P4 | 与「提交成功」语义未完全闭合 |
 
 ---
 
@@ -166,5 +172,6 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-10-21 | P4 闭合为持有：Raft 存储落盘失败返回 `StorageError`，节点 Raft 停止而非继续推进；写明 degraded 语义与人工恢复方式 |
 | 2026-09-11 | S5 闭合为持有：sync 模式下 Failover/Switchover 强制 `/sync` 成员资格；空名单不晋升 |
 | 2026-07-18 | 初稿：从架构 / 运维文档抽取闭环不变量，并标注持有 / 目标 / 待裁定 |
