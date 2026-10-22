@@ -1440,9 +1440,14 @@ mod tests {
     /// **Property 2: Preservation** - PG Normal Query Completion
     /// **Validates: Requirements 3.1**
     ///
-    /// Verify that all four methods (health_check, is_in_recovery, wal_status,
-    /// checkpoint) follow the identical timeout pattern, ensuring consistent
-    /// preservation behavior across all PG query methods.
+    /// Verify that every method opening a PG connection (health_check,
+    /// is_in_recovery, wal_status, checkpoint, set_synchronous_standby_names, ...)
+    /// follows the identical timeout pattern, ensuring consistent preservation
+    /// behavior across all PG query methods.
+    ///
+    /// The check pairs connects with timeout-wrapped spawns instead of pinning a
+    /// fixed method count, so adding a new query method does not break it as long
+    /// as the new method follows the pattern.
     #[test]
     fn test_all_methods_follow_same_preservation_pattern() {
         let source = include_str!("postgresql.rs");
@@ -1458,20 +1463,22 @@ mod tests {
         let connect_pattern = "tokio_postgres::connect(&connstr, tokio_postgres::NoTls)";
         let spawn_timeout_pattern = "tokio::spawn(async move {\n            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection)";
 
-        // Count connect calls in production code (should be 4: health_check, is_in_recovery, wal_status, checkpoint)
         let connect_count = prod_code.matches(connect_pattern).count();
-        assert_eq!(
-            connect_count, 4,
-            "Expected exactly 4 PG connect calls (one per method). \
-             Each must follow the preservation pattern: connect → spawn with timeout → query via client."
+        let spawn_timeout_count = prod_code.matches(spawn_timeout_pattern).count();
+
+        // At least the original four query methods must still use this pattern.
+        assert!(
+            connect_count >= 4,
+            "Expected at least 4 PG connect calls (health_check, is_in_recovery, \
+             wal_status, checkpoint), found {connect_count}."
         );
 
-        // Count spawn+timeout patterns (should also be 4)
-        let spawn_timeout_count = prod_code.matches(spawn_timeout_pattern).count();
+        // Every connect must be paired with a timeout-wrapped connection task.
         assert_eq!(
-            spawn_timeout_count, 4,
-            "Expected exactly 4 spawn+timeout patterns (one per method). \
-             All connection methods must use identical timeout handling for consistent behavior."
+            connect_count, spawn_timeout_count,
+            "Found {connect_count} PG connect calls but {spawn_timeout_count} spawn+timeout \
+             patterns. Each method must follow the preservation pattern: \
+             connect → spawn with timeout → query via client."
         );
     }
 }
