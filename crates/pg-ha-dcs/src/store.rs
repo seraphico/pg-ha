@@ -882,9 +882,18 @@ mod tests {
         let inner = store.inner.read().await;
         let start = Instant::now();
         store.rewrite_wal(&inner).await;
-        store.persist_hard_state(&inner).await.expect("persist failed");
-        store.persist_state_machine(&inner).await.expect("persist failed");
-        store.persist_membership(&inner).await.expect("persist failed");
+        store
+            .persist_hard_state(&inner)
+            .await
+            .expect("persist failed");
+        store
+            .persist_state_machine(&inner)
+            .await
+            .expect("persist failed");
+        store
+            .persist_membership(&inner)
+            .await
+            .expect("persist failed");
         let total_duration = start.elapsed();
         drop(inner);
 
