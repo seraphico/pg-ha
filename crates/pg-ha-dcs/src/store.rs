@@ -16,12 +16,12 @@ use openraft::TokioRuntime;
 use openraft::entry::RaftPayload;
 use openraft::storage::{LogState, Snapshot};
 use openraft::{
-    BasicNode, Entry, LogId, RaftLogReader, RaftSnapshotBuilder, RaftStorage, SnapshotMeta,
-    StorageError, StoredMembership, Vote,
+    BasicNode, Entry, ErrorSubject, ErrorVerb, LogId, RaftLogReader, RaftSnapshotBuilder,
+    RaftStorage, SnapshotMeta, StorageError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::state_machine::{KvStateMachine, Request, Response};
 use crate::wal::{COMPACTION_THRESHOLD, PurgePayload, RecordType, TruncatePayload, WalWriter};
@@ -55,6 +55,36 @@ openraft::declare_raft_types!(
 
 pub type LogEntry = Entry<TypeConfig>;
 pub type Raft = openraft::Raft<TypeConfig>;
+
+// ─────────────────── Persistence error plumbing ───────────────────
+
+/// Flatten the result of a `spawn_blocking` disk write into one `io::Result`.
+///
+/// A panicked blocking task is reported as an I/O error so callers treat it
+/// the same way as a failed write.
+fn join_io(
+    result: Result<std::io::Result<()>, tokio::task::JoinError>,
+    what: &str,
+) -> std::io::Result<()> {
+    match result {
+        Ok(r) => r,
+        Err(e) => Err(std::io::Error::other(format!("{what} task panicked: {e}"))),
+    }
+}
+
+/// Convert a persistence failure into the `StorageError` openraft expects.
+///
+/// Returning this from a storage trait method tells openraft the write did NOT
+/// become durable, so it stops the node instead of acknowledging state that
+/// would be lost on restart (invariants P1 / P4).
+fn storage_err(
+    subject: openraft::ErrorSubject<NodeId>,
+    verb: openraft::ErrorVerb,
+    e: std::io::Error,
+) -> StorageError<NodeId> {
+    error!("Raft storage persistence failed ({subject:?} {verb:?}): {e}");
+    StorageError::from_io_error(subject, verb, e)
+}
 
 // ─────────────────── Persisted hard state (vote + committed) ───────────────────
 
@@ -223,39 +253,36 @@ impl MemStore {
 
     // ─────────────────── Persistence helpers ───────────────────
 
-    async fn persist_hard_state(&self, inner: &MemStoreInner) {
-        if let Some(dir) = &self.data_dir {
-            let hs = PersistedHardState {
-                vote: inner.vote,
-                committed: inner.committed,
-            };
-            let path = dir.join("hard_state.json");
-            let json = match serde_json::to_string(&hs) {
-                Ok(j) => j,
-                Err(e) => {
-                    warn!("Failed to serialize hard_state: {e}");
-                    return;
-                }
-            };
-            let result = tokio::task::spawn_blocking(move || {
-                Self::atomic_write_json(&path, json.as_bytes())
-            })
-            .await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("Failed to persist hard_state: {e}"),
-                Err(e) => warn!("persist_hard_state task panicked: {e}"),
-            }
-        }
+    /// Persist vote + committed to `hard_state.json`.
+    ///
+    /// Returns `Ok(())` without writing when the store is in-memory only.
+    async fn persist_hard_state(&self, inner: &MemStoreInner) -> std::io::Result<()> {
+        let Some(dir) = &self.data_dir else {
+            return Ok(());
+        };
+        let hs = PersistedHardState {
+            vote: inner.vote,
+            committed: inner.committed,
+        };
+        let path = dir.join("hard_state.json");
+        let json = serde_json::to_string(&hs)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let result =
+            tokio::task::spawn_blocking(move || Self::atomic_write_json(&path, json.as_bytes()))
+                .await;
+        join_io(result, "persist_hard_state")
     }
 
     /// Persist log mutations incrementally to the WAL.
     ///
-    /// TODO: after repeated WAL write failures, surface `StorageError` so Raft can react
-    /// instead of only logging warnings.
-    async fn wal_append_entries(&self, entries: Vec<LogEntry>, inner: &MemStoreInner) {
+    /// Returns `Ok(())` without writing when the store has no WAL (in-memory mode).
+    async fn wal_append_entries(
+        &self,
+        entries: Vec<LogEntry>,
+        inner: &MemStoreInner,
+    ) -> std::io::Result<()> {
         let Some(wal) = self.wal.clone() else {
-            return;
+            return Ok(());
         };
         let log = inner.log.clone();
         let last_purged = inner.last_purged;
@@ -277,18 +304,17 @@ impl MemStore {
         })
         .await;
 
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("Failed to append to WAL: {e}"),
-            Err(e) => warn!("WAL append task panicked: {e}"),
-        }
+        join_io(result, "WAL append")
     }
 
-    /// TODO: after repeated WAL write failures, surface `StorageError` so Raft can react
-    /// instead of only logging warnings.
-    async fn wal_truncate_since(&self, since_index: u64, inner: &MemStoreInner) {
+    /// Record a `Truncate` (delete conflicting logs from `since_index`) in the WAL.
+    async fn wal_truncate_since(
+        &self,
+        since_index: u64,
+        inner: &MemStoreInner,
+    ) -> std::io::Result<()> {
         let Some(wal) = self.wal.clone() else {
-            return;
+            return Ok(());
         };
         let log = inner.log.clone();
         let last_purged = inner.last_purged;
@@ -307,18 +333,17 @@ impl MemStore {
         })
         .await;
 
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("Failed to write Truncate to WAL: {e}"),
-            Err(e) => warn!("WAL truncate task panicked: {e}"),
-        }
+        join_io(result, "WAL truncate")
     }
 
-    /// TODO: after repeated WAL write failures, surface `StorageError` so Raft can react
-    /// instead of only logging warnings.
-    async fn wal_purge_upto(&self, log_id: LogId<NodeId>, inner: &MemStoreInner) {
+    /// Record a `Purge` (drop logs up to and including `log_id`) in the WAL.
+    async fn wal_purge_upto(
+        &self,
+        log_id: LogId<NodeId>,
+        inner: &MemStoreInner,
+    ) -> std::io::Result<()> {
         let Some(wal) = self.wal.clone() else {
-            return;
+            return Ok(());
         };
         let log = inner.log.clone();
         let last_purged = inner.last_purged;
@@ -337,11 +362,7 @@ impl MemStore {
         })
         .await;
 
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("Failed to write Purge to WAL: {e}"),
-            Err(e) => warn!("WAL purge task panicked: {e}"),
-        }
+        join_io(result, "WAL purge")
     }
 
     /// Compact/rewrite the WAL from the current in-memory log snapshot.
@@ -370,52 +391,36 @@ impl MemStore {
         }
     }
 
-    async fn persist_state_machine(&self, inner: &MemStoreInner) {
-        if let Some(dir) = &self.data_dir {
-            let path = dir.join("state_machine.json");
-            let json = match serde_json::to_string_pretty(&inner.state_machine) {
-                Ok(j) => j,
-                Err(e) => {
-                    warn!("Failed to serialize state machine: {e}");
-                    return;
-                }
-            };
-            let result = tokio::task::spawn_blocking(move || {
-                Self::atomic_write_json(&path, json.as_bytes())
-            })
-            .await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("Failed to persist state machine: {e}"),
-                Err(e) => warn!("persist_state_machine task panicked: {e}"),
-            }
-        }
+    /// Persist the KV state machine to `state_machine.json`.
+    async fn persist_state_machine(&self, inner: &MemStoreInner) -> std::io::Result<()> {
+        let Some(dir) = &self.data_dir else {
+            return Ok(());
+        };
+        let path = dir.join("state_machine.json");
+        let json = serde_json::to_string_pretty(&inner.state_machine)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let result =
+            tokio::task::spawn_blocking(move || Self::atomic_write_json(&path, json.as_bytes()))
+                .await;
+        join_io(result, "persist_state_machine")
     }
 
-    async fn persist_membership(&self, inner: &MemStoreInner) {
-        if let Some(dir) = &self.data_dir {
-            let pm = PersistedMembership {
-                last_applied_log: inner.last_applied_log,
-                last_membership: inner.last_membership.clone(),
-            };
-            let path = dir.join("membership.json");
-            let json = match serde_json::to_string(&pm) {
-                Ok(j) => j,
-                Err(e) => {
-                    warn!("Failed to serialize membership: {e}");
-                    return;
-                }
-            };
-            let result = tokio::task::spawn_blocking(move || {
-                Self::atomic_write_json(&path, json.as_bytes())
-            })
-            .await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("Failed to persist membership: {e}"),
-                Err(e) => warn!("persist_membership task panicked: {e}"),
-            }
-        }
+    /// Persist last-applied log id + membership to `membership.json`.
+    async fn persist_membership(&self, inner: &MemStoreInner) -> std::io::Result<()> {
+        let Some(dir) = &self.data_dir else {
+            return Ok(());
+        };
+        let pm = PersistedMembership {
+            last_applied_log: inner.last_applied_log,
+            last_membership: inner.last_membership.clone(),
+        };
+        let path = dir.join("membership.json");
+        let json = serde_json::to_string(&pm)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let result =
+            tokio::task::spawn_blocking(move || Self::atomic_write_json(&path, json.as_bytes()))
+                .await;
+        join_io(result, "persist_membership")
     }
 
     /// Atomically write bytes via temp file + fsync + rename.
@@ -515,8 +520,9 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.write().await;
         inner.vote = Some(*vote);
-        self.persist_hard_state(&inner).await;
-        Ok(())
+        self.persist_hard_state(&inner)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Vote, ErrorVerb::Write, e))
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
@@ -529,8 +535,9 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     ) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.write().await;
         inner.committed = committed;
-        self.persist_hard_state(&inner).await;
-        Ok(())
+        self.persist_hard_state(&inner)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Store, ErrorVerb::Write, e))
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
@@ -541,14 +548,19 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
     where
         I: IntoIterator<Item = LogEntry> + Send,
     {
+        // Memory is updated before the WAL write because compaction needs the
+        // full in-memory log. If the write fails we return an error, and
+        // openraft stops this node instead of acknowledging the entries, so
+        // the memory/disk divergence is never reported as durable.
         let mut inner = self.inner.write().await;
         let mut appended = Vec::new();
         for entry in entries {
             appended.push(entry.clone());
             inner.log.insert(entry.log_id.index, entry);
         }
-        self.wal_append_entries(appended, &inner).await;
-        Ok(())
+        self.wal_append_entries(appended, &inner)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Logs, ErrorVerb::Write, e))
     }
 
     async fn delete_conflict_logs_since(
@@ -560,8 +572,9 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         for key in keys {
             inner.log.remove(&key);
         }
-        self.wal_truncate_since(log_id.index, &inner).await;
-        Ok(())
+        self.wal_truncate_since(log_id.index, &inner)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Logs, ErrorVerb::Delete, e))
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
@@ -571,8 +584,9 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
             inner.log.remove(&key);
         }
         inner.last_purged = Some(log_id);
-        self.wal_purge_upto(log_id, &inner).await;
-        Ok(())
+        self.wal_purge_upto(log_id, &inner)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Logs, ErrorVerb::Delete, e))
     }
 
     async fn last_applied_state(
@@ -613,8 +627,12 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
         }
 
         // Persist state machine and membership after applying entries
-        self.persist_state_machine(&inner).await;
-        self.persist_membership(&inner).await;
+        self.persist_state_machine(&inner)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+        self.persist_membership(&inner)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
         Ok(results)
     }
 
@@ -651,10 +669,18 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
             data,
         });
 
-        // Persist everything after snapshot install
-        self.persist_state_machine(&inner).await;
-        self.persist_membership(&inner).await;
-        self.persist_hard_state(&inner).await;
+        // Persist everything after snapshot install. After a snapshot the old
+        // logs are gone, so these files are the only durable copy of the state.
+        let snapshot_subject = || ErrorSubject::Snapshot(Some(meta.signature()));
+        self.persist_state_machine(&inner)
+            .await
+            .map_err(|e| storage_err(snapshot_subject(), ErrorVerb::Write, e))?;
+        self.persist_membership(&inner)
+            .await
+            .map_err(|e| storage_err(snapshot_subject(), ErrorVerb::Write, e))?;
+        self.persist_hard_state(&inner)
+            .await
+            .map_err(|e| storage_err(ErrorSubject::Vote, ErrorVerb::Write, e))?;
         Ok(())
     }
 
@@ -856,9 +882,18 @@ mod tests {
         let inner = store.inner.read().await;
         let start = Instant::now();
         store.rewrite_wal(&inner).await;
-        store.persist_hard_state(&inner).await;
-        store.persist_state_machine(&inner).await;
-        store.persist_membership(&inner).await;
+        store
+            .persist_hard_state(&inner)
+            .await
+            .expect("persist failed");
+        store
+            .persist_state_machine(&inner)
+            .await
+            .expect("persist failed");
+        store
+            .persist_membership(&inner)
+            .await
+            .expect("persist failed");
         let total_duration = start.elapsed();
         drop(inner);
 
@@ -992,7 +1027,7 @@ mod tests {
                     let mut inner = store.inner.write().await;
                     inner.vote = vote;
                     inner.committed = committed;
-                    store.persist_hard_state(&inner).await;
+                    store.persist_hard_state(&inner).await.expect("persist failed");
                 }
 
                 // Wait briefly for spawn_blocking to complete
@@ -1082,7 +1117,7 @@ mod tests {
                         };
                         inner.state_machine.apply(&req, (idx + 1) as u64);
                     }
-                    store.persist_state_machine(&inner).await;
+                    store.persist_state_machine(&inner).await.expect("persist failed");
                 }
 
                 // Wait for spawn_blocking
@@ -1147,7 +1182,7 @@ mod tests {
                     let mut inner = store.inner.write().await;
                     inner.last_applied_log = last_applied_log;
                     inner.last_membership = stored_membership.clone();
-                    store.persist_membership(&inner).await;
+                    store.persist_membership(&inner).await.expect("persist failed");
                 }
 
                 // Wait for spawn_blocking
@@ -1206,10 +1241,10 @@ mod tests {
                     ));
 
                     // Persist all state
-                    store.persist_hard_state(&inner).await;
+                    store.persist_hard_state(&inner).await.expect("persist failed");
                     store.rewrite_wal(&inner).await;
-                    store.persist_state_machine(&inner).await;
-                    store.persist_membership(&inner).await;
+                    store.persist_state_machine(&inner).await.expect("persist failed");
+                    store.persist_membership(&inner).await.expect("persist failed");
                 }
 
                 // Wait for all spawn_blocking tasks
@@ -1234,6 +1269,94 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    // ─── Persistence failure propagation (P1 / P4) ───
+    //
+    // A storage trait method must not return Ok when its disk write failed:
+    // openraft treats Ok as "durable" and acknowledges the write to clients.
+
+    /// Block `atomic_write_json` for `file_name` by putting a directory at its
+    /// path: renaming the temp file onto a directory fails, even as root.
+    fn block_json_file(dir: &std::path::Path, file_name: &str) {
+        std::fs::create_dir_all(dir.join(file_name)).expect("create blocking dir");
+    }
+
+    fn blank_entry(index: u64) -> LogEntry {
+        Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            payload: openraft::EntryPayload::Blank,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_vote_returns_error_when_hard_state_write_fails() {
+        let dir = tempdir();
+        let mut store = Arc::new(MemStore::new_persistent(dir.clone()));
+        block_json_file(&dir, "hard_state.json");
+
+        let result = store.save_vote(&Vote::new(3, 1)).await;
+
+        assert!(
+            result.is_err(),
+            "save_vote must surface the failed hard_state write, got {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn save_committed_returns_error_when_hard_state_write_fails() {
+        let dir = tempdir();
+        let mut store = Arc::new(MemStore::new_persistent(dir.clone()));
+        block_json_file(&dir, "hard_state.json");
+
+        let committed = Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), 5));
+        let result = store.save_committed(committed).await;
+
+        assert!(
+            result.is_err(),
+            "save_committed must surface the failed hard_state write, got {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_to_log_returns_error_when_wal_write_fails() {
+        let dir = tempdir();
+        let mut store = Arc::new(MemStore::new_persistent(dir.clone()));
+
+        // Sanity check: with a healthy WAL the append succeeds.
+        store
+            .append_to_log(vec![blank_entry(1)])
+            .await
+            .expect("append with healthy WAL");
+
+        // Poison the WAL mutex so the next WAL write fails inside spawn_blocking.
+        let wal = store.wal.clone().expect("persistent store has a WAL");
+        let _ = std::thread::spawn(move || {
+            let _guard = wal.lock().unwrap();
+            panic!("intentionally poisoning WAL mutex for test");
+        })
+        .join();
+
+        let result = store.append_to_log(vec![blank_entry(2)]).await;
+
+        assert!(
+            result.is_err(),
+            "append_to_log must surface the failed WAL write, got {result:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_persistence_is_a_no_op() {
+        // No data_dir: nothing to write, so trait methods must still succeed.
+        let mut store = Arc::new(MemStore::new());
+        store.save_vote(&Vote::new(1, 1)).await.expect("save_vote");
+        store
+            .append_to_log(vec![blank_entry(1)])
+            .await
+            .expect("append_to_log");
     }
 
     // ─── Helper functions ───

@@ -38,6 +38,34 @@
 
 **相关**：架构图「HA 决策循环」「选举流程」；运维「集群状态检查」。
 
+### 1a. 身份判定（L2–L5 的依据）
+
+「本节点 PG 是不是主」只由观测决定，不由内存里记录的 role 决定（role 只记录 pg-ha 之前做过什么）。实现：`crates/pg-ha-core/src/ha/identity.rs`。
+
+**观测**：每个 HA cycle 在确认 PG 运行后执行一次 `pg_is_in_recovery()`（超时 5 秒）。pg-ha 自己执行 start / stop / promote 后，观测作废，需重新观测。查询失败、超时或进程未运行都记为「未观测」。
+
+**身份** = 观测 × `standby.signal` 是否存在：
+
+| 身份 | 观测 | `standby.signal` |
+|------|------|------------------|
+| Primary | 不在 recovery | 不看 |
+| ManagedStandby（pg-ha 配置的备库） | 在 recovery | 有 |
+| UnmanagedRecovery（非 pg-ha 造成的恢复） | 在 recovery | 无 |
+| Unknown | 未观测 | — |
+
+`standby.signal` 只说明 PG 下次怎样启动，不说明它现在是什么，所以观测为「不在 recovery」时一律是 Primary。pg-ha 配置的每个备库都会写 `standby.signal`（clone、rejoin、switchover 降级）；正常选举路径上 PG promote 后自行删除它。因此「持锁且在 recovery 却没有 `standby.signal`」不会由 pg-ha 自身产生，只来自 `recovery.signal`（归档 / PITR）或运行中被删掉的 `standby.signal`。
+
+**规则**：pg-ha 只 promote 它自己配置为备库的节点。非 pg-ha 造成的恢复交给运维：不 promote、不 rewind、不参选；若持锁则释放锁。
+
+| 身份 | 持锁 | 他人持锁 | 无主（选举） |
+|------|------|----------|--------------|
+| Primary | 保持主 | rejoin（S4） | 参选；非最健康则按陈旧主 rejoin |
+| ManagedStandby | promote，重新观测确认后才记为主 | 跟随 | 参选 |
+| UnmanagedRecovery | 释放锁，交运维（pause 下保留锁，但不宣称主） | 交运维 | 不参选 |
+| Unknown | 本轮不动作，不宣称主 | 有 `standby.signal`：等待；无：停库围栏（L5） | 本轮不参选 |
+
+**对外发布**：成员 `state` 在 DCS 与 REST 中一致。`running` 表示进程在运行且身份为 Primary 或 ManagedStandby；UnmanagedRecovery 与 Unknown 发布为 `unknown`，其他节点因此不把它当作候选、同步备或 switchover 目标。`role` 只在观测确认后才记为 `primary`；观测到在 recovery 时，记录的 `primary` 降为 `replica`。
+
 ---
 
 ## 2. 健康检查 ↔ 身份
@@ -54,7 +82,13 @@
 | H6 | 当 `synchronous_mode` 为 true 且 `/sync` 已发布时：`/sync` 返回 200 的节点集合 = `/sync.sync_standby` 解析结果与健康 Replica 的交集；其余健康 Replica 对 `/async` 为 200。 | 持有 |
 | H7 | Switchover / Failover 完成后，在约定时限内（建议：≤ `2 * loop_wait` + promote/重配耗时）重新满足 H1–H4；若启用同步复制，同时满足 H6。 | 持有 |
 
-**稳态检查**：运维指南中 Primary / Replica / sync / async 的 curl 示例；三节点交叉探测 H3。
+**H1 / H2 的逐条判定**（`crates/pg-ha-api/src/state.rs`，数据最多滞后一个 HA cycle）：
+
+- `/primary` 200 ⟺ 持有 leader lock ∧ `state = running` ∧ `role = primary` ∧ 观测不在 recovery。观测缺失时为 503。
+- `/replica` 200 ⟺ `state = running` ∧ `role = replica` ∧ 观测在 recovery（再叠加 `lag` 阈值）。观测为不在 recovery 的节点，不论记录的 role 是什么，都不作为副本对外服务。
+- `/health` 只反映 PG 进程是否运行，与 HA 身份无关。
+
+**稳态检查**：运维指南中 Primary / Replica / sync / async 的 curl 示例；三节点交叉探测 H3；`GET /patroni` 的 `pg_in_recovery` 字段即本节点最近一次观测。
 
 **相关**：架构「认证与安全 / 开放端点」；运维「同步 / 异步备库检查」；架构「同步复制数据流」「TCP Proxy 健康检查」。
 
@@ -109,9 +143,16 @@
 | P1 | 进程崩溃重启后，从本地磁盘恢复的 Raft 日志与状态机，须能重建与崩溃前**已提交**语义一致的集群视图（未提交日志可丢，符合 Raft）。 | 持有 |
 | P2 | 日志存储实现从全量 JSON 改为 append-only WAL 等优化时，必须保持 P1 与对外 HA 语义不变（M2）。 | 持有 |
 | P3 | Failsafe：文档中的 `/failsafe` 与「重启后是否仍生效」必须一致。 | **待裁定** |
-| P4 | 本地持久化（含 WAL）若失败，不得长期呈现「内存/Raft 已成功、磁盘未成功」且无 degraded 语义。 | **目标** |
+| P4 | 本地持久化（含 WAL）若失败，不得长期呈现「内存/Raft 已成功、磁盘未成功」且无 degraded 语义。 | 持有 |
 
-**相关**：架构 Raft / DCS；`raft_log.wal` 与 `hard_state.json` 等；代码中 failsafe / WAL 写失败 TODO。
+**P4 的 degraded 语义**（`crates/pg-ha-dcs/src/store.rs`）：
+
+- 存储 trait 方法（`save_vote`、`save_committed`、`append_to_log`、`delete_conflict_logs_since`、`purge_logs_upto`、`apply_to_state_machine`、`install_snapshot`）在落盘失败时返回 `StorageError`，不再返回 `Ok`。openraft 因此不会把这次写当成已持久化去推进 commit 或应答客户端。
+- openraft 收到 `StorageError` 后停止该节点的 Raft core（`Fatal`），之后所有 Raft 写都失败。进程不退出，日志有 `ERROR Raft storage persistence failed (...)`。
+- 对 HA 的后果：`get_cluster` 读本地状态机，会返回冻结的旧视图，但所有改变身份的动作（抢锁、续锁）都要经过 Raft 写，因此该节点既不能成为 leader，也不能保持 leader；若它正持锁，下一次续锁失败即按 L5 停库降级。集群其余多数派继续服务。
+- 恢复需要人工：修复磁盘后重启 pg-ha。内存先于磁盘更新这一顺序未变（WAL 压缩需要完整内存日志），但分歧不会被报告为已持久化。
+
+**相关**：架构 Raft / DCS；`raft_log.wal` 与 `hard_state.json` 等；代码中 failsafe TODO。
 
 ---
 
@@ -158,7 +199,8 @@
 |----|---------|------|
 | Failsafe 持久化 | P3 | 架构列出 `/failsafe`；实现仍有「未读 key」类缺口 |
 | Member `conn_url` 含密码 | R3 | 落盘与最小密钥面目标冲突，需先裁定再改 |
-| WAL 写失败仅告警 | P4 | 与「提交成功」语义未完全闭合 |
+| switchover 释放锁失败被忽略 | S1 | `delete_leader` 结果被忽略；连续失败时旧主带 `standby.signal` 重启后仍持锁，会 promote 自己，撤销 switchover |
+| 降级不写 `standby.signal` | L5 / S4 | `demote()`、`handle_dcs_error` 停库后不写 `standby.signal`；下一轮重启后 PG 以可写主起来，到下一轮才被处理 |
 
 ---
 
@@ -166,5 +208,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-10-21 | 新增 1a 身份判定：「是否为主」以 `pg_is_in_recovery()` 观测为准；只 promote pg-ha 配置的备库，非 pg-ha 造成的恢复交运维；写明 H1 / H2 逐条判定与 `/health` 语义；第 9 节登记两个已知缺口 |
+| 2026-10-21 | P4 闭合为持有：Raft 存储落盘失败返回 `StorageError`，节点 Raft 停止而非继续推进；写明 degraded 语义与人工恢复方式 |
 | 2026-09-11 | S5 闭合为持有：sync 模式下 Failover/Switchover 强制 `/sync` 成员资格；空名单不晋升 |
 | 2026-07-18 | 初稿：从架构 / 运维文档抽取闭环不变量，并标注持有 / 目标 / 待裁定 |

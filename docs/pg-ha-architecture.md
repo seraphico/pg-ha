@@ -35,12 +35,15 @@ flowchart TD
     DATADIR -->|是| BOOTSTRAP[Bootstrap initdb/clone]
     DATADIR -->|否| PGRUN{PG 运行中?}
     PGRUN -->|否| PGSTART[尝试启动 PG]
-    PGRUN -->|是| LOCKED{集群有 Leader?}
+    PGRUN -->|是| OBSERVE[观测 pg_is_in_recovery<br/>得出身份]
+    OBSERVE --> LOCKED{集群有 Leader?}
     LOCKED -->|unlocked| ELECTION[选举流程]
     LOCKED -->|locked| OWNER{我持有 lock?}
     OWNER -->|是| RENEW[续约 enforce_primary]
     OWNER -->|否| FOLLOW[follow_upstream]
 ```
+
+之后的每个分支都按身份（Primary / ManagedStandby / UnmanagedRecovery / Unknown）决策，不依据内存里记录的 role。完整决策表见 [invariants.md](invariants.md) 1a 节。
 
 ## 选举流程 (process_unhealthy_cluster)
 
@@ -48,7 +51,10 @@ flowchart TD
 flowchart TD
     START[集群 unlocked] --> PAUSE{暂停模式?}
     PAUSE -->|是| NOOP[不操作]
-    PAUSE -->|否| STALE{是旧 Primary?}
+    PAUSE -->|否| IDENT{身份?}
+    IDENT -->|UnmanagedRecovery| ASIDE[不参选 交运维]
+    IDENT -->|Unknown| SKIP[本轮不参选]
+    IDENT -->|Primary / ManagedStandby| STALE{观测为主且非最健康?}
     STALE -->|是| REJOIN[rejoin_as_replica]
     STALE -->|否| FAILOVER{有 failover key 指定 candidate?}
     FAILOVER -->|是 我是candidate| ACQUIRE[尝试获取 leader lock]
@@ -56,7 +62,7 @@ flowchart TD
     FAILOVER -->|否| HEALTH{is_healthiest_node?}
     HEALTH -->|是| ACQUIRE
     HEALTH -->|否| WAIT[等待选举结果]
-    ACQUIRE -->|成功| PROMOTE[pg_ctl promote]
+    ACQUIRE -->|成功| PROMOTE[ManagedStandby: pg_ctl promote<br/>重新观测确认后记为主]
     ACQUIRE -->|失败| WAIT
 ```
 
@@ -78,6 +84,7 @@ sequenceDiagram
     R1->>DCS: attempt_to_acquire_leader()
     DCS-->>R1: OK (获取成功)
     R1->>R1: pg_ctl promote
+    R1->>R1: 重新观测 pg_is_in_recovery() = f
     Note over R1: 成为新 Primary
 
     R2->>DCS: get_cluster() → leader=node2
@@ -87,7 +94,7 @@ sequenceDiagram
 
     Note over P: 旧 Primary 重启
     P->>DCS: get_cluster()
-    P->>P: 检测: 无 standby.signal + 不是最健康
+    P->>P: 观测: 不在 recovery (身份 Primary) + 不是最健康
     P->>P: rejoin_as_replica(node2)
     P->>P: pg_ctl stop
     P->>P: pg_rewind (从 node2)

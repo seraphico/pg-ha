@@ -92,10 +92,10 @@ pub(crate) async fn health_replica(
 }
 
 /// GET /health
-/// Returns 200 if PostgreSQL is running.
+/// Returns 200 if the PostgreSQL process is running, whatever its HA role.
 pub(crate) async fn health_check(State(state): State<RouterState>) -> impl IntoResponse {
     let s = state.app.read().await;
-    if s.state == pg_ha_core::cluster::MemberState::Running {
+    if s.pg_running {
         (
             StatusCode::OK,
             Json(json!({
@@ -199,6 +199,7 @@ pub(crate) async fn node_status(State(state): State<RouterState>) -> impl IntoRe
         "replication_lag": s.replication_lag,
         "paused": s.is_paused,
         "pending_restart": s.pending_restart,
+        "pg_in_recovery": s.pg_in_recovery,
         "tags": s.tags,
     }))
 }

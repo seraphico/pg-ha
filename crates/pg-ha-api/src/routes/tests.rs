@@ -13,7 +13,9 @@ async fn set_primary(state: &AppState) {
         .update(|s| {
             s.role = MemberRole::Primary;
             s.state = MemberState::Running;
+            s.pg_running = true;
             s.is_leader = true;
+            s.pg_in_recovery = Some(false);
             s.timeline = Some(1);
             s.wal_position = Some(12345);
             s.last_loop_at = Some(std::time::Instant::now());
@@ -26,7 +28,9 @@ async fn set_replica(state: &AppState) {
         .update(|s| {
             s.role = MemberRole::Replica;
             s.state = MemberState::Running;
+            s.pg_running = true;
             s.is_leader = false;
+            s.pg_in_recovery = Some(true);
             s.timeline = Some(1);
             s.wal_position = Some(12300);
             s.replication_lag = Some(45);
@@ -51,6 +55,59 @@ async fn test_primary_returns_200_when_leader() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+async fn status_of(state: AppState, uri: &str) -> StatusCode {
+    build_router(state)
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+/// H1: every clause of "holds the lock AND PostgreSQL is a healthy primary"
+/// is necessary. Dropping any one of them must turn /primary into 503.
+#[tokio::test]
+async fn test_primary_requires_every_h1_clause() {
+    type Breaker = fn(&mut crate::state::NodeState);
+    let cases: [(&str, Breaker); 6] = [
+        ("lock not held", |s| s.is_leader = false),
+        ("process stopped", |s| s.state = MemberState::Stopped),
+        ("not vouched (unmanaged / unknown)", |s| {
+            s.state = MemberState::Unknown
+        }),
+        ("role not confirmed primary", |s| {
+            s.role = MemberRole::Replica
+        }),
+        ("observed in recovery", |s| s.pg_in_recovery = Some(true)),
+        ("recovery state not observed", |s| s.pg_in_recovery = None),
+    ];
+    for (name, breaker) in cases {
+        let state = test_state();
+        set_primary(&state).await;
+        state.update(breaker).await;
+        assert_eq!(
+            status_of(state, "/primary").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/primary must be 503 when {name}"
+        );
+    }
+}
+
+/// H2: a server observed out of recovery is never served as a replica, even
+/// if its recorded role says replica (e.g. a demoted primary that restarted).
+#[tokio::test]
+async fn test_replica_requires_observed_recovery() {
+    for (name, obs) in [("observed primary", Some(false)), ("not observed", None)] {
+        let state = test_state();
+        set_replica(&state).await;
+        state.update(|s| s.pg_in_recovery = obs).await;
+        assert_eq!(
+            status_of(state, "/replica").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/replica must be 503 when {name}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -179,6 +236,31 @@ async fn test_health_returns_503_when_stopped() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
+/// /health reports the PostgreSQL process, not the HA role: a running server
+/// pg-ha cannot vouch for (unmanaged recovery, unobserved) is still "up",
+/// while /primary and /replica refuse it.
+#[tokio::test]
+async fn test_health_reports_process_even_when_role_not_vouched() {
+    let state = test_state();
+    state
+        .update(|s| {
+            s.pg_running = true;
+            s.state = MemberState::Unknown;
+            s.role = MemberRole::Replica;
+            s.pg_in_recovery = Some(true);
+        })
+        .await;
+    assert_eq!(status_of(state.clone(), "/health").await, StatusCode::OK);
+    assert_eq!(
+        status_of(state.clone(), "/replica").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        status_of(state, "/primary").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
 #[tokio::test]
 async fn test_liveness_returns_200_when_recent() {
     let state = test_state();
@@ -224,6 +306,7 @@ async fn test_noloadbalance_excludes_from_replica() {
         .update(|s| {
             s.role = MemberRole::Replica;
             s.state = MemberState::Running;
+            s.pg_running = true;
             s.tags
                 .insert("noloadbalance".into(), serde_json::json!(true));
             s.last_loop_at = Some(std::time::Instant::now());
@@ -250,6 +333,7 @@ async fn test_metrics_returns_prometheus_format() {
         .update(|s| {
             s.role = MemberRole::Primary;
             s.state = MemberState::Running;
+            s.pg_running = true;
             s.timeline = Some(3);
             s.replication_lag = Some(0);
             s.pending_restart = false;
@@ -301,6 +385,7 @@ async fn test_metrics_with_replica_state() {
         .update(|s| {
             s.role = MemberRole::Replica;
             s.state = MemberState::Running;
+            s.pg_running = true;
             s.timeline = Some(1);
             s.replication_lag = Some(1024);
             s.pending_restart = true;

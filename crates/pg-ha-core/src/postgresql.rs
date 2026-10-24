@@ -32,11 +32,25 @@ pub fn redact_connstr(connstr: &str) -> String {
 /// If PG is unresponsive, the task will be cancelled after this duration.
 const PG_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Upper bound for one `pg_is_in_recovery()` observation. A PostgreSQL that
+/// cannot answer within this time is treated as "unknown" for the cycle, so a
+/// stuck server cannot stall the HA loop.
+const RECOVERY_OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Manages a local PostgreSQL instance lifecycle
 pub struct Postgresql {
     config: PostgresqlConfig,
+    /// Role this node last confirmed or was configured into. Meaningful only
+    /// together with the process state; it is never evidence that PostgreSQL
+    /// is currently writable (use [`Postgresql::is_observed_primary`]).
     role: MemberRole,
     state: PgState,
+    /// Last observed `pg_is_in_recovery()` result.
+    ///
+    /// `None` means "not observed": PostgreSQL is not running, the query failed,
+    /// or pg-ha has since run an action that can change the recovery state
+    /// (start / stop / promote), which invalidates the previous observation.
+    in_recovery: Option<bool>,
 }
 
 /// Internal PostgreSQL process state
@@ -92,6 +106,7 @@ impl Postgresql {
             config,
             role: MemberRole::Uninitialized,
             state: PgState::Unknown,
+            in_recovery: None,
         }
     }
 
@@ -205,6 +220,7 @@ impl Postgresql {
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting PostgreSQL");
         self.state = PgState::Starting;
+        self.in_recovery = None;
 
         // Build pg_ctl start command with log file in data directory
         let log_file = self.config.data_dir.join("pg_log.log");
@@ -257,6 +273,7 @@ impl Postgresql {
     /// Stop PostgreSQL with the specified mode (smart, fast, immediate)
     pub async fn stop(&mut self, mode: &str) -> Result<()> {
         info!(mode, "Stopping PostgreSQL");
+        self.in_recovery = None;
 
         let status = Command::new(self.pg_ctl())
             .args(["stop", "-D", self.data_dir_str(), "-m", mode, "-w"])
@@ -276,9 +293,14 @@ impl Postgresql {
         }
     }
 
-    /// Promote a standby to primary using pg_ctl promote
+    /// Promote a standby to primary using pg_ctl promote.
+    ///
+    /// Success means `pg_ctl promote -w` reported completion. It does not set
+    /// the role: callers must re-observe with [`Postgresql::observe_recovery`]
+    /// and only then record `MemberRole::Primary`.
     pub async fn promote(&mut self) -> Result<()> {
         info!("Promoting PostgreSQL to primary");
+        self.in_recovery = None;
 
         let output = Command::new(self.pg_ctl())
             .args(["promote", "-D", self.data_dir_str(), "-w"])
@@ -287,8 +309,7 @@ impl Postgresql {
             .await?;
 
         if output.status.success() {
-            self.role = MemberRole::Primary;
-            info!("Promotion successful");
+            info!("pg_ctl promote reported success");
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -742,8 +763,45 @@ impl Postgresql {
         self.state = state;
     }
 
-    pub fn is_primary(&self) -> bool {
-        self.role == MemberRole::Primary
+    /// Observe `pg_is_in_recovery()` now and record the result.
+    ///
+    /// Returns `None` (and records it) when PostgreSQL is not running, the
+    /// query fails, or it does not answer within [`RECOVERY_OBSERVE_TIMEOUT`].
+    pub async fn observe_recovery(&mut self) -> Option<bool> {
+        self.in_recovery = if !self.is_running() {
+            None
+        } else {
+            match tokio::time::timeout(RECOVERY_OBSERVE_TIMEOUT, self.is_in_recovery()).await {
+                Ok(Ok(v)) => Some(v),
+                Ok(Err(e)) => {
+                    warn!("Could not observe recovery state: {e}");
+                    None
+                }
+                Err(_) => {
+                    warn!(
+                        "Could not observe recovery state: no answer within {RECOVERY_OBSERVE_TIMEOUT:?}"
+                    );
+                    None
+                }
+            }
+        };
+        self.in_recovery
+    }
+
+    /// Last recorded recovery observation (see the `in_recovery` field).
+    pub fn observed_in_recovery(&self) -> Option<bool> {
+        self.in_recovery
+    }
+
+    /// True only when PostgreSQL was observed out of recovery, i.e. it is a
+    /// writable primary, and no state-changing action ran since.
+    pub fn is_observed_primary(&self) -> bool {
+        self.in_recovery == Some(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_observed_in_recovery(&mut self, v: Option<bool>) {
+        self.in_recovery = v;
     }
 
     pub fn config(&self) -> &PostgresqlConfig {
@@ -838,16 +896,55 @@ mod tests {
         let pg = Postgresql::new(test_config());
         assert_eq!(pg.role(), &MemberRole::Uninitialized);
         assert_eq!(pg.state(), PgState::Unknown);
-        assert!(!pg.is_primary());
+        assert_eq!(pg.observed_in_recovery(), None);
+        assert!(!pg.is_observed_primary());
     }
 
     #[test]
-    fn test_role_mutation() {
+    fn test_recorded_role_is_not_evidence_of_primary() {
+        // Setting the role records intent; only an observation makes it a primary.
         let mut pg = Postgresql::new(test_config());
         pg.set_role(MemberRole::Primary);
-        assert!(pg.is_primary());
-        pg.set_role(MemberRole::Replica);
-        assert!(!pg.is_primary());
+        assert_eq!(pg.role(), &MemberRole::Primary);
+        assert!(!pg.is_observed_primary());
+
+        pg.set_observed_in_recovery(Some(true));
+        assert!(!pg.is_observed_primary());
+
+        pg.set_observed_in_recovery(Some(false));
+        assert!(pg.is_observed_primary());
+    }
+
+    #[tokio::test]
+    async fn test_observe_when_not_running_is_unknown() {
+        let mut pg = Postgresql::new(test_config());
+        pg.set_observed_in_recovery(Some(false));
+        // No postmaster.pid: not running, so the old observation is dropped.
+        assert_eq!(pg.observe_recovery().await, None);
+        assert!(!pg.is_observed_primary());
+    }
+
+    #[tokio::test]
+    async fn test_state_changing_actions_invalidate_observation() {
+        // pg_ctl does not exist here, so each action fails, but the observation
+        // must already be invalidated: the server state is no longer known once
+        // pg-ha attempted to change it.
+        let mut config = test_config();
+        config.bin_dir = PathBuf::from("/nonexistent/pg-ha-test-bin");
+        config.data_dir = PathBuf::from("/nonexistent/pg-ha-test-data");
+        let mut pg = Postgresql::new(config);
+
+        pg.set_observed_in_recovery(Some(false));
+        let _ = pg.promote().await;
+        assert_eq!(pg.observed_in_recovery(), None, "promote");
+
+        pg.set_observed_in_recovery(Some(false));
+        let _ = pg.stop("fast").await;
+        assert_eq!(pg.observed_in_recovery(), None, "stop");
+
+        pg.set_observed_in_recovery(Some(true));
+        let _ = pg.start().await;
+        assert_eq!(pg.observed_in_recovery(), None, "start");
     }
 
     #[test]
@@ -1440,9 +1537,14 @@ mod tests {
     /// **Property 2: Preservation** - PG Normal Query Completion
     /// **Validates: Requirements 3.1**
     ///
-    /// Verify that all four methods (health_check, is_in_recovery, wal_status,
-    /// checkpoint) follow the identical timeout pattern, ensuring consistent
-    /// preservation behavior across all PG query methods.
+    /// Verify that every method opening a PG connection (health_check,
+    /// is_in_recovery, wal_status, checkpoint, set_synchronous_standby_names, ...)
+    /// follows the identical timeout pattern, ensuring consistent preservation
+    /// behavior across all PG query methods.
+    ///
+    /// The check pairs connects with timeout-wrapped spawns instead of pinning a
+    /// fixed method count, so adding a new query method does not break it as long
+    /// as the new method follows the pattern.
     #[test]
     fn test_all_methods_follow_same_preservation_pattern() {
         let source = include_str!("postgresql.rs");
@@ -1458,20 +1560,22 @@ mod tests {
         let connect_pattern = "tokio_postgres::connect(&connstr, tokio_postgres::NoTls)";
         let spawn_timeout_pattern = "tokio::spawn(async move {\n            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection)";
 
-        // Count connect calls in production code (should be 4: health_check, is_in_recovery, wal_status, checkpoint)
         let connect_count = prod_code.matches(connect_pattern).count();
-        assert_eq!(
-            connect_count, 4,
-            "Expected exactly 4 PG connect calls (one per method). \
-             Each must follow the preservation pattern: connect → spawn with timeout → query via client."
+        let spawn_timeout_count = prod_code.matches(spawn_timeout_pattern).count();
+
+        // At least the original four query methods must still use this pattern.
+        assert!(
+            connect_count >= 4,
+            "Expected at least 4 PG connect calls (health_check, is_in_recovery, \
+             wal_status, checkpoint), found {connect_count}."
         );
 
-        // Count spawn+timeout patterns (should also be 4)
-        let spawn_timeout_count = prod_code.matches(spawn_timeout_pattern).count();
+        // Every connect must be paired with a timeout-wrapped connection task.
         assert_eq!(
-            spawn_timeout_count, 4,
-            "Expected exactly 4 spawn+timeout patterns (one per method). \
-             All connection methods must use identical timeout handling for consistent behavior."
+            connect_count, spawn_timeout_count,
+            "Found {connect_count} PG connect calls but {spawn_timeout_count} spawn+timeout \
+             patterns. Each method must follow the preservation pattern: \
+             connect → spawn with timeout → query via client."
         );
     }
 }

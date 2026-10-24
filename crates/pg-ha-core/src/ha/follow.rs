@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 use crate::cascading::CascadeManager;
 use crate::cluster::MemberRole;
 
+use super::identity::{FollowerAction, follower_action};
 use super::{CycleResult, Ha};
 
 impl Ha {
@@ -35,29 +36,62 @@ impl Ha {
             );
         }
 
-        // ─── Key check: is this node running as primary but NOT holding the lock? ───
-        // This happens when an old primary restarts after failover.
-        // It needs to be converted to a streaming replica via pg_rewind.
-        if self.postgresql.is_running() && self.postgresql.is_primary() {
-            info!(
-                "This node is running as primary but another node ({}) holds the leader lock — initiating rejoin as replica",
-                lock_owner
-            );
-            return self.rejoin_as_replica(lock_owner).await;
+        // ─── What is this node, given that another node holds the lock? ───
+        // Decided from this cycle's observation (see `identity`).
+        let identity = self.pg_identity();
+        match follower_action(identity) {
+            FollowerAction::Rejoin => {
+                // Old primary that lost the lock (S4): convert it via pg_rewind.
+                info!(
+                    "PostgreSQL is a primary but another node ({}) holds the leader lock — initiating rejoin as replica",
+                    lock_owner
+                );
+                return self.rejoin_as_replica(lock_owner).await;
+            }
+            FollowerAction::HandOff => {
+                let cause = if self.has_recovery_signal() {
+                    "recovery.signal present (archive or point-in-time recovery)"
+                } else {
+                    "neither standby.signal nor recovery.signal present"
+                };
+                error!(
+                    cause,
+                    "PostgreSQL is in recovery pg-ha did not create; not following, rewinding or \
+                     restarting it. Operator action required: finish the recovery, or recreate \
+                     standby.signal to hand the node back to pg-ha"
+                );
+                let _ = self.touch_member().await;
+                return CycleResult::Error(format!(
+                    "PostgreSQL in unmanaged recovery ({cause}); operator action required"
+                ));
+            }
+            FollowerAction::Fence => {
+                warn!(
+                    "Cannot observe PostgreSQL recovery state and there is no standby.signal, while \
+                     {} holds the leader lock — stopping PostgreSQL so it cannot serve writes",
+                    lock_owner
+                );
+                if let Err(e) = self.postgresql.stop("fast").await {
+                    error!("Failed to stop PostgreSQL while fencing: {e}");
+                    return CycleResult::Error(format!("Fence stop failed: {e}"));
+                }
+                return CycleResult::Follower(
+                    "stopped PostgreSQL: recovery state unobserved and no standby.signal".into(),
+                );
+            }
+            FollowerAction::Wait => {
+                let _ = self.touch_member().await;
+                return CycleResult::Follower(format!(
+                    "PostgreSQL is {}; waiting for the next cycle before following ({})",
+                    identity.describe(),
+                    upstream_name
+                ));
+            }
+            FollowerAction::Follow => {}
         }
 
-        // Also check: PG is running but NOT in recovery and no standby.signal exists
-        // This covers the case where role tracking says Replica but PG is actually a standalone primary
-        if self.postgresql.is_running() && !self.has_standby_signal() {
-            info!(
-                "Node has no standby.signal — needs reconfiguration to follow {}",
-                upstream_name
-            );
-            return self.rejoin_as_replica(lock_owner).await;
-        }
-
-        // Ensure role is set to Replica when following
-        if self.postgresql.is_running() && self.has_standby_signal() {
+        // A standby pg-ha configured: keep it following the right upstream.
+        {
             self.postgresql.set_role(MemberRole::Replica);
 
             // ─── Check if primary_conninfo needs updating ───

@@ -33,7 +33,12 @@ pub struct NodeState {
     pub name: String,
     pub scope: String,
     pub role: MemberRole,
+    /// State pg-ha vouches for, identical to what it publishes in DCS:
+    /// `Running` only when the process runs and its role is confirmed.
     pub state: MemberState,
+    /// Whether the PostgreSQL process is alive, regardless of role. Backs
+    /// `/health`, which reports the process, not the HA role.
+    pub pg_running: bool,
     pub is_leader: bool,
     pub is_paused: bool,
     pub pending_restart: bool,
@@ -50,6 +55,10 @@ pub struct NodeState {
     pub dcs_last_seen: Option<Instant>,
     /// Whether failsafe mode is currently active
     pub failsafe_active: bool,
+    /// Last `pg_is_in_recovery()` observation from the HA loop. `None` when
+    /// not observed (PostgreSQL stopped, query failed, or a start / stop /
+    /// promote ran since). At most one HA cycle old.
+    pub pg_in_recovery: Option<bool>,
 }
 
 impl AppState {
@@ -60,6 +69,7 @@ impl AppState {
                 scope,
                 role: MemberRole::Uninitialized,
                 state: MemberState::Unknown,
+                pg_running: false,
                 is_leader: false,
                 is_paused: false,
                 pending_restart: false,
@@ -72,6 +82,7 @@ impl AppState {
                 ttl_seconds: ttl,
                 dcs_last_seen: None,
                 failsafe_active: false,
+                pg_in_recovery: None,
             })),
             dcs: None,
             history: Arc::new(RwLock::new(History::new())),
@@ -86,6 +97,7 @@ impl AppState {
                 scope,
                 role: MemberRole::Uninitialized,
                 state: MemberState::Unknown,
+                pg_running: false,
                 is_leader: false,
                 is_paused: false,
                 pending_restart: false,
@@ -98,6 +110,7 @@ impl AppState {
                 ttl_seconds: ttl,
                 dcs_last_seen: None,
                 failsafe_active: false,
+                pg_in_recovery: None,
             })),
             dcs: Some(dcs),
             history: Arc::new(RwLock::new(History::new())),
@@ -128,14 +141,26 @@ impl AppState {
 }
 
 impl NodeState {
-    /// True if this node is the primary with the leader lock
+    /// H1: `/primary` is 200 exactly when this node holds the leader lock and
+    /// PostgreSQL is a healthy primary. Each clause is required:
+    /// - `is_leader`: holds the leader lock
+    /// - `state == Running`: PostgreSQL is running and pg-ha vouches for it
+    /// - `role == Primary`: the HA loop confirmed and recorded the primary role
+    /// - `pg_in_recovery == Some(false)`: observed out of recovery (writable)
     pub fn is_primary_with_lock(&self) -> bool {
-        self.role == MemberRole::Primary && self.is_leader
+        self.is_leader
+            && self.state == MemberState::Running
+            && self.role == MemberRole::Primary
+            && self.pg_in_recovery == Some(false)
     }
 
-    /// True if this node is a healthy running replica
+    /// H2: a healthy replica is running, recorded as a replica, and observed
+    /// in recovery. A server observed out of recovery is never served as a
+    /// replica, whatever its recorded role.
     pub fn is_healthy_replica(&self) -> bool {
-        self.state == MemberState::Running && self.role == MemberRole::Replica
+        self.state == MemberState::Running
+            && self.role == MemberRole::Replica
+            && self.pg_in_recovery == Some(true)
     }
 
     /// True if this node is a standby leader
