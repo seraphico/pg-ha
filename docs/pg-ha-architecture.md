@@ -45,6 +45,12 @@ flowchart TD
 
 之后的每个分支都按身份（Primary / ManagedStandby / UnmanagedRecovery / Unknown）决策，不依据内存里记录的 role。完整决策表见 [invariants.md](invariants.md) 1a 节。
 
+**时间界**：
+- 主循环每 `loop_wait` 秒启动一轮；一轮超时后下一轮立即开始，错过的 tick 不连发（`MissedTickBehavior::Delay`）。
+- 每次 DCS 写最多等 `retry_timeout` 秒，超时按写失败处理（openraft 0.9 的 Raft leader 失去多数派后不退位，不设上限时续锁会一直挂到网络恢复）。
+- 持锁节点维护 leader 租约：每次抢锁 / 续锁开始前记录锚点（单调时钟和墙钟），成功后截止时间 = 锚点 + 写入锁的 TTL − `watchdog.safety_margin`。每轮周期与这个截止时间赛跑（`Ha::run_cycle_bounded`）：截止时间先到就放弃本轮，先写 `standby.signal` 和 rewind 检查标记，再 `pg_ctl stop -m immediate`。`pg_ctl promote` 之前和保持主之前也检查租约。pause 下不围栏。
+- 参数约束 `ttl >= loop_wait + retry_timeout + safety_margin` 保证健康的主库能在租约内完成一轮周期和一次续锁。完整规则见 [invariants.md](invariants.md) L5 与 1a「leader 租约」。
+
 ## 选举流程 (process_unhealthy_cluster)
 
 ```mermaid
@@ -454,6 +460,7 @@ sequenceDiagram
 2. **CHECKPOINT 在释放锁之前**：确保所有已提交事务的 WAL 已刷盘，避免数据丢失
 3. **fast 模式停止 PG**：立即断开客户端连接，但允许正在进行的 WAL 写入完成
 4. **信号处理的 tokio::select!**：与 HA 循环、API 服务器、Proxy 并行监听，任一退出触发关停
+5. **租约已到期时直接围栏**：释放锁这次 DCS 写最多等 `retry_timeout`；如果关停时 leader 租约已经到期，跳过 CHECKPOINT 和释放锁，直接写 `standby.signal` 后 `pg_ctl stop -m immediate`
 
 **时间线：**
 

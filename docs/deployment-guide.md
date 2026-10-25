@@ -260,8 +260,9 @@ scope: <string>                    # 集群名称/范围 (必填)
 # ─── 可选顶层字段 ───
 namespace: <string>                # DCS key 路径前缀 (默认: "service")
 loop_wait: <u64>                   # HA 循环间隔秒数 (默认: 10)
-ttl: <u64>                         # Leader Lock TTL 秒数 (默认: 30, 必须 > loop_wait)
-retry_timeout: <u64>               # DCS/PG 操作重试超时秒数 (默认: 10)
+ttl: <u64>                         # Leader Lock TTL 秒数 (默认: 30, 必须 > loop_wait, 且见下方约束)
+retry_timeout: <u64>               # 每次 DCS 写的超时秒数, 超时按写失败处理; 也是重配上游后的宽限期 (默认: 10, 至少 1)
+                                   # 约束: ttl >= loop_wait + retry_timeout + watchdog.safety_margin, 不满足时拒绝启动
 
 # ─── PostgreSQL 配置 (必填) ───
 postgresql:
@@ -321,7 +322,8 @@ shutdown:
 watchdog:
   mode: <string>                   # "off" | "automatic" | "required" (默认: "off")
   device: <string>                 # 看门狗设备路径 (默认: "/dev/watchdog")
-  safety_margin: <u64>             # 安全边际秒数 (默认: 5)
+  safety_margin: <u64>             # 安全边际秒数 (默认: 5)。也用于 leader 租约: 锁持有者在最后一次续锁开始后
+                                   # ttl - safety_margin 秒内没能再续锁就停掉 PostgreSQL。须大于节点间墙钟偏差
 
 # ─── 节点标签 (可选) ───
 tags:
@@ -383,7 +385,7 @@ Docker 入口 `docker/entrypoint.sh` 是另一层：它用下面这些变量**�
 | `PG_HA_RAFT_SELF` / `PG_HA_RAFT_PARTNERS` | 本节点地址，以及逗号分隔的对端列表 |
 | `PG_HA_RAFT_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | 设置了 `PG_HA_RAFT_TLS_CERT` 就写入 `raft.tls` |
 
-开发集群 `docker-compose.yml` 会设置 Raft TLS，并把 `./docker/tls` 挂到 `/etc/pg-ha/tls`。入口生成的 HA 参数是 `loop_wait: 5`、`ttl: 15`，REST 认证为 `admin` / `secret`。
+开发集群 `docker-compose.yml` 会设置 Raft TLS，并把 `./docker/tls` 挂到 `/etc/pg-ha/tls`。入口生成的 HA 参数是 `loop_wait: 5`、`ttl: 15`、`retry_timeout: 5`（`watchdog.safety_margin` 用默认 5，正好满足 `ttl >= loop_wait + retry_timeout + safety_margin`），REST 认证为 `admin` / `secret`。
 
 ---
 

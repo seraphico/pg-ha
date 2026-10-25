@@ -3,6 +3,7 @@
 //! Updated by the HA loop each cycle, read by API handlers.
 
 use pg_ha_core::cluster::{MemberRole, MemberState};
+use pg_ha_core::config::LeaseTiming;
 use pg_ha_core::dcs::DcsAdapter;
 use pg_ha_core::history::History;
 use std::sync::Arc;
@@ -14,6 +15,9 @@ use tokio::sync::RwLock;
 pub struct AppState {
     inner: Arc<RwLock<NodeState>>,
     dcs: Option<Arc<dyn DcsAdapter>>,
+    /// This node's static lease timing; PATCH / PUT /config checks dynamic
+    /// `ttl` / `loop_wait` / `retry_timeout` changes against it
+    lease_timing: Option<LeaseTiming>,
     history: Arc<RwLock<History>>,
 }
 
@@ -85,12 +89,20 @@ impl AppState {
                 pg_in_recovery: None,
             })),
             dcs: None,
+            lease_timing: None,
             history: Arc::new(RwLock::new(History::new())),
         }
     }
 
     /// Create AppState with a DCS adapter reference (for /config endpoints)
-    pub fn with_dcs(name: String, scope: String, ttl: u64, dcs: Arc<dyn DcsAdapter>) -> Self {
+    /// and this node's static lease timing (checked by PATCH / PUT /config)
+    pub fn with_dcs(
+        name: String,
+        scope: String,
+        ttl: u64,
+        dcs: Arc<dyn DcsAdapter>,
+        lease_timing: LeaseTiming,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(NodeState {
                 name,
@@ -113,6 +125,7 @@ impl AppState {
                 pg_in_recovery: None,
             })),
             dcs: Some(dcs),
+            lease_timing: Some(lease_timing),
             history: Arc::new(RwLock::new(History::new())),
         }
     }
@@ -132,6 +145,11 @@ impl AppState {
     /// Get a reference to the DCS adapter (for /config endpoints)
     pub fn dcs(&self) -> Option<&Arc<dyn DcsAdapter>> {
         self.dcs.as_ref()
+    }
+
+    /// This node's static lease timing (set together with the DCS adapter)
+    pub fn lease_timing(&self) -> Option<LeaseTiming> {
+        self.lease_timing
     }
 
     /// Get a reference to the shared history

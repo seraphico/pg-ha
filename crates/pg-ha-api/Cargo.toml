@@ -15,4 +15,5 @@ axum = { workspace = true }
 base64 = "0.22"
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

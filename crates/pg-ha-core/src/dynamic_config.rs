@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
+use crate::config::LeaseTiming;
 use crate::standby_cluster::StandbyClusterConfig;
 
 /// Dynamic cluster-wide configuration stored in DCS /config key.
@@ -313,6 +314,41 @@ pub fn patch_config(
 
     // Deserialize back to GlobalConfig
     serde_json::from_value(base_value).map_err(|e| format!("Invalid config after patch: {e}"))
+}
+
+impl GlobalConfig {
+    /// Lease timing with this configuration's `ttl`, `loop_wait` and
+    /// `retry_timeout` over a node's static values (`base`).
+    pub fn lease_timing(&self, base: LeaseTiming) -> LeaseTiming {
+        LeaseTiming {
+            ttl: self.ttl.unwrap_or(base.ttl),
+            loop_wait: self.loop_wait.unwrap_or(base.loop_wait),
+            retry_timeout: self.retry_timeout.unwrap_or(base.retry_timeout),
+            safety_margin: base.safety_margin,
+        }
+    }
+}
+
+/// PATCH / PUT /config: when the update changes `ttl`, `loop_wait` or
+/// `retry_timeout`, the result must satisfy
+/// `ttl >= loop_wait + retry_timeout + safety_margin` on the node that
+/// receives it (`base` = its static values). Err carries the reason; the
+/// caller must not write the update.
+pub fn check_lease_timing_change(
+    current: &GlobalConfig,
+    new: &GlobalConfig,
+    base: LeaseTiming,
+) -> Result<(), String> {
+    if current.ttl == new.ttl
+        && current.loop_wait == new.loop_wait
+        && current.retry_timeout == new.retry_timeout
+    {
+        return Ok(());
+    }
+    match new.lease_timing(base).violation() {
+        Some(problem) => Err(problem),
+        None => Ok(()),
+    }
 }
 
 /// Recursively merge a JSON patch into a base value.

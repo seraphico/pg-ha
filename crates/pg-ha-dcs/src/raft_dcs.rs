@@ -10,7 +10,7 @@ use std::sync::Arc;
 use openraft::storage::Adaptor;
 use openraft::{BasicNode, Config as RaftConfig, Raft};
 use tokio::sync::Notify;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use pg_ha_core::cluster::{
     Cluster, ClusterConfig, Failover, Leader, Member, MemberRole, MemberState, SyncState,
@@ -42,6 +42,10 @@ pub struct RaftDcs {
     /// HA loop wait interval
     loop_wait: u64,
 
+    /// Upper bound for one DCS write (`retry_timeout`), covering both the
+    /// local Raft commit and the forward to the Raft leader
+    write_timeout: std::time::Duration,
+
     /// Notification channel for waking up watchers
     notify: Arc<Notify>,
 
@@ -61,6 +65,7 @@ impl RaftDcs {
     /// `namespace`: DCS namespace (default "service")
     /// `ttl`: leader lock TTL in seconds
     /// `loop_wait`: HA loop interval in seconds
+    /// `retry_timeout`: upper bound in seconds for every DCS write (at least 1)
     /// `data_dir`: optional directory for persisting Raft state to disk
     /// `tls`: optional TLS configuration for Raft RPC connections
     pub async fn new(
@@ -70,6 +75,7 @@ impl RaftDcs {
         namespace: String,
         ttl: u64,
         loop_wait: u64,
+        retry_timeout: u64,
         data_dir: Option<PathBuf>,
         tls: Option<&pg_ha_core::config::RaftTlsConfig>,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
@@ -147,6 +153,7 @@ impl RaftDcs {
             base_path,
             ttl,
             loop_wait,
+            write_timeout: std::time::Duration::from_secs(retry_timeout.max(1)),
             notify: Arc::new(Notify::new()),
             http_client,
             tls_enabled,
@@ -298,8 +305,20 @@ impl RaftDcs {
 
     // ─────────── Internal helpers ───────────
 
-    /// Propose a write to the Raft cluster and wait for commit
+    /// Propose a write to the Raft cluster and wait for commit, at most
+    /// `retry_timeout`. openraft 0.9 has no check-quorum: a Raft leader cut
+    /// off from the majority never steps down, and its `client_write` only
+    /// returns after the partition heals. Without this bound a lock renewal
+    /// on such a node would hang and the HA loop would never demote.
+    ///
+    /// A write that times out may still commit later. That is safe: every
+    /// lock write is a CAS ordered in the Raft log, so a late renewal either
+    /// fails against a newer holder or extends a lock nobody else took.
     async fn propose(&self, request: Request) -> Result<Response> {
+        bounded_write(self.write_timeout, self.propose_unbounded(request)).await
+    }
+
+    async fn propose_unbounded(&self, request: Request) -> Result<Response> {
         let result = self.raft.client_write(request.clone()).await;
         match result {
             Ok(resp) => Ok(resp.data),
@@ -652,6 +671,27 @@ impl DcsAdapter for RaftDcs {
     }
 }
 
+/// Run one DCS write with an upper bound. On expiry the write is abandoned
+/// and reported as `Error::Timeout`; callers treat it like any failed write.
+async fn bounded_write<F>(limit: std::time::Duration, write: F) -> Result<Response>
+where
+    F: std::future::Future<Output = Result<Response>>,
+{
+    match tokio::time::timeout(limit, write).await {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                "DCS write timed out after {}s (retry_timeout); treating it as failed",
+                limit.as_secs()
+            );
+            Err(Error::Timeout(format!(
+                "DCS write did not complete within {}s (retry_timeout)",
+                limit.as_secs()
+            )))
+        }
+    }
+}
+
 /// CAS request that raises the `/timeline` key to `timeline` (no TTL), or
 /// None when the stored value is already >= `timeline`. The write is
 /// conditioned on the version that was read (or on the key being absent), so
@@ -819,6 +859,160 @@ mod tests {
                 "after {tl}"
             );
         }
+    }
+
+    /// R19: a DCS write that never completes is abandoned after the bound
+    /// and reported as `Error::Timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_write_times_out_after_retry_timeout() {
+        let limit = std::time::Duration::from_secs(5);
+        let start = tokio::time::Instant::now();
+        let result = bounded_write(limit, std::future::pending::<Result<Response>>()).await;
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(Error::Timeout(ref m)) if m.contains("DCS write")),
+            "{result:?}"
+        );
+        assert!(elapsed >= limit, "returned early after {elapsed:?}");
+        assert!(
+            elapsed < limit + std::time::Duration::from_millis(10),
+            "returned late after {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_write_passes_through_a_completed_write() {
+        let limit = std::time::Duration::from_secs(5);
+        let result = bounded_write(limit, async { Ok(Response::NotChanged) }).await;
+        assert_eq!(result.unwrap(), Response::NotChanged);
+        let failed = bounded_write(limit, async { Err(Error::Dcs("rejected".into())) }).await;
+        assert!(matches!(failed, Err(Error::Dcs(_))));
+    }
+
+    /// R19 reproduction with three in-process Raft nodes: the lock holder is
+    /// the Raft leader and loses both peers. openraft 0.9 keeps it leader, so
+    /// an unbounded `client_write` never returns; the bounded renewal returns
+    /// `Error::Timeout` after `retry_timeout`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn renewal_on_a_minority_raft_leader_returns_within_retry_timeout() {
+        use std::time::Duration;
+        const RETRY_TIMEOUT: u64 = 2;
+
+        let mut listeners = Vec::new();
+        let mut members = Vec::new();
+        for id in 1..=3u64 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            members.push((id, listener.local_addr().unwrap().to_string()));
+            listeners.push(listener);
+        }
+        let mut nodes = Vec::new();
+        let mut servers = Vec::new();
+        for (listener, (id, _)) in listeners.into_iter().zip(&members) {
+            let dcs = RaftDcs::new(
+                *id,
+                format!("node{id}"),
+                "r19".into(),
+                "service".into(),
+                30,
+                10,
+                RETRY_TIMEOUT,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let router = crate::raft_router(dcs.raft().clone());
+            servers.push(tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            }));
+            nodes.push(Arc::new(dcs));
+        }
+        nodes[0].bootstrap_cluster(&members).await.unwrap();
+        nodes[0].wait_for_leader(20).await.unwrap();
+
+        // Find the Raft leader and let it take the HA leader lock while the
+        // cluster is healthy.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let leader_id = loop {
+            let leader = nodes[0].raft().metrics().borrow().current_leader;
+            if let Some(id) = leader
+                && nodes[(id - 1) as usize]
+                    .attempt_to_acquire_leader()
+                    .await
+                    .ok()
+                    == Some(true)
+            {
+                break id;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no Raft leader");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let leader = nodes[(leader_id - 1) as usize].clone();
+        assert_eq!(
+            leader.raft().metrics().borrow().current_leader,
+            Some(leader_id)
+        );
+
+        // Partition: stop the peers' RPC servers and their Raft cores. The
+        // core shutdown also covers keep-alive connections that outlive the
+        // aborted accept loop.
+        for (i, node) in nodes.iter().enumerate() {
+            if i as u64 + 1 != leader_id {
+                servers[i].abort();
+                node.raft().shutdown().await.unwrap();
+            }
+        }
+
+        // The hang: an unbounded write on the minority leader does not return.
+        let renewal = Request::Set {
+            key: leader.leader_path(),
+            value: leader.node_name.clone(),
+            ttl: Some(30),
+            prev_exist: None,
+            prev_value: Some(leader.node_name.clone()),
+            prev_version: None,
+            now: current_millis(),
+        };
+        let unbounded = tokio::time::timeout(
+            Duration::from_secs(2 * RETRY_TIMEOUT),
+            leader.propose_unbounded(renewal),
+        )
+        .await;
+        assert!(
+            unbounded.is_err(),
+            "unbounded write returned on a minority leader: {unbounded:?}"
+        );
+        assert_eq!(
+            leader.raft().metrics().borrow().current_leader,
+            Some(leader_id),
+            "openraft 0.9 keeps the minority leader"
+        );
+
+        // The fix: the renewal returns Error::Timeout after retry_timeout.
+        let start = std::time::Instant::now();
+        let lock = Leader {
+            name: leader.node_name.clone(),
+            version: 0,
+        };
+        let renewed = tokio::time::timeout(
+            Duration::from_secs(RETRY_TIMEOUT + 3),
+            leader.update_leader(&lock),
+        )
+        .await
+        .expect("the bounded renewal must return");
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(renewed, Err(Error::Timeout(_))),
+            "expected Error::Timeout, got {renewed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(RETRY_TIMEOUT),
+            "returned after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(RETRY_TIMEOUT + 1),
+            "returned after {elapsed:?}"
+        );
     }
 
     #[test]

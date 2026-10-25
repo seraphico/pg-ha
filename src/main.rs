@@ -56,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     let mut config = Config::from_file(&cli.configfile)?;
     config.apply_env_overrides();
+    // Environment overrides can change ttl / loop_wait / retry_timeout.
+    config.validate()?;
 
     // Initialize tracing: env var PG_HA_LOG_FORMAT overrides config.log_format
     let env_filter = EnvFilter::from_default_env()
@@ -112,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         config.namespace.clone(),
         config.ttl,
         config.loop_wait,
+        config.retry_timeout,
         config.raft.data_dir.clone(),
         config.raft.tls.as_ref(),
     )
@@ -221,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
         config.scope.clone(),
         config.ttl,
         dcs.clone(),
+        config.lease_timing(),
     );
     let auth_config = AuthConfig {
         username: config.restapi.username.clone(),
@@ -260,9 +264,7 @@ async fn main() -> anyhow::Result<()> {
         // HA Loop
         _ = async {
             let mut current_loop_wait = config.loop_wait;
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_secs(current_loop_wait)
-            );
+            let mut interval = ha_interval(current_loop_wait);
             loop {
                 interval.tick().await;
                 let result = ha.run_cycle().await;
@@ -277,9 +279,7 @@ async fn main() -> anyhow::Result<()> {
                         "loop_wait changed, recreating interval"
                     );
                     current_loop_wait = new_loop_wait;
-                    interval = tokio::time::interval(
-                        std::time::Duration::from_secs(current_loop_wait)
-                    );
+                    interval = ha_interval(current_loop_wait);
                 }
 
                 // Track DCS last seen: if the cycle didn't return an error about DCS,
@@ -412,6 +412,15 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Graceful shutdown complete");
     Ok(())
+}
+
+/// HA loop timer. After a cycle that overran `loop_wait`, the next cycle
+/// starts at once and the schedule restarts from there: missed ticks are not
+/// replayed as a burst of back-to-back cycles.
+fn ha_interval(loop_wait: u64) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(loop_wait));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }
 
 /// Extract host/port from a libpq-style conn_url (`host=node1 port=5432 ...`).

@@ -282,7 +282,7 @@ curl -u admin:secret http://localhost:8008/config | jq .
 ### 部分更新 (PATCH)
 
 ```bash
-# 修改 loop_wait 和 ttl
+# 修改 loop_wait 和 ttl（结果须满足下文「HA 时间参数约束」，否则返回 400 且不写入）
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
   -d '{
@@ -371,6 +371,38 @@ curl -u admin:secret -X POST http://localhost:8008/restart
 ```
 
 在持锁的节点上，PG 按原角色重启。在不持锁的节点上，pg-ha 先按启动规则做准备（写 `standby.signal`，`pg_controldata` 显示上次以主库运行时写 rewind 检查标记），再停库、以备库启动；准备失败时返回错误 `Not restarting PostgreSQL: standby configuration could not be written: ...`，PG 不动（见 [invariants.md](invariants.md) 1a「启动规则」）。
+
+### HA 时间参数约束
+
+`ttl`、`loop_wait`、`retry_timeout` 和 `watchdog.safety_margin` 必须满足：
+
+```text
+ttl >= loop_wait + retry_timeout + watchdog.safety_margin，且 retry_timeout >= 1
+```
+
+原因：锁持有者在最后一次续锁**开始前**的时刻 + `ttl` − `safety_margin` 秒内没有再次续锁成功，就自己停掉 PostgreSQL（leader 租约，见 [invariants.md](invariants.md) 1a「leader 租约」）；健康的主库要在这段时间里完成一轮 HA 周期（`loop_wait`）和一次续锁写（每次 DCS 写最多等 `retry_timeout` 秒）。默认值 30 ≥ 10 + 10 + 5，docker 开发集群 15 ≥ 5 + 5 + 5。
+
+- 静态配置（`pg-ha.yml`、环境变量覆盖、`bootstrap.dcs`）不满足时 pg-ha 拒绝启动，`--validate-config` 同样报错：
+  ```text
+  Error: Configuration error: ttl (20) must be >= loop_wait (10) + retry_timeout (6) + watchdog.safety_margin (5) = 21: ...
+  ```
+  `bootstrap.dcs` 不满足时错误以 `bootstrap.dcs:` 开头。
+- `PATCH` / `PUT /config` 改动 `ttl`、`loop_wait` 或 `retry_timeout` 后不满足时返回 400，配置不写入：
+  ```json
+  {"error": "Rejected, configuration not changed: ttl (15) must be >= loop_wait (6) + retry_timeout (5) + watchdog.safety_margin (5) = 16: ..."}
+  ```
+  动态配置里没有的项按接收请求的节点的静态值计算；`safety_margin` 只有静态值。不改这三项的请求不检查。
+- 已知缺口：动态修改 `ttl` 目前不改变写进锁的 TTL，DCS 写的超时也一直是静态 `retry_timeout`（[invariants.md](invariants.md) 第 9 节）。调大 `loop_wait` 前，先确认静态 `ttl` 也满足约束。
+
+**分区下的旧主**：锁持有者与多数派断开后，最晚在最后一次续锁开始后 `ttl − safety_margin` 秒停掉 PostgreSQL（默认 25 秒，docker 10 秒），不论 DCS 调用是否返回；多数派最早在 `ttl` 秒后抢锁。前提是节点间墙钟偏差小于 `safety_margin`。pause 下不围栏。相关日志：
+
+| 日志 | 含义 |
+|------|------|
+| WARN `DCS write timed out after <n>s (retry_timeout); treating it as failed` | 一次 DCS 写在 `retry_timeout` 内没有完成（例如本节点是失去多数派的 Raft leader），按写失败处理。这次写之后仍可能提交，这是安全的（[invariants.md](invariants.md) 1a） |
+| ERROR `Leader lease expired before the lock renewal completed; fencing PostgreSQL (immediate stop) without waiting for the DCS` | 租约到期，本轮 HA 周期被放弃，PostgreSQL 以 `immediate` 模式停库 |
+| INFO `Created rewind-check marker: leader lease expired before renewal` | 围栏停库前写了 `standby.signal` 和 rewind 检查标记；之后按启动规则以备库启动，看到新 leader 后先 pg_rewind |
+
+健康集群里如果出现租约围栏，通常是 PG 或 DCS 太慢，一轮续锁来不及在 `ttl − safety_margin` 内完成，可以调大 `ttl`。
 
 ---
 
@@ -589,6 +621,8 @@ pg-ha 收到 SIGTERM 或 SIGINT 后：
 2. 等待 `shutdown.drain_timeout_secs`（默认 30 秒）。这只是 sleep，不会主动关掉已有 TCP
 3. 若本节点持有 leader lock：`CHECKPOINT`，然后删除 leader lock
 4. `pg_ctl stop -m fast`
+
+删除 leader lock 是一次 DCS 写，最多等 `retry_timeout` 秒。关停时 leader 租约已经到期（例如本节点被分区），pg-ha 跳过 CHECKPOINT 和删除锁，直接写 `standby.signal` 和标记，再 `pg_ctl stop -m immediate`。
 
 锁删除成功后，其他节点在各自下一个 HA cycle（不超过 `loop_wait`）里可以选举。删除失败则要等到 lock TTL。systemd 的 `TimeoutStopSec` 需要盖住 drain、CHECKPOINT 和 `pg_ctl stop`，示例见部署指南（120 秒）。
 
@@ -929,7 +963,10 @@ journalctl -u pg-ha --no-pager | jq 'select(.message | contains("failover") or c
 | API 返回 `401 Unauthorized` | Basic Auth 凭证错误 | 检查配置的 username/password |
 | Proxy 6432 连不上 | Primary 不健康或 HA 未就绪 | 检查 `/primary` 端点 |
 | `pending_restart = true` | 修改了需要 restart 的 PG 参数 | 执行 `POST /restart` |
-| 节点反复重启 | 配置错误（ttl <= loop_wait） | 检查 ttl > loop_wait 约束 |
+| 节点反复重启，`Configuration error: ttl (...) must be ...` | 配置不满足 `ttl > loop_wait` 或 `ttl >= loop_wait + retry_timeout + watchdog.safety_margin` | 见「HA 时间参数约束」 |
+| `PATCH /config` 返回 400 `Rejected, configuration not changed` | 改动后的 `ttl` / `loop_wait` / `retry_timeout` 不满足约束 | 见「HA 时间参数约束」 |
+| `DCS write timed out` | DCS 写在 `retry_timeout` 内没有完成：Raft 失去多数派或网络慢 | 检查 Raft 节点间连通性；锁持有者上会随之降级 |
+| `Leader lease expired before the lock renewal completed` | 锁持有者在租约内没能续锁，已自行停库 | 分区时是预期行为；健康集群里出现则检查 PG 与 DCS 延迟，或调大 `ttl` |
 | `replication lag` 持续增长 | 网络带宽不足或 Primary 写入过重 | 检查网络、考虑调大 `wal_keep_size` |
 
 ### pg-ha-ctl CLI 工具
