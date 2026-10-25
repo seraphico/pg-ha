@@ -24,8 +24,8 @@ use management::{
     delete_switchover, post_failover, post_reinitialize, post_restart, post_switchover,
 };
 use observability::{get_history, get_metrics};
-pub use router_state::{AuthConfig, CommandSender};
 use router_state::RouterState;
+pub use router_state::{AuthConfig, CommandSender};
 
 /// Build the full API router (without command channel, for tests)
 pub fn build_router(state: AppState) -> Router {
