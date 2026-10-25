@@ -28,8 +28,13 @@ pub(crate) mod election;
 mod follow;
 mod helpers;
 pub(crate) mod identity;
+mod lease;
 
 use identity::{LeaderAction, PgIdentity};
+use lease::{LeaderLease, LeaseAnchor};
+
+/// Rewind-check marker reason written by the lease-expiry fence.
+const LEASE_EXPIRED_REASON: &str = "leader lease expired before renewal";
 
 /// Result of a single HA cycle, used for logging
 #[derive(Debug)]
@@ -104,6 +109,13 @@ pub struct Ha {
     /// When the full hold ERROR was last logged (at most every
     /// `REWIND_HOLD_LOG_INTERVAL`).
     rewind_hold_logged_at: Option<std::time::Instant>,
+
+    /// L5 time bound: the lease granted by the last successful leader-lock
+    /// write (see `lease`). None when this node does not hold the lock.
+    leader_lease: Option<LeaderLease>,
+    /// The lease `run_cycle_bounded` races against: `leader_lease`, or None
+    /// in pause mode (W1).
+    fence_deadline_tx: tokio::sync::watch::Sender<Option<LeaderLease>>,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -138,8 +150,44 @@ impl Ha {
             rewind_hold: false,
             rewind_hold_persisted: false,
             rewind_hold_logged_at: None,
+            leader_lease: None,
+            fence_deadline_tx: tokio::sync::watch::Sender::new(None),
         };
         (ha, cmd_tx)
+    }
+
+    /// Run one HA cycle, raced against the leader lease (L5 time bound).
+    ///
+    /// When the lease expires before the cycle finishes, the cycle is dropped
+    /// (a dropped DCS write may still commit later, which is safe, see
+    /// docs/invariants.md 1a) and PostgreSQL is fenced without waiting for the
+    /// DCS. Not raced in pause mode (W1). An already expired lease fences
+    /// before the cycle does anything.
+    pub async fn run_cycle_bounded(&mut self) -> CycleResult {
+        self.publish_fence_deadline();
+        let expiry = lease::wait_for_expiry(self.fence_deadline_tx.subscribe());
+        let finished = tokio::select! {
+            biased;
+            () = expiry => None,
+            result = self.run_cycle() => Some(result),
+        };
+        match finished {
+            Some(result) => {
+                if !self.is_leader {
+                    self.set_leader_lease(None);
+                }
+                result
+            }
+            None => {
+                error!(
+                    "Leader lease expired before the lock renewal completed; fencing PostgreSQL (immediate stop) without waiting for the DCS"
+                );
+                let _ = self.fence_for_lost_lease().await;
+                CycleResult::Error(
+                    "leader lease expired before the lock renewal completed (no DCS answer in time); PostgreSQL fenced".into(),
+                )
+            }
+        }
     }
 
     /// Run one HA cycle. This is the main decision loop.
@@ -171,6 +219,9 @@ impl Ha {
                 // D6: the promote target belongs to one lock term.
                 if !self.is_lock_owner() {
                     self.promote_timeline_target = None;
+                    // Another node (or nobody) holds the lock: no lease left
+                    // to race; the follower / election paths fence a primary.
+                    self.set_leader_lease(None);
                 }
             }
             Err(e) => {
@@ -181,6 +232,8 @@ impl Ha {
 
         // Step 1b: Process dynamic configuration changes from DCS /config key
         self.process_dynamic_config().await;
+        // Pause mode may have changed (W1: no lease fence while paused).
+        self.publish_fence_deadline();
 
         // Step 2: Ensure we are registered as a member
         if !self.cluster.has_member(&self.config.name) {
@@ -232,9 +285,15 @@ impl Ha {
         if lock_owner == self.config.name {
             // I hold the lock — renew it
             let leader = self.cluster.leader.as_ref().unwrap().clone();
-            match self.dcs.update_leader(&leader).await {
+            let anchor = LeaseAnchor::now();
+            let renewed = self.dcs.update_leader(&leader).await;
+            if !matches!(renewed, Ok(true)) {
+                self.set_leader_lease(None);
+            }
+            match renewed {
                 Ok(true) => {
                     self.is_leader = true;
+                    self.extend_leader_lease(anchor);
                     self.enforce_primary_role().await
                 }
                 Ok(false) => {
@@ -281,6 +340,9 @@ impl Ha {
         let identity = self.pg_identity();
         match identity::leader_action(identity) {
             LeaderAction::Hold => {
+                if self.lease_lost() {
+                    return self.fence_at_lease_check("reporting the leader role").await;
+                }
                 self.postgresql.set_role(MemberRole::Primary);
                 let _ = self.touch_member().await;
                 // D6: /timeline must not be below this primary's timeline.
@@ -356,6 +418,9 @@ impl Ha {
             ));
         }
 
+        if self.lease_lost() {
+            return self.fence_at_lease_check("pg_ctl promote").await;
+        }
         info!("Promoting PostgreSQL from standby to primary (holding the leader lock)");
         if let Err(e) = self.postgresql.promote().await {
             error!("pg_ctl promote failed: {e}");
@@ -677,9 +742,11 @@ impl Ha {
                     if self.postgresql.is_observed_primary() {
                         self.postgresql.set_role(MemberRole::Primary);
                     }
+                    let anchor = LeaseAnchor::now();
                     match self.dcs.attempt_to_acquire_leader().await {
                         Ok(true) => {
                             self.is_leader = true;
+                            self.extend_leader_lease(anchor);
                             let _ = self.touch_member().await;
                             CycleResult::Leader("bootstrapped new cluster as leader".into())
                         }
@@ -966,6 +1033,13 @@ mod tests {
         fail_timeline_writes: std::sync::atomic::AtomicBool,
         /// The last data passed to touch_member.
         last_member_data: Mutex<Option<serde_json::Value>>,
+        /// When set, leader-lock writes never return (R19: a minority Raft
+        /// leader); checked after `leader_write_delay`.
+        hang_leader_writes: std::sync::atomic::AtomicBool,
+        /// How long each leader-lock write takes before it answers.
+        leader_write_delay: Mutex<std::time::Duration>,
+        /// `ttl()`: the TTL written into the lock.
+        lock_ttl: std::sync::atomic::AtomicU64,
     }
 
     impl MockDcs {
@@ -979,6 +1053,9 @@ mod tests {
                 timeline_writes: Mutex::new(Vec::new()),
                 fail_timeline_writes: std::sync::atomic::AtomicBool::new(false),
                 last_member_data: Mutex::new(None),
+                hang_leader_writes: std::sync::atomic::AtomicBool::new(false),
+                leader_write_delay: Mutex::new(std::time::Duration::ZERO),
+                lock_ttl: std::sync::atomic::AtomicU64::new(30),
             }
         }
 
@@ -999,6 +1076,9 @@ mod tests {
                 timeline_writes: Mutex::new(Vec::new()),
                 fail_timeline_writes: std::sync::atomic::AtomicBool::new(false),
                 last_member_data: Mutex::new(None),
+                hang_leader_writes: std::sync::atomic::AtomicBool::new(false),
+                leader_write_delay: Mutex::new(std::time::Duration::ZERO),
+                lock_ttl: std::sync::atomic::AtomicU64::new(30),
             }
         }
 
@@ -1029,6 +1109,25 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
+        fn hang_leader_writes(&self, hang: bool) {
+            self.hang_leader_writes
+                .store(hang, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Delay and hang injection for leader-lock writes.
+        async fn leader_write_latency(&self) {
+            let delay = *self.leader_write_delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if self
+                .hang_leader_writes
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::future::pending::<()>().await;
+            }
+        }
+
         fn leader_writes_fail(&self) -> Result<()> {
             if self
                 .fail_leader_writes
@@ -1051,6 +1150,7 @@ mod tests {
         }
 
         async fn attempt_to_acquire_leader(&self) -> Result<bool> {
+            self.leader_write_latency().await;
             self.leader_writes_fail()?;
             let mut held = self.leader_held_by.lock().unwrap();
             if held.is_none() {
@@ -1068,6 +1168,7 @@ mod tests {
         }
 
         async fn update_leader(&self, _leader: &Leader) -> Result<bool> {
+            self.leader_write_latency().await;
             self.leader_writes_fail()?;
             let held = self.leader_held_by.lock().unwrap();
             Ok(held.as_deref() == Some("test_node"))
@@ -1126,7 +1227,7 @@ mod tests {
         }
 
         fn ttl(&self) -> u64 {
-            30
+            self.lock_ttl.load(std::sync::atomic::Ordering::SeqCst)
         }
         fn loop_wait(&self) -> u64 {
             10
@@ -2580,6 +2681,243 @@ mod tests {
         assert_demoted_files(&dir, &ha, "demoted after losing the leader lock");
         assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
         assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────── Leader lease (R19, L5 time bound) ───────────────────
+
+    /// The lock holder with a lease taken now; the mock DCS reports the same
+    /// cluster (`run_cycle` reloads it).
+    fn lease_test_ha(label: &str, dcs: Arc<MockDcs>) -> (Ha, PathBuf) {
+        dcs.set_cluster(leader_cluster("test_node", "node2"));
+        let (mut ha, dir) = identity_test_ha("test_node", label, dcs, Some(false), false);
+        preset_auto_conf(&dir, "old");
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_leader = true;
+        ha.extend_leader_lease(LeaseAnchor::now());
+        (ha, dir)
+    }
+
+    fn assert_lease_fenced(dir: &std::path::Path, ha: &Ha) {
+        assert_demoted_files(dir, ha, LEASE_EXPIRED_REASON);
+        assert!(!ha.is_leader());
+        assert!(ha.stop_pending, "no pg_ctl: the stop failed");
+        assert_eq!(ha.leader_lease, None);
+        assert_eq!(ha.postgresql().role(), &MemberRole::Replica);
+    }
+
+    /// The anchor is read before update_leader (a slow renewal does not move
+    /// it), and the lease uses dcs.ttl(), not the dynamic ttl.
+    #[tokio::test(start_paused = true)]
+    async fn test_lease_anchor_is_taken_before_renewal_and_uses_dcs_ttl() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        dcs.lock_ttl.store(20, std::sync::atomic::Ordering::SeqCst);
+        *dcs.leader_write_delay.lock().unwrap() = std::time::Duration::from_secs(3);
+        let (mut ha, dir) = lease_test_ha("r19-anchor", dcs);
+        ha.config.ttl = 60;
+        ha.leader_lease = None;
+        let start = tokio::time::Instant::now();
+
+        let _ = ha.process_healthy_cluster().await;
+
+        let lease = ha.leader_lease.expect("renewal returned Ok(true)");
+        let wall = std::time::SystemTime::now();
+        // anchor (start) + 20 - 5; not start + 3 + 15, not start + 60 - 5.
+        let deadline = start + std::time::Duration::from_secs(15);
+        assert!(!lease.expired_at(deadline - std::time::Duration::from_millis(1), wall));
+        assert!(lease.expired_at(deadline, wall));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_failed_renewal_does_not_extend_the_lease() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        dcs.fail_leader_writes();
+        let (mut ha, dir) = lease_test_ha("r19-renew-err", dcs);
+
+        let _ = ha.process_healthy_cluster().await;
+
+        assert_eq!(ha.leader_lease, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R19: renewal never returns. At the lease deadline the cycle is
+    /// dropped and PostgreSQL fenced (signal + marker, immediate stop).
+    #[tokio::test(start_paused = true)]
+    async fn test_bounded_cycle_fences_at_lease_deadline_when_renewal_hangs() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        dcs.hang_leader_writes(true);
+        let (mut ha, dir) = lease_test_ha("r19-bounded", dcs.clone());
+        let start = tokio::time::Instant::now();
+
+        let result = ha.run_cycle_bounded().await;
+
+        let elapsed = start.elapsed();
+        // ttl 30 - safety_margin 5.
+        assert!(
+            elapsed >= std::time::Duration::from_secs(25)
+                && elapsed <= std::time::Duration::from_secs(26),
+            "{elapsed:?}"
+        );
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("leader lease expired")),
+            "got: {result}"
+        );
+        assert_lease_fenced(&dir, &ha);
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bounded_cycle_with_expired_lease_fences_before_the_cycle() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = lease_test_ha("r19-expired-start", dcs.clone());
+        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+
+        let result = ha.run_cycle_bounded().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("leader lease expired")),
+            "got: {result}"
+        );
+        assert_lease_fenced(&dir, &ha);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A renewal that answers Ok(true) after the deadline is dropped with the
+    /// cycle; the fenced node does not become a primary again.
+    #[tokio::test(start_paused = true)]
+    async fn test_late_renewal_after_lease_fence_does_not_resurrect_primary() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        *dcs.leader_write_delay.lock().unwrap() = std::time::Duration::from_secs(40);
+        let (mut ha, dir) = lease_test_ha("r19-late", dcs.clone());
+
+        let result = ha.run_cycle_bounded().await;
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("leader lease expired")),
+            "got: {result}"
+        );
+        // Past the time the dropped renewal would have answered Ok(true).
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert_lease_fenced(&dir, &ha);
+
+        // The immediate stop took effect; the lock is still ours in DCS (the
+        // write committed late). Next cycle: no primary, the lock is released.
+        std::fs::remove_file(dir.join("postmaster.pid")).unwrap();
+        *dcs.leader_write_delay.lock().unwrap() = std::time::Duration::ZERO;
+        let result = ha.run_cycle_bounded().await;
+
+        assert!(!matches!(result, CycleResult::Leader(_)), "got: {result}");
+        assert!(!ha.is_leader());
+        assert_eq!(ha.leader_lease, None);
+        assert_eq!(lock_held_by(&dcs), None);
+        assert_ne!(ha.postgresql().role(), &MemberRole::Primary);
+        assert!(dir.join("standby.signal").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W1: no lease fence in pause mode, even when renewal hangs.
+    #[tokio::test(start_paused = true)]
+    async fn test_bounded_cycle_does_not_fence_in_pause_mode() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        dcs.hang_leader_writes(true);
+        let (mut ha, dir) = lease_test_ha("r19-paused", dcs.clone());
+        let mut cluster = leader_cluster("test_node", "node2");
+        cluster.config = Some(crate::cluster::ClusterConfig {
+            version: 1,
+            data: HashMap::from([("pause".to_string(), serde_json::json!(true))]),
+        });
+        dcs.set_cluster(cluster);
+
+        let r =
+            tokio::time::timeout(std::time::Duration::from_secs(120), ha.run_cycle_bounded()).await;
+
+        assert!(r.is_err(), "the cycle must not be cut off in pause mode");
+        assert!(ha.is_paused());
+        assert!(!dir.join("standby.signal").exists());
+        assert!(marker(&dir).is_none());
+        assert!(!ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_promote_skipped_when_lease_expired() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
+        // The renewal answers Ok(true) after the lease from its anchor ended.
+        *dcs.leader_write_delay.lock().unwrap() = std::time::Duration::from_secs(26);
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "r19-promote", dcs.clone(), Some(true), true);
+        preset_auto_conf(&dir, "old");
+        ha.cluster = self_led(Some(2), Some(2));
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m)
+                if m.contains("leader lease expired before pg_ctl promote")),
+            "got: {result}"
+        );
+        assert_lease_fenced(&dir, &ha);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_hold_not_reported_when_lease_expired() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        *dcs.leader_write_delay.lock().unwrap() = std::time::Duration::from_secs(26);
+        let (mut ha, dir) = lease_test_ha("r19-hold", dcs);
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m)
+                if m.contains("leader lease expired before reporting the leader role")),
+            "got: {result}"
+        );
+        assert_lease_fenced(&dir, &ha);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Decision 8: lease already expired when the shutdown signal arrives.
+    /// Fenced at once; the caller skips drain, CHECKPOINT and lock release,
+    /// so the lock (maybe another node's by now) is not touched.
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_with_expired_lease_fences_and_skips_release() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = lease_test_ha("r19-shutdown-expired", dcs.clone());
+        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+
+        assert!(ha.shutdown_fence_if_lease_expired().await);
+
+        assert_eq!(
+            lock_held_by(&dcs).as_deref(),
+            Some("test_node"),
+            "lock not touched"
+        );
+        assert_lease_fenced(&dir, &ha);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Valid lease, not the lock holder, or pause mode: the normal shutdown
+    /// sequence runs and nothing is written or stopped here.
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_without_expired_lease_keeps_normal_sequence() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = lease_test_ha("r19-shutdown-valid", dcs.clone());
+        assert!(!ha.shutdown_fence_if_lease_expired().await, "valid lease");
+
+        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+        ha.is_paused = true;
+        assert!(!ha.shutdown_fence_if_lease_expired().await, "paused (W1)");
+
+        ha.is_paused = false;
+        ha.is_leader = false;
+        assert!(!ha.shutdown_fence_if_lease_expired().await, "not leader");
+
+        assert!(!dir.join("standby.signal").exists());
+        assert!(marker(&dir).is_none());
+        assert!(!ha.stop_pending);
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

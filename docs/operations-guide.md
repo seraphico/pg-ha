@@ -400,6 +400,8 @@ ttl >= loop_wait + retry_timeout + watchdog.safety_margin，且 retry_timeout >=
 |------|------|
 | WARN `DCS write timed out after <n>s (retry_timeout); treating it as failed` | 一次 DCS 写在 `retry_timeout` 内没有完成（例如本节点是失去多数派的 Raft leader），按写失败处理。这次写之后仍可能提交，这是安全的（[invariants.md](invariants.md) 1a） |
 | ERROR `Leader lease expired before the lock renewal completed; fencing PostgreSQL (immediate stop) without waiting for the DCS` | 租约到期，本轮 HA 周期被放弃，PostgreSQL 以 `immediate` 模式停库 |
+| ERROR `Leader lease expired before pg_ctl promote; fencing PostgreSQL (immediate stop)` / `Leader lease expired before reporting the leader role; fencing PostgreSQL (immediate stop)` | 续锁返回成功，但返回时租约已经到期（续锁写太慢），不 promote、不报告主库，按失去锁围栏 |
+| ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)` | 关停时租约已到期，直接围栏停库 |
 | INFO `Created rewind-check marker: leader lease expired before renewal` | 围栏停库前写了 `standby.signal` 和 rewind 检查标记；之后按启动规则以备库启动，看到新 leader 后先 pg_rewind |
 
 健康集群里如果出现租约围栏，通常是 PG 或 DCS 太慢，一轮续锁来不及在 `ttl − safety_margin` 内完成，可以调大 `ttl`。
@@ -622,7 +624,7 @@ pg-ha 收到 SIGTERM 或 SIGINT 后：
 3. 若本节点持有 leader lock：`CHECKPOINT`，然后删除 leader lock
 4. `pg_ctl stop -m fast`
 
-删除 leader lock 是一次 DCS 写，最多等 `retry_timeout` 秒。关停时 leader 租约已经到期（例如本节点被分区），pg-ha 跳过 CHECKPOINT 和删除锁，直接写 `standby.signal` 和标记，再 `pg_ctl stop -m immediate`。
+删除 leader lock 是一次 DCS 写，最多等 `retry_timeout` 秒。收到信号时 leader 租约已经到期（例如本节点被分区），pg-ha 跳过 drain、CHECKPOINT 和删除锁，直接写 `standby.signal` 和标记，再 `pg_ctl stop -m immediate`（日志 ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)`）。租约有效时按上面的顺序关停。注意 drain 期间不续锁：`drain_timeout_secs` 长于 `ttl − safety_margin`（默认 30 > 25）时，锁可能在 drain 期间过期，其他节点可能在本节点停库前 promote（[invariants.md](invariants.md) 第 9 节）。
 
 锁删除成功后，其他节点在各自下一个 HA cycle（不超过 `loop_wait`）里可以选举。删除失败则要等到 lock TTL。systemd 的 `TimeoutStopSec` 需要盖住 drain、CHECKPOINT 和 `pg_ctl stop`，示例见部署指南（120 秒）。
 

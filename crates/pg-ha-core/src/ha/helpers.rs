@@ -6,7 +6,10 @@ use tracing::{error, info, warn};
 use crate::error::Result;
 use crate::standby_config;
 
-use super::{CycleResult, Ha, identity};
+use crate::cluster::MemberRole;
+
+use super::lease::{LeaderLease, LeaseAnchor};
+use super::{CycleResult, Ha, LEASE_EXPIRED_REASON, identity};
 
 /// Cycle result while a node is held after a pg_rewind failure (D5).
 const REWIND_HOLD_RESULT: &str =
@@ -197,6 +200,81 @@ impl Ha {
             );
         }
         self.stop_after_demotion_write(mode).await
+    }
+
+    // ─── Leader lease (L5 time bound, see `lease`) ───
+
+    /// A leader-lock write that started at `anchor` returned `Ok(true)`. The
+    /// lease uses the TTL written into the lock (`dcs.ttl()`), not the
+    /// dynamic `ttl`.
+    pub(super) fn extend_leader_lease(&mut self, anchor: LeaseAnchor) {
+        let lease = LeaderLease::new(anchor, self.dcs.ttl(), self.config.watchdog.safety_margin);
+        self.set_leader_lease(Some(lease));
+    }
+
+    pub(super) fn set_leader_lease(&mut self, lease: Option<LeaderLease>) {
+        self.leader_lease = lease;
+        self.publish_fence_deadline();
+    }
+
+    /// Publish the deadline `run_cycle_bounded` races against: none while
+    /// paused (W1).
+    pub(super) fn publish_fence_deadline(&self) {
+        let deadline = if self.is_paused {
+            None
+        } else {
+            self.leader_lease
+        };
+        self.fence_deadline_tx.send_replace(deadline);
+    }
+
+    /// The lease no longer covers acting as the lock holder (expired, or no
+    /// successful lock write). Never in pause mode (W1).
+    pub(super) fn lease_lost(&self) -> bool {
+        !self.is_paused && self.leader_lease.is_none_or(|l| l.is_expired())
+    }
+
+    /// The lease-expiry fence: handled as loss of the lock. standby.signal +
+    /// rewind-check marker first, then an immediate stop (a failed stop sets
+    /// `stop_pending`).
+    pub(super) async fn fence_for_lost_lease(&mut self) -> crate::error::Result<()> {
+        self.is_leader = false;
+        self.set_leader_lease(None);
+        let stopped = self
+            .fence_primary("immediate", LEASE_EXPIRED_REASON, None)
+            .await;
+        self.postgresql.set_role(MemberRole::Replica);
+        stopped
+    }
+
+    /// Lease checkpoint inside a cycle (before `pg_ctl promote`, before
+    /// reporting the leader role).
+    pub(super) async fn fence_at_lease_check(&mut self, before: &str) -> CycleResult {
+        error!("Leader lease expired before {before}; fencing PostgreSQL (immediate stop)");
+        let _ = self.fence_for_lost_lease().await;
+        CycleResult::Error(format!(
+            "leader lease expired before {before}; PostgreSQL fenced"
+        ))
+    }
+
+    /// Graceful shutdown, checked when the shutdown signal arrives (before
+    /// the drain, src/main.rs). When this node still believes it holds the
+    /// lock but the leader lease has already expired, the lock may belong to
+    /// another node by now: fence PostgreSQL at once (standby.signal + marker,
+    /// then an immediate stop) and return true, so the caller skips the drain,
+    /// CHECKPOINT and lock release. Otherwise (no lock, valid lease, or pause
+    /// mode, W1) returns false and the normal shutdown sequence runs.
+    pub async fn shutdown_fence_if_lease_expired(&mut self) -> bool {
+        if !self.is_leader || !self.lease_lost() {
+            return false;
+        }
+        error!(
+            "Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)"
+        );
+        if let Err(e) = self.fence_for_lost_lease().await {
+            error!("Failed to stop PostgreSQL during shutdown: {e}");
+        }
+        true
     }
 
     /// Graceful shutdown, Phase 4 (src/main.rs): stop PostgreSQL. The lock was

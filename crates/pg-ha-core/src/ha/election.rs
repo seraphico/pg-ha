@@ -236,9 +236,11 @@ impl Ha {
         };
 
         if should_attempt {
+            let anchor = super::lease::LeaseAnchor::now();
             match self.dcs.attempt_to_acquire_leader().await {
                 Ok(true) => {
                     self.is_leader = true;
+                    self.extend_leader_lease(anchor);
                     // Clear the failover key after successful acquisition
                     let _ = self.dcs.set_failover_value("").await;
                     self.enforce_primary_role().await

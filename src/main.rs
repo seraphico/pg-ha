@@ -18,7 +18,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use pg_ha_api::{AppState, AuthConfig};
-use pg_ha_core::cluster::{MemberRole, MemberState};
+use pg_ha_core::cluster::{Member, MemberRole, MemberState};
 use pg_ha_core::config::Config;
 use pg_ha_core::dcs::DcsAdapter;
 use pg_ha_core::ha::Ha;
@@ -257,8 +257,17 @@ async fn main() -> anyhow::Result<()> {
     // ─── Start remaining subsystems concurrently ───
     info!(%api_addr, %rw_addr, %ro_addr, "All subsystems starting");
 
-    let proxy_clone = proxy.clone();
     let app_state_clone = app_state.clone();
+
+    // Proxy backends are refreshed on their own task, fed with the latest
+    // member list after each HA cycle. The task ends when the HA loop (the
+    // sender) is dropped.
+    let (members_tx, members_rx) = tokio::sync::watch::channel(Vec::<Member>::new());
+    tokio::spawn(refresh_proxy_backends(
+        members_rx,
+        proxy.clone(),
+        config.restapi.port,
+    ));
 
     tokio::select! {
         // HA Loop
@@ -267,7 +276,7 @@ async fn main() -> anyhow::Result<()> {
             let mut interval = ha_interval(current_loop_wait);
             loop {
                 interval.tick().await;
-                let result = ha.run_cycle().await;
+                let result = ha.run_cycle_bounded().await;
                 info!("{result}");
 
                 // Detect dynamic loop_wait change and recreate interval
@@ -302,33 +311,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }).await;
 
-                // Update proxy backends from cluster state (resolve Docker DNS hostnames)
-                let mut backends: Vec<PgBackend> = Vec::new();
-                for m in &ha.cluster().members {
-                    let Some(addr) = resolve_pg_addr(&m.conn_url).await else {
-                        warn!(
-                            member = %m.name,
-                            conn_url = %m.conn_url,
-                            "Skipping proxy backend: failed to resolve conn_url"
-                        );
-                        continue;
-                    };
-                    let api_url = if m.api_url.is_empty() {
-                        api_url_from_conn_url(&m.conn_url, config.restapi.port).unwrap_or_else(|| {
-                            format!("http://{}:{}", addr.ip(), config.restapi.port)
-                        })
-                    } else {
-                        m.api_url.clone()
-                    };
-                    backends.push(PgBackend {
-                        addr,
-                        name: m.name.clone(),
-                        is_primary: m.role == MemberRole::Primary,
-                        is_healthy: m.state == MemberState::Running,
-                        api_url,
-                    });
-                }
-                proxy_clone.update_backends(backends).await;
+                // Hand the members to the proxy refresher task. Never await the
+                // refresh here: its DNS lookups have no timeout, and the HA loop
+                // must not await anything unbounded outside run_cycle_bounded
+                // (docs/invariants.md 1a, "leader 租约").
+                members_tx.send_replace(ha.cluster().members.clone());
             }
         } => {}
 
@@ -369,6 +356,18 @@ async fn main() -> anyhow::Result<()> {
 
     // ─── Graceful Shutdown Sequence ───
     info!("Initiating graceful shutdown...");
+
+    // Leader lease already expired (e.g. partitioned): the lock may belong to
+    // another node by now. Fence at once and skip drain, CHECKPOINT and lock
+    // release (docs/invariants.md 1a, "leader 租约").
+    if ha.shutdown_fence_if_lease_expired().await {
+        // No-op when the immediate stop succeeded; otherwise one more try.
+        if let Err(e) = ha.stop_postgres_for_shutdown().await {
+            error!("Failed to stop PostgreSQL during shutdown: {e}");
+        }
+        info!("Graceful shutdown complete (fenced: leader lease expired)");
+        return Ok(());
+    }
 
     // Phase 1: Stop accepting new connections
     // (Already done — tokio::select! drops the proxy/API listeners above)
@@ -421,6 +420,45 @@ fn ha_interval(loop_wait: u64) -> tokio::time::Interval {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(loop_wait));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval
+}
+
+/// Rebuild the proxy backends from each member list the HA loop publishes
+/// (resolves Docker DNS hostnames). Runs off the HA task because the lookups
+/// have no timeout. Snapshots are handled one at a time; one published while
+/// a refresh runs replaces any older pending one.
+async fn refresh_proxy_backends(
+    mut members_rx: tokio::sync::watch::Receiver<Vec<Member>>,
+    proxy: Arc<PgProxy>,
+    api_port: u16,
+) {
+    while members_rx.changed().await.is_ok() {
+        let members = members_rx.borrow_and_update().clone();
+        let mut backends: Vec<PgBackend> = Vec::new();
+        for m in &members {
+            let Some(addr) = resolve_pg_addr(&m.conn_url).await else {
+                warn!(
+                    member = %m.name,
+                    conn_url = %m.conn_url,
+                    "Skipping proxy backend: failed to resolve conn_url"
+                );
+                continue;
+            };
+            let api_url = if m.api_url.is_empty() {
+                api_url_from_conn_url(&m.conn_url, api_port)
+                    .unwrap_or_else(|| format!("http://{}:{}", addr.ip(), api_port))
+            } else {
+                m.api_url.clone()
+            };
+            backends.push(PgBackend {
+                addr,
+                name: m.name.clone(),
+                is_primary: m.role == MemberRole::Primary,
+                is_healthy: m.state == MemberState::Running,
+                api_url,
+            });
+        }
+        proxy.update_backends(backends).await;
+    }
 }
 
 /// Extract host/port from a libpq-style conn_url (`host=node1 port=5432 ...`).
@@ -823,6 +861,72 @@ mod tests {
                    section 2.2b with a reason";
         assert_eq!(prod_code.matches(".stop(").count(), 0, "{msg}");
         assert!(prod_code.contains("stop_postgres_for_shutdown("), "{msg}");
+    }
+
+    /// Outside `run_cycle_bounded` the HA loop awaits only the tick and the
+    /// API state write lock (handlers hold it only for local reads); nothing
+    /// there races the leader lease (docs/invariants.md 1a). Anything else,
+    /// such as the proxy refresh's DNS lookups, belongs on another task.
+    #[test]
+    fn test_ha_loop_awaits_nothing_unbounded_outside_the_bounded_cycle() {
+        let source = include_str!("main.rs");
+        let prod_code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let ha_loop = prod_code
+            .split("// HA Loop")
+            .nth(1)
+            .and_then(|s| s.split("// REST API server").next())
+            .expect("HA loop arm not found");
+        let awaits: Vec<&str> = ha_loop
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains(".await"))
+            .collect();
+        assert_eq!(
+            awaits,
+            vec![
+                "interval.tick().await;",
+                "let result = ha.run_cycle_bounded().await;",
+                "}).await;",
+            ],
+            "a new await in the HA loop is not raced against the leader lease: \
+             move it into run_cycle_bounded or onto another task"
+        );
+        assert!(ha_loop.contains("app_state_clone.update("));
+    }
+
+    /// The proxy refresher applies the published member list and ends when the
+    /// HA loop drops the sender.
+    #[tokio::test]
+    async fn test_refresh_proxy_backends_follows_published_members() {
+        let proxy = Arc::new(PgProxy::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        ));
+        let (tx, rx) = tokio::sync::watch::channel(Vec::<Member>::new());
+        let task = tokio::spawn(refresh_proxy_backends(rx, proxy.clone(), 8008));
+        tx.send_replace(vec![Member {
+            name: "node1".to_string(),
+            conn_url: "host=10.0.0.1 port=5433".to_string(),
+            api_url: String::new(),
+            state: MemberState::Running,
+            role: MemberRole::Primary,
+            wal_position: None,
+            timeline: None,
+            tags: Default::default(),
+            version: None,
+            rewind_check: false,
+        }]);
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("refresher did not end after the sender was dropped")
+            .unwrap();
+        let upstream = proxy.upstream_handle();
+        let state = upstream.read().await;
+        let primary = state.primary().expect("primary backend registered");
+        assert_eq!(primary.name, "node1");
+        assert_eq!(primary.addr, "10.0.0.1:5433".parse::<SocketAddr>().unwrap());
+        assert_eq!(primary.api_url, "http://10.0.0.1:8008");
     }
 
     #[test]
