@@ -34,7 +34,7 @@ flowchart TD
     DYNCONF --> DATADIR{数据目录为空?}
     DATADIR -->|是| BOOTSTRAP[Bootstrap initdb/clone]
     DATADIR -->|否| PGRUN{PG 运行中?}
-    PGRUN -->|否| PGSTART[尝试启动 PG]
+    PGRUN -->|否| PGSTART[有 rewind 保持文件: 不启动<br/>否则写 standby.signal 和按 pg_controldata 写标记<br/>以备库启动; 写失败不启动<br/>只有持锁时以主库启动]
     PGRUN -->|是| OBSERVE[观测 pg_is_in_recovery<br/>得出身份]
     OBSERVE --> LOCKED{集群有 Leader?}
     LOCKED -->|unlocked| ELECTION[选举流程]
@@ -45,6 +45,12 @@ flowchart TD
 
 之后的每个分支都按身份（Primary / ManagedStandby / UnmanagedRecovery / Unknown）决策，不依据内存里记录的 role。完整决策表见 [invariants.md](invariants.md) 1a 节。
 
+**时间界**：
+- 主循环每 `loop_wait` 秒启动一轮；一轮超时后下一轮立即开始，错过的 tick 不连发（`MissedTickBehavior::Delay`）。
+- 每次 DCS 写最多等 `retry_timeout` 秒，超时按写失败处理（openraft 0.9 的 Raft leader 失去多数派后不退位，不设上限时续锁会一直挂到网络恢复）。
+- 持锁节点维护 leader 租约：每次抢锁 / 续锁开始前记录锚点（单调时钟和墙钟），成功后截止时间 = 锚点 + 写入锁的 TTL − `watchdog.safety_margin`。每轮周期与这个截止时间赛跑（`Ha::run_cycle_bounded`）：截止时间先到就放弃本轮，先写 `standby.signal` 和 rewind 检查标记，再 `pg_ctl stop -m immediate`。`pg_ctl promote` 之前和保持主之前也检查租约。pause 下不围栏。
+- 参数约束 `ttl >= loop_wait + retry_timeout + safety_margin` 保证健康的主库能在租约内完成一轮周期和一次续锁。完整规则见 [invariants.md](invariants.md) L5 与 1a「leader 租约」。
+
 ## 选举流程 (process_unhealthy_cluster)
 
 ```mermaid
@@ -54,17 +60,22 @@ flowchart TD
     PAUSE -->|否| IDENT{身份?}
     IDENT -->|UnmanagedRecovery| ASIDE[不参选 交运维]
     IDENT -->|Unknown| SKIP[本轮不参选]
-    IDENT -->|Primary / ManagedStandby| STALE{观测为主且非最健康?}
-    STALE -->|是| REJOIN[rejoin_as_replica]
+    IDENT -->|降级停库失败未确认| FENCE[先停库 不参选]
+    IDENT -->|Primary / ManagedStandby| MARK{带 rewind 检查标记且 timeline < /timeline?}
+    MARK -->|是| ASIDE2[不参选 以主库运行则先停库<br/>等 leader 后 rewind]
+    MARK -->|否| STALE{观测为主且非最健康?}
+    STALE -->|是| STOPSTALE[停库 下次以备库启动]
     STALE -->|否| FAILOVER{有 failover key 指定 candidate?}
     FAILOVER -->|是 我是candidate| ACQUIRE[尝试获取 leader lock]
-    FAILOVER -->|是 我不是| DEFER[让步给 candidate]
-    FAILOVER -->|否| HEALTH{is_healthiest_node?}
+    FAILOVER -->|是 我不是| DEFER[让步给 candidate<br/>candidate 带标记且不能参选时按无 candidate 处理]
+    FAILOVER -->|否| HEALTH{is_healthiest_node?<br/>不计入不能参选的带标记 peer}
     HEALTH -->|是| ACQUIRE
     HEALTH -->|否| WAIT[等待选举结果]
-    ACQUIRE -->|成功| PROMOTE[ManagedStandby: pg_ctl promote<br/>重新观测确认后记为主]
+    ACQUIRE -->|成功| PROMOTE[ManagedStandby: promote 前写 /timeline<br/>pg_ctl promote<br/>重新观测确认后记为主]
     ACQUIRE -->|失败| WAIT
 ```
+
+带 rewind 检查标记的节点能否参选、`/timeline` 的写入时机见 [invariants.md](invariants.md) 1a「集群 timeline 记录」。
 
 ## Failover + Rejoin 完整流程
 
@@ -83,8 +94,10 @@ sequenceDiagram
     R1->>R1: is_healthiest_node() = true
     R1->>DCS: attempt_to_acquire_leader()
     DCS-->>R1: OK (获取成功)
+    R1->>DCS: /timeline = tl+1 (promote 前, 写不成不 promote)
     R1->>R1: pg_ctl promote
     R1->>R1: 重新观测 pg_is_in_recovery() = f
+    R1->>DCS: /timeline = 实际 timeline
     Note over R1: 成为新 Primary
 
     R2->>DCS: get_cluster() → leader=node2
@@ -93,14 +106,22 @@ sequenceDiagram
     R2->>R2: reconfigure → 重启 PG 指向 node2
 
     Note over P: 旧 Primary 重启
-    P->>DCS: get_cluster()
-    P->>P: 观测: 不在 recovery (身份 Primary) + 不是最健康
-    P->>P: rejoin_as_replica(node2)
-    P->>P: pg_ctl stop
-    P->>P: pg_rewind (从 node2)
-    P->>P: 写入 standby.signal + primary_conninfo
+    P->>DCS: get_cluster() → leader=node2
+    P->>P: 不持锁: 写 standby.signal<br/>pg_controldata = in production → 写 rewind 检查标记
     P->>P: pg_ctl start (standby 模式)
-    Note over P: 自动 streaming 追赶数据
+    P->>DCS: node2 持锁且 running/primary
+    P->>R1: SELECT pg_is_in_recovery() → f (实时确认)
+    P->>P: pg_ctl stop
+    P->>R1: SELECT pg_is_in_recovery() → f (停库后再确认)
+    P->>P: pg_rewind (从 node2)
+    alt pg_rewind 成功
+        P->>P: 删除标记, 写入 standby.signal + primary_conninfo
+        P->>P: pg_ctl start (standby 模式)
+        Note over P: 自动 streaming 追赶数据
+    else pg_rewind 失败
+        P->>P: 停库, 保留数据目录, 写 pg-ha.rewind_failed
+        Note over P: 等运维: POST /reinitialize 或打开<br/>remove_data_directory_on_rewind_failure
+    end
 ```
 
 ## 动态配置流程
@@ -206,9 +227,10 @@ flowchart LR
 /service/{scope}/
 ├── leader          → "node1"              (TTL=15s, CAS 原子操作)
 ├── members/
-│   ├── node1       → {conn_url, api_url, state, role}  (TTL)
-│   ├── node2       → {conn_url, api_url, state, role}  (TTL)
-│   └── node3       → {conn_url, api_url, state, role}  (TTL)
+│   ├── node1       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check}  (TTL)
+│   ├── node2       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check}  (TTL)
+│   └── node3       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check}  (TTL)
+├── timeline        → "3"                  (无 TTL, 单调不减, 持锁主写)
 ├── initialize      → "system_id"          (原子创建, 初始化竞争)
 ├── config          → {loop_wait, ttl, synchronous_mode, postgresql: {...}}
 ├── failover        → {leader, candidate}  (switchover 请求)
@@ -438,6 +460,7 @@ sequenceDiagram
 2. **CHECKPOINT 在释放锁之前**：确保所有已提交事务的 WAL 已刷盘，避免数据丢失
 3. **fast 模式停止 PG**：立即断开客户端连接，但允许正在进行的 WAL 写入完成
 4. **信号处理的 tokio::select!**：与 HA 循环、API 服务器、Proxy 并行监听，任一退出触发关停
+5. **租约已到期时直接围栏**：释放锁这次 DCS 写最多等 `retry_timeout`；如果收到信号时（drain 之前）leader 租约已经到期，跳过 drain、CHECKPOINT 和释放锁，直接写 `standby.signal` 后 `pg_ctl stop -m immediate`。drain 期间不续锁，是已登记的缺口（invariants.md 第 9 节）
 
 **时间线：**
 

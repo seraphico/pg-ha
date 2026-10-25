@@ -173,7 +173,13 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
 {"status": "rejected", "message": "Candidate 'node3' is not a synchronous standby (sync mode requires /sync membership)"}
 ```
 
-候选不存在、带 `nofailover` 或不在 Running，同样是 409。
+候选不存在、带 `nofailover` 或不在 Running，同样是 409。候选带 rewind 检查标记（`pg-ha.rewind_check`，尚未经 pg_rewind 验证）时也是 409，`POST /failover` 同样：
+
+```json
+{"status": "rejected", "message": "Candidate 'node2' has a rewind-check marker (not yet verified with pg_rewind)"}
+```
+
+请求受理之后 candidate 才带上标记、且按 [invariants.md](invariants.md) 1a 的规则不能参选时，其他节点打 WARN `Designated candidate <c> has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated`，按没有指定 candidate 选举。
 
 **取消已计划的 switchover：**
 
@@ -186,8 +192,8 @@ curl -u admin:secret -X DELETE http://localhost:8008/switchover
 1. 校验候选（含同步复制资格）
 2. 把 `{leader, candidate}` 写入 DCS `/failover`
 3. 删除本节点 leader lock
-4. `pg_ctl stop -m fast`，角色改为 Replica
-5. 写入 `standby.signal`，并把 `postgresql.auto.conf` 的 `primary_conninfo` 指到候选
+4. 写入 `standby.signal` 并 fsync；有 candidate 时把 `postgresql.auto.conf` 的 `primary_conninfo` 指到候选，没有时删除 `primary_conninfo`；`postgresql.auto.conf` 的其他设置保留
+5. `pg_ctl stop -m fast`，角色改为 Replica
 
 ```mermaid
 sequenceDiagram
@@ -202,13 +208,34 @@ sequenceDiagram
     Note over HA: sync 开启时 candidate 必须属于 /sync<br/>否则 409，不写 key、不 demote
     HA->>DCS: 写入 /failover
     HA->>DCS: 删除 leader lock
-    HA->>HA: pg_ctl stop -m fast，写 standby.signal
+    HA->>HA: 写 standby.signal（+ primary_conninfo），然后 pg_ctl stop -m fast
     API-->>Admin: 200 accepted，leader lock released
     New->>DCS: 读到未持锁 + failover key
     Note over New: 再校验自身 sync 资格后才抢锁
     New->>DCS: attempt_to_acquire_leader()
+    New->>DCS: /timeline = tl+1（promote 前）
     New->>New: pg_ctl promote
+    HA->>HA: 以备库启动（pg_controldata 为 shut down → 写 rewind 检查标记）
+    HA->>New: SELECT pg_is_in_recovery() = f（实时确认新主就绪）
+    HA->>HA: 停库 → pg_rewind（no rewind required）→ 删除标记 → 启动跟随
 ```
+
+**switchover 之后旧主的 rewind 检查**：旧主 `pg_ctl stop -m fast` 之后 `pg_controldata` 为 `shut down`，下次启动时按启动规则写 rewind 检查标记，日志：
+
+```text
+Created rewind-check marker: pg_controldata reports 'shut down' (last ran as a primary)
+Starting PostgreSQL as a standby (not holding the leader lock)
+```
+
+看到新主就绪后：
+
+```text
+Rewind-check marker present and <new> holds the leader lock — checking with pg_rewind before following
+Running pg_rewind to resync from current primary
+pg_rewind succeeded; removed the rewind-check marker
+```
+
+正常 switchover 没有分叉，pg_rewind 报 `no rewind required`。所以每次 switchover 后旧主都会多一次「以备库启动 → 停库 → pg_rewind → 再启动」，期间短暂不可用于只读流量。在这次检查完成之前，以旧主为 candidate 的反向 switchover / failover 会被拒绝（409，`Candidate '<old>' has a rewind-check marker (not yet verified with pg_rewind)`），等日志出现 `pg_rewind succeeded` 后再发。
 
 ---
 
@@ -255,7 +282,7 @@ curl -u admin:secret http://localhost:8008/config | jq .
 ### 部分更新 (PATCH)
 
 ```bash
-# 修改 loop_wait 和 ttl
+# 修改 loop_wait 和 ttl（结果须满足下文「HA 时间参数约束」，否则返回 400 且不写入）
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
   -d '{
@@ -343,6 +370,42 @@ curl -u admin:secret -X PUT http://localhost:8008/config \
 curl -u admin:secret -X POST http://localhost:8008/restart
 ```
 
+在持锁的节点上，PG 按原角色重启。在不持锁的节点上，pg-ha 先按启动规则做准备（写 `standby.signal`，`pg_controldata` 显示上次以主库运行时写 rewind 检查标记），再停库、以备库启动；准备失败时返回错误 `Not restarting PostgreSQL: standby configuration could not be written: ...`，PG 不动（见 [invariants.md](invariants.md) 1a「启动规则」）。
+
+### HA 时间参数约束
+
+`ttl`、`loop_wait`、`retry_timeout` 和 `watchdog.safety_margin` 必须满足：
+
+```text
+ttl >= loop_wait + retry_timeout + watchdog.safety_margin，且 retry_timeout >= 1
+```
+
+原因：锁持有者在最后一次续锁**开始前**的时刻 + `ttl` − `safety_margin` 秒内没有再次续锁成功，就自己停掉 PostgreSQL（leader 租约，见 [invariants.md](invariants.md) 1a「leader 租约」）；健康的主库要在这段时间里完成一轮 HA 周期（`loop_wait`）和一次续锁写（每次 DCS 写最多等 `retry_timeout` 秒）。默认值 30 ≥ 10 + 10 + 5，docker 开发集群 15 ≥ 5 + 5 + 5。
+
+- 静态配置（`pg-ha.yml`、环境变量覆盖、`bootstrap.dcs`）不满足时 pg-ha 拒绝启动，`--validate-config` 同样报错：
+  ```text
+  Error: Configuration error: ttl (20) must be >= loop_wait (10) + retry_timeout (6) + watchdog.safety_margin (5) = 21: ...
+  ```
+  `bootstrap.dcs` 不满足时错误以 `bootstrap.dcs:` 开头。
+- `PATCH` / `PUT /config` 改动 `ttl`、`loop_wait` 或 `retry_timeout` 后不满足时返回 400，配置不写入：
+  ```json
+  {"error": "Rejected, configuration not changed: ttl (15) must be >= loop_wait (6) + retry_timeout (5) + watchdog.safety_margin (5) = 16: ..."}
+  ```
+  动态配置里没有的项按接收请求的节点的静态值计算；`safety_margin` 只有静态值。不改这三项的请求不检查。
+- 已知缺口：动态修改 `ttl` 目前不改变写进锁的 TTL，DCS 写的超时也一直是静态 `retry_timeout`（[invariants.md](invariants.md) 第 9 节）。调大 `loop_wait` 前，先确认静态 `ttl` 也满足约束。
+
+**分区下的旧主**：锁持有者与多数派断开后，最晚在最后一次续锁开始后 `ttl − safety_margin` 秒停掉 PostgreSQL（默认 25 秒，docker 10 秒），不论 DCS 调用是否返回；多数派最早在 `ttl` 秒后抢锁。前提是节点间墙钟偏差小于 `safety_margin`。pause 下不围栏。相关日志：
+
+| 日志 | 含义 |
+|------|------|
+| WARN `DCS write timed out after <n>s (retry_timeout); treating it as failed` | 一次 DCS 写在 `retry_timeout` 内没有完成（例如本节点是失去多数派的 Raft leader），按写失败处理。这次写之后仍可能提交，这是安全的（[invariants.md](invariants.md) 1a） |
+| ERROR `Leader lease expired before the lock renewal completed; fencing PostgreSQL (immediate stop) without waiting for the DCS` | 租约到期，本轮 HA 周期被放弃，PostgreSQL 以 `immediate` 模式停库 |
+| ERROR `Leader lease expired before pg_ctl promote; fencing PostgreSQL (immediate stop)` / `Leader lease expired before reporting the leader role; fencing PostgreSQL (immediate stop)` | 续锁返回成功，但返回时租约已经到期（续锁写太慢），不 promote、不报告主库，按失去锁围栏 |
+| ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)` | 关停时租约已到期，直接围栏停库 |
+| INFO `Created rewind-check marker: leader lease expired before renewal` | 围栏停库前写了 `standby.signal` 和 rewind 检查标记；之后按启动规则以备库启动，看到新 leader 后先 pg_rewind |
+
+健康集群里如果出现租约围栏，通常是 PG 或 DCS 太慢，一轮续锁来不及在 `ttl − safety_margin` 内完成，可以调大 `ttl`。
+
 ---
 
 ## 同步复制
@@ -367,7 +430,7 @@ pg-ha 在每个 HA cycle 中（仅 Primary 执行）：
 1. 从 DCS 读取动态配置（`synchronous_mode` 等参数）
 2. 获取所有集群成员的状态（Running/Crashed、角色、WAL position）
 3. 按筛选条件和优先级计算出 `synchronous_standby_names` 目标值
-4. 如果与上次不同 → `ALTER SYSTEM SET synchronous_standby_names = '...'` + `pg_ctl reload`
+4. 如果与上次不同 → `ALTER SYSTEM SET synchronous_standby_names = '...'` + `pg_ctl reload`。每个主任期第一次总会执行（降级或重写备库配置时 pg-ha 会忘掉上次应用的值）
 5. 将当前 sync 状态写入 DCS `/sync` key（供健康检查 API 使用）
 
 **筛选条件**（同时满足才能成为 sync standby 候选）：
@@ -413,7 +476,7 @@ node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
 2. node2 promote 为 Primary → 首个 cycle 计算新的 sync 列表
 3. 结果：`'FIRST 1 (node1,node3)'`（node1 现在是 Replica 候选）
 
-**无残留**：Replica 上的 `synchronous_standby_names` 被 PG 忽略（仅 Primary 读取此参数）。
+**无残留**：降级不再覆盖 `postgresql.auto.conf`（只替换 `primary_conninfo` / `recovery_target_timeline`），`synchronous_standby_names` 留在副本上，被 PG 忽略（仅 Primary 读取此参数）；它下次成为主库时，pg-ha 在第一个 cycle 重新写入当前的期望值。
 
 #### Failover（Primary 崩溃）
 
@@ -561,7 +624,11 @@ pg-ha 收到 SIGTERM 或 SIGINT 后：
 3. 若本节点持有 leader lock：`CHECKPOINT`，然后删除 leader lock
 4. `pg_ctl stop -m fast`
 
+删除 leader lock 是一次 DCS 写，最多等 `retry_timeout` 秒。收到信号时 leader 租约已经到期（例如本节点被分区），pg-ha 跳过 drain、CHECKPOINT 和删除锁，直接写 `standby.signal` 和标记，再 `pg_ctl stop -m immediate`（日志 ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)`）。租约有效时按上面的顺序关停。注意 drain 期间不续锁：`drain_timeout_secs` 长于 `ttl − safety_margin`（默认 30 > 25）时，锁可能在 drain 期间过期，其他节点可能在本节点停库前 promote（[invariants.md](invariants.md) 第 9 节）。
+
 锁删除成功后，其他节点在各自下一个 HA cycle（不超过 `loop_wait`）里可以选举。删除失败则要等到 lock TTL。systemd 的 `TimeoutStopSec` 需要盖住 drain、CHECKPOINT 和 `pg_ctl stop`，示例见部署指南（120 秒）。
+
+Phase 4 停库前，若 PG 以主库运行（或观测不到），pg-ha 先写 `standby.signal` 和 rewind 检查标记（日志 `Created rewind-check marker: stopped by graceful shutdown`）、删除 `primary_conninfo`，再 `pg_ctl stop -m fast`。下次启动时 pg-ha 按启动规则以备库启动它；它上次是主库的话，要经选举 promote 才重新成为主（timeline +1），或在别人持锁时先做一次 rewind 检查再跟随。关停时 PostgreSQL 不应答的备库也会被这样处理：它会被删除 `primary_conninfo`，下次启动后由跟随路径重新配置上游（多一次重启），并多一次 rewind 检查。
 
 ### 计划维护操作顺序
 
@@ -623,14 +690,27 @@ curl -s http://<any-alive-node>:8008/primary
 sudo systemctl start pg-ha
 
 # 4. pg-ha 自动处理：
-#    - 检测到不是 Leader 且无 standby.signal
-#    - 执行 rejoin_as_replica (pg_rewind → 启动为 standby)
-#    - 开始 streaming replication 追赶数据
+#    - 不持锁，以备库启动它：写 standby.signal；pg_controldata 显示上次以主库
+#      运行时写 pg-ha.rewind_check
+#    - 看到 leader 以主库运行（DCS + 实时 SELECT pg_is_in_recovery()）后停库、
+#      pg_rewind（没分叉时立即报 no rewind required）、删除标记
+#    - 以备库启动，开始 streaming replication 追赶数据
 
 # 5. 验证节点状态
 curl -s http://<recovered-node>:8008/patroni | jq .
 # state: "Running", role: "Replica"
 ```
+
+日志关键行（按顺序）：
+
+```text
+Starting PostgreSQL as a standby (not holding the leader lock)
+Created rewind-check marker: pg_controldata reports 'in production' (last ran as a primary)
+Rewind-check marker present and <leader> holds the leader lock — checking with pg_rewind before following
+pg_rewind succeeded; removed the rewind-check marker
+```
+
+> ⚠️ **注意**：从旧主以备库启动到 pg_rewind 完成之间，它对外是健康副本（`/replica` 200），经 RO 端口的读请求可能读到旧主失锁前写入、新主上没有的数据。对一致性敏感的只读业务在这段时间应只读新主，或等日志出现 `pg_rewind succeeded` 之后再把它算作副本。这是已知窗口，登记在 [invariants.md](invariants.md) 第 9 节。
 
 ### 场景 2：Timeline 分歧处理
 
@@ -638,11 +718,14 @@ curl -s http://<recovered-node>:8008/patroni | jq .
 
 ```mermaid
 flowchart TD
-    START[旧 Primary 重启] --> DETECT[检测到不再是 Leader]
-    DETECT --> REJOIN[rejoin_as_replica]
+    START[旧 Primary 重启] --> DETECT[不持锁: 以备库启动<br/>带 rewind 检查标记]
+    DETECT --> READY{leader 以主库运行?<br/>DCS + 实时确认}
+    READY -->|否| WAITL[只读备库等待 不跑 pg_rewind]
+    READY -->|是| REJOIN[rejoin_as_replica 停库]
     REJOIN --> REWIND[pg_rewind --target-pgdata=... --source-server=new_primary]
-    REWIND -->|成功| STANDBY[写入 standby.signal + 启动]
-    REWIND -->|失败| BASEBACKUP[回退到 pg_basebackup]
+    REWIND -->|成功| STANDBY[删除标记 写入 standby.signal + 启动]
+    REWIND -->|失败 默认| HOLD[停库 保留数据目录 等运维 见场景 3]
+    REWIND -->|失败 且开启 remove_data_directory_on_rewind_failure| BASEBACKUP[删除数据目录 + pg_basebackup]
     BASEBACKUP --> STANDBY
     STANDBY --> STREAMING[streaming replication 追赶]
 ```
@@ -653,18 +736,57 @@ flowchart TD
 - 或者启用 `wal_log_hints = on`
 - 新 Primary 必须可达
 
-### 场景 3：pg_rewind 失败后 basebackup 回退
+### 场景 3：pg_rewind 失败，节点停库等待运维
 
-如果 pg_rewind 失败（例如 WAL 已被清理），pg-ha 会自动回退到 pg_basebackup：
+pg_rewind 失败（例如新主上已经回收了需要的 WAL），或 pg_rewind 成功但随后 PostgreSQL 起不来时，pg-ha 默认**不会**删除数据目录重建：几百 GB 的库全量复制代价很高，是否接受由运维决定。语义见 [invariants.md](invariants.md) 1a「pg_rewind 失败」。
+
+**现象：**
+
+- 日志有一条 ERROR（之后每 60 秒最多重复一次），例如：
+
+  ```text
+  ERROR pg_rewind failed; PostgreSQL is stopped and its data directory is kept (pg-ha did not delete or rebuild it). Cause: pg_rewind: error: could not open file "/var/lib/postgresql/16/data/pg_wal/000000010000000000000003": No such file or directory. Data directory: /var/lib/postgresql/16/data (412.0 GiB). pg-ha will not start, rewind or rebuild this node on its own. Operator action required: call POST /reinitialize on this node to delete the local data and copy it again from the primary with pg_basebackup (a full copy, about 412.0 GiB); or set postgresql.remove_data_directory_on_rewind_failure: true and restart pg-ha to let it rebuild automatically. If the cause was temporary, delete /var/lib/postgresql/16/data/pg-ha.rewind_failed to let pg-ha retry pg_rewind once (no pg-ha restart needed).
+  ```
+
+  PostgreSQL 启动失败时开头是 `Starting PostgreSQL after pg_rewind failed; ...`，其余相同。每个 cycle 的结果是 `PostgreSQL stopped after a pg_rewind failure; operator action required (see the ERROR log)`。`Cause` 取 pg_rewind 输出里的 `error:` / `fatal:` 行（没有这类行时取全部输出），多行用 ` | ` 连接。大小是数据目录下文件的总和，统计限时 2 秒：超时显示 `size unknown`，有读不了的子目录时显示 `at least <大小>`。
+- `/patroni` 的 `state` 为 `stopped`；`/primary`、`/replica` 均为 503；该节点不参选。
+- PGDATA 里的标记文件：pg_rewind 失败时有 `pg-ha.rewind_failed` 和 `pg-ha.rewind_check`；pg_rewind 成功但随后 PostgreSQL 起不来时只有 `pg-ha.rewind_failed`（`pg-ha.rewind_check` 在 rewind 成功后已删除）。两种情况都没有自动 pg_basebackup（日志里没有 `Running pg_basebackup`）。
+- 其他节点正常服务。
+- 保持期间有人手工启动 PostgreSQL，pg-ha 会再把它停掉。
+
+**处理 1（全量重建）：**
 
 ```bash
-# pg-ha 自动执行的流程：
-# 1. pg_rewind 失败
-# 2. 删除 PGDATA 目录内容
-# 3. pg_basebackup -h <new_primary> -D <data_dir> -X stream -R
-# 4. 启动 PostgreSQL (standby mode)
+curl -u admin:secret -X POST http://<node>:8008/reinitialize
+```
 
-# 如果自动恢复也失败，可手动执行：
+代价：删除本地数据，从主库完整复制（大小见 ERROR 里的 `Data directory: ... (<大小>)`）。
+
+**处理 2（让 pg-ha 以后自动重建）：** 在 `pg-ha.yml` 设
+
+```yaml
+postgresql:
+  remove_data_directory_on_rewind_failure: true
+```
+
+然后重启 pg-ha。打开后，pg_rewind 失败时 pg-ha 删除数据目录并 pg_basebackup（WARN `pg_rewind failed: <错误> — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup`；pg_rewind 成功但随后 PostgreSQL 起不来时是 `PostgreSQL failed to start after pg_rewind: <错误> — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup`）。已经处于保持状态的节点在打开选项并重启 pg-ha 后，等 leader 以主库运行时先再试一次 pg_rewind，失败再重建。默认 `false`，因为全量重建会删除本地数据、耗时与库大小成正比，自动执行可能在业务高峰把一次暂时性故障变成长时间的复制。配置项说明见部署指南。
+
+**处理 3（暂时性原因，重试一次）：** 原因是暂时性的（网络中断、主库刚切换），且 pg_rewind 在改动目录之前就失败（例如连接错误）时，删除保持文件：
+
+```bash
+sudo -u postgres rm /var/lib/postgresql/16/data/pg-ha.rewind_failed
+```
+
+不用重启 pg-ha。日志出现 `Rewind hold file /var/lib/postgresql/16/data/pg-ha.rewind_failed was removed; pg-ha will retry pg_rewind`，pg-ha 以备库启动它。pg_rewind 失败的情况：在 leader 就绪后重试一次 pg_rewind，再失败就重新停库保持。pg_rewind 成功但 PostgreSQL 起不来的情况：pg-ha 先以备库重试启动，连续 3 次启动失败后才对 leader 再跑一次 pg_rewind。pg_rewind 在复制阶段失败时目录可能已不可用，这种情况用处理 1。
+
+**不算失败的情况**（pg-ha 不进入保持，不需要处理）：
+
+- 源（新主）还没有以主库应答：pg-ha 不跑 pg_rewind，只记 INFO `Not running pg_rewind: <leader> does not answer as a primary yet (...)` 并等待。实时确认在停本地 PG 之前和之后各做一次。
+- pg_rewind 成功后 `pg_ctl` 等待超时、但 PostgreSQL 仍在启动（大库回放到一致点之前不接受连接）：WARN `PostgreSQL is still starting after pg_rewind (...); not treating this as a failure`，pg-ha 等它启动完成。
+
+**附：手工 basebackup**（pg-ha 不可用时）：
+
+```bash
 sudo systemctl stop pg-ha
 
 # 清除数据目录
@@ -695,8 +817,9 @@ sleep 10
 # 3. 检查状态
 curl -s http://node1:8008/cluster | jq .
 
-# 4. 如果集群 Leader Lock 丢失（Raft 数据损坏），
-#    最新的节点会自动竞争 Leader Lock 并 promote
+# 4. 所有节点都以备库启动（不持锁时 pg-ha 只以备库启动 PostgreSQL），
+#    由选举 promote 其中一个（timeline +1）。上次是主库的节点带 rewind 检查标记，
+#    只有它发布的 timeline ≥ DCS /timeline 时才参选
 ```
 
 ### 场景 5：DCS (Raft) 数据损坏
@@ -727,7 +850,8 @@ Raft 数据落盘失败时，该节点的 Raft 会停止，不会继续把未落
 
 - 日志出现 `ERROR Raft storage persistence failed (<对象> <动作>): <错误>`
 - 该节点所有 DCS 写失败（日志里续锁、`touch_member` 报错）；`/cluster` 显示的是停止那一刻的旧视图
-- 如果该节点当时持有 leader lock，下一次续锁失败后会停掉 PostgreSQL，其他节点按正常 failover 接管
+- 如果该节点当时持有 leader lock，下一次续锁失败后先写 `standby.signal` 和 rewind 检查标记、再停掉 PostgreSQL；之后 pg-ha 只把它作为只读备库启动，不会再成为可写主。其他节点按正常 failover 接管
+- 修复并重启 pg-ha 后，它对新主做一次 pg_rewind 检查后跟随
 - 集群剩余多数派不受影响
 
 ```bash
@@ -832,7 +956,7 @@ journalctl -u pg-ha --no-pager | jq 'select(.message | contains("failover") or c
 | `Raft cluster not ready after 30s` | 节点间 2380 端口不通 | 检查防火墙、DNS 解析 |
 | `Cannot resolve Raft RPC address` | DNS 解析失败 | 确认 hostname 可解析，或改用 IP |
 | `Failed to acquire leader lock` | 已有其他节点持有 Lock | 正常行为，检查 /cluster 确认 |
-| `pg_rewind failed` | WAL 不可用或无 data-checksums | 检查 `wal_keep_size`，确认 initdb 使用了 `--data-checksums` |
+| `pg_rewind failed; PostgreSQL is stopped ...` | WAL 不可用或无 data-checksums；节点停库等待运维 | 见「场景 3」；以后检查 `wal_keep_size`，确认 initdb 使用了 `--data-checksums` |
 | `DCS write failed` | Raft 集群无 leader | 检查 Raft 节点数是否满足多数派 |
 | `Raft storage persistence failed` | Raft 数据目录磁盘满或 IO 错误，本节点 Raft 已停止 | 见「场景 6」，修复磁盘后重启 pg-ha |
 | `unmanaged recovery` / `operator action required` | PG 在 recovery 但没有 `standby.signal`（`recovery.signal` 归档恢复，或 `standby.signal` 被删） | 见「场景 7」 |
@@ -841,7 +965,10 @@ journalctl -u pg-ha --no-pager | jq 'select(.message | contains("failover") or c
 | API 返回 `401 Unauthorized` | Basic Auth 凭证错误 | 检查配置的 username/password |
 | Proxy 6432 连不上 | Primary 不健康或 HA 未就绪 | 检查 `/primary` 端点 |
 | `pending_restart = true` | 修改了需要 restart 的 PG 参数 | 执行 `POST /restart` |
-| 节点反复重启 | 配置错误（ttl <= loop_wait） | 检查 ttl > loop_wait 约束 |
+| 节点反复重启，`Configuration error: ttl (...) must be ...` | 配置不满足 `ttl > loop_wait` 或 `ttl >= loop_wait + retry_timeout + watchdog.safety_margin` | 见「HA 时间参数约束」 |
+| `PATCH /config` 返回 400 `Rejected, configuration not changed` | 改动后的 `ttl` / `loop_wait` / `retry_timeout` 不满足约束 | 见「HA 时间参数约束」 |
+| `DCS write timed out` | DCS 写在 `retry_timeout` 内没有完成：Raft 失去多数派或网络慢 | 检查 Raft 节点间连通性；锁持有者上会随之降级 |
+| `Leader lease expired before the lock renewal completed` | 锁持有者在租约内没能续锁，已自行停库 | 分区时是预期行为；健康集群里出现则检查 PG 与 DCS 延迟，或调大 `ttl` |
 | `replication lag` 持续增长 | 网络带宽不足或 Primary 写入过重 | 检查网络、考虑调大 `wal_keep_size` |
 
 ### pg-ha-ctl CLI 工具
@@ -858,7 +985,7 @@ pg-ha-ctl --endpoint http://localhost:8008 pause
 pg-ha-ctl --endpoint http://localhost:8008 resume
 ```
 
-`reinitialize` 对应 `POST /reinitialize`：拒绝在 leader 上执行；在副本上会 `pg_ctl stop -m immediate` 并删掉数据目录，下一个 HA cycle 再 clone。成功响应的 `message` 是 `Node reinitialized, will clone on next cycle`。
+`reinitialize` 对应 `POST /reinitialize`：拒绝在 leader 上执行；在副本上会 `pg_ctl stop -m immediate` 并删掉数据目录（包括 `pg-ha.rewind_check`、`pg-ha.rewind_failed`），下一个 HA cycle 再 clone。成功响应的 `message` 是 `Node reinitialized, will clone on next cycle`。它是 pg_rewind 失败后的标准处理（见「场景 3」）。节点上的 PostgreSQL 正以主库运行（不持锁）时，pg-ha 先写 `standby.signal` 和标记再停库；停库失败则返回错误 `Reinitialize: stopping PostgreSQL failed: <错误>; data directory not removed (pg-ha keeps fencing it)`，不删除数据目录。
 
 `GET /history` 返回进程内历史数组。HA 循环目前不写入事件，所以线上通常是 `[]`。不要把它当成 failover 审计日志。
 

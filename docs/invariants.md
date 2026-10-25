@@ -28,7 +28,7 @@
 | L2 | 持有 leader lock 的节点上，PostgreSQL **不在** recovery（可写 Primary）。 | 持有 |
 | L3 | 未持有 lock、且对外以副本身份服务的节点，PostgreSQL **处于** recovery；或处于文档定义的过渡态（rewind / rejoin / bootstrap），过渡态不得对外宣称 Primary。 | 持有 |
 | L4 | DCS `members/{name}.role`（及 HA 内存视图）与该节点真实 PG 角色一致；允许至多约一个 HA cycle 的传播延迟，延迟上限应可观测。 | 持有 |
-| L5 | 节点失去 leader lock 后，不得继续以可写 Primary 对外服务（须停库、拒绝写、或进入 rejoin 路径之一；具体策略以实现为准，但结果必须满足本条）。 | 持有 |
+| L5 | 节点失去 leader lock 后，不得继续以可写 Primary 对外服务（须停库、拒绝写、或进入 rejoin 路径之一；具体策略以实现为准，但结果必须满足本条）。**时间界**：锁持有者最晚在「最后一次成功的抢锁 / 续锁**开始前**的时刻 + 写入锁的 TTL − `watchdog.safety_margin`」变为不可写，不论 DCS 调用是否返回（见 1a「leader 租约」）。前提：节点间墙钟偏差小于 `safety_margin`（再减去约 0.1 秒的围栏耗时）。pause 下豁免（W1）。 | 持有 |
 
 **稳态检查（示例）**
 
@@ -53,18 +53,110 @@
 | UnmanagedRecovery（非 pg-ha 造成的恢复） | 在 recovery | 无 |
 | Unknown | 未观测 | — |
 
-`standby.signal` 只说明 PG 下次怎样启动，不说明它现在是什么，所以观测为「不在 recovery」时一律是 Primary。pg-ha 配置的每个备库都会写 `standby.signal`（clone、rejoin、switchover 降级）；正常选举路径上 PG promote 后自行删除它。因此「持锁且在 recovery 却没有 `standby.signal`」不会由 pg-ha 自身产生，只来自 `recovery.signal`（归档 / PITR）或运行中被删掉的 `standby.signal`。
+`standby.signal` 只说明 PG 下次怎样启动，不说明它现在是什么，所以观测为「不在 recovery」时一律是 Primary。pg-ha 在以下场合写 `standby.signal`：clone、rejoin、switchover 降级、所有降级路径（停库之前），以及每一次不持锁时的启动（见下文「启动规则」）；正常选举路径上 PG promote 后自行删除它。因此「持锁且在 recovery 却没有 `standby.signal`」不会由 pg-ha 自身产生，只来自 `recovery.signal`（归档 / PITR）或运行中被删掉的 `standby.signal`。
 
 **规则**：pg-ha 只 promote 它自己配置为备库的节点。非 pg-ha 造成的恢复交给运维：不 promote、不 rewind、不参选；若持锁则释放锁。
 
 | 身份 | 持锁 | 他人持锁 | 无主（选举） |
 |------|------|----------|--------------|
-| Primary | 保持主 | rejoin（S4） | 参选；非最健康则按陈旧主 rejoin |
-| ManagedStandby | promote，重新观测确认后才记为主 | 跟随 | 参选 |
+| Primary | 保持主 | rejoin（S4）；leader 还没有以主库运行时先停库 | 参选（有 rewind 检查标记时同样受 `/timeline` 约束，不能参选时先停库）；非最健康则按陈旧主停库，下次以备库启动 |
+| ManagedStandby | promote，重新观测确认后才记为主 | 跟随；有 rewind 检查标记时先对 leader 跑 pg_rewind | 参选；有 rewind 检查标记时须 timeline ≥ `/timeline` |
 | UnmanagedRecovery | 释放锁，交运维（pause 下保留锁，但不宣称主） | 交运维 | 不参选 |
-| Unknown | 本轮不动作，不宣称主 | 有 `standby.signal`：等待；无：停库围栏（L5） | 本轮不参选 |
+| Unknown | 本轮不动作，不宣称主 | 有 `standby.signal`：等待；无：停库围栏（L5）。降级停库失败后，直到确认已停，一律按围栏处理（即使有 `standby.signal`） | 本轮不参选；降级停库失败后先停库 |
+
+降级停库失败后，直到确认 PG 已停，以主库运行的节点在选举入口也先停库，不参选（见下文「降级」）。
 
 **对外发布**：成员 `state` 在 DCS 与 REST 中一致。`running` 表示进程在运行且身份为 Primary 或 ManagedStandby；UnmanagedRecovery 与 Unknown 发布为 `unknown`，其他节点因此不把它当作候选、同步备或 switchover 目标。`role` 只在观测确认后才记为 `primary`；观测到在 recovery 时，记录的 `primary` 降为 `replica`。
+
+#### 启动规则
+
+**pg-ha 只在持有 leader lock 时以主库方式启动 PostgreSQL；其他情况一律以备库启动。**
+
+- HA 循环只在一处启动 PG：`handle_postgres_not_running`。启动前若本节点不持锁（包括刚在这里因 PG 未运行而释放锁之后），先写 `standby.signal` 并 fsync 文件和目录；leader 已知、不是自己、且它的成员 `conn_url` 带 `host=` 时，同时把 `primary_conninfo` 指向它；leader 未知时保留 `postgresql.auto.conf` 里已有的 `primary_conninfo`。日志 `Starting PostgreSQL as a standby (not holding the leader lock)`。
+- 写不成就不启动，返回错误，下一轮重试：停着的 PG 不丢数据，以可写主起来的 PG 违反 L5。日志 `Not starting PostgreSQL: could not write the standby configuration (<错误>). pg-ha starts PostgreSQL as a primary only while holding the leader lock; retrying next cycle`。
+- 启动前读 `pg_controldata` 的 `Database cluster state`，判断上次是否以主库运行，决定是否写 rewind 检查标记（见下文）。写标记失败同样不启动。
+
+  | `Database cluster state` | rewind 检查标记 |
+  |--------------------------|----------------|
+  | `in production`、`shut down`、`shutting down`、`in crash recovery`、`starting up` | 写（`Created rewind-check marker: pg_controldata reports '<state>' (last ran as a primary)`） |
+  | 无法识别的值、`pg_controldata` 读取失败 | 写（读取失败时 WARN `Could not read the cluster state from pg_controldata (...); creating the rewind-check marker to be safe`） |
+  | `shut down in recovery`、`in archive recovery` | 不写 |
+
+  `shutting down` 是主库关机中途崩溃；`in crash recovery` 只出现在不带 `standby.signal` 的启动。不确定的状态按保守方向处理：多写一次标记只多一次 pg_rewind 检查（没有分叉时它立即报告 `no rewind required`）。clone 后第一次启动失败的节点，`pg_controldata` 显示的是从源端复制来的 `in production`，下次启动也会带上标记，代价同样只是一次检查。
+- 其他启动入口：clone 后启动、pg_rewind 之后启动、重配上游后的重启都先写备库配置，写失败不启动。`POST /restart` 在持锁时行为不变；不持锁时先做与上面相同的准备（含 `pg_controldata` 标记），写失败则拒绝，PG 不动；处于 rewind 失败保持状态时拒绝。唯一例外是 bootstrap 中 initdb 的节点：它赢得了 `/initialize` 的原子竞争，是集群里唯一有数据的节点，initdb 出来的库没有可跟随的上游，启动后紧接着抢锁。
+- 代价：主库崩溃或短暂 DCS 中断后，节点以备库重启，只能经选举 + promote 再成为主库（timeline +1）；整个集群冷启动也要经过选举。
+- 节点停着且有 `recovery.signal` 时，pg-ha 启动它会同时写 `standby.signal`，备库模式优先，归档 / PITR 的恢复目标不会按预期执行。做归档恢复或 PITR 前先停 pg-ha。
+
+#### 降级：先写 `standby.signal`，再停库
+
+- `demote()`（续锁失败）、`handle_dcs_error` 的两个降级分支、Fence、switchover 在**停库之前**写 `standby.signal`，fsync 文件和目录；前两者以主库运行，同时写 rewind 检查标记。写失败仍然停库（L5 优先），记 ERROR、返回错误；之后启动规则拒绝在没有 `standby.signal` 时启动。
+- 这条规则适用于所有停掉「可能是不持锁可写主」的 PG 的路径，不只上面几条：rejoin 前停掉以主库运行的 PG、rewind 源未就绪时停库、陈旧主停库、带标记且不能参选的主停库、rewind 失败保持中被手工启动的主、`POST /reinitialize` 停掉以主库运行的 PG、`POST /restart`（不持锁时）、优雅关停（释放锁之后停掉以主库运行或观测不到的 PG）、降级停库失败后重新围栏（含选举入口），都先写 `standby.signal`（以主库运行过的还写标记）再停库。`POST /reinitialize` 遇到这种 PG 且停库失败时，不删除数据目录。只读备库（观测在 recovery 且有 `standby.signal`）可以直接停库。
+- 停库失败时，直到确认 PG 已停（`pg_ctl stop` 成功，或某一轮观察到 PG 不再运行），观测不到的 PG 一律按围栏处理：每轮重试停库，即使已有 `standby.signal`。原因是这个 signal 写在一个可能可写的 PG 上，不能再据此认为它不可写。
+- 降级停库成功后，节点立即发布一次成员状态（`state=stopped`），让其他节点尽快看到它已停。发布有时限（不超过 `loop_wait`），DCS 不可达时不会拖住 HA 循环或关停。
+- **租约到期围栏**（与 `demote()` 并列的降级入口，见下一小节）：leader 租约到期时不再等任何 DCS 调用返回，丢弃本轮 HA 周期，先写 `standby.signal` 和 rewind 检查标记（原因 `leader lease expired before renewal`），再 `pg_ctl stop -m immediate`，并把本节点记为不持锁。停库失败时按上文 `stop_pending` 规则每轮继续围栏。
+- **DCS 写有上限**：每次 DCS 写（`RaftDcs` 的 `propose`，包括本地 Raft 提交和转发给 Raft leader 两条路径）最多等 `retry_timeout` 秒，超时返回 `Error::Timeout`，调用方按写失败处理（续锁超时即降级）。日志 WARN `DCS write timed out after <n>s (retry_timeout); treating it as failed`。原因：openraft 0.9 没有 check-quorum，失去多数派的 Raft leader 不会退位，它的 `client_write` 要等网络恢复才返回。
+- **超时后迟到提交是安全的**：放弃的写仍可能在之后提交。(1) 本节点是失去多数派的 Raft leader：多数派选出新 leader 后，这条未提交的日志在恢复时被截断，不会提交；只有分区短于多数派重选时间时，它才可能在原 term 里提交。(2) 本节点是 Raft follower：请求已交给 leader，可能在 HA 放弃后提交。续锁是 CAS（`prev_value` = 本节点名）：新主已写锁时它失败；锁已按真实时间过期但没人抢时，状态机用请求里的旧 `now` 判断，会把锁续到这次请求的时刻 + TTL。这不会产生两个锁持有者：抢锁同样是 CAS，二者在 Raft 日志里有先后，后到的一方失败；promote 只发生在持锁路径。被续上的锁只是让多数派多等一段时间；本节点此时已经降级（续锁失败或租约到期），下一轮看到锁仍是自己的，就按 1a 身份表以备库 promote（timeline +1），与「释放锁失败后以备库拿回锁」是同一条路径，没有别人 promote 过，所以数据没有分叉。迟到提交只会让锁在 DCS 里活得更久，而租约锚在最后一次**成功**的请求上，所以不会让旧主多写。
+
+#### leader 租约（L5 的时间界）
+
+- 锚点：每次调用 `attempt_to_acquire_leader` / `update_leader` **之前**，同时记录单调时钟（`Instant`）和墙钟（`SystemTime`）。调用返回 `Ok(true)` 后，租约截止时间 = 锚点 + `dcs.ttl()`（实际写进锁的 TTL，不是动态配置里的 `ttl`）− `watchdog.safety_margin`，单调时钟和墙钟各算一个。`Ok(false)` 或 `Err` 不延长租约。锚点取在调用之前，而 RaftDcs 构造请求时取的 `now` 只会更晚，所以 DCS 里锁的过期时刻不早于锚点 + TTL，租约是保守的。
+- 判定：单调时钟或墙钟任一到达截止时间，租约即到期。墙钟判定覆盖本节点墙钟被往回调、以及单调时钟在系统挂起时不计时的情况（DCS 的过期判断用的是墙钟）。
+- 检查点：`pg_ctl promote` 之前、报告 Hold（保持主）之前都检查租约，到期按失去锁处理：执行租约到期围栏，日志 ERROR `Leader lease expired before pg_ctl promote; fencing PostgreSQL (immediate stop)` 或 `Leader lease expired before reporting the leader role; fencing PostgreSQL (immediate stop)`。
+- 有界周期：每轮 HA 周期与租约截止时间赛跑（`Ha::run_cycle_bounded`，`src/main.rs` 只调用它）。截止时间先到时，丢弃本轮（被丢弃的 DCS 写可能迟到提交，见上文），执行上一小节的租约到期围栏。日志 ERROR `Leader lease expired before the lock renewal completed; fencing PostgreSQL (immediate stop) without waiting for the DCS`。两轮之间 HA 循环只等定时器（受下文参数约束限制）和 REST API 状态的写锁（API 处理函数只在本地读时持有它），不做其他无上限的 await：代理后端刷新要做没有超时的 DNS 解析，所以放在单独的任务里，HA 循环每轮只把成员列表交给它（`src/main.rs` 的 `refresh_proxy_backends`，测试 `test_ha_loop_awaits_nothing_unbounded_outside_the_bounded_cycle` 检查这一点）。
+- 时间界：旧主最后可写时刻 ≤ 锚点 + TTL − `safety_margin` + ε（ε 为定时器唤醒、写 signal 和标记并 fsync、发 SIGQUIT 的耗时，约 0.1 秒）；多数派最早在锚点 + TTL − δ 抢到锁（δ 为多数派墙钟比旧主快的量），之后还要 Raft 提交、写 `/timeline`、promote。所以只要 δ < `safety_margin` − ε 就不会重叠，与 DCS 调用是否返回无关。
+- 参数约束：`ttl ≥ loop_wait + retry_timeout + watchdog.safety_margin`，并且 `retry_timeout ≥ 1`。健康的主库要在租约内完成一轮 HA 周期加一次有界的续锁写。静态配置（包括环境变量覆盖后的值和 `bootstrap.dcs`）不满足时拒绝启动；`PATCH` / `PUT /config` 改动 `ttl`、`loop_wait` 或 `retry_timeout` 后不满足时返回 400，配置不写入。动态配置缺省的项按接收请求的节点的静态值计算。
+- 代价：PG 或 DCS 慢到一轮续锁来不及在租约内完成时（例如 docker 配置下 `pg_is_in_recovery()` 接近 5 秒的超时），健康的主库也会被围栏，集群多一次 failover。这是用可用性换 L5。
+- pause 下豁免：与 pause 下续锁失败保持主库一致（W1，pause 时其他节点不会自动抢锁），租约到期不围栏。
+- 优雅关停：DCS 写有上限，所以释放锁最多等 `retry_timeout`。收到关停信号时（drain 之前）检查租约：本节点记为持锁而租约已经到期，就跳过 drain、CHECKPOINT 和释放锁，直接执行租约到期围栏，日志 ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)`。租约有效时按原有顺序关停；drain 期间不再检查租约（这段时间的缺口见第 9 节「关停 drain 期间不续锁」）。
+- 不覆盖：HA 循环被同步调用阻塞、tokio worker 被占满、进程被 SIGSTOP 或 VM 冻结时，赛跑无法执行，只有 watchdog 能兜底；watchdog 尚未接入（W2，第 9 节）。
+- 降级时 leader 未知（`demote`、`handle_dcs_error`、无 candidate 的 switchover、优雅关停）就删除 `postgresql.auto.conf` 里的 `primary_conninfo`，不保留猜测。上游只由跟随路径按观测到的 leader 配置，包括 `postgresql.auto.conf` 里没有 `primary_conninfo` 的情况。
+- 写备库配置时，`postgresql.auto.conf` 只替换 `primary_conninfo` 和 `recovery_target_timeline` 两项，其他行（`ALTER SYSTEM` 写入的内容，如 `synchronous_standby_names`）一律保留；文件经临时文件 + rename 写入并 fsync。成员 `conn_url` 没有 `host=` 时按 leader 未知处理，不写指向 `127.0.0.1` 的 `primary_conninfo`。节点每次离开主库角色或重写备库配置后，pg-ha 都忘掉上次应用的 `synchronous_standby_names`，下一个主任期第一次一定重新 `ALTER SYSTEM` 并写 `/sync`（C4）。
+
+#### rewind 检查标记（`PGDATA/pg-ha.rewind_check`）
+
+- 含义：本节点可能有分叉点之后的 WAL，跟随前须用 pg_rewind 验证。标记只决定是否做 rewind 检查，不决定身份，也不改变健康判定。
+- 谁写：降级路径（上一节）、启动规则（`pg_controldata` 显示上次以主库运行）。谁删：pg_rewind 成功（含 `no rewind required`）之后（日志 `pg_rewind succeeded; removed the rewind-check marker`）；clone 和 pg_rewind 从源端复制过来的 `pg-ha.rewind_check`、`pg-ha.rewind_failed` 也会被删，它们描述的是源端；`POST /reinitialize` 随数据目录一起删除。
+- 带标记的 ManagedStandby 在他人持锁且 leader 就绪时走 rejoin：停本地 PG，对 leader 跑 pg_rewind，再以备库启动跟随（日志 `Rewind-check marker present and <leader> holds the leader lock — checking with pg_rewind before following`）。leader 未就绪时保持只读备库运行等待（`rewind-check marker present; waiting for <leader> to run as a primary before pg_rewind`）。
+- 「leader 就绪」：DCS 视图中它持锁，且成员记录为 `state=running`、`role=primary`；**并且**用它的 `conn_url` 实时连接执行 `SELECT pg_is_in_recovery()` 得到 `f`（5 秒连接超时，10 秒总超时；连不上、超时或答 `t` 都算未就绪）。实时确认做两次：停本地 PG 之前一次，停库之后、跑 pg_rewind 之前再一次。这样源端刚停库而 DCS 里的成员记录还没更新的几秒内，以及本地停库（大库上要刷盘，可能很慢）期间源端被降级时，都不会对它跑 pg_rewind。
+- 所有 pg_rewind 都只以就绪的锁持有者为源。源未就绪时不跑 pg_rewind、不算失败、不进入「rewind 失败」保持：日志 INFO `Not running pg_rewind: <leader> <原因>`；本地 PG 若是主库身份先停库（先写 `standby.signal` 和标记）；第二次确认失败时 PG 已停，保持停止，下一轮以备库启动后再等。
+- 没有锁持有者时发现的陈旧主（以主库运行、不是最健康节点）只停库，不 rewind；下次以备库启动（带标记），等 leader 出现后再 rewind。如果它是唯一可当选的节点，就按带标记节点的规则参选。
+- 节点在成员数据里发布 `rewind_check`（标记文件是否存在），供其他节点在选举和 switchover 中使用（见下一小节）。老版本节点不发布这个字段，按未带标记处理；滚动升级期间老节点仍可能让位给不会参选的新版本带标记节点。
+- **已知窗口（不在任务 3 修改，登记在第 9 节）**：带标记的备库在等待 rewind 检查期间（leader 未就绪、分区期间、恢复网络后 pg_rewind 之前）仍以只读备库运行，`/patroni` state 为 `running`，满足 `/replica` 200 的判定（H2）。经 RO 端口的只读客户端因此可能读到只存在于分叉历史上的数据，例如旧主失锁前接受、新主上没有的写入。
+
+#### 集群 timeline 记录（`/timeline`）与带标记节点的选举
+
+- key：`/<namespace>/<scope>/timeline`，值为十进制字符串（如 `"3"`），**无 TTL**。
+- 单调不减：写入用 CAS，只在新值大于当前值时写。
+- 写入者：只有持锁节点写。
+- 写入时机：
+  1. promote 之前写 `max(自身成员 timeline, 当前值) + 1`。同一个持锁任期内 promote 重试复用这个值，不再加 1。写不成就不 promote（返回错误，下一轮重试；DCS 写抖动会让 failover 推迟一轮）。
+  2. 确认 promote（观测不在 recovery）后写实际 timeline，取主库上的精确值（`pg_walfile_name(pg_current_wal_lsn())` 的前 8 位十六进制）。
+  3. Hold（持锁且为主）时，key 缺失或小于实际 timeline 则补写。
+  
+  key 可能因 promote 失败而高于实际 timeline（Hold 时 WARN `DCS /timeline (<k>) is higher than this primary's timeline (<tl>); a promote attempt recorded it in advance`，同一对值只打一次）。偏高只会让带标记节点更严格。
+- 选举规则：带 rewind 检查标记的节点，只有在**自身成员记录的 timeline ≥ `/timeline`** 时才参选；否则不参选，等看到 leader 后 rewind（INFO `Not taking part in the election: rewind-check marker present and this node's timeline <own> is behind the cluster timeline <cluster>; waiting for a leader to rewind against`）。key 不存在（升级来的集群）时改为与其他成员发布的 timeline 比较，并 WARN `No /timeline key in DCS; comparing this node's timeline with the timelines members published. The evidence is incomplete`。自身 timeline 还没发布时本轮不参选。
+- 成员记录的 timeline 来自 `pg_control_checkpoint()`，在副本上、以及 promote 后 checkpoint 完成之前的主库上可能落后于实际 timeline，所以这个比较只会更严格。用成员发布值而不是本地值，是因为其他节点判断这个节点能否参选时只能看到发布值，两边必须得出同一结论。
+- 带标记、不能参选的节点如果正以主库运行，先停库（L5，先写 `standby.signal` 和标记）。
+- 其他节点用同一规则判断带标记的 peer：不能参选的 peer 不计入「谁最健康」的比较，避免所有节点都让位给一个不会参选的节点。`POST /switchover`、`POST /failover` 拒绝带标记的 candidate（409，`Candidate '<c>' has a rewind-check marker (not yet verified with pg_rewind)`）。`/failover` 里已经指定的 candidate 之后才带上标记、且按此规则不能参选时，其他节点 WARN `Designated candidate <c> has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated`，按没有指定 candidate 继续选举。
+- 不带标记的节点自己不加 timeline 检查（一般的 timeline 感知选举见第 9 节）。
+- 后果：如果只剩带标记且 timeline 落后的节点，集群不会自动选出主库。运维确认接受数据丢失后，可删除该节点的 `pg-ha.rewind_check` 让它参选。
+
+#### pg_rewind 失败
+
+- pg_rewind 必须执行，并且自动执行。
+- pg_rewind 失败，或 pg_rewind 成功但随后 PG 启动失败时，默认（`postgresql.remove_data_directory_on_rewind_failure: false`）：PG 保持停止；数据目录不删除也不重建；写 `PGDATA/pg-ha.rewind_failed`；不参选；不自动重试。rewind 检查标记：pg_rewind 失败时保留；pg_rewind 成功后 PG 启动失败时，标记已在 rewind 成功后删除，只留 `pg-ha.rewind_failed`。进入保持时 pg-ha 先确认 PG 已停，再记一条 ERROR，之后每 60 秒最多重复一次：
+
+  ```text
+  <pg_rewind | Starting PostgreSQL after pg_rewind> failed; PostgreSQL is stopped and its data directory is kept (pg-ha did not delete or rebuild it). Cause: <原因>. Data directory: <dir> (<大小>). pg-ha will not start, rewind or rebuild this node on its own. Operator action required: call POST /reinitialize on this node to delete the local data and copy it again from the primary with pg_basebackup (a full copy, about <大小>); or set postgresql.remove_data_directory_on_rewind_failure: true and restart pg-ha to let it rebuild automatically. If the cause was temporary, delete <dir>/pg-ha.rewind_failed to let pg-ha retry pg_rewind once (no pg-ha restart needed).
+  ```
+
+  `<原因>` 取自 pg_rewind（或 `pg_ctl start`）的错误输出，只保留 `error:` / `fatal:` 行（没有时保留全部），多行用 ` | ` 连接；`<大小>` 是数据目录下文件大小之和，限时 2 秒统计，超时为 `size unknown`，有读不了的子目录时为 `at least <大小>`。
+
+  日志写「data directory is kept」而不是「unchanged」：pg_rewind 在复制阶段失败时可能已经改动了目录，pg-ha 只能保证自己没有删除或重建它。这也是保持期间不自动启动的原因。
+- 处理：`POST /reinitialize`；或打开该选项后重启 pg-ha；原因是暂时性的、且 pg_rewind 在改动目录之前就失败（例如连接错误）时，删除 `pg-ha.rewind_failed`：不需要重启 pg-ha（日志 `Rewind hold file <dir>/pg-ha.rewind_failed was removed; pg-ha will retry pg_rewind`），下一轮以备库启动该节点。pg_rewind 失败的情况（标记还在）：看到 leader 就绪后再跑一次 pg_rewind，再失败就重新进入保持。pg_rewind 成功后启动失败的情况（标记已删）：先以备库重试启动，连续 3 次启动失败后才对 leader 再跑一次 pg_rewind。
+- 保持期间 PG 被人手工启动也会被 pg-ha 停掉。保持状态记在 `pg-ha.rewind_failed` 里，跨 pg-ha 重启有效；这个文件写失败时保持只在内存里，持续到 pg-ha 重启（ERROR `Could not write <dir>/pg-ha.rewind_failed (...); the hold lasts until pg-ha restarts`）。
+- 打开选项时恢复旧行为：删除数据目录后 pg_basebackup（WARN `pg_rewind failed: <错误> — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup`）。
+- 不算失败的情况：源未就绪（上一小节）；pg_rewind 成功后 `pg_ctl start -w` 等待超时、但 postmaster 仍在运行（备库回放到一致点之前不接受连接，大库上常见），只 WARN `PostgreSQL is still starting after pg_rewind (...); not treating this as a failure`，下一轮按观测继续。「PG 启动失败」只指 postmaster 没有起来。
 
 ---
 
@@ -130,6 +222,8 @@
 | R2 | 成员发布的 timeline / wal_position 与选举、lag 判断所依据的规则一致（同一套度量，禁止各读各的）。 | 持有 |
 | R3 | 跨节点 clone / rewind / basebackup 所需的地址信息来自 DCS 成员（至少 host/port）；**密码是否写入 DCS** 必须在文档中唯一裁定，并与实现一致。 | **待裁定** |
 
+**例外（R2，任务 3）**：带 rewind 检查标记的节点参选时，比较的是成员发布的 timeline（来自 `pg_control_checkpoint()`，可能落后）与 `/timeline`（持锁主库写入的精确值，`pg_walfile_name(pg_current_wal_lsn())`）。偏差只会让带标记节点更严格，不会放宽；所有节点判定同一个带标记节点时用的都是它发布的同一个值（见 1a）。
+
 **说明（R3）**：当前实现由 `touch_member` 将 superuser 密码写入 `conn_url` 并进入 Raft 日志；多数运行路径（Proxy、重配 upstream）仅需 host/port，密码来自本地配置。产品语义应二选一写死，避免「磁盘有密、代码有时又不用」的双故事。
 
 **相关**：架构 DCS KV `members/*`；运维集群成员字段。
@@ -149,7 +243,7 @@
 
 - 存储 trait 方法（`save_vote`、`save_committed`、`append_to_log`、`delete_conflict_logs_since`、`purge_logs_upto`、`apply_to_state_machine`、`install_snapshot`）在落盘失败时返回 `StorageError`，不再返回 `Ok`。openraft 因此不会把这次写当成已持久化去推进 commit 或应答客户端。
 - openraft 收到 `StorageError` 后停止该节点的 Raft core（`Fatal`），之后所有 Raft 写都失败。进程不退出，日志有 `ERROR Raft storage persistence failed (...)`。
-- 对 HA 的后果：`get_cluster` 读本地状态机，会返回冻结的旧视图，但所有改变身份的动作（抢锁、续锁）都要经过 Raft 写，因此该节点既不能成为 leader，也不能保持 leader；若它正持锁，下一次续锁失败即按 L5 停库降级。集群其余多数派继续服务。
+- 对 HA 的后果：`get_cluster` 读本地状态机，会返回冻结的旧视图，但所有改变身份的动作（抢锁、续锁）都要经过 Raft 写，因此该节点既不能成为 leader，也不能保持 leader。若它正持锁，下一次续锁失败（`Ok(false)` 或 `Err`）或租约到期（1a「leader 租约」）即降级：先写 `standby.signal` 和 rewind 检查标记、再停库；之后 pg-ha 只把它作为备库启动（1a 启动规则）。本地视图里 leader key 按 TTL 过期后，它最多以只读备库参选，抢锁需要 Raft 写而必然失败，所以不会再以可写主出现。集群其余多数派继续服务。
 - 恢复需要人工：修复磁盘后重启 pg-ha。内存先于磁盘更新这一顺序未变（WAL 压缩需要完整内存日志），但分歧不会被报告为已持久化。
 
 **相关**：架构 Raft / DCS；`raft_log.wal` 与 `hard_state.json` 等；代码中 failsafe TODO。
@@ -161,7 +255,9 @@
 | ID | 陈述 | 状态 |
 |----|------|------|
 | W1 | `pause`（或等价维护模式）下：不自动抢锁 / 不自动 failover（与运维「暂停」语义一致）。 | 持有 |
-| W2 | Watchdog 仅在「本节点自认可写 Primary」路径喂狗；失去 lock 或不再是 Primary 时必须停止喂狗，防止僵尸主。 | 持有 |
+| W2 | Watchdog 仅在「本节点自认可写 Primary」路径喂狗；失去 lock 或不再是 Primary 时必须停止喂狗，防止僵尸主。 | 目标 |
+
+**W2 现状**：`crates/pg-ha-core/src/watchdog.rs` 没有调用点（`Ha` 不持有它，全仓库没有 `activate` / `keepalive` 调用），Linux 下的超时硬编码为 30 秒，默认 `mode: off`。所以目前不喂狗，本条只是没有反例。`watchdog.safety_margin` 已被 leader 租约使用（L5）。HA 循环被同步阻塞、进程被 SIGSTOP 或 VM 冻结时，只有接入 watchdog 才能兜底（第 9 节）。
 
 **相关**：运维暂停与维护；架构 / 代码 `watchdog.rs`。
 
@@ -200,7 +296,16 @@
 | Failsafe 持久化 | P3 | 架构列出 `/failsafe`；实现仍有「未读 key」类缺口 |
 | Member `conn_url` 含密码 | R3 | 落盘与最小密钥面目标冲突，需先裁定再改 |
 | switchover 释放锁失败被忽略 | S1 | `delete_leader` 结果被忽略；连续失败时旧主带 `standby.signal` 重启后仍持锁，会 promote 自己，撤销 switchover |
-| 降级不写 `standby.signal` | L5 / S4 | `demote()`、`handle_dcs_error` 停库后不写 `standby.signal`；下一轮重启后 PG 以可写主起来，到下一轮才被处理 |
+| switchover 与优雅退出先释放锁再停库 | L5 / H3 | `ha/commands.rs` `handle_switchover_command` 与 `src/main.rs` 关停 Phase 3 → Phase 4：释放锁后到停库完成之间旧主仍可写，候选可能已 promote，存在短暂双可写窗口。（任务 3 起两者都在停库前写 `standby.signal`，停库失败时持续围栏或记 ERROR，但释放锁仍在停库之前。） |
+| 无 candidate 的 switchover 不排除旧 leader | S1 | failover key 为 `{"leader": old, "candidate": null}`，选举只看 `candidate`（`ha/election.rs` `process_unhealthy_cluster`），不看 `Failover.leader`（`cluster.rs`）；旧主带 `standby.signal` 参选，WAL 往往打平或最高，可能重新当选，switchover 被悄悄撤销 |
+| 选举不比较 timeline | S2 / S4 | `is_healthiest_node` 只比较 WAL 位置（`ha/election.rs` 中 peer 的 timeline 未使用）；任务 3 只对带 rewind 检查标记的节点按 `/timeline` 把关，一般节点的 timeline 感知选举另开项 |
+| 带标记、等待 rewind 检查的备库对外是健康副本 | H2 / S4 | 带 `pg-ha.rewind_check` 的 ManagedStandby 在 leader 未就绪、分区期间、恢复后 pg_rewind 之前以只读备库运行，`/replica` 200，RO 客户端可能读到只存在于分叉历史上的数据（见 1a「rewind 检查标记」）。候选修法：带标记的节点 `/replica` 返回 503 |
+| 分区节点重新加入 Raft 会引发 Raft 重选 | L4 / L5 | openraft 0.9 没有 pre-vote：分区节点的 term 在分区期间上涨，重新连上后迫使集群重选 Raft leader；重选期间当前锁持有者续锁失败而被降级（多一次 failover，timeline +1）。任务 3 在 docker 集群上复现分区场景时每次都出现，不在任务 3 处理 |
+| watchdog 未接入租约 | W2 / L5 | `watchdog.rs` 没有调用点，超时硬编码 30 秒。HA 循环被同步阻塞、tokio worker 被占满、进程被 SIGSTOP 或 VM 冻结时，leader 租约的围栏无法执行。待做：只在租约有效且本节点是 Primary 时喂狗，超时 = TTL − `safety_margin` |
+| 动态修改 `ttl` 不改变写入锁的 TTL | L5 / C1 | `RaftDcs` 的 TTL 和 DCS 写超时在启动时由静态 `ttl`、`retry_timeout` 固定（`raft_dcs.rs` `RaftDcs::new`，锁写入用 `ttl: Some(self.ttl)`）；动态配置只改 HA 内存里的值。leader 租约按实际写进锁的 TTL 计算。`PATCH /config` 的参数约束按动态值检查，所以同时调大 `ttl` 和 `loop_wait` 的请求会被接受，而锁的 TTL 和租约仍按静态 `ttl`：`loop_wait` 超过它时，健康的主库也会在两轮之间失锁或被围栏 |
+| TTL 过期按墙钟判断 | L5 | 状态机用墙钟判断锁是否过期（写入时用请求里的 `now`，读取时用读取节点的本地墙钟）。多数派一侧节点的墙钟比旧主快超过 `safety_margin`（减去约 0.1 秒）时，新主仍可能在旧主围栏前出现 |
+| 关停 drain 期间不续锁 | L5 / H3 | 优雅关停的 drain（`shutdown.drain_timeout_secs`，默认 30 秒）期间 HA 循环已停止，不再续锁。drain 比 leader 租约长时（默认 30 秒 > 25 秒），锁可能在 DCS 里过期，而 PostgreSQL 仍可写，其他节点可能在关停释放锁之前 promote。租约只在收到关停信号时检查一次。候选修法：drain 期间继续续锁，或把 drain 限制在租约以内 |
+| `Request.now` 注释与实现不符 | — | `state_machine.rs` 中 `Request::Set` 的 `now` 字段注释说由 Raft leader 在提出时填写，实际是发起节点构造请求时取的墙钟（转发时也不改）。迟到提交与租约的分析按实现的语义（见 1a） |
 
 ---
 
@@ -208,6 +313,8 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-10-25 | R19（锁持有者兼 Raft leader 被分区时续锁挂起，实测双可写约 58 秒；锁持有者是 Raft follower 时由 10 秒转发超时限住，docker 配置下实测余量只有 0.67 秒）：L5 增加时间界；1a 降级增加租约到期围栏入口、DCS 写上限 `retry_timeout` 与迟到提交的安全性说明，新增「leader 租约」小节（锚点、判定、检查点、有界周期、参数约束 `ttl ≥ loop_wait + retry_timeout + safety_margin`、pause 豁免、优雅关停）；P4 补充「或租约到期」；W2 改为目标并写明 watchdog 未接入；第 9 节新增 5 项（watchdog 未接入、动态 `ttl` 不改变锁的 TTL、TTL 按墙钟判断、`Request.now` 注释、关停 drain 期间不续锁）。第 9 节原来没有 R19 和 follower 转发余量的条目，二者由本项关闭，不再登记。实现分 2 个提交：第 1 个提交 DCS 写上限、参数约束、HA 循环定时器不补发错过的 tick；第 2 个提交 leader 租约、租约到期围栏与优雅关停的处理。第 2 个提交完成前，租约相关的条目以本文为目标语义。第 2 个提交：优雅关停在收到信号时（drain 之前）检查租约，不在 drain 之后检查（drain 默认 30 秒，长于默认租约 25 秒，之后检查会让健康主库的正常关停几乎都走围栏）；drain 期间不续锁的既有缺口登记到第 9 节；补充检查点和关停的日志文本 |
+| 2026-10-25 | 任务 3：1a 增加启动规则、降级先写 `standby.signal`（适用于所有停掉不持锁可写主的路径）、rewind 检查标记、`/timeline` 与带标记节点的选举规则、rewind 失败处理；R2 增加带标记节点 timeline 比较的例外说明；修正 P4 的 degraded 语义；第 9 节删除已闭合的「降级不写 standby.signal」，登记 5 项。实现分 5 个提交，完成前以本文为目标语义；第 5 个提交补充 rewind 失败日志里原因与数据目录大小的取法；并写明 pg_rewind 成功后 PG 启动失败进入保持时 rewind 检查标记已删除、删除保持文件后先以备库重试启动（连续 3 次失败后再 pg_rewind） |
 | 2026-10-21 | 新增 1a 身份判定：「是否为主」以 `pg_is_in_recovery()` 观测为准；只 promote pg-ha 配置的备库，非 pg-ha 造成的恢复交运维；写明 H1 / H2 逐条判定与 `/health` 语义；第 9 节登记两个已知缺口 |
 | 2026-10-21 | P4 闭合为持有：Raft 存储落盘失败返回 `StorageError`，节点 Raft 停止而非继续推进；写明 degraded 语义与人工恢复方式 |
 | 2026-09-11 | S5 闭合为持有：sync 模式下 Failover/Switchover 强制 `/sync` 成员资格；空名单不晋升 |

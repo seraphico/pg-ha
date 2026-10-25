@@ -41,6 +41,10 @@ pub trait DcsAdapter: Send + Sync {
     /// Read the dynamic configuration value from the DCS /config key.
     /// Returns None if the key does not exist.
     async fn get_config_value(&self) -> Result<Option<String>>;
+    /// Raise the persistent `/timeline` key to `timeline` (no TTL). Never lowers
+    /// it: Ok(false) when the stored value is already >= `timeline`, Ok(true)
+    /// when written. Read it through `get_cluster().timeline`.
+    async fn set_cluster_timeline(&self, timeline: u64) -> Result<bool>;
 
     /// Get the configured TTL
     fn ttl(&self) -> u64;

@@ -1,11 +1,14 @@
 //! Election logic: unhealthy cluster processing, healthiest node determination,
 //! stale primary detection, and failover key / designated candidate handling.
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::cluster::SyncState;
 
-use super::identity::{ElectionStance, PgIdentity, election_stance};
+use super::identity::{
+    self, ElectionStance, MarkedElectionGate, MarkedGateAction, PgIdentity, election_stance,
+    marked_election_gate, marked_gate_action,
+};
 use super::{CycleResult, Ha};
 
 /// Whether `name` may acquire the leader lock under current sync settings.
@@ -40,9 +43,14 @@ impl Ha {
             return CycleResult::Follower("no action in pause mode (cluster has no leader)".into());
         }
 
+        // D5: a held node never campaigns (and is stopped if started by hand).
+        if let Some(r) = self.enforce_rewind_hold().await {
+            return r;
+        }
+
         // ─── May this node take part at all? (see `identity`) ───
         let identity = self.pg_identity();
-        match election_stance(identity) {
+        match election_stance(identity, self.stop_pending) {
             ElectionStance::Participate => {}
             ElectionStance::StandAside => {
                 error!(
@@ -54,6 +62,21 @@ impl Ha {
                     "PostgreSQL in unmanaged recovery; not taking part in the election".into(),
                 );
             }
+            ElectionStance::Fence => {
+                warn!(
+                    "A previous stop after writing standby.signal failed and PostgreSQL may still \
+                     be writable — stopping it again before any election"
+                );
+                return match self
+                    .fence_primary("fast", "stopped again after a failed demotion stop", None)
+                    .await
+                {
+                    Ok(()) => CycleResult::Follower(
+                        "stopped PostgreSQL: a demotion stop had failed".into(),
+                    ),
+                    Err(e) => CycleResult::Error(format!("Fence stop failed: {e}")),
+                };
+            }
             ElectionStance::Wait => {
                 let _ = self.touch_member().await;
                 return CycleResult::Follower(format!(
@@ -63,42 +86,91 @@ impl Ha {
             }
         }
 
+        // ─── D6: a node with the rewind-check marker campaigns only if its
+        // published timeline is >= the recorded cluster timeline ───
+        let gate = marked_election_gate(
+            self.has_rewind_check_marker(),
+            self.own_published_timeline(),
+            self.cluster.timeline,
+            self.max_peer_timeline(),
+        );
+        if gate == MarkedElectionGate::AllowedIncompleteEvidence {
+            warn!(
+                "No /timeline key in DCS; comparing this node's timeline with the timelines members published. The evidence is incomplete"
+            );
+        }
+        let stand_aside = match gate {
+            MarkedElectionGate::Behind { own, cluster } => {
+                info!(
+                    "Not taking part in the election: rewind-check marker present and this node's timeline {own} is behind the cluster timeline {cluster}; waiting for a leader to rewind against"
+                );
+                format!(
+                    "rewind-check marker present and timeline {own} is behind the cluster timeline {cluster}; not taking part in the election"
+                )
+            }
+            MarkedElectionGate::OwnTimelineUnknown => {
+                info!(
+                    "Not taking part in the election this cycle: rewind-check marker present and this node's timeline is not published yet"
+                );
+                "rewind-check marker present and own timeline not published yet; not taking part in the election this cycle".to_string()
+            }
+            MarkedElectionGate::Allowed | MarkedElectionGate::AllowedIncompleteEvidence => {
+                String::new()
+            }
+        };
+        match marked_gate_action(gate, identity) {
+            MarkedGateAction::Proceed => {}
+            MarkedGateAction::StandAside => {
+                let _ = self.touch_member().await;
+                return CycleResult::Follower(stand_aside);
+            }
+            MarkedGateAction::StopThenStandAside => {
+                warn!(
+                    "Rewind-check marker present and not eligible for the election while PostgreSQL is a primary without the leader lock — stopping PostgreSQL"
+                );
+                // standby.signal + marker first; a failed stop sets
+                // stop_pending, so the next cycle fences it again. A
+                // successful stop is already published by fence_primary.
+                if let Err(e) = self
+                    .fence_primary(
+                        "fast",
+                        "stopped: marked node not eligible for the election while running as a primary",
+                        None,
+                    )
+                    .await
+                {
+                    return CycleResult::Error(format!(
+                        "stop failed for a marked, ineligible primary: {e}"
+                    ));
+                }
+                return CycleResult::Follower(format!("{stand_aside}; stopped PostgreSQL"));
+            }
+        }
+
         // ─── Stale primary detection ───
         // If PG is observed as a primary AND we're not the healthiest node,
-        // this is a former primary that restarted after failover. It needs to rejoin
-        // as a replica even though we can't see the new leader in DCS yet.
+        // this is a former primary that restarted after failover. With no
+        // lock holder there is no ready pg_rewind source (A12), so it is only
+        // stopped (A22): it starts as a standby (with the rewind-check
+        // marker) and is rewound once a leader runs as a primary.
         if identity == PgIdentity::Primary
             && !self.is_healthiest_node()
             && !self.cluster.members.is_empty()
         {
-            // Prefer the leader member, then any primary-role member, then any running member
-            let source_member = self
-                .cluster
-                .leader
-                .as_ref()
-                .and_then(|l| self.cluster.get_member(&l.name))
-                .filter(|m| m.state == crate::cluster::MemberState::Running)
-                .or_else(|| {
-                    self.cluster.members.iter().find(|m| {
-                        m.name != self.config.name
-                            && m.role == crate::cluster::MemberRole::Primary
-                            && m.state == crate::cluster::MemberState::Running
-                    })
-                })
-                .or_else(|| {
-                    self.cluster.members.iter().find(|m| {
-                        m.name != self.config.name
-                            && m.state == crate::cluster::MemberState::Running
-                    })
-                });
-            if let Some(source) = source_member {
-                info!(
-                    source = %source.name,
-                    "Stale primary detected (no leader visible, not healthiest) — initiating rejoin"
-                );
-                let source_name = source.name.clone();
-                return self.rejoin_as_replica(&source_name).await;
+            info!(
+                "Stale primary detected (no leader visible, not healthiest) — stopping PostgreSQL; it will start as a standby and be rewound once a leader runs as a primary"
+            );
+            // No lock holder, so no upstream (D3).
+            if let Err(e) = self
+                .fence_primary("fast", "stopped as a stale primary", None)
+                .await
+            {
+                return CycleResult::Error(format!("stale primary: stop failed: {e}"));
             }
+            let _ = self.touch_member().await;
+            return CycleResult::Follower(
+                "stale primary: stopped PostgreSQL; it will start as a standby and be rewound once a leader runs as a primary".into(),
+            );
         }
 
         // ─── Normal election logic ───
@@ -112,6 +184,26 @@ impl Ha {
             .failover
             .as_ref()
             .and_then(|f| f.candidate.as_deref());
+        // A25: a designated candidate that has the marker and may not take
+        // part in the election would leave the cluster without a leader.
+        let designated_candidate = designated_candidate.filter(|c| {
+            let may = self.cluster.get_member(c).map(|m| {
+                identity::peer_may_campaign(
+                    m.rewind_check,
+                    m.timeline,
+                    self.cluster.timeline,
+                    identity::max_timeline_excluding(&self.cluster.members, &m.name),
+                )
+            });
+            let honour = identity::honour_designated_candidate(*c == self.config.name, may);
+            if !honour {
+                warn!(
+                    candidate = %c,
+                    "Designated candidate {c} has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated"
+                );
+            }
+            honour
+        });
 
         let should_attempt = if let Some(candidate) = designated_candidate {
             if candidate == self.config.name {
@@ -144,9 +236,11 @@ impl Ha {
         };
 
         if should_attempt {
+            let anchor = super::lease::LeaseAnchor::now();
             match self.dcs.attempt_to_acquire_leader().await {
                 Ok(true) => {
                     self.is_leader = true;
+                    self.extend_leader_lease(anchor);
                     // Clear the failover key after successful acquisition
                     let _ = self.dcs.set_failover_value("").await;
                     self.enforce_primary_role().await
@@ -222,6 +316,16 @@ impl Ha {
                 continue;
             }
             if !sync_failover_allowed(&member.name, sync_mode, self.cluster.sync_state.as_ref()) {
+                continue;
+            }
+            // A18: do not defer to a peer that will not campaign under the
+            // marked-node rule (the same rule it applies to itself).
+            if !identity::peer_may_campaign(
+                member.rewind_check,
+                member.timeline,
+                self.cluster.timeline,
+                identity::max_timeline_excluding(&self.cluster.members, &member.name),
+            ) {
                 continue;
             }
 

@@ -1,13 +1,20 @@
 //! Command processing: switchover, failover, restart, and reinitialize commands
 //! received from the management API.
 
-use tracing::info;
+use tracing::{error, info};
 
 use crate::cluster::MemberRole;
 use crate::commands::{CommandResponse, ManagementCommand};
 
-use super::election::sync_failover_allowed;
 use super::Ha;
+use super::election::sync_failover_allowed;
+use super::identity::PgIdentity;
+
+/// A21: a candidate with the rewind-check marker may not campaign once the
+/// lock is released (D6), while the other nodes defer to it.
+fn marked_candidate_message(candidate: &str) -> String {
+    format!("Candidate '{candidate}' has a rewind-check marker (not yet verified with pg_rewind)")
+}
 
 impl Ha {
     /// Process pending management commands from the API
@@ -89,6 +96,9 @@ impl Ha {
                         cand
                     ));
                 }
+                Some(m) if m.rewind_check => {
+                    return CommandResponse::rejected(marked_candidate_message(cand));
+                }
                 _ => {}
             }
             if let Some(resp) = self.reject_if_sync_ineligible_candidate(cand) {
@@ -122,48 +132,43 @@ impl Ha {
             let _ = self.dcs.delete_leader(leader).await;
         }
         self.is_leader = false;
+        self.reset_sync_cache();
 
-        // Stop PostgreSQL to ensure clean demotion
-        let _ = self.postgresql.stop("fast").await;
+        // Write standby.signal before stopping PostgreSQL (D2), so this node
+        // restarts as a standby. With a candidate, point primary_conninfo at
+        // it; without one the new leader is unknown, so primary_conninfo is
+        // removed (D3).
+        let candidate_conn_url = candidate
+            .as_deref()
+            .and_then(|c| self.cluster.get_member(c))
+            .map(|m| m.conn_url.clone());
+        let write_error = self.prepare_demotion(candidate_conn_url, None).await.err();
+        if let Some(we) = &write_error {
+            error!(
+                "Failed to write standby configuration before stopping PostgreSQL: {we}; stopping it anyway"
+            );
+        }
+        let stop_error = self.stop_after_demotion_write("fast").await.err();
         self.postgresql.set_role(MemberRole::Replica);
 
-        // Write standby.signal so this node is recognized as a replica on next cycle
-        // (prevents it from re-acquiring the lock as a stale primary)
-        let standby_signal = self.config.postgresql.data_dir.join("standby.signal");
-        let _ = std::fs::write(&standby_signal, "");
-
-        // Write primary_conninfo pointing to the candidate (new primary)
-        // so when PG restarts it streams from the correct source
-        if let Some(ref cand_name) = candidate
-            && let Some(cand_member) = self.cluster.get_member(cand_name)
-        {
-            let mut host = "127.0.0.1".to_string();
-            let mut port = "5432".to_string();
-            for part in cand_member.conn_url.split_whitespace() {
-                if let Some(val) = part.strip_prefix("host=") {
-                    host = val.to_string();
-                }
-                if let Some(val) = part.strip_prefix("port=") {
-                    port = val.to_string();
-                }
+        // A failed stop comes first: PostgreSQL may still be writable.
+        match (write_error, stop_error) {
+            (None, None) => {}
+            (None, Some(e)) => {
+                return CommandResponse::error(format!(
+                    "Switchover initiated, but stopping PostgreSQL failed: {e}; pg-ha keeps fencing it"
+                ));
             }
-            let repl_user = &self.config.postgresql.replication.username;
-            let repl_pass = self
-                .config
-                .postgresql
-                .replication
-                .password
-                .as_deref()
-                .unwrap_or("");
-            let conninfo = format!(
-                "host={host} port={port} user={repl_user} password={repl_pass} application_name={}",
-                self.config.name
-            );
-            let auto_conf = self.config.postgresql.data_dir.join("postgresql.auto.conf");
-            let content = format!(
-                "# pg-ha managed (switchover demotion)\nprimary_conninfo = '{conninfo}'\nrecovery_target_timeline = 'latest'\n"
-            );
-            let _ = std::fs::write(&auto_conf, content);
+            (Some(we), Some(e)) => {
+                return CommandResponse::error(format!(
+                    "Switchover initiated, but stopping PostgreSQL failed: {e}; pg-ha keeps fencing it; writing standby configuration also failed: {we}"
+                ));
+            }
+            (Some(we), None) => {
+                return CommandResponse::error(format!(
+                    "Switchover initiated and PostgreSQL stopped, but writing standby configuration failed: {we}"
+                ));
+            }
         }
 
         CommandResponse::accepted("Switchover initiated, leader lock released")
@@ -172,8 +177,14 @@ impl Ha {
     async fn handle_failover_command(&mut self, candidate: Option<String>) -> CommandResponse {
         // Failover can be initiated from any node — it writes /failover key
         if let Some(ref cand) = candidate {
-            if self.cluster.get_member(cand).is_none() {
-                return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
+            match self.cluster.get_member(cand) {
+                None => {
+                    return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
+                }
+                Some(m) if m.rewind_check => {
+                    return CommandResponse::rejected(marked_candidate_message(cand));
+                }
+                _ => {}
             }
             if let Some(resp) = self.reject_if_sync_ineligible_candidate(cand) {
                 return resp;
@@ -193,8 +204,35 @@ impl Ha {
     }
 
     async fn handle_restart_command(&mut self) -> CommandResponse {
+        // D5: a held node stays stopped until the operator reinitializes it.
+        if self.refresh_rewind_hold() {
+            return CommandResponse::rejected(
+                "PostgreSQL is held after a pg_rewind failure; use POST /reinitialize (see the ERROR log)",
+            );
+        }
         info!("Restarting PostgreSQL (requested via API)");
-        if let Err(e) = self.postgresql.stop("fast").await {
+        // D1: pg-ha starts PostgreSQL as a primary only while holding the
+        // leader lock. `is_leader` is last cycle's value (commands run before
+        // get_cluster), so the lock must also be ours in the current view.
+        let holding = self.is_leader && self.is_lock_owner();
+        let stopped = if holding {
+            self.postgresql.stop("fast").await
+        } else {
+            // Prepare the standby start before touching PostgreSQL; if that
+            // fails, leave it as it is.
+            if let Err(e) = self.prepare_standby_start().await {
+                error!(
+                    "Not restarting PostgreSQL: could not write the standby configuration ({e})"
+                );
+                return CommandResponse::error(format!(
+                    "Not restarting PostgreSQL: standby configuration could not be written: {e}"
+                ));
+            }
+            // It may be a writable primary without the lock: a failed stop
+            // keeps it fenced (stop_pending).
+            self.stop_after_demotion_write("fast").await
+        };
+        if let Err(e) = stopped {
             return CommandResponse::error(format!("Stop failed: {e}"));
         }
         if let Err(e) = self.postgresql.start().await {
@@ -210,10 +248,30 @@ impl Ha {
             return CommandResponse::rejected("Cannot reinitialize the leader node");
         }
         info!("Reinitializing node (requested via API)");
-        let _ = self.postgresql.stop("immediate").await;
+        if self.postgresql.is_running() && self.pg_identity() == PgIdentity::Primary {
+            // A primary without the lock may be writable: write
+            // standby.signal + marker first, and never delete the data
+            // directory under a server that could not be stopped.
+            if let Err(e) = self
+                .fence_primary(
+                    "immediate",
+                    "stopped for reinitialize while running as a primary without the leader lock",
+                    None,
+                )
+                .await
+            {
+                return CommandResponse::error(format!(
+                    "Reinitialize: stopping PostgreSQL failed: {e}; data directory not removed (pg-ha keeps fencing it)"
+                ));
+            }
+        } else {
+            let _ = self.postgresql.stop("immediate").await;
+        }
         if let Err(e) = self.postgresql.remove_data_directory() {
             return CommandResponse::error(format!("Remove data dir failed: {e}"));
         }
+        // The hold file went with the data directory (D5).
+        self.clear_rewind_hold();
         CommandResponse::accepted("Node reinitialized, will clone on next cycle")
     }
 }

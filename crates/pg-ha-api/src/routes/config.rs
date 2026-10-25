@@ -4,7 +4,7 @@ use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde_json::json;
 
 use super::router_state::RouterState;
-use pg_ha_core::dynamic_config::{GlobalConfig, patch_config};
+use pg_ha_core::dynamic_config::{GlobalConfig, check_lease_timing_change, patch_config};
 
 // ─────────────────── Config Endpoints ───────────────────
 
@@ -78,6 +78,20 @@ pub(crate) async fn put_config(
         }
     };
 
+    let current_config: GlobalConfig = match dcs.get_config_value().await {
+        Ok(Some(value)) => serde_json::from_str(&value).unwrap_or_default(),
+        Ok(None) => GlobalConfig::default(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to read current config: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    if let Some(rejected) = reject_lease_timing(&state, &current_config, &config) {
+        return rejected;
+    }
     // Serialize and write to DCS
     let value = serde_json::to_string(&config).unwrap_or_default();
     match dcs.set_config_value(&value).await {
@@ -141,6 +155,9 @@ pub(crate) async fn patch_config_endpoint(
         }
     };
 
+    if let Some(rejected) = reject_lease_timing(&state, &current_config, &patched) {
+        return rejected;
+    }
     // Write back to DCS
     let value = serde_json::to_string(&patched).unwrap_or_default();
     match dcs.set_config_value(&value).await {
@@ -160,4 +177,24 @@ pub(crate) async fn patch_config_endpoint(
         )
             .into_response(),
     }
+}
+/// 400 when the update changes `ttl` / `loop_wait` / `retry_timeout` to
+/// values that break `ttl >= loop_wait + retry_timeout + safety_margin` on
+/// this node. The update is not written.
+fn reject_lease_timing(
+    state: &RouterState,
+    current: &GlobalConfig,
+    new: &GlobalConfig,
+) -> Option<axum::response::Response> {
+    let base = state.app.lease_timing()?;
+    let problem = check_lease_timing_change(current, new, base).err()?;
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Rejected, configuration not changed: {problem}")
+            })),
+        )
+            .into_response(),
+    )
 }

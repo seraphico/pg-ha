@@ -143,6 +143,11 @@ pub struct PostgresqlConfig {
     /// Replication user connection parameters
     pub replication: ConnectionParams,
 
+    /// When pg_rewind fails (or PostgreSQL does not start after it), delete the
+    /// data directory and rebuild it with pg_basebackup. Off by default: the node
+    /// is stopped and left to the operator (same name as Patroni's option).
+    #[serde(default)]
+    pub remove_data_directory_on_rewind_failure: bool,
     /// Additional PostgreSQL parameters to set in postgresql.conf
     #[serde(default)]
     pub parameters: HashMap<String, String>,
@@ -255,6 +260,51 @@ pub enum WatchdogMode {
     Off,
     Automatic,
     Required,
+}
+
+/// The timing values the leader lease depends on, in seconds.
+///
+/// A primary that cannot renew the leader lock must stop PostgreSQL
+/// `ttl - safety_margin` seconds after its last renewal began. A healthy
+/// primary must fit one HA cycle (`loop_wait`) plus one bounded DCS write
+/// (`retry_timeout`) into that time, hence
+/// `ttl >= loop_wait + retry_timeout + safety_margin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseTiming {
+    pub ttl: u64,
+    pub loop_wait: u64,
+    pub retry_timeout: u64,
+    /// `watchdog.safety_margin`
+    pub safety_margin: u64,
+}
+
+impl LeaseTiming {
+    /// Why these values are not allowed, or None when they are.
+    pub fn violation(&self) -> Option<String> {
+        if self.retry_timeout == 0 {
+            return Some("retry_timeout must be at least 1 second".into());
+        }
+        let required = self
+            .loop_wait
+            .saturating_add(self.retry_timeout)
+            .saturating_add(self.safety_margin);
+        (self.ttl < required).then(|| {
+            format!(
+                "ttl ({}) must be >= loop_wait ({}) + retry_timeout ({}) + watchdog.safety_margin ({}) = {required}: \
+                 a primary that cannot renew the leader lock stops PostgreSQL ttl - safety_margin seconds \
+                 after its last renewal began, and one HA cycle plus one DCS write must fit in that time",
+                self.ttl, self.loop_wait, self.retry_timeout, self.safety_margin
+            )
+        })
+    }
+
+    /// `violation` as a configuration error.
+    pub fn check(&self) -> crate::Result<()> {
+        match self.violation() {
+            Some(problem) => Err(crate::Error::Config(problem)),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Node tags that influence HA behavior
@@ -504,6 +554,20 @@ impl Config {
                 self.ttl, self.loop_wait
             )));
         }
+        self.lease_timing().check()?;
+        if let Some(bootstrap) = &self.bootstrap {
+            // bootstrap.dcs becomes the dynamic /config, which overrides these.
+            let dcs_value = |key: &str| bootstrap.dcs.get(key).and_then(|v| v.as_u64());
+            let initial = LeaseTiming {
+                ttl: dcs_value("ttl").unwrap_or(self.ttl),
+                loop_wait: dcs_value("loop_wait").unwrap_or(self.loop_wait),
+                retry_timeout: dcs_value("retry_timeout").unwrap_or(self.retry_timeout),
+                safety_margin: self.watchdog.safety_margin,
+            };
+            if let Some(problem) = initial.violation() {
+                return Err(crate::Error::Config(format!("bootstrap.dcs: {problem}")));
+            }
+        }
         if self.raft.self_addr.is_empty() {
             return Err(crate::Error::Config("raft.self_addr is required".into()));
         }
@@ -513,6 +577,16 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    /// The static values the leader lease depends on.
+    pub fn lease_timing(&self) -> LeaseTiming {
+        LeaseTiming {
+            ttl: self.ttl,
+            loop_wait: self.loop_wait,
+            retry_timeout: self.retry_timeout,
+            safety_margin: self.watchdog.safety_margin,
+        }
     }
 
     /// Generate a sample configuration YAML string
@@ -539,6 +613,7 @@ impl Config {
                     password: Some("secret".to_string()),
                     dbname: "postgres".to_string(),
                 },
+                remove_data_directory_on_rewind_failure: false,
                 parameters: HashMap::from([
                     ("max_connections".to_string(), "100".to_string()),
                     ("wal_level".to_string(), "replica".to_string()),
@@ -652,6 +727,93 @@ proxy:
         assert!(result.unwrap_err().to_string().contains("ttl"));
     }
 
+    /// R19: refuse to start when ttl < loop_wait + retry_timeout +
+    /// safety_margin; the error names the four values and the inequality.
+    #[test]
+    fn test_validation_rejects_ttl_below_lease_requirement() {
+        // 20 < 10 + 6 + 5 = 21
+        let yaml = format!("{MINIMAL_YAML}\nttl: 20\nloop_wait: 10\nretry_timeout: 6");
+        let err = Config::from_yaml(&yaml).unwrap_err().to_string();
+        for part in [
+            "ttl (20)",
+            "loop_wait (10)",
+            "retry_timeout (6)",
+            "watchdog.safety_margin (5)",
+            ">= loop_wait",
+            "= 21",
+        ] {
+            assert!(err.contains(part), "missing {part:?} in: {err}");
+        }
+
+        // The margin is part of the sum: 21 passes with 5, fails with 6.
+        let yaml = format!("{MINIMAL_YAML}\nttl: 21\nloop_wait: 10\nretry_timeout: 6");
+        assert!(Config::from_yaml(&yaml).is_ok());
+        let yaml = format!(
+            "{MINIMAL_YAML}\nttl: 21\nloop_wait: 10\nretry_timeout: 6\nwatchdog:\n  safety_margin: 6"
+        );
+        let err = Config::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("watchdog.safety_margin (6)"), "{err}");
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_retry_timeout() {
+        let yaml = format!("{MINIMAL_YAML}\nretry_timeout: 0");
+        let err = Config::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("retry_timeout"), "{err}");
+    }
+
+    /// Environment overrides are validated again at startup (src/main.rs).
+    #[test]
+    fn test_validation_after_env_style_override() {
+        let mut config = Config::from_yaml(MINIMAL_YAML).unwrap();
+        config.ttl = 24; // 24 < 10 + 10 + 5
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("ttl (24)"), "{err}");
+    }
+
+    #[test]
+    fn test_validation_rejects_bootstrap_dcs_below_lease_requirement() {
+        let yaml = format!(
+            "{MINIMAL_YAML}\nbootstrap:\n  dcs:\n    ttl: 15\n    loop_wait: 5\n    retry_timeout: 6"
+        );
+        let err = Config::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("bootstrap.dcs"), "{err}");
+        assert!(err.contains("ttl (15)"), "{err}");
+        // Missing keys fall back to the top-level values (here 10 / 10 / 5).
+        let yaml = format!("{MINIMAL_YAML}\nbootstrap:\n  dcs:\n    ttl: 25");
+        assert!(Config::from_yaml(&yaml).is_ok());
+    }
+
+    /// The defaults and the docker / test configs satisfy the constraint.
+    #[test]
+    fn test_shipped_timings_satisfy_lease_requirement() {
+        let defaults = Config::from_yaml(MINIMAL_YAML).unwrap().lease_timing();
+        assert_eq!(
+            defaults,
+            LeaseTiming {
+                ttl: 30,
+                loop_wait: 10,
+                retry_timeout: 10,
+                safety_margin: 5
+            }
+        );
+        assert!(defaults.violation().is_none());
+        // docker/entrypoint.sh and test-config.yml: 15 >= 5 + 5 + 5
+        let docker = LeaseTiming {
+            ttl: 15,
+            loop_wait: 5,
+            retry_timeout: 5,
+            safety_margin: 5,
+        };
+        assert!(docker.violation().is_none());
+        assert!(
+            serde_yaml::from_str::<Config>(&Config::sample())
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+    }
+
     #[test]
     fn test_validation_empty_raft_partners() {
         let yaml = MINIMAL_YAML.replace(
@@ -694,6 +856,23 @@ proxy:
         assert!(config.tags.nofailover);
         assert_eq!(config.tags.failover_priority, 0);
         assert_eq!(config.tags.replicatefrom, Some("node2".to_string()));
+    }
+
+    #[test]
+    fn test_remove_data_directory_on_rewind_failure_defaults_off() {
+        let config = Config::from_yaml(MINIMAL_YAML).unwrap();
+        assert!(!config.postgresql.remove_data_directory_on_rewind_failure);
+    }
+
+    #[test]
+    fn test_remove_data_directory_on_rewind_failure_can_be_enabled() {
+        let yaml = MINIMAL_YAML.replace(
+            "  bin_dir: /usr/bin\n",
+            "  bin_dir: /usr/bin\n  remove_data_directory_on_rewind_failure: true\n",
+        );
+        assert_ne!(yaml, MINIMAL_YAML);
+        let config = Config::from_yaml(&yaml).unwrap();
+        assert!(config.postgresql.remove_data_directory_on_rewind_failure);
     }
 
     #[test]

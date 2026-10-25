@@ -37,6 +37,24 @@ const PG_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// stuck server cannot stall the HA loop.
 const RECOVERY_OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound for the live check of a pg_rewind source (psql also gets
+/// PGCONNECT_TIMEOUT=5).
+const SOURCE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pure: exit status + stdout of the `SELECT pg_is_in_recovery()` probe ->
+/// Some(true) = answers as a primary, Some(false) = in recovery, None = no
+/// usable answer.
+pub(crate) fn parse_recovery_probe(success: bool, stdout: &str) -> Option<bool> {
+    if !success {
+        return None;
+    }
+    match stdout.trim() {
+        "f" => Some(true),
+        "t" => Some(false),
+        _ => None,
+    }
+}
+
 /// Manages a local PostgreSQL instance lifecycle
 pub struct Postgresql {
     config: PostgresqlConfig,
@@ -100,6 +118,16 @@ pub fn parse_lsn(lsn: &str) -> Option<u64> {
     Some((hi << 32) | lo)
 }
 
+/// Timeline from a WAL file name: its first 8 hex digits.
+/// "00000003000000000000000A" -> Some(3)
+pub fn parse_walfile_timeline(walfile: &str) -> Option<u64> {
+    let walfile = walfile.trim();
+    if walfile.len() != 24 || !walfile.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(&walfile[..8], 16).ok()
+}
+
 impl Postgresql {
     pub fn new(config: PostgresqlConfig) -> Self {
         Self {
@@ -130,6 +158,10 @@ impl Postgresql {
 
     fn pg_controldata_bin(&self) -> PathBuf {
         self.config.bin_dir.join("pg_controldata")
+    }
+
+    fn psql_bin(&self) -> PathBuf {
+        self.config.bin_dir.join("psql")
     }
 
     fn data_dir_str(&self) -> &str {
@@ -413,6 +445,60 @@ impl Postgresql {
         }
     }
 
+    /// Live check of a pg_rewind source: run
+    /// `psql -X -tAq -w -d <conn_url> -c "SELECT pg_is_in_recovery()"` with
+    /// PGCONNECT_TIMEOUT=5 under a 10 s limit (the child is killed on
+    /// timeout). Some(true) = it answers as a primary, Some(false) = it is in
+    /// recovery, None = no usable answer.
+    pub async fn source_answers_as_primary(&self, conn_url: &str) -> Option<bool> {
+        let probe = Command::new(self.psql_bin())
+            .args([
+                "-X",
+                "-tAq",
+                "-w",
+                "-d",
+                conn_url,
+                "-c",
+                "SELECT pg_is_in_recovery()",
+            ])
+            .env("PGCONNECT_TIMEOUT", "5")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let output = match tokio::time::timeout(SOURCE_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                warn!(source = %redact_connstr(conn_url), "Live check of the pg_rewind source failed: {e}");
+                return None;
+            }
+            Err(_) => {
+                warn!(
+                    source = %redact_connstr(conn_url),
+                    "Live check of the pg_rewind source failed: no answer within {SOURCE_PROBE_TIMEOUT:?}"
+                );
+                return None;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let answer = parse_recovery_probe(output.status.success(), &stdout);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let first = stderr.lines().next().unwrap_or("").trim();
+            warn!(
+                source = %redact_connstr(conn_url),
+                "Live check of the pg_rewind source failed: psql exited with {}: {first}",
+                output.status
+            );
+        } else if answer.is_none() {
+            warn!(
+                source = %redact_connstr(conn_url),
+                "Live check of the pg_rewind source failed: unexpected answer {:?}",
+                stdout.trim()
+            );
+        }
+        answer
+    }
+
     // ─────────────────────── Introspection ───────────────────────
 
     /// Get system identifier from pg_controldata
@@ -574,6 +660,40 @@ impl Postgresql {
             }
         }
         Err(Error::Postgres("Could not determine recovery state".into()))
+    }
+
+    /// Timeline the primary is writing WAL on right now, from
+    /// pg_walfile_name(pg_current_wal_lsn()). Errors on a server in recovery.
+    pub async fn primary_timeline(&self) -> Result<u64> {
+        let connstr = self.connection_string();
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
+
+        tokio::spawn(async move {
+            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
+                Ok(Err(e)) => debug!("Connection closed: {e}"),
+                Err(_) => warn!("PG connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Ok(Ok(())) => {}
+            }
+        });
+
+        let rows = client
+            .simple_query("SELECT pg_walfile_name(pg_current_wal_lsn())")
+            .await
+            .map_err(|e| Error::Postgres(format!("Query failed: {e}")))?;
+
+        for msg in rows {
+            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg
+                && let Some(val) = row.get(0)
+            {
+                return parse_walfile_timeline(val)
+                    .ok_or_else(|| Error::Postgres(format!("Unexpected WAL file name '{val}'")));
+            }
+        }
+        Err(Error::Postgres(
+            "Could not determine the primary's timeline".into(),
+        ))
     }
 
     /// Get WAL position and timeline information
@@ -851,6 +971,7 @@ mod tests {
                 password: Some("replpass".to_string()),
                 dbname: "postgres".to_string(),
             },
+            remove_data_directory_on_rewind_failure: false,
             parameters: Default::default(),
         }
     }
@@ -948,6 +1069,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_recovery_probe_table() {
+        let table = [
+            (true, "f\n", Some(true)),
+            (true, " t ", Some(false)),
+            (true, "", None),
+            (true, "x", None),
+            (false, "f", None),
+        ];
+        for (success, stdout, expected) in table {
+            assert_eq!(
+                parse_recovery_probe(success, stdout),
+                expected,
+                "{success} {stdout:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_probe_without_psql_is_none() {
+        let mut config = test_config();
+        config.bin_dir = PathBuf::from("/nonexistent/pg-ha-test-bin");
+        let pg = Postgresql::new(config);
+        assert_eq!(
+            pg.source_answers_as_primary("host=node1 port=5432").await,
+            None
+        );
+    }
+
+    #[test]
     fn test_pg_ctl_path() {
         let pg = Postgresql::new(test_config());
         assert_eq!(
@@ -980,6 +1130,26 @@ mod tests {
         assert_eq!(parse_lsn("0/0/0"), None);
         assert_eq!(parse_lsn("G/0"), None);
         assert_eq!(parse_lsn("0/G"), None);
+    }
+
+    #[test]
+    fn parse_walfile_timeline_valid() {
+        assert_eq!(parse_walfile_timeline("000000010000000000000003"), Some(1));
+        assert_eq!(parse_walfile_timeline("0000000A0000000000000003"), Some(10));
+        assert_eq!(parse_walfile_timeline("00000003000000000000000A"), Some(3));
+        assert_eq!(
+            parse_walfile_timeline("000000ff00000001000000FE"),
+            Some(255)
+        );
+    }
+
+    #[test]
+    fn parse_walfile_timeline_invalid() {
+        assert_eq!(parse_walfile_timeline(""), None);
+        assert_eq!(parse_walfile_timeline("00000001"), None);
+        assert_eq!(parse_walfile_timeline("0000000100000000000000030"), None);
+        assert_eq!(parse_walfile_timeline("0000000G0000000000000003"), None);
+        assert_eq!(parse_walfile_timeline("+00000010000000000000003"), None);
     }
 
     // ─────────────────────────────────────────────────────────────────────

@@ -6,8 +6,19 @@ use tracing::{error, info, warn};
 use crate::cascading::CascadeManager;
 use crate::cluster::MemberRole;
 
-use super::identity::{FollowerAction, follower_action};
+use super::identity::{
+    self, AfterRewindStart, FollowerAction, PgIdentity, follower_action, leader_ready_for_rewind,
+    rewind_source_not_ready_reason,
+};
 use super::{CycleResult, Ha};
+
+/// Error text without the "PostgreSQL error: " wrapper, for the hold message.
+fn error_text(e: &crate::error::Error) -> String {
+    match e {
+        crate::error::Error::Postgres(m) => m.clone(),
+        other => other.to_string(),
+    }
+}
 
 impl Ha {
     /// Follow the appropriate upstream node, using cascading replication when configured.
@@ -15,6 +26,11 @@ impl Ha {
     /// If this node has the `replicatefrom` tag set, it will attempt to stream from
     /// the tagged member. If that member is unavailable, it falls back to the primary.
     pub(super) async fn follow_upstream(&mut self, lock_owner: &str) -> CycleResult {
+        // D5: a held node is kept stopped (also when started by hand).
+        if let Some(r) = self.enforce_rewind_hold().await {
+            return r;
+        }
+
         let replicatefrom = self.config.tags.replicatefrom.as_deref();
 
         let upstream =
@@ -39,12 +55,32 @@ impl Ha {
         // ─── What is this node, given that another node holds the lock? ───
         // Decided from this cycle's observation (see `identity`).
         let identity = self.pg_identity();
-        match follower_action(identity) {
+        match follower_action(identity, self.stop_pending, self.has_rewind_check_marker()) {
             FollowerAction::Rejoin => {
                 // Old primary that lost the lock (S4): convert it via pg_rewind.
                 info!(
                     "PostgreSQL is a primary but another node ({}) holds the leader lock — initiating rejoin as replica",
                     lock_owner
+                );
+                return self.rejoin_as_replica(lock_owner).await;
+            }
+            FollowerAction::RewindCheck => {
+                // D4: this standby may hold WAL beyond a fork point. Check
+                // with pg_rewind once the leader runs as a primary; until
+                // then keep it running read-only (the live probe runs in
+                // rejoin_as_replica, before anything is stopped).
+                if !identity::leader_ready_in_dcs(
+                    Some(lock_owner),
+                    lock_owner,
+                    self.cluster.get_member(lock_owner),
+                ) {
+                    let _ = self.touch_member().await;
+                    return CycleResult::Follower(format!(
+                        "rewind-check marker present; waiting for {lock_owner} to run as a primary before pg_rewind"
+                    ));
+                }
+                info!(
+                    "Rewind-check marker present and {lock_owner} holds the leader lock — checking with pg_rewind before following"
                 );
                 return self.rejoin_as_replica(lock_owner).await;
             }
@@ -66,18 +102,45 @@ impl Ha {
                 ));
             }
             FollowerAction::Fence => {
-                warn!(
-                    "Cannot observe PostgreSQL recovery state and there is no standby.signal, while \
-                     {} holds the leader lock — stopping PostgreSQL so it cannot serve writes",
-                    lock_owner
-                );
-                if let Err(e) = self.postgresql.stop("fast").await {
-                    error!("Failed to stop PostgreSQL while fencing: {e}");
+                let retry = self.stop_pending;
+                if retry {
+                    warn!(
+                        "A previous stop after writing standby.signal failed and PostgreSQL is \
+                         unobserved, while {} holds the leader lock — stopping PostgreSQL again",
+                        lock_owner
+                    );
+                } else {
+                    warn!(
+                        "Cannot observe PostgreSQL recovery state and there is no standby.signal, while \
+                         {} holds the leader lock — stopping PostgreSQL so it cannot serve writes",
+                        lock_owner
+                    );
+                }
+                // Write standby.signal first (D2); the lock holder is the
+                // known upstream.
+                let upstream = self
+                    .cluster
+                    .get_member(lock_owner)
+                    .map(|m| m.conn_url.clone());
+                let written = self.prepare_demotion(upstream, None).await;
+                if let Err(e) = &written {
+                    error!(
+                        "Failed to write standby configuration before stopping PostgreSQL: {e}; stopping it anyway"
+                    );
+                }
+                if let Err(e) = self.stop_after_demotion_write("fast").await {
                     return CycleResult::Error(format!("Fence stop failed: {e}"));
                 }
-                return CycleResult::Follower(
-                    "stopped PostgreSQL: recovery state unobserved and no standby.signal".into(),
-                );
+                if let Err(e) = written {
+                    return CycleResult::Error(format!(
+                        "Fence: stopped PostgreSQL, but standby configuration could not be written: {e}"
+                    ));
+                }
+                return CycleResult::Follower(if retry {
+                    "stopped PostgreSQL: a demotion stop had failed".into()
+                } else {
+                    "stopped PostgreSQL: recovery state unobserved and no standby.signal".into()
+                });
             }
             FollowerAction::Wait => {
                 let _ = self.touch_member().await;
@@ -116,12 +179,11 @@ impl Ha {
                 })
                 .unwrap_or_default();
 
-            let needs_reconfig = current_upstream
-                .as_ref()
-                .is_some_and(|current| !expected_host.is_empty() && current != &expected_host);
+            let needs_reconfig =
+                needs_upstream_reconfig(current_upstream.as_deref(), &expected_host);
 
             if needs_reconfig && !self.is_recently_reconfigured() {
-                let current = current_upstream.unwrap_or_default();
+                let current = current_upstream.unwrap_or_else(|| "none".to_string());
                 info!(
                     current_upstream = %current,
                     expected_upstream = %expected_host,
@@ -146,76 +208,164 @@ impl Ha {
         ))
     }
 
-    /// Rejoin the cluster as a replica after being a former primary.
+    /// Rejoin the cluster as a replica: a former primary, or a standby with
+    /// the rewind-check marker (D4).
     ///
     /// Steps:
-    /// 1. Stop PostgreSQL (if running as primary)
-    /// 2. Run pg_rewind to resync from the current primary
-    /// 3. Write standby.signal + primary_conninfo
-    /// 4. Restart PostgreSQL in standby mode
+    /// 0. Stop if held after a pg_rewind failure (D5); stop if the source is
+    ///    not ready (A12: lock holder running as a primary in the DCS view
+    ///    and in a live check), without counting it as a failure
+    /// 1. Stop PostgreSQL (a primary through `fence_primary`)
+    /// 2. Check the source live again, then run pg_rewind against it
+    /// 3. Remove the marker, write standby.signal + primary_conninfo
+    /// 4. Start PostgreSQL in standby mode
     ///
-    /// If pg_rewind fails (e.g., WAL diverged too much), falls back to pg_basebackup.
+    /// When pg_rewind fails, or PostgreSQL does not start after it, the node
+    /// is held (stopped, data directory kept) unless
+    /// `postgresql.remove_data_directory_on_rewind_failure` is set, in which
+    /// case it is rebuilt with pg_basebackup.
     pub(super) async fn rejoin_as_replica(&mut self, leader_name: &str) -> CycleResult {
-        // Get the leader's connection info for pg_rewind
-        let leader_member = self.cluster.get_member(leader_name);
-        let leader_connstr = match leader_member {
-            Some(m) => m.conn_url.clone(),
-            None => {
+        let rebuild_enabled = self
+            .config
+            .postgresql
+            .remove_data_directory_on_rewind_failure;
+
+        // Step 0a: a held node does not rewind again on its own.
+        if self.refresh_rewind_hold() && !rebuild_enabled {
+            return self.hold_stop_and_report().await;
+        }
+
+        // Step 0b: only rewind from a ready lock holder. The live probe runs
+        // only when the DCS view already says ready, and before any stop.
+        let lock_holder = self.cluster.leader.as_ref().map(|l| l.name.clone());
+        let member = self.cluster.get_member(leader_name).cloned();
+        let dcs_ready =
+            identity::leader_ready_in_dcs(lock_holder.as_deref(), leader_name, member.as_ref());
+        let probe = match (&member, dcs_ready) {
+            (Some(m), true) => self.postgresql.source_answers_as_primary(&m.conn_url).await,
+            _ => None,
+        };
+        if !leader_ready_for_rewind(lock_holder.as_deref(), leader_name, member.as_ref(), probe) {
+            // Not a failure: never enters the D5 hold.
+            let why = rewind_source_not_ready_reason(dcs_ready, probe);
+            if self.pg_identity() == PgIdentity::Primary {
                 warn!(
-                    "Cannot rejoin: leader '{}' not found in cluster members",
-                    leader_name
+                    "PostgreSQL is a primary without the leader lock and {leader_name} {why} — stopping PostgreSQL; it will start as a standby and be rewound once the leader is ready"
                 );
-                return CycleResult::Error(format!(
-                    "Cannot rejoin: leader '{}' not found",
-                    leader_name
+                // D3: point primary_conninfo only at this cycle's lock holder.
+                let upstream = if lock_holder.as_deref() == Some(leader_name) {
+                    member.as_ref().map(|m| m.conn_url.clone())
+                } else {
+                    None
+                };
+                if let Err(e) = self
+                    .fence_primary(
+                        "fast",
+                        "stopped while running as a primary without the leader lock; leader not ready for pg_rewind",
+                        upstream,
+                    )
+                    .await
+                {
+                    return CycleResult::Error(format!("Rejoin stop failed: {e}"));
+                }
+                return CycleResult::Follower(format!(
+                    "stopped PostgreSQL: {leader_name} {why}; pg_rewind will run once it is ready"
                 ));
             }
+            info!("Not running pg_rewind: {leader_name} {why}");
+            let _ = self.touch_member().await;
+            return CycleResult::Follower(format!("not running pg_rewind: {leader_name} {why}"));
+        }
+        // Ready implies the member record exists.
+        let Some(leader_connstr) = member.map(|m| m.conn_url) else {
+            return CycleResult::Error(format!("Cannot rejoin: leader '{leader_name}' not found"));
         };
 
-        // Step 1: Stop PostgreSQL (only if it's running)
+        // Step 1: Stop PostgreSQL (only if it's running). A primary without
+        // the lock may be writable: write standby.signal + marker first (D2).
         if self.postgresql.is_running() {
             info!("Stopping PostgreSQL for rejoin (pg_rewind)");
-            if let Err(e) = self.postgresql.stop("fast").await {
+            let stopped = if self.pg_identity() == PgIdentity::Primary {
+                self.fence_primary(
+                    "fast",
+                    "stopped for pg_rewind while running as a primary without the leader lock",
+                    Some(leader_connstr.clone()),
+                )
+                .await
+            } else {
+                self.postgresql.stop("fast").await
+            };
+            if let Err(e) = stopped {
                 error!("Failed to stop PostgreSQL for rejoin: {e}");
                 return CycleResult::Error(format!("Rejoin stop failed: {e}"));
             }
         }
 
-        // Step 2: Run pg_rewind
-        info!(source = %leader_name, "Running pg_rewind to resync from current primary");
-        let rewind_result = self.postgresql.rewind(&leader_connstr).await;
-
-        match rewind_result {
-            Ok(()) => {
-                info!("pg_rewind succeeded");
-            }
-            Err(e) => {
-                warn!("pg_rewind failed: {e} — falling back to pg_basebackup");
-                // Fallback: remove data and clone fresh
-                if let Err(re) = self.postgresql.remove_data_directory() {
-                    error!("Failed to remove data directory for fresh clone: {re}");
-                    return CycleResult::Error(format!("Rejoin failed: rewind={e}, cleanup={re}"));
-                }
-                // Clone from leader
-                match self.postgresql.basebackup(&leader_connstr).await {
-                    Ok(()) => {
-                        info!("pg_basebackup fallback succeeded");
-                    }
-                    Err(be) => {
-                        return CycleResult::Error(format!(
-                            "Rejoin failed: rewind={e}, basebackup={be}"
-                        ));
-                    }
-                }
-            }
+        // Step 2: the local stop can take long on a large database; check the
+        // source again right before pg_rewind. Not ready is not a failure:
+        // PostgreSQL stays stopped and starts as a standby next cycle (D1).
+        let probe = self
+            .postgresql
+            .source_answers_as_primary(&leader_connstr)
+            .await;
+        let member_now = self.cluster.get_member(leader_name);
+        if !leader_ready_for_rewind(lock_holder.as_deref(), leader_name, member_now, probe) {
+            let why = rewind_source_not_ready_reason(true, probe);
+            info!(
+                "Not running pg_rewind: {leader_name} {why}; PostgreSQL stays stopped and starts as a standby next cycle"
+            );
+            let _ = self.touch_member().await;
+            return CycleResult::Follower(format!(
+                "not running pg_rewind: {leader_name} {why}; PostgreSQL stopped, it starts as a standby next cycle"
+            ));
         }
 
-        // Step 3: Write standby.signal + primary_conninfo
-        self.write_standby_config_for_rejoin(&leader_connstr).await;
+        info!(source = %leader_name, "Running pg_rewind to resync from current primary");
+        if let Err(e) = self.postgresql.rewind(&leader_connstr).await {
+            if rebuild_enabled {
+                warn!(
+                    "pg_rewind failed: {e} — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup"
+                );
+                return self
+                    .rebuild_from_leader(leader_name, &leader_connstr, "rewind", &e)
+                    .await;
+            }
+            return self.enter_rewind_hold("pg_rewind", &error_text(&e)).await;
+        }
+
+        // Step 3: the rewind check is done (also for "no rewind required").
+        // Files pg_rewind copied from the source are dropped with it (A16).
+        let data_dir = self.config.postgresql.data_dir.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            crate::standby_config::remove_node_state_files(&data_dir)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|r| r);
+        match removed {
+            Ok(()) => info!("pg_rewind succeeded; removed the rewind-check marker"),
+            Err(e) => {
+                warn!("pg_rewind succeeded but the rewind-check marker could not be removed: {e}")
+            }
+        }
+        self.clear_rewind_hold();
+
+        // D1: without standby.signal PostgreSQL would start as a primary, so a
+        // failed write means no start.
+        if let Err(e) = self.write_standby_config(Some(&leader_connstr)).await {
+            error!(
+                "Failed to write standby configuration for rejoin: {e}; not starting PostgreSQL"
+            );
+            return CycleResult::Error(format!(
+                "Rejoin: not starting PostgreSQL, standby configuration could not be written: {e}"
+            ));
+        }
 
         // Step 4: Start PostgreSQL in standby mode
-        match self.postgresql.start().await {
-            Ok(()) => {
+        let start = self.postgresql.start().await;
+        let outcome = identity::after_rewind_start(start.is_ok(), self.postgresql.is_running());
+        match (outcome, start) {
+            (AfterRewindStart::Started, _) | (_, Ok(())) => {
                 self.postgresql.set_role(MemberRole::Replica);
                 let _ = self.touch_member().await;
                 info!("Successfully rejoined cluster as replica");
@@ -224,38 +374,84 @@ impl Ha {
                     leader_name
                 ))
             }
-            Err(e) => {
-                // pg_rewind appeared to succeed but PG can't start (e.g., timeline
-                // history files missing, or checkpoint at exact fork point).
-                // Fallback: full clone via pg_basebackup.
-                warn!("PG failed to start after pg_rewind: {e} — falling back to pg_basebackup");
-                if let Err(re) = self.postgresql.remove_data_directory() {
-                    return CycleResult::Error(format!(
-                        "Rejoin fallback failed: start={e}, cleanup={re}"
-                    ));
+            (AfterRewindStart::StillStarting, Err(e)) => {
+                // A28: pg_ctl -w gave up, but the postmaster is still
+                // replaying to the consistent point (large databases).
+                warn!(
+                    "PostgreSQL is still starting after pg_rewind ({e}); not treating this as a failure"
+                );
+                self.postgresql
+                    .set_state(crate::postgresql::PgState::Starting);
+                self.postgresql.set_role(MemberRole::Replica);
+                let _ = self.touch_member().await;
+                CycleResult::Follower("rejoined via pg_rewind; PostgreSQL still starting".into())
+            }
+            (AfterRewindStart::Failed, Err(e)) => {
+                if rebuild_enabled {
+                    warn!(
+                        "PostgreSQL failed to start after pg_rewind: {e} — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup"
+                    );
+                    return self
+                        .rebuild_from_leader(leader_name, &leader_connstr, "start", &e)
+                        .await;
                 }
-                match self.postgresql.basebackup(&leader_connstr).await {
-                    Ok(()) => {
-                        self.write_standby_config_for_rejoin(&leader_connstr).await;
-                        match self.postgresql.start().await {
-                            Ok(()) => {
-                                self.postgresql.set_role(MemberRole::Replica);
-                                let _ = self.touch_member().await;
-                                info!("Rejoined cluster via pg_basebackup fallback");
-                                CycleResult::Follower(format!(
-                                    "rejoined as replica via basebackup fallback, following ({})",
-                                    leader_name
-                                ))
-                            }
-                            Err(e2) => CycleResult::Error(format!(
-                                "Failed to start after basebackup fallback: {e2}"
-                            )),
-                        }
-                    }
-                    Err(be) => {
-                        CycleResult::Error(format!("Rejoin fallback basebackup failed: {be}"))
-                    }
-                }
+                self.enter_rewind_hold("Starting PostgreSQL after pg_rewind", &error_text(&e))
+                    .await
+            }
+        }
+    }
+
+    /// D5 with `remove_data_directory_on_rewind_failure: true`: delete the
+    /// data directory and clone it again from the leader, then start as a
+    /// standby. `failed` names the step that failed ("rewind" or "start").
+    async fn rebuild_from_leader(
+        &mut self,
+        leader_name: &str,
+        leader_connstr: &str,
+        failed: &str,
+        e: &crate::error::Error,
+    ) -> CycleResult {
+        if let Err(re) = self.postgresql.remove_data_directory() {
+            error!("Failed to remove data directory for fresh clone: {re}");
+            return CycleResult::Error(format!("Rejoin failed: {failed}={e}, cleanup={re}"));
+        }
+        if let Err(be) = self.postgresql.basebackup(leader_connstr).await {
+            return CycleResult::Error(format!("Rejoin failed: {failed}={e}, basebackup={be}"));
+        }
+        info!("pg_basebackup fallback succeeded");
+        // The clone carries the source's pg-ha state files (A16).
+        let data_dir = self.config.postgresql.data_dir.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            crate::standby_config::remove_node_state_files(&data_dir)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|r| r);
+        if let Err(re) = removed {
+            warn!("Could not remove pg-ha state files copied by pg_basebackup: {re}");
+        }
+        self.clear_rewind_hold();
+
+        if let Err(e) = self.write_standby_config(Some(leader_connstr)).await {
+            error!(
+                "Failed to write standby configuration for rejoin: {e}; not starting PostgreSQL"
+            );
+            return CycleResult::Error(format!(
+                "Rejoin: not starting PostgreSQL, standby configuration could not be written: {e}"
+            ));
+        }
+        match self.postgresql.start().await {
+            Ok(()) => {
+                self.postgresql.set_role(MemberRole::Replica);
+                let _ = self.touch_member().await;
+                info!("Rejoined cluster via pg_basebackup fallback");
+                CycleResult::Follower(format!(
+                    "rejoined as replica via basebackup fallback, following ({})",
+                    leader_name
+                ))
+            }
+            Err(e2) => {
+                CycleResult::Error(format!("Failed to start after basebackup fallback: {e2}"))
             }
         }
     }
@@ -274,36 +470,13 @@ impl Ha {
             }
         }
 
-        let repl_user = &self.config.postgresql.replication.username;
-        let repl_pass = self
-            .config
-            .postgresql
-            .replication
-            .password
-            .as_deref()
-            .unwrap_or("");
-        let primary_conninfo = format!(
-            "host={host} port={port} user={repl_user} password={repl_pass} application_name={}",
-            self.config.name
-        );
-
-        // Write updated postgresql.auto.conf (offload to blocking thread)
-        let auto_conf_path = self.config.postgresql.data_dir.join("postgresql.auto.conf");
-        let content = format!(
-            "# pg-ha managed standby configuration\nprimary_conninfo = '{primary_conninfo}'\nrecovery_target_timeline = 'latest'\n"
-        );
-        let write_result =
-            tokio::task::spawn_blocking(move || std::fs::write(&auto_conf_path, &content)).await;
-        match write_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                error!("Failed to write postgresql.auto.conf: {e}");
-                return;
-            }
-            Err(e) => {
-                error!("reconfigure_replica spawn_blocking failed: {e}");
-                return;
-            }
+        // Rewrite primary_conninfo (other postgresql.auto.conf lines are kept).
+        // D1: only reached for a ManagedStandby, and the writer always writes
+        // standby.signal; a failed write returns before the stop, so the
+        // restart below never starts PostgreSQL as a primary.
+        if let Err(e) = self.write_standby_config(Some(new_upstream_connstr)).await {
+            error!("Failed to write standby configuration: {e}");
+            return;
         }
 
         info!(
@@ -341,61 +514,34 @@ impl Ha {
             error!("Failed to restart PG after reconfiguration: {e}");
         }
     }
+}
 
-    /// Write standby.signal and primary_conninfo for a node rejoining as replica.
-    pub(super) async fn write_standby_config_for_rejoin(&self, leader_connstr: &str) {
-        let data_dir = self.config.postgresql.data_dir.clone();
+/// D3: reconfigure when the expected upstream is known and the configured one
+/// differs from it or is missing (no primary_conninfo, e.g. removed at
+/// demotion because the new leader was unknown).
+pub(super) fn needs_upstream_reconfig(current: Option<&str>, expected_host: &str) -> bool {
+    !expected_host.is_empty() && current != Some(expected_host)
+}
 
-        // Parse host/port from leader connection string
-        let mut host = "127.0.0.1".to_string();
-        let mut port = "5432".to_string();
-        for part in leader_connstr.split_whitespace() {
-            if let Some(val) = part.strip_prefix("host=") {
-                host = val.to_string();
-            } else if let Some(val) = part.strip_prefix("port=") {
-                port = val.to_string();
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let repl_user = self.config.postgresql.replication.username.clone();
-        let repl_pass = self
-            .config
-            .postgresql
-            .replication
-            .password
-            .clone()
-            .unwrap_or_default();
-        let app_name = self.config.name.clone();
-        let primary_conninfo = format!(
-            "host={host} port={port} user={repl_user} password={repl_pass} application_name={app_name}",
-        );
-
-        let host_log = host.clone();
-        let port_log = port.clone();
-
-        // Offload filesystem writes to blocking thread pool
-        let write_result = tokio::task::spawn_blocking(move || {
-            // Create standby.signal
-            let standby_signal = data_dir.join("standby.signal");
-            if let Err(e) = std::fs::write(&standby_signal, "") {
-                tracing::warn!("Failed to create standby.signal: {e}");
-            }
-
-            // Write to postgresql.auto.conf
-            let auto_conf_path = data_dir.join("postgresql.auto.conf");
-            let auto_conf_content = format!(
-                "# pg-ha managed standby configuration (rejoin)\nprimary_conninfo = '{primary_conninfo}'\nrecovery_target_timeline = 'latest'\n"
+    #[test]
+    fn needs_upstream_reconfig_table() {
+        let table = [
+            (None, "", false),
+            (None, "node1", true),
+            (Some("node1"), "node1", false),
+            (Some("node1"), "node2", true),
+            (Some("node1"), "", false),
+        ];
+        for (current, expected_host, expected) in table {
+            assert_eq!(
+                needs_upstream_reconfig(current, expected_host),
+                expected,
+                "{current:?} {expected_host:?}"
             );
-            if let Err(e) = std::fs::write(&auto_conf_path, auto_conf_content) {
-                tracing::warn!("Failed to write postgresql.auto.conf: {e}");
-            }
-        })
-        .await;
-
-        if let Err(e) = write_result {
-            warn!("write_standby_config_for_rejoin spawn_blocking failed: {e}");
         }
-
-        info!(host = %host_log, port = %port_log, "Wrote standby configuration for rejoin");
     }
 }

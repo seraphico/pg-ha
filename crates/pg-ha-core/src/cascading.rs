@@ -231,6 +231,7 @@ mod tests {
             timeline: Some(1),
             tags,
             version: None,
+            rewind_check: false,
         }
     }
 
