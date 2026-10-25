@@ -370,6 +370,8 @@ curl -u admin:secret -X PUT http://localhost:8008/config \
 curl -u admin:secret -X POST http://localhost:8008/restart
 ```
 
+在持锁的节点上，PG 按原角色重启。在不持锁的节点上，pg-ha 先按启动规则做准备（写 `standby.signal`，`pg_controldata` 显示上次以主库运行时写 rewind 检查标记），再停库、以备库启动；准备失败时返回错误 `Not restarting PostgreSQL: standby configuration could not be written: ...`，PG 不动（见 [invariants.md](invariants.md) 1a「启动规则」）。
+
 ---
 
 ## 同步复制

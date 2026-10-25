@@ -178,6 +178,15 @@ pub(crate) fn create_rewind_check_marker(data_dir: &Path, reason: &str) -> std::
     fsync_dir(data_dir)
 }
 
+/// Remove pg-ha's own state files copied from another node by pg_basebackup
+/// (A16): they describe the source, not this node. A missing file is fine.
+pub(crate) fn remove_node_state_files(data_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(data_dir.join(REWIND_CHECK_MARKER)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 /// Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (proleptic Gregorian, UTC).
 fn format_utc(unix_secs: u64) -> String {
     let days = (unix_secs / 86_400) as i64;
@@ -622,6 +631,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(create_rewind_check_marker(&dir, "x").is_err());
         assert!(!dir.exists(), "nothing may be created");
+    }
+
+    #[test]
+    fn remove_node_state_files_drops_copied_marker() {
+        let dir = temp_data_dir("state-files");
+        create_rewind_check_marker(&dir, "copied from the clone source").unwrap();
+        remove_node_state_files(&dir).unwrap();
+        assert!(!dir.join(REWIND_CHECK_MARKER).exists());
+        // Nothing to remove is not an error.
+        remove_node_state_files(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

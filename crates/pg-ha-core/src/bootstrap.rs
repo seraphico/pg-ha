@@ -94,7 +94,10 @@ impl<'a> Bootstrap<'a> {
         // Write post-initdb PG configuration (postgresql.conf, pg_hba.conf)
         self.write_pg_config();
 
-        // Start PostgreSQL
+        // Start PostgreSQL. The one documented exception to the D1 start rule
+        // (docs/invariants.md 1a): this node won the atomic /initialize race,
+        // so it holds the only data in the cluster and there is no upstream to
+        // follow; the caller tries to acquire the leader lock right after.
         if let Err(e) = self.postgresql.start().await {
             error!("Failed to start PostgreSQL after bootstrap: {e}");
             self.cleanup_on_failure();
@@ -143,26 +146,16 @@ impl<'a> Bootstrap<'a> {
             Ok(()) => {
                 // Write replication config for standby
                 self.write_pg_config();
-                // Configure as a streaming standby (standby.signal +
-                // primary_conninfo; other postgresql.auto.conf lines are kept)
-                let conninfo = standby_config::build_primary_conninfo(
-                    &source.conn_url,
-                    &self.config.postgresql.replication,
-                    &self.config.name,
-                );
-                if conninfo.is_none() {
-                    error!(
-                        "Clone source {} has no host= in its conn_url; writing standby.signal without primary_conninfo",
-                        source.name
-                    );
+                // D1: the caller starts PostgreSQL only on ClonedAsReplica, so
+                // without a standby configuration the clone is a failure.
+                if let Err(e) = Self::configure_clone(self.config, &source) {
+                    error!("Standby configuration after clone failed: {e}");
+                    self.cleanup_on_failure();
+                    return BootstrapResult::Failed(format!(
+                        "Standby configuration after clone failed: {e}"
+                    ));
                 }
-                match standby_config::write_standby_config(
-                    &self.config.postgresql.data_dir,
-                    conninfo.as_deref(),
-                ) {
-                    Ok(()) => info!(source = %source.name, "Configured as streaming standby"),
-                    Err(e) => error!("Failed to write standby configuration after clone: {e}"),
-                }
+                info!(source = %source.name, "Configured as streaming standby");
                 BootstrapResult::ClonedAsReplica
             }
             Err(e) => {
@@ -171,6 +164,23 @@ impl<'a> Bootstrap<'a> {
                 BootstrapResult::Failed(format!("Clone from {} failed: {e}", source.name))
             }
         }
+    }
+
+    /// Configure a fresh clone as a streaming standby of `source`: drop
+    /// pg-ha's state files copied from the source (A16), then write
+    /// standby.signal and primary_conninfo (other postgresql.auto.conf lines
+    /// are kept). A source conn_url without `host=` is an error: the clone
+    /// would have no upstream (A26).
+    fn configure_clone(config: &Config, source: &Member) -> std::result::Result<(), String> {
+        let data_dir = &config.postgresql.data_dir;
+        standby_config::remove_node_state_files(data_dir).map_err(|e| e.to_string())?;
+        let conninfo = standby_config::build_primary_conninfo(
+            &source.conn_url,
+            &config.postgresql.replication,
+            &config.name,
+        )
+        .ok_or_else(|| format!("clone source {} has no host= in its conn_url", source.name))?;
+        standby_config::write_standby_config(data_dir, Some(&conninfo)).map_err(|e| e.to_string())
     }
 
     /// Select the best clone source from the cluster.
@@ -634,6 +644,66 @@ mod tests {
         // Should pick first clonefrom member found (node2)
         let source = Bootstrap::select_clone_source(&cluster, "node4").unwrap();
         assert_eq!(source.name, "node2");
+    }
+
+    /// Sample config with its own data directory (created, empty).
+    fn clone_test_config(label: &str) -> Config {
+        let mut config: Config = serde_yaml::from_str(&Config::sample()).unwrap();
+        let dir = std::env::temp_dir().join(format!("pg-ha-bs-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        config.postgresql.data_dir = dir;
+        config
+    }
+
+    #[test]
+    fn test_configure_clone_writes_standby_config_and_drops_copied_marker() {
+        let config = clone_test_config("clone-ok");
+        let dir = config.postgresql.data_dir.clone();
+        let sync = "synchronous_standby_names = 'FIRST 1 (node2)'";
+        std::fs::write(dir.join(standby_config::REWIND_CHECK_MARKER), "copied").unwrap();
+        std::fs::write(dir.join("postgresql.auto.conf"), format!("{sync}\n")).unwrap();
+
+        let source = make_member("node1", HashMap::new());
+        assert_eq!(Bootstrap::configure_clone(&config, &source), Ok(()));
+
+        assert!(!dir.join(standby_config::REWIND_CHECK_MARKER).exists());
+        assert!(dir.join("standby.signal").is_file());
+        let auto_conf = std::fs::read_to_string(dir.join("postgresql.auto.conf")).unwrap();
+        assert!(auto_conf.contains(sync), "{auto_conf}");
+        assert!(
+            auto_conf
+                .lines()
+                .any(|l| l.starts_with("primary_conninfo") && l.contains("host=node1")),
+            "{auto_conf}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_configure_clone_fails_when_standby_config_cannot_be_written() {
+        let config = clone_test_config("clone-write-fail");
+        let dir = config.postgresql.data_dir.clone();
+        std::fs::create_dir(dir.join("standby.signal")).unwrap();
+
+        let source = make_member("node1", HashMap::new());
+        assert!(Bootstrap::configure_clone(&config, &source).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_configure_clone_fails_for_hostless_source() {
+        let config = clone_test_config("clone-hostless");
+        let dir = config.postgresql.data_dir.clone();
+        let source = Member {
+            conn_url: String::new(),
+            ..make_member("node1", HashMap::new())
+        };
+
+        let err = Bootstrap::configure_clone(&config, &source).unwrap_err();
+        assert!(err.contains("no host="), "{err}");
+        assert!(!dir.join("standby.signal").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

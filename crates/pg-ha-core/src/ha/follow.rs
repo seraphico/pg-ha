@@ -143,12 +143,11 @@ impl Ha {
                 })
                 .unwrap_or_default();
 
-            let needs_reconfig = current_upstream
-                .as_ref()
-                .is_some_and(|current| !expected_host.is_empty() && current != &expected_host);
+            let needs_reconfig =
+                needs_upstream_reconfig(current_upstream.as_deref(), &expected_host);
 
             if needs_reconfig && !self.is_recently_reconfigured() {
-                let current = current_upstream.unwrap_or_default();
+                let current = current_upstream.unwrap_or_else(|| "none".to_string());
                 info!(
                     current_upstream = %current,
                     expected_upstream = %expected_host,
@@ -248,9 +247,15 @@ impl Ha {
             }
         }
 
-        // Step 3: Write standby.signal + primary_conninfo
+        // Step 3: Write standby.signal + primary_conninfo. D1: without them
+        // PostgreSQL would start as a primary, so a failed write means no start.
         if let Err(e) = self.write_standby_config(Some(&leader_connstr)).await {
-            error!("Failed to write standby configuration for rejoin: {e}");
+            error!(
+                "Failed to write standby configuration for rejoin: {e}; not starting PostgreSQL"
+            );
+            return CycleResult::Error(format!(
+                "Rejoin: not starting PostgreSQL, standby configuration could not be written: {e}"
+            ));
         }
 
         // Step 4: Start PostgreSQL in standby mode
@@ -277,7 +282,12 @@ impl Ha {
                 match self.postgresql.basebackup(&leader_connstr).await {
                     Ok(()) => {
                         if let Err(e) = self.write_standby_config(Some(&leader_connstr)).await {
-                            error!("Failed to write standby configuration for rejoin: {e}");
+                            error!(
+                                "Failed to write standby configuration for rejoin: {e}; not starting PostgreSQL"
+                            );
+                            return CycleResult::Error(format!(
+                                "Rejoin: not starting PostgreSQL, standby configuration could not be written: {e}"
+                            ));
                         }
                         match self.postgresql.start().await {
                             Ok(()) => {
@@ -316,7 +326,10 @@ impl Ha {
             }
         }
 
-        // Rewrite primary_conninfo (other postgresql.auto.conf lines are kept)
+        // Rewrite primary_conninfo (other postgresql.auto.conf lines are kept).
+        // D1: only reached for a ManagedStandby, and the writer always writes
+        // standby.signal; a failed write returns before the stop, so the
+        // restart below never starts PostgreSQL as a primary.
         if let Err(e) = self.write_standby_config(Some(new_upstream_connstr)).await {
             error!("Failed to write standby configuration: {e}");
             return;
@@ -355,6 +368,36 @@ impl Ha {
         }
         if let Err(e) = self.postgresql.start().await {
             error!("Failed to restart PG after reconfiguration: {e}");
+        }
+    }
+}
+
+/// D3: reconfigure when the expected upstream is known and the configured one
+/// differs from it or is missing (no primary_conninfo, e.g. removed at
+/// demotion because the new leader was unknown).
+pub(super) fn needs_upstream_reconfig(current: Option<&str>, expected_host: &str) -> bool {
+    !expected_host.is_empty() && current != Some(expected_host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_upstream_reconfig_table() {
+        let table = [
+            (None, "", false),
+            (None, "node1", true),
+            (Some("node1"), "node1", false),
+            (Some("node1"), "node2", true),
+            (Some("node1"), "", false),
+        ];
+        for (current, expected_host, expected) in table {
+            assert_eq!(
+                needs_upstream_reconfig(current, expected_host),
+                expected,
+                "{current:?} {expected_host:?}"
+            );
         }
     }
 }

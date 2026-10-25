@@ -190,7 +190,28 @@ impl Ha {
 
     async fn handle_restart_command(&mut self) -> CommandResponse {
         info!("Restarting PostgreSQL (requested via API)");
-        if let Err(e) = self.postgresql.stop("fast").await {
+        // D1: pg-ha starts PostgreSQL as a primary only while holding the
+        // leader lock. `is_leader` is last cycle's value (commands run before
+        // get_cluster), so the lock must also be ours in the current view.
+        let holding = self.is_leader && self.is_lock_owner();
+        let stopped = if holding {
+            self.postgresql.stop("fast").await
+        } else {
+            // Prepare the standby start before touching PostgreSQL; if that
+            // fails, leave it as it is.
+            if let Err(e) = self.prepare_standby_start().await {
+                error!(
+                    "Not restarting PostgreSQL: could not write the standby configuration ({e})"
+                );
+                return CommandResponse::error(format!(
+                    "Not restarting PostgreSQL: standby configuration could not be written: {e}"
+                ));
+            }
+            // It may be a writable primary without the lock: a failed stop
+            // keeps it fenced (stop_pending).
+            self.stop_after_demotion_write("fast").await
+        };
+        if let Err(e) = stopped {
             return CommandResponse::error(format!("Stop failed: {e}"));
         }
         if let Err(e) = self.postgresql.start().await {

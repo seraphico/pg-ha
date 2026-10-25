@@ -16,6 +16,7 @@
 
 use crate::cluster::{MemberRole, MemberState};
 use crate::postgresql::PgState;
+use crate::standby_config::conn_url_has_host;
 
 /// PostgreSQL identity for one HA cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +155,32 @@ pub(crate) fn shutdown_needs_fence(identity: PgIdentity) -> bool {
     match identity {
         PgIdentity::Primary | PgIdentity::Unknown { .. } => true,
         PgIdentity::ManagedStandby | PgIdentity::UnmanagedRecovery => false,
+    }
+}
+
+/// D1: does the last recorded cluster state say this data directory last ran
+/// as a primary (so it may hold WAL beyond a fork point)? `None` =
+/// pg_controldata could not be read. Only the two recovery states say "no";
+/// unknown values count as "yes" (A7).
+pub(crate) fn last_ran_as_primary(controldata_state: Option<&str>) -> bool {
+    !matches!(
+        controldata_state.map(str::trim),
+        Some("shut down in recovery" | "in archive recovery")
+    )
+}
+
+/// D1 / A8 / A31: which conn_url to point primary_conninfo at when starting
+/// as a standby. None = write standby.signal only and keep the existing
+/// primary_conninfo (leader unknown, this node, missing member, or a conn_url
+/// without `host=`).
+pub(crate) fn standby_start_upstream<'a>(
+    leader: Option<&str>,
+    self_name: &str,
+    leader_conn_url: Option<&'a str>,
+) -> Option<&'a str> {
+    match (leader, leader_conn_url) {
+        (Some(name), Some(url)) if name != self_name && conn_url_has_host(url) => Some(url),
+        _ => None,
     }
 }
 
@@ -371,6 +398,66 @@ mod tests {
         assert!(shutdown_needs_fence(UNKNOWN_SIGNAL));
         assert!(!shutdown_needs_fence(PgIdentity::ManagedStandby));
         assert!(!shutdown_needs_fence(PgIdentity::UnmanagedRecovery));
+    }
+
+    #[test]
+    fn start_marker_table() {
+        let table = [
+            (Some("in production"), true),
+            (Some("shut down"), true),
+            (Some("shutting down"), true),
+            (Some("in crash recovery"), true),
+            (Some("starting up"), true),
+            (Some("shut down in recovery"), false),
+            (Some("in archive recovery"), false),
+            (Some("something else"), true),
+            (None, true),
+        ];
+        for (state, expected) in table {
+            assert_eq!(last_ran_as_primary(state), expected, "{state:?}");
+        }
+        // Compared after trim().
+        assert!(!last_ran_as_primary(Some("  in archive recovery ")));
+    }
+
+    #[test]
+    fn only_standby_states_skip_the_marker() {
+        // Every DBState value PostgreSQL 16 prints (pg_controldata.c dbState()).
+        let all = [
+            "starting up",
+            "shut down",
+            "shut down in recovery",
+            "shutting down",
+            "in crash recovery",
+            "in archive recovery",
+            "in production",
+            "unrecognized status code",
+        ];
+        let skipped: Vec<&str> = all
+            .into_iter()
+            .filter(|s| !last_ran_as_primary(Some(s)))
+            .collect();
+        assert_eq!(skipped, ["shut down in recovery", "in archive recovery"]);
+    }
+
+    #[test]
+    fn standby_start_upstream_table() {
+        let leader_url = "host=node1 port=5432";
+        let table = [
+            (None, Some(leader_url), None),
+            (Some("self"), Some("host=self port=5432"), None),
+            (Some("node1"), None, None),
+            (Some("node1"), Some(""), None),
+            (Some("node1"), Some("port=5432"), None),
+            (Some("node1"), Some(leader_url), Some(leader_url)),
+        ];
+        for (leader, url, expected) in table {
+            assert_eq!(
+                standby_start_upstream(leader, "self", url),
+                expected,
+                "{leader:?} {url:?}"
+            );
+        }
     }
 
     #[test]

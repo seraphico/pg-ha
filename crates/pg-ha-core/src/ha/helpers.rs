@@ -53,6 +53,67 @@ impl Ha {
         Ok(())
     }
 
+    /// standby.signal only (postgresql.auto.conf untouched, an existing
+    /// primary_conninfo is kept, A8); also resets the sync cache. Runs in
+    /// spawn_blocking.
+    pub(super) async fn ensure_standby_signal(&mut self) -> std::io::Result<()> {
+        self.reset_sync_cache();
+        let data_dir = self.config.postgresql.data_dir.clone();
+        tokio::task::spawn_blocking(move || standby_config::ensure_standby_signal(&data_dir))
+            .await
+            .map_err(std::io::Error::other)??;
+        info!("Wrote standby.signal (primary_conninfo left as it is)");
+        Ok(())
+    }
+
+    /// D1: everything that must be on disk before pg-ha starts PostgreSQL
+    /// without holding the leader lock. Creates the rewind-check marker when
+    /// pg_controldata says the directory last ran as a primary or cannot be
+    /// read (A7), then writes standby.signal and, when the leader is known and
+    /// is not this node, primary_conninfo pointing at it (A8). Any error means
+    /// PostgreSQL must not be started.
+    pub(super) async fn prepare_standby_start(&mut self) -> std::io::Result<()> {
+        let state = match self.postgresql.controldata_state().await {
+            Ok(state) => Some(state),
+            Err(e) => {
+                warn!(
+                    "Could not read the cluster state from pg_controldata ({e}); creating the rewind-check marker to be safe"
+                );
+                None
+            }
+        };
+        if identity::last_ran_as_primary(state.as_deref()) {
+            let reason = match &state {
+                Some(s) => format!("pg_controldata reports '{s}' (last ran as a primary)"),
+                None => "pg_controldata could not be read".to_string(),
+            };
+            let data_dir = self.config.postgresql.data_dir.clone();
+            let marker_reason = reason.clone();
+            tokio::task::spawn_blocking(move || {
+                standby_config::create_rewind_check_marker(&data_dir, &marker_reason)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            info!("Created rewind-check marker: {reason}");
+        }
+
+        let leader = self.cluster.leader.as_ref().map(|l| l.name.clone());
+        let leader_conn_url = leader
+            .as_deref()
+            .and_then(|n| self.cluster.get_member(n))
+            .map(|m| m.conn_url.clone());
+        let upstream = identity::standby_start_upstream(
+            leader.as_deref(),
+            &self.config.name,
+            leader_conn_url.as_deref(),
+        )
+        .map(str::to_owned);
+        match upstream {
+            Some(url) => self.write_standby_config(Some(&url)).await,
+            None => self.ensure_standby_signal().await,
+        }
+    }
+
     /// Before stopping PostgreSQL on a demotion path (D2): create the
     /// rewind-check marker when `rewind_check_reason` is set, then write
     /// standby.signal and set primary_conninfo to `upstream_conn_url`, or

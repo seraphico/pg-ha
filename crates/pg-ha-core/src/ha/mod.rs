@@ -567,8 +567,20 @@ impl Ha {
             }
         }
 
-        // Try to start PostgreSQL
-        info!("Attempting to start PostgreSQL");
+        // D1: pg-ha starts PostgreSQL as a primary only while holding the
+        // leader lock. It never holds it here (released above, or returned in
+        // pause mode), so PostgreSQL always starts as a standby. If the lock
+        // release failed, the lock may still be ours in DCS; this node then
+        // gets it back as a standby and is promoted (timeline +1).
+        if let Err(e) = self.prepare_standby_start().await {
+            error!(
+                "Not starting PostgreSQL: could not write the standby configuration ({e}). pg-ha starts PostgreSQL as a primary only while holding the leader lock; retrying next cycle"
+            );
+            return CycleResult::Error(format!(
+                "not starting PostgreSQL: standby configuration could not be written: {e}"
+            ));
+        }
+        info!("Starting PostgreSQL as a standby (not holding the leader lock)");
         match self.postgresql.start().await {
             Ok(()) => {
                 self.start_fail_count = 0;
@@ -635,6 +647,9 @@ impl Ha {
             let cluster_clone = self.cluster.clone();
             let mut bootstrap = Bootstrap::new(&self.config, &mut self.postgresql, &self.dcs);
             match bootstrap.clone_from_member(&cluster_clone).await {
+                // D1: ClonedAsReplica means standby.signal and primary_conninfo
+                // were written (Bootstrap::configure_clone); a failed write
+                // returns Failed, so PostgreSQL is not started.
                 BootstrapResult::ClonedAsReplica => match self.postgresql.start().await {
                     Ok(()) => {
                         self.postgresql.set_role(MemberRole::Replica);
@@ -2898,6 +2913,479 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ─────────────────── Start rule (D1) and upstream reconfiguration (D3) ───────────────────
+
+    use crate::postgresql::PgState;
+
+    /// Data directory with PG_VERSION, no postmaster.pid: PostgreSQL not
+    /// running. `bin_dir` None: `no_bin_dir()`. Port 1, so no test can reach
+    /// a real local PostgreSQL.
+    fn stopped_pg_test_ha(
+        name: &str,
+        label: &str,
+        dcs: Arc<MockDcs>,
+        bin_dir: Option<PathBuf>,
+    ) -> (Ha, PathBuf, CommandSender) {
+        let mut config = test_config(name);
+        config.postgresql.port = 1;
+        config.postgresql.bin_dir = bin_dir.unwrap_or_else(no_bin_dir);
+        let data_dir =
+            std::env::temp_dir().join(format!("pg-ha-test-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join("PG_VERSION"), "16\n").unwrap();
+        // Set before both Postgresql::new and Ha::new (Ha keeps its own copy).
+        config.postgresql.data_dir = data_dir.clone();
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (ha, cmd_tx) = Ha::new(config, dcs, pg);
+        assert!(!ha.postgresql().is_running());
+        (ha, data_dir, cmd_tx)
+    }
+
+    /// Fake PostgreSQL tool directories (see `fake_pg_bin`).
+    #[derive(Debug, Clone, Copy)]
+    enum FakeBin {
+        /// pg_controldata: `Database cluster state: in production`.
+        ControldataInProduction,
+        /// pg_controldata: `Database cluster state: shut down in recovery`.
+        ControldataShutDownInRecovery,
+    }
+
+    impl FakeBin {
+        const ALL: [FakeBin; 2] = [
+            FakeBin::ControldataInProduction,
+            FakeBin::ControldataShutDownInRecovery,
+        ];
+
+        fn dir_name(self) -> &'static str {
+            match self {
+                FakeBin::ControldataInProduction => "controldata-in-production",
+                FakeBin::ControldataShutDownInRecovery => "controldata-shut-down-in-recovery",
+            }
+        }
+
+        /// (tool name, shell script body)
+        fn scripts(self) -> Vec<(&'static str, &'static str)> {
+            match self {
+                FakeBin::ControldataInProduction => vec![(
+                    "pg_controldata",
+                    "echo 'Database cluster state:               in production'\n",
+                )],
+                FakeBin::ControldataShutDownInRecovery => vec![(
+                    "pg_controldata",
+                    "echo 'Database cluster state:               shut down in recovery'\n",
+                )],
+            }
+        }
+    }
+
+    static FAKE_BINS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+    /// A bin_dir whose tools print fixed output. All scripts are written,
+    /// synced and closed once, before any test runs one (no ETXTBSY on Linux).
+    /// pg_ctl is never faked, so start() fails at once.
+    fn fake_pg_bin(kind: FakeBin) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let root = FAKE_BINS.get_or_init(|| {
+            let root = std::env::temp_dir().join(format!("pg-ha-fakebin-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for kind in FakeBin::ALL {
+                let dir = root.join(kind.dir_name());
+                std::fs::create_dir_all(&dir).unwrap();
+                for (tool, body) in kind.scripts() {
+                    let path = dir.join(tool);
+                    let mut file = std::fs::File::create(&path).unwrap();
+                    file.write_all(format!("#!/bin/sh\n{body}").as_bytes())
+                        .unwrap();
+                    file.sync_all().unwrap();
+                    drop(file);
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+            }
+            root
+        });
+        root.join(kind.dir_name())
+    }
+
+    fn assert_start_attempted(ha: &Ha, attempts: u32) {
+        assert_eq!(ha.postgresql().state(), PgState::Starting, "start() called");
+        assert_eq!(ha.start_fail_count, attempts);
+    }
+
+    fn assert_not_started(ha: &Ha) {
+        assert_eq!(
+            ha.postgresql().state(),
+            PgState::Unknown,
+            "start() not called"
+        );
+        assert_eq!(ha.start_fail_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_start_without_lock_writes_standby_config_with_leader_conninfo() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c3-start-leader",
+            Arc::new(MockDcs::with_leader("node1")),
+            None,
+        );
+        ha.cluster = cluster_led_by("node1", None, "node3");
+
+        let result = ha.handle_postgres_not_running().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m)
+                if m.starts_with("Failed to start PostgreSQL") && m.ends_with("(attempt 1)")),
+            "got: {result}"
+        );
+        assert!(dir.join("standby.signal").is_file());
+        assert_eq!(ha.read_current_upstream().as_deref(), Some("node1"));
+        assert_start_attempted(&ha, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_after_releasing_lock_is_standby() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir, _tx) =
+            stopped_pg_test_ha("test_node", "c3-start-released", dcs.clone(), None);
+        ha.cluster = cluster_led_by("test_node", None, "node2");
+        ha.is_leader = true;
+
+        let _ = ha.handle_postgres_not_running().await;
+
+        assert_eq!(lock_held_by(&dcs), None, "lock released");
+        assert!(!ha.is_leader());
+        assert!(dir.join("standby.signal").is_file());
+        // The leader in this cycle's view is this node: signal only.
+        assert!(!auto_conf(&dir).contains("primary_conninfo"));
+        assert_start_attempted(&ha, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_with_unknown_leader_keeps_existing_conninfo() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c3-start-no-leader",
+            Arc::new(MockDcs::new()),
+            None,
+        );
+        preset_auto_conf(&dir, "old");
+
+        let _ = ha.handle_postgres_not_running().await;
+
+        assert!(dir.join("standby.signal").is_file());
+        assert_eq!(ha.read_current_upstream().as_deref(), Some("old"), "A8");
+        assert!(auto_conf(&dir).contains(SYNC_LINE));
+        assert_start_attempted(&ha, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_refused_when_standby_config_cannot_be_written() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c3-start-refused",
+            Arc::new(MockDcs::with_leader("node1")),
+            None,
+        );
+        ha.cluster = cluster_led_by("node1", None, "node3");
+        std::fs::create_dir(dir.join("standby.signal")).unwrap();
+
+        let result = ha.handle_postgres_not_running().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("not starting PostgreSQL")),
+            "got: {result}"
+        );
+        assert_not_started(&ha);
+        // Retried next cycle, still refused.
+        let result = ha.handle_postgres_not_running().await;
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("not starting PostgreSQL")),
+            "got: {result}"
+        );
+        assert_not_started(&ha);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_marks_rewind_check_when_controldata_unreadable() {
+        // bin_dir None (no_bin_dir()): there is no pg_controldata.
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c3-start-cd-unreadable",
+            Arc::new(MockDcs::new()),
+            None,
+        );
+
+        let _ = ha.handle_postgres_not_running().await;
+
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(m.contains("pg_controldata could not be read"), "{m}");
+        assert!(dir.join("standby.signal").is_file());
+        assert_start_attempted(&ha, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_marks_rewind_check_when_last_ran_as_primary() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c3-start-cd-production",
+            Arc::new(MockDcs::new()),
+            Some(fake_pg_bin(FakeBin::ControldataInProduction)),
+        );
+
+        let _ = ha.handle_postgres_not_running().await;
+
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(
+            m.contains("pg_controldata reports 'in production' (last ran as a primary)"),
+            "{m}"
+        );
+        assert!(dir.join("standby.signal").is_file());
+        assert_start_attempted(&ha, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_without_marker_when_last_ran_as_standby() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c3-start-cd-standby",
+            Arc::new(MockDcs::new()),
+            Some(fake_pg_bin(FakeBin::ControldataShutDownInRecovery)),
+        );
+
+        let _ = ha.handle_postgres_not_running().await;
+
+        assert_eq!(marker(&dir), None);
+        assert!(dir.join("standby.signal").is_file());
+        assert_start_attempted(&ha, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_refused_when_marker_cannot_be_written() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c3-start-marker-refused",
+            Arc::new(MockDcs::new()),
+            Some(fake_pg_bin(FakeBin::ControldataInProduction)),
+        );
+        std::fs::create_dir(dir.join(REWIND_CHECK_MARKER)).unwrap();
+
+        let result = ha.handle_postgres_not_running().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("not starting PostgreSQL")),
+            "got: {result}"
+        );
+        assert_not_started(&ha);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_paused_node_is_not_started() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c3-start-paused",
+            Arc::new(MockDcs::with_leader("node1")),
+            None,
+        );
+        ha.cluster = cluster_led_by("node1", None, "node3");
+        ha.is_paused = true;
+
+        let result = ha.handle_postgres_not_running().await;
+
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m == "postgres is not running (paused)"),
+            "got: {result}"
+        );
+        assert!(!dir.join("standby.signal").exists());
+        assert_eq!(marker(&dir), None);
+        assert_not_started(&ha);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_follow_configures_upstream_when_none() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c3-follow-none",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+        );
+        let _ = std::fs::remove_file(dir.join("postgresql.auto.conf"));
+        ha.cluster = cluster_led_by("node1", None, "node3");
+
+        let _ = ha.process_healthy_cluster().await;
+
+        assert_eq!(ha.read_current_upstream().as_deref(), Some("node1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_follow_keeps_matching_upstream() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c3-follow-match",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+        );
+        preset_auto_conf(&dir, "node1");
+        let before = std::fs::read(dir.join("postgresql.auto.conf")).unwrap();
+        ha.cluster = cluster_led_by("node1", None, "node3");
+
+        let _ = ha.process_healthy_cluster().await;
+
+        let after = std::fs::read(dir.join("postgresql.auto.conf")).unwrap();
+        assert_eq!(before, after, "not rewritten");
+        assert_eq!(
+            ha.postgresql().observed_in_recovery(),
+            Some(true),
+            "not restarted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_restart_command_on_replica_refused_when_config_cannot_be_written() {
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c3-restart-refused",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            false,
+            None,
+        );
+        ha.is_leader = false;
+        std::fs::create_dir(dir.join("standby.signal")).unwrap();
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Restart).await;
+
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(
+            resp.message.starts_with("Not restarting PostgreSQL"),
+            "{}",
+            resp.message
+        );
+        assert_eq!(
+            ha.postgresql().observed_in_recovery(),
+            Some(true),
+            "stop not called"
+        );
+        assert!(!ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_restart_command_on_replica_writes_signal_before_stop() {
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c3-restart-replica",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            false,
+            None,
+        );
+        ha.is_leader = false;
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Restart).await;
+
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(resp.message.starts_with("Stop failed"), "{}", resp.message);
+        assert!(dir.join("standby.signal").is_file());
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert!(ha.stop_pending, "M4: a failed stop keeps it fenced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_restart_command_on_unlocked_primary_is_fenced_after_stop_failure() {
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c3-restart-primary",
+            Arc::new(MockDcs::new()),
+            Some(false),
+            false,
+            None,
+        );
+        ha.is_leader = false;
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Restart).await;
+
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(resp.message.starts_with("Stop failed"), "{}", resp.message);
+        assert!(ha.stop_pending);
+        assert!(dir.join("standby.signal").is_file());
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(m.contains("pg_controldata could not be read"), "{m}");
+
+        // Next cycle: unobserved, no leader → fenced, not campaigned.
+        ha.postgresql.set_observed_in_recovery(None);
+        let result = ha.process_unhealthy_cluster().await;
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("Fence stop failed")),
+            "got: {result}"
+        );
+        assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_restart_command_on_leader_does_not_write_signal() {
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node1",
+            "c3-restart-leader",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+            None,
+        );
+        ha.is_leader = true;
+        ha.cluster = leader_cluster("node1", "node2");
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Restart).await;
+
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(resp.message.starts_with("Stop failed"), "{}", resp.message);
+        assert!(!dir.join("standby.signal").exists());
+        assert_eq!(marker(&dir), None);
+        assert!(!ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_restart_command_with_stale_is_leader_prepares_standby_start() {
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c3-restart-stale-leader",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+            None,
+        );
+        // Last cycle's flag says leader, but the lock is node1's in this view.
+        ha.is_leader = true;
+        ha.cluster = leader_cluster("node1", "node2");
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Restart).await;
+
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(resp.message.starts_with("Stop failed"), "{}", resp.message);
+        assert!(dir.join("standby.signal").is_file());
+        assert!(marker(&dir).is_some());
+        assert!(ha.stop_pending, "the not-holding branch was taken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ─────────────────── Source-order checks for the stop paths ───────────────────
     // Stops fail in tests (no pg_ctl), so file assertions alone cannot show
     // that the standby config was written before the stop. These pin it.
@@ -3021,13 +3509,55 @@ mod tests {
 
         let reinit = body(commands_rs, "async fn handle_reinitialize_command");
         assert_before(reinit, "fence_primary(", DIRECT_STOP, "reinitialize");
+
+        // POST /restart without the lock (D1, A15): standby start prepared,
+        // then stopped through stop_after_demotion_write.
+        let restart = body(commands_rs, "async fn handle_restart_command");
+        assert_before(
+            restart,
+            "prepare_standby_start(",
+            "stop_after_demotion_write(",
+            "restart",
+        );
+    }
+
+    #[test]
+    fn test_start_paths_write_standby_config_before_start() {
+        const START: &str = ".postgresql.start(";
+        let mod_rs = include_str!("mod.rs");
+        let follow_rs = include_str!("follow.rs");
+        let commands_rs = include_str!("commands.rs");
+
+        // D1: the HA loop's start.
+        let not_running = body(mod_rs, "async fn handle_postgres_not_running");
+        assert_eq!(not_running.matches(START).count(), 1);
+        assert_before(not_running, "prepare_standby_start(", START, "start rule");
+
+        // Rejoin: both starts follow a write that returns on failure.
+        let rejoin = body(follow_rs, "async fn rejoin_as_replica");
+        assert_eq!(rejoin.matches(START).count(), 2);
+        for start in rejoin.match_indices(START).map(|(i, _)| i) {
+            let before = &rejoin[..start];
+            let write = before
+                .rfind("self.write_standby_config(")
+                .expect("rejoin: a write before every start");
+            assert!(
+                before[write..].contains("Rejoin: not starting PostgreSQL"),
+                "rejoin: a failed write must return before the start"
+            );
+        }
+
+        // POST /restart: the start comes after the prepared stop.
+        let restart = body(commands_rs, "async fn handle_restart_command");
+        assert_before(restart, "prepare_standby_start(", START, "restart");
     }
 
     #[test]
     fn test_stop_call_sites_are_audited() {
         // Direct stops left in production code (plan section 2.2b):
         // follow.rs: rejoin of a non-primary, reconfigure_replica (2);
-        // commands.rs: POST /restart, POST /reinitialize of a non-primary;
+        // commands.rs: POST /restart while holding the lock, POST /reinitialize
+        // of a non-primary;
         // helpers.rs: stop_after_demotion_write, shutdown of a standby.
         let files = [
             ("mod.rs", include_str!("mod.rs"), 0),
