@@ -178,6 +178,11 @@ pub(crate) fn create_rewind_check_marker(data_dir: &Path, reason: &str) -> std::
     fsync_dir(data_dir)
 }
 
+/// Whether PGDATA/pg-ha.rewind_check exists as a regular file (a directory
+/// or symlink of that name does not count).
+pub(crate) fn has_rewind_check_marker(data_dir: &Path) -> bool {
+    std::fs::symlink_metadata(data_dir.join(REWIND_CHECK_MARKER)).is_ok_and(|m| m.is_file())
+}
 /// Remove pg-ha's own state files copied from another node by pg_basebackup
 /// (A16): they describe the source, not this node. A missing file is fine.
 pub(crate) fn remove_node_state_files(data_dir: &Path) -> std::io::Result<()> {
@@ -631,6 +636,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(create_rewind_check_marker(&dir, "x").is_err());
         assert!(!dir.exists(), "nothing may be created");
+    }
+
+    #[test]
+    fn marker_check_requires_a_regular_file() {
+        let dir = temp_data_dir("marker-check");
+        assert!(!has_rewind_check_marker(&dir));
+        create_rewind_check_marker(&dir, "x").unwrap();
+        assert!(has_rewind_check_marker(&dir));
+        std::fs::remove_file(dir.join(REWIND_CHECK_MARKER)).unwrap();
+        std::fs::create_dir(dir.join(REWIND_CHECK_MARKER)).unwrap();
+        assert!(
+            !has_rewind_check_marker(&dir),
+            "a directory is not a marker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

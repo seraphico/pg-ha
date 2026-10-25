@@ -100,6 +100,16 @@ pub fn parse_lsn(lsn: &str) -> Option<u64> {
     Some((hi << 32) | lo)
 }
 
+/// Timeline from a WAL file name: its first 8 hex digits.
+/// "00000003000000000000000A" -> Some(3)
+pub fn parse_walfile_timeline(walfile: &str) -> Option<u64> {
+    let walfile = walfile.trim();
+    if walfile.len() != 24 || !walfile.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(&walfile[..8], 16).ok()
+}
+
 impl Postgresql {
     pub fn new(config: PostgresqlConfig) -> Self {
         Self {
@@ -576,6 +586,40 @@ impl Postgresql {
         Err(Error::Postgres("Could not determine recovery state".into()))
     }
 
+    /// Timeline the primary is writing WAL on right now, from
+    /// pg_walfile_name(pg_current_wal_lsn()). Errors on a server in recovery.
+    pub async fn primary_timeline(&self) -> Result<u64> {
+        let connstr = self.connection_string();
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
+
+        tokio::spawn(async move {
+            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
+                Ok(Err(e)) => debug!("Connection closed: {e}"),
+                Err(_) => warn!("PG connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Ok(Ok(())) => {}
+            }
+        });
+
+        let rows = client
+            .simple_query("SELECT pg_walfile_name(pg_current_wal_lsn())")
+            .await
+            .map_err(|e| Error::Postgres(format!("Query failed: {e}")))?;
+
+        for msg in rows {
+            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg
+                && let Some(val) = row.get(0)
+            {
+                return parse_walfile_timeline(val)
+                    .ok_or_else(|| Error::Postgres(format!("Unexpected WAL file name '{val}'")));
+            }
+        }
+        Err(Error::Postgres(
+            "Could not determine the primary's timeline".into(),
+        ))
+    }
+
     /// Get WAL position and timeline information
     pub async fn wal_status(&self) -> Result<WalStatus> {
         let connstr = self.connection_string();
@@ -980,6 +1024,26 @@ mod tests {
         assert_eq!(parse_lsn("0/0/0"), None);
         assert_eq!(parse_lsn("G/0"), None);
         assert_eq!(parse_lsn("0/G"), None);
+    }
+
+    #[test]
+    fn parse_walfile_timeline_valid() {
+        assert_eq!(parse_walfile_timeline("000000010000000000000003"), Some(1));
+        assert_eq!(parse_walfile_timeline("0000000A0000000000000003"), Some(10));
+        assert_eq!(parse_walfile_timeline("00000003000000000000000A"), Some(3));
+        assert_eq!(
+            parse_walfile_timeline("000000ff00000001000000FE"),
+            Some(255)
+        );
+    }
+
+    #[test]
+    fn parse_walfile_timeline_invalid() {
+        assert_eq!(parse_walfile_timeline(""), None);
+        assert_eq!(parse_walfile_timeline("00000001"), None);
+        assert_eq!(parse_walfile_timeline("0000000100000000000000030"), None);
+        assert_eq!(parse_walfile_timeline("0000000G0000000000000003"), None);
+        assert_eq!(parse_walfile_timeline("+00000010000000000000003"), None);
     }
 
     // ─────────────────────────────────────────────────────────────────────

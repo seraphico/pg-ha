@@ -258,6 +258,8 @@ impl Ha {
             "api_url": format!("http://{}:{}", reachable_host, self.config.restapi.port),
             "state": self.advertised_state(),
             "role": format!("{}", self.postgresql.role()),
+            // A18: other nodes apply the marked-node election rule to us.
+            "rewind_check": self.has_rewind_check_marker(),
         });
 
         if let Some(pos) = wal_position {
@@ -278,6 +280,54 @@ impl Ha {
             .data_dir
             .join("standby.signal")
             .exists()
+    }
+
+    /// Whether the rewind-check marker (PGDATA/pg-ha.rewind_check) exists (D4).
+    pub(super) fn has_rewind_check_marker(&self) -> bool {
+        standby_config::has_rewind_check_marker(&self.config.postgresql.data_dir)
+    }
+
+    /// The timeline this node published in its member record this cycle:
+    /// the value every node uses when judging it (A9).
+    pub(super) fn own_published_timeline(&self) -> Option<u64> {
+        self.cluster
+            .get_member(&self.config.name)
+            .and_then(|m| m.timeline)
+    }
+
+    /// Highest timeline other members published this cycle.
+    pub(super) fn max_peer_timeline(&self) -> Option<u64> {
+        identity::max_timeline_excluding(&self.cluster.members, &self.config.name)
+    }
+
+    /// D6: make /timeline >= the timeline this primary writes WAL on. Failures
+    /// only warn; a key above the primary's timeline is never lowered.
+    pub(super) async fn record_cluster_timeline(&mut self) {
+        let tl = match self.postgresql.primary_timeline().await {
+            Ok(tl) => tl,
+            Err(e) => {
+                warn!("Could not read this primary's timeline to record it in DCS: {e}");
+                return;
+            }
+        };
+        let recorded = self.cluster.timeline;
+        match identity::timeline_record_action(tl, recorded) {
+            identity::TimelineRecord::Write => {
+                if let Err(e) = self.dcs.set_cluster_timeline(tl).await {
+                    warn!("Failed to record cluster timeline {tl} in DCS: {e}");
+                }
+            }
+            identity::TimelineRecord::UpToDate => {}
+            identity::TimelineRecord::RecordedAhead => {
+                let k = recorded.unwrap_or(tl);
+                if identity::should_warn_timeline_ahead(self.timeline_ahead_warned, k, tl) {
+                    warn!(
+                        "DCS /timeline ({k}) is higher than this primary's timeline ({tl}); a promote attempt recorded it in advance"
+                    );
+                    self.timeline_ahead_warned = Some((k, tl));
+                }
+            }
+        }
     }
 
     /// Check if recovery.signal exists (targeted archive / point-in-time

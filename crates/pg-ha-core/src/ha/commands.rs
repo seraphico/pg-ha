@@ -10,6 +10,12 @@ use super::Ha;
 use super::election::sync_failover_allowed;
 use super::identity::PgIdentity;
 
+/// A21: a candidate with the rewind-check marker may not campaign once the
+/// lock is released (D6), while the other nodes defer to it.
+fn marked_candidate_message(candidate: &str) -> String {
+    format!("Candidate '{candidate}' has a rewind-check marker (not yet verified with pg_rewind)")
+}
+
 impl Ha {
     /// Process pending management commands from the API
     pub(super) async fn process_commands(&mut self) {
@@ -90,6 +96,9 @@ impl Ha {
                         cand
                     ));
                 }
+                Some(m) if m.rewind_check => {
+                    return CommandResponse::rejected(marked_candidate_message(cand));
+                }
                 _ => {}
             }
             if let Some(resp) = self.reject_if_sync_ineligible_candidate(cand) {
@@ -168,8 +177,14 @@ impl Ha {
     async fn handle_failover_command(&mut self, candidate: Option<String>) -> CommandResponse {
         // Failover can be initiated from any node — it writes /failover key
         if let Some(ref cand) = candidate {
-            if self.cluster.get_member(cand).is_none() {
-                return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
+            match self.cluster.get_member(cand) {
+                None => {
+                    return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
+                }
+                Some(m) if m.rewind_check => {
+                    return CommandResponse::rejected(marked_candidate_message(cand));
+                }
+                _ => {}
             }
             if let Some(resp) = self.reject_if_sync_ineligible_candidate(cand) {
                 return resp;

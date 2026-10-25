@@ -32,6 +32,11 @@ pub struct Cluster {
 
     /// Cluster history (timeline changes)
     pub history: Vec<HistoryEntry>,
+
+    /// Highest timeline a lock-holding primary recorded in the DCS `/timeline`
+    /// key (no TTL, never decreases). None when the key does not exist.
+    #[serde(default)]
+    pub timeline: Option<u64>,
 }
 
 impl Cluster {
@@ -119,6 +124,12 @@ pub struct Member {
     /// Patroni/pg-ha version running on this member
     #[serde(default)]
     pub version: Option<String>,
+
+    /// The member has the pg-ha.rewind_check marker: it may hold WAL beyond a
+    /// fork point and has not been verified with pg_rewind yet. Members that do
+    /// not publish it (older versions) count as unmarked.
+    #[serde(default)]
+    pub rewind_check: bool,
 }
 
 impl Member {
@@ -309,6 +320,20 @@ mod tests {
     }
 
     #[test]
+    fn member_without_rewind_check_field_deserializes_as_unmarked() {
+        let old: Member = serde_json::from_str(
+            r#"{"name":"n1","conn_url":"host=n1","api_url":"","state":"running","role":"replica","timeline":2}"#,
+        )
+        .unwrap();
+        assert!(!old.rewind_check);
+        let new: Member = serde_json::from_str(
+            r#"{"name":"n1","conn_url":"host=n1","api_url":"","state":"running","role":"replica","rewind_check":true}"#,
+        )
+        .unwrap();
+        assert!(new.rewind_check);
+    }
+
+    #[test]
     fn test_cluster_is_unlocked() {
         let cluster = Cluster::empty();
         assert!(cluster.is_unlocked());
@@ -351,6 +376,7 @@ mod tests {
                 ("failover_priority".to_string(), serde_json::json!(0)),
             ]),
             version: None,
+            rewind_check: false,
         };
         assert!(member.is_nofailover());
         assert_eq!(member.failover_priority(), 0);
@@ -375,6 +401,7 @@ mod tests {
                     timeline: None,
                     tags: HashMap::new(),
                     version: None,
+                    rewind_check: false,
                 },
                 Member {
                     name: "node2".to_string(),
@@ -386,6 +413,7 @@ mod tests {
                     timeline: None,
                     tags: HashMap::from([("clonefrom".to_string(), serde_json::json!(true))]),
                     version: None,
+                    rewind_check: false,
                 },
             ],
             ..Default::default()

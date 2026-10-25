@@ -465,6 +465,7 @@ mod tests {
             timeline: None,
             tags,
             version: None,
+            rewind_check: false,
         }
     }
 

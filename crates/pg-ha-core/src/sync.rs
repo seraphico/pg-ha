@@ -118,6 +118,7 @@ mod tests {
             timeline: Some(1),
             tags,
             version: None,
+            rewind_check: false,
         }
     }
 
@@ -132,6 +133,7 @@ mod tests {
             timeline: Some(1),
             tags: HashMap::from([("nosync".to_string(), serde_json::json!(true))]),
             version: None,
+            rewind_check: false,
         }
     }
 
