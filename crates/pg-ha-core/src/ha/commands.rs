@@ -116,7 +116,9 @@ impl Ha {
             return CommandResponse::accepted("Switchover scheduled");
         }
 
-        // Execute immediate switchover: write /failover key, then release lock
+        // Execute immediate switchover. The leader lock stays until PostgreSQL
+        // has stopped, so another node cannot promote while this one is still
+        // writable (L5). standby.signal is written before the stop (D2).
         info!(candidate = ?candidate, "Initiating switchover");
         let failover_value = serde_json::json!({
             "leader": self.config.name,
@@ -127,17 +129,17 @@ impl Ha {
             .set_failover_value(&failover_value.to_string())
             .await;
 
-        // Release leader lock — this triggers election
-        if let Some(leader) = &self.cluster.leader.clone() {
-            let _ = self.dcs.delete_leader(leader).await;
+        // The HA loop is blocked inside this command, so renew once before the
+        // stop. The lease then covers ttl - safety_margin from here.
+        if !self.renew_held_lock().await {
+            let _ = self.fence_for_lost_lease().await;
+            return CommandResponse::error(
+                "Switchover aborted: leader lock renewal failed; pg-ha keeps fencing it and holds the leader lock",
+            );
         }
-        self.is_leader = false;
-        self.reset_sync_cache();
 
-        // Write standby.signal before stopping PostgreSQL (D2), so this node
-        // restarts as a standby. With a candidate, point primary_conninfo at
-        // it; without one the new leader is unknown, so primary_conninfo is
-        // removed (D3).
+        // With a candidate, point primary_conninfo at it; without one the new
+        // leader is unknown, so primary_conninfo is removed (D3).
         let candidate_conn_url = candidate
             .as_deref()
             .and_then(|c| self.cluster.get_member(c))
@@ -151,24 +153,30 @@ impl Ha {
         let stop_error = self.stop_after_demotion_write("fast").await.err();
         self.postgresql.set_role(MemberRole::Replica);
 
-        // A failed stop comes first: PostgreSQL may still be writable.
-        match (write_error, stop_error) {
-            (None, None) => {}
-            (None, Some(e)) => {
-                return CommandResponse::error(format!(
-                    "Switchover initiated, but stopping PostgreSQL failed: {e}; pg-ha keeps fencing it"
-                ));
-            }
-            (Some(we), Some(e)) => {
-                return CommandResponse::error(format!(
-                    "Switchover initiated, but stopping PostgreSQL failed: {e}; pg-ha keeps fencing it; writing standby configuration also failed: {we}"
-                ));
-            }
-            (Some(we), None) => {
-                return CommandResponse::error(format!(
-                    "Switchover initiated and PostgreSQL stopped, but writing standby configuration failed: {we}"
-                ));
-            }
+        // A failed stop comes first: PostgreSQL may still be writable, so the
+        // lock is kept and later cycles keep fencing (stop_pending).
+        if let Some(e) = stop_error {
+            let write = write_error.map_or(String::new(), |we| {
+                format!("; writing standby configuration also failed: {we}")
+            });
+            return CommandResponse::error(format!(
+                "Switchover initiated, but stopping PostgreSQL failed: {e}; pg-ha keeps fencing it and holds the leader lock{write}"
+            ));
+        }
+
+        if !self.release_leader_lock_if_stopped().await {
+            let write = write_error.map_or(String::new(), |we| {
+                format!("; writing standby configuration also failed: {we}")
+            });
+            return CommandResponse::error(format!(
+                "Switchover stopped PostgreSQL, but the leader lock was not released{write}"
+            ));
+        }
+
+        if let Some(we) = write_error {
+            return CommandResponse::error(format!(
+                "Switchover initiated and PostgreSQL stopped, but writing standby configuration failed: {we}"
+            ));
         }
 
         CommandResponse::accepted("Switchover initiated, leader lock released")

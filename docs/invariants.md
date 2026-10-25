@@ -90,7 +90,7 @@
 #### 降级：先写 `standby.signal`，再停库
 
 - `demote()`（续锁失败）、`handle_dcs_error` 的两个降级分支、Fence、switchover 在**停库之前**写 `standby.signal`，fsync 文件和目录；前两者以主库运行，同时写 rewind 检查标记。写失败仍然停库（L5 优先），记 ERROR、返回错误；之后启动规则拒绝在没有 `standby.signal` 时启动。
-- 这条规则适用于所有停掉「可能是不持锁可写主」的 PG 的路径，不只上面几条：rejoin 前停掉以主库运行的 PG、rewind 源未就绪时停库、陈旧主停库、带标记且不能参选的主停库、rewind 失败保持中被手工启动的主、`POST /reinitialize` 停掉以主库运行的 PG、`POST /restart`（不持锁时）、优雅关停（释放锁之后停掉以主库运行或观测不到的 PG）、降级停库失败后重新围栏（含选举入口），都先写 `standby.signal`（以主库运行过的还写标记）再停库。`POST /reinitialize` 遇到这种 PG 且停库失败时，不删除数据目录。只读备库（观测在 recovery 且有 `standby.signal`）可以直接停库。
+- 这条规则适用于所有停掉「可能是不持锁可写主」的 PG 的路径，不只上面几条：rejoin 前停掉以主库运行的 PG、rewind 源未就绪时停库、陈旧主停库、带标记且不能参选的主停库、rewind 失败保持中被手工启动的主、`POST /reinitialize` 停掉以主库运行的 PG、`POST /restart`（不持锁时）、优雅关停（仍持锁时先停掉以主库运行或观测不到的 PG，停库成功后才释放锁）、降级停库失败后重新围栏（含选举入口），都先写 `standby.signal`（以主库运行过的还写标记）再停库。`POST /reinitialize` 遇到这种 PG 且停库失败时，不删除数据目录。只读备库（观测在 recovery 且有 `standby.signal`）可以直接停库。
 - 停库失败时，直到确认 PG 已停（`pg_ctl stop` 成功，或某一轮观察到 PG 不再运行），观测不到的 PG 一律按围栏处理：每轮重试停库，即使已有 `standby.signal`。原因是这个 signal 写在一个可能可写的 PG 上，不能再据此认为它不可写。
 - 降级停库成功后，节点立即发布一次成员状态（`state=stopped`），让其他节点尽快看到它已停。发布有时限（不超过 `loop_wait`），DCS 不可达时不会拖住 HA 循环或关停。
 - **租约到期围栏**（与 `demote()` 并列的降级入口，见下一小节）：leader 租约到期时不再等任何 DCS 调用返回，丢弃本轮 HA 周期，先写 `standby.signal` 和 rewind 检查标记（原因 `leader lease expired before renewal`），再 `pg_ctl stop -m immediate`，并把本节点记为不持锁。停库失败时按上文 `stop_pending` 规则每轮继续围栏。
@@ -107,7 +107,7 @@
 - 参数约束：`ttl ≥ loop_wait + retry_timeout + watchdog.safety_margin`，并且 `retry_timeout ≥ 1`。健康的主库要在租约内完成一轮 HA 周期加一次有界的续锁写。静态配置（包括环境变量覆盖后的值和 `bootstrap.dcs`）不满足时拒绝启动；`PATCH` / `PUT /config` 改动 `ttl`、`loop_wait` 或 `retry_timeout` 后不满足时返回 400，配置不写入。动态配置缺省的项按接收请求的节点的静态值计算。
 - 代价：PG 或 DCS 慢到一轮续锁来不及在租约内完成时（例如 docker 配置下 `pg_is_in_recovery()` 接近 5 秒的超时），健康的主库也会被围栏，集群多一次 failover。这是用可用性换 L5。
 - pause 下豁免：与 pause 下续锁失败保持主库一致（W1，pause 时其他节点不会自动抢锁），租约到期不围栏。
-- 优雅关停：DCS 写有上限，所以释放锁最多等 `retry_timeout`。收到关停信号时（drain 之前）检查租约：本节点记为持锁而租约已经到期，就跳过 drain、CHECKPOINT 和释放锁，直接执行租约到期围栏，日志 ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)`。租约有效时按原有顺序关停；drain 期间不再检查租约（这段时间的缺口见第 9 节「关停 drain 期间不续锁」）。
+- 优雅关停：DCS 写有上限，所以释放锁最多等 `retry_timeout`。收到关停信号时（drain 之前）检查租约：本节点记为持锁而租约已经到期，就跳过 drain、CHECKPOINT 和释放锁，直接执行租约到期围栏，日志 ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)`。租约有效时，drain 期间每个 `loop_wait` 续一次锁；续锁失败则立即围栏，不 CHECKPOINT、不释放锁。CHECKPOINT 仍在持锁时做。然后先停库，停库成功后才 `delete_leader`；停库失败或删除被拒绝时锁留下。switchover 同样先停库再释放锁，停库失败时锁留下，下一轮持锁继续围栏。
 - 不覆盖：HA 循环被同步调用阻塞、tokio worker 被占满、进程被 SIGSTOP 或 VM 冻结时，赛跑无法执行，只有 watchdog 能兜底；watchdog 尚未接入（W2，第 9 节）。
 - 降级时 leader 未知（`demote`、`handle_dcs_error`、无 candidate 的 switchover、优雅关停）就删除 `postgresql.auto.conf` 里的 `primary_conninfo`，不保留猜测。上游只由跟随路径按观测到的 leader 配置，包括 `postgresql.auto.conf` 里没有 `primary_conninfo` 的情况。
 - 写备库配置时，`postgresql.auto.conf` 只替换 `primary_conninfo` 和 `recovery_target_timeline` 两项，其他行（`ALTER SYSTEM` 写入的内容，如 `synchronous_standby_names`）一律保留；文件经临时文件 + rename 写入并 fsync。成员 `conn_url` 没有 `host=` 时按 leader 未知处理，不写指向 `127.0.0.1` 的 `primary_conninfo`。节点每次离开主库角色或重写备库配置后，pg-ha 都忘掉上次应用的 `synchronous_standby_names`，下一个主任期第一次一定重新 `ALTER SYSTEM` 并写 `/sync`（C4）。
@@ -295,8 +295,7 @@
 |----|---------|------|
 | Failsafe 持久化 | P3 | 架构列出 `/failsafe`；实现仍有「未读 key」类缺口 |
 | Member `conn_url` 含密码 | R3 | 落盘与最小密钥面目标冲突，需先裁定再改 |
-| switchover 释放锁失败被忽略 | S1 | `delete_leader` 结果被忽略；连续失败时旧主带 `standby.signal` 重启后仍持锁，会 promote 自己，撤销 switchover |
-| switchover 与优雅退出先释放锁再停库 | L5 / H3 | `ha/commands.rs` `handle_switchover_command` 与 `src/main.rs` 关停 Phase 3 → Phase 4：释放锁后到停库完成之间旧主仍可写，候选可能已 promote，存在短暂双可写窗口。（任务 3 起两者都在停库前写 `standby.signal`，停库失败时持续围栏或记 ERROR，但释放锁仍在停库之前。） |
+| switchover 释放锁失败被忽略 | S1 | 停库成功后 `delete_leader` 失败会返回错误并留下锁。PG 已经不在跑时的释放（`handle_postgres_not_running`）仍忽略 `delete_leader` 的结果；连续失败时旧主重启后仍持锁，会 promote 自己，撤销 switchover |
 | 无 candidate 的 switchover 不排除旧 leader | S1 | failover key 为 `{"leader": old, "candidate": null}`，选举只看 `candidate`（`ha/election.rs` `process_unhealthy_cluster`），不看 `Failover.leader`（`cluster.rs`）；旧主带 `standby.signal` 参选，WAL 往往打平或最高，可能重新当选，switchover 被悄悄撤销 |
 | 选举不比较 timeline | S2 / S4 | `is_healthiest_node` 只比较 WAL 位置（`ha/election.rs` 中 peer 的 timeline 未使用）；任务 3 只对带 rewind 检查标记的节点按 `/timeline` 把关，一般节点的 timeline 感知选举另开项 |
 | 带标记、等待 rewind 检查的备库对外是健康副本 | H2 / S4 | 带 `pg-ha.rewind_check` 的 ManagedStandby 在 leader 未就绪、分区期间、恢复后 pg_rewind 之前以只读备库运行，`/replica` 200，RO 客户端可能读到只存在于分叉历史上的数据（见 1a「rewind 检查标记」）。候选修法：带标记的节点 `/replica` 返回 503 |
@@ -304,7 +303,6 @@
 | watchdog 未接入租约 | W2 / L5 | `watchdog.rs` 没有调用点，超时硬编码 30 秒。HA 循环被同步阻塞、tokio worker 被占满、进程被 SIGSTOP 或 VM 冻结时，leader 租约的围栏无法执行。待做：只在租约有效且本节点是 Primary 时喂狗，超时 = TTL − `safety_margin` |
 | 动态修改 `ttl` 不改变写入锁的 TTL | L5 / C1 | `RaftDcs` 的 TTL 和 DCS 写超时在启动时由静态 `ttl`、`retry_timeout` 固定（`raft_dcs.rs` `RaftDcs::new`，锁写入用 `ttl: Some(self.ttl)`）；动态配置只改 HA 内存里的值。leader 租约按实际写进锁的 TTL 计算。`PATCH /config` 的参数约束按动态值检查，所以同时调大 `ttl` 和 `loop_wait` 的请求会被接受，而锁的 TTL 和租约仍按静态 `ttl`：`loop_wait` 超过它时，健康的主库也会在两轮之间失锁或被围栏 |
 | TTL 过期按墙钟判断 | L5 | 状态机用墙钟判断锁是否过期（写入时用请求里的 `now`，读取时用读取节点的本地墙钟）。多数派一侧节点的墙钟比旧主快超过 `safety_margin`（减去约 0.1 秒）时，新主仍可能在旧主围栏前出现 |
-| 关停 drain 期间不续锁 | L5 / H3 | 优雅关停的 drain（`shutdown.drain_timeout_secs`，默认 30 秒）期间 HA 循环已停止，不再续锁。drain 比 leader 租约长时（默认 30 秒 > 25 秒），锁可能在 DCS 里过期，而 PostgreSQL 仍可写，其他节点可能在关停释放锁之前 promote。租约只在收到关停信号时检查一次。候选修法：drain 期间继续续锁，或把 drain 限制在租约以内 |
 | `Request.now` 注释与实现不符 | — | `state_machine.rs` 中 `Request::Set` 的 `now` 字段注释说由 Raft leader 在提出时填写，实际是发起节点构造请求时取的墙钟（转发时也不改）。迟到提交与租约的分析按实现的语义（见 1a） |
 
 ---
@@ -313,6 +311,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-10-25 | 闭合「switchover 与优雅退出先释放锁再停库」和「关停 drain 期间不续锁」：switchover 与优雅关停都先停库，确认停掉后才 `delete_leader`；停库失败时锁留下，持锁的下一轮继续围栏。drain 期间每个 `loop_wait` 续锁，续锁失败则围栏且不释放锁。`handle_postgres_not_running` 仍忽略 `delete_leader` 的结果，第 9 节保留「switchover 释放锁失败被忽略」 |
 | 2026-10-25 | R19（锁持有者兼 Raft leader 被分区时续锁挂起，实测双可写约 58 秒；锁持有者是 Raft follower 时由 10 秒转发超时限住，docker 配置下实测余量只有 0.67 秒）：L5 增加时间界；1a 降级增加租约到期围栏入口、DCS 写上限 `retry_timeout` 与迟到提交的安全性说明，新增「leader 租约」小节（锚点、判定、检查点、有界周期、参数约束 `ttl ≥ loop_wait + retry_timeout + safety_margin`、pause 豁免、优雅关停）；P4 补充「或租约到期」；W2 改为目标并写明 watchdog 未接入；第 9 节新增 5 项（watchdog 未接入、动态 `ttl` 不改变锁的 TTL、TTL 按墙钟判断、`Request.now` 注释、关停 drain 期间不续锁）。第 9 节原来没有 R19 和 follower 转发余量的条目，二者由本项关闭，不再登记。实现分 2 个提交：第 1 个提交 DCS 写上限、参数约束、HA 循环定时器不补发错过的 tick；第 2 个提交 leader 租约、租约到期围栏与优雅关停的处理。第 2 个提交完成前，租约相关的条目以本文为目标语义。第 2 个提交：优雅关停在收到信号时（drain 之前）检查租约，不在 drain 之后检查（drain 默认 30 秒，长于默认租约 25 秒，之后检查会让健康主库的正常关停几乎都走围栏）；drain 期间不续锁的既有缺口登记到第 9 节；补充检查点和关停的日志文本 |
 | 2026-10-25 | 任务 3：1a 增加启动规则、降级先写 `standby.signal`（适用于所有停掉不持锁可写主的路径）、rewind 检查标记、`/timeline` 与带标记节点的选举规则、rewind 失败处理；R2 增加带标记节点 timeline 比较的例外说明；修正 P4 的 degraded 语义；第 9 节删除已闭合的「降级不写 standby.signal」，登记 5 项。实现分 5 个提交，完成前以本文为目标语义；第 5 个提交补充 rewind 失败日志里原因与数据目录大小的取法；并写明 pg_rewind 成功后 PG 启动失败进入保持时 rewind 检查标记已删除、删除保持文件后先以备库重试启动（连续 3 次失败后再 pg_rewind） |
 | 2026-10-21 | 新增 1a 身份判定：「是否为主」以 `pg_is_in_recovery()` 观测为准；只 promote pg-ha 配置的备库，非 pg-ha 造成的恢复交运维；写明 H1 / H2 逐条判定与 `/health` 语义；第 9 节登记两个已知缺口 |
