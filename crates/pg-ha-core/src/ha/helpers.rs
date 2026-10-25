@@ -277,9 +277,104 @@ impl Ha {
         true
     }
 
-    /// Graceful shutdown, Phase 4 (src/main.rs): stop PostgreSQL. The lock was
-    /// released in Phase 3, so a primary here is writable without the lock (D2,
-    /// A27): write standby.signal + marker first through `fence_primary`.
+    /// Renew the leader lock while this node still holds it.
+    ///
+    /// False when there is no lock to renew or the renewal did not land. The
+    /// caller keeps PostgreSQL fenced and does not delete the lock.
+    pub(super) async fn renew_held_lock(&mut self) -> bool {
+        let Some(leader) = self.cluster.leader.clone() else {
+            return false;
+        };
+        if leader.name != self.config.name {
+            return false;
+        }
+        let anchor = LeaseAnchor::now();
+        match self.dcs.update_leader(&leader).await {
+            Ok(true) => {
+                self.is_leader = true;
+                self.extend_leader_lease(anchor);
+                true
+            }
+            Ok(false) => {
+                error!("Failed to renew leader lock during shutdown");
+                self.set_leader_lease(None);
+                false
+            }
+            Err(e) => {
+                error!("DCS error renewing the leader lock during shutdown: {e}");
+                self.set_leader_lease(None);
+                false
+            }
+        }
+    }
+
+    /// Sleep for `drain`, renewing the leader lock every `loop_wait` so it
+    /// cannot expire while PostgreSQL is still up. The HA loop is already
+    /// stopped (src/main.rs). Returns true when a renewal failed and
+    /// PostgreSQL was fenced; the caller must not checkpoint or release the
+    /// lock.
+    pub async fn drain_renewing_leader_lock(&mut self, drain: std::time::Duration) -> bool {
+        if !self.is_leader {
+            tokio::time::sleep(drain).await;
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + drain;
+        loop {
+            if !self.renew_held_lock().await {
+                error!(
+                    "Leader lock renewal failed during shutdown drain; fencing PostgreSQL (immediate stop) and not releasing the lock"
+                );
+                let _ = self.fence_for_lost_lease().await;
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let slice =
+                (deadline - now).min(std::time::Duration::from_secs(self.config.loop_wait.max(1)));
+            tokio::time::sleep(slice).await;
+        }
+    }
+
+    /// Delete the leader lock only after PostgreSQL has stopped. False when it
+    /// is still running or the delete did not succeed; the lock stays so
+    /// another node cannot promote over a writable primary.
+    pub async fn release_leader_lock_if_stopped(&mut self) -> bool {
+        if self.postgresql.is_running() {
+            error!("Not releasing the leader lock: PostgreSQL is still running");
+            return false;
+        }
+        if !self.is_leader {
+            return true;
+        }
+        let Some(leader) = self.cluster.leader.clone() else {
+            self.is_leader = false;
+            self.reset_sync_cache();
+            return true;
+        };
+        match self.dcs.delete_leader(&leader).await {
+            Ok(true) => {
+                info!("Leader lock released after PostgreSQL stopped");
+                self.is_leader = false;
+                self.reset_sync_cache();
+                true
+            }
+            Ok(false) => {
+                error!("Leader lock delete was rejected; the lock is still held");
+                false
+            }
+            Err(e) => {
+                error!("Failed to release leader lock after PostgreSQL stopped: {e}");
+                false
+            }
+        }
+    }
+
+    /// Graceful shutdown, after the drain (src/main.rs): stop PostgreSQL while
+    /// this node still holds the leader lock. A primary gets standby.signal
+    /// first (D2), then the caller releases the lock only if the stop
+    /// succeeded.
     pub async fn stop_postgres_for_shutdown(&mut self) -> crate::error::Result<()> {
         if !self.postgresql.is_running() {
             return Ok(());

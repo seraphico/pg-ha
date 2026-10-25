@@ -294,6 +294,17 @@ impl Ha {
                 Ok(true) => {
                     self.is_leader = true;
                     self.extend_leader_lease(anchor);
+                    // A switchover stop failed: keep the lock (so nobody else
+                    // promotes) and keep fencing, instead of resuming as primary.
+                    if self.stop_pending && self.postgresql.is_running() {
+                        warn!(
+                            "PostgreSQL stop is still pending; holding the leader lock and fencing again"
+                        );
+                        let _ = self.stop_after_demotion_write("fast").await;
+                        return CycleResult::Error(
+                            "leader lock held but PostgreSQL stop is still pending".into(),
+                        );
+                    }
                     self.enforce_primary_role().await
                 }
                 Ok(false) => {
@@ -1167,11 +1178,11 @@ mod tests {
             }
         }
 
-        async fn update_leader(&self, _leader: &Leader) -> Result<bool> {
+        async fn update_leader(&self, leader: &Leader) -> Result<bool> {
             self.leader_write_latency().await;
             self.leader_writes_fail()?;
             let held = self.leader_held_by.lock().unwrap();
-            Ok(held.as_deref() == Some("test_node"))
+            Ok(held.as_deref() == Some(leader.name.as_str()))
         }
 
         async fn delete_leader(&self, _leader: &Leader) -> Result<bool> {
@@ -2498,15 +2509,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn switchover_test_ha(label: &str, upstream_host: &str) -> (Ha, PathBuf, CommandSender) {
-        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
-            "node1",
-            label,
-            Arc::new(MockDcs::with_leader("node1")),
-            Some(false),
-            false,
-            None,
-        );
+    fn switchover_test_ha(
+        label: &str,
+        upstream_host: &str,
+    ) -> (Ha, PathBuf, CommandSender, Arc<MockDcs>) {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir, tx) =
+            identity_test_ha_with_cmd("node1", label, dcs.clone(), Some(false), false, None);
         preset_auto_conf(&dir, upstream_host);
         ha.is_leader = true;
         ha.applied_sync_standby_names = applied_sync();
@@ -2521,12 +2530,12 @@ mod tests {
             ],
             ..Default::default()
         };
-        (ha, dir, tx)
+        (ha, dir, tx, dcs)
     }
 
     #[tokio::test]
     async fn test_switchover_with_candidate_keeps_auto_conf_lines() {
-        let (mut ha, dir, tx) = switchover_test_ha("c1-so-cand", "old");
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("c1-so-cand", "old");
 
         let resp = send_cmd(
             &mut ha,
@@ -2539,7 +2548,7 @@ mod tests {
         )
         .await;
 
-        // No pg_ctl: the stop fails and is reported (the lock is released).
+        // No pg_ctl: the stop fails and is reported. The lock is kept.
         assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
         assert!(
             resp.message
@@ -2551,14 +2560,18 @@ mod tests {
         assert!(auto_conf(&dir).contains(SYNC_LINE));
         assert_eq!(ha.read_current_upstream().as_deref(), Some("node2"));
         assert_eq!(ha.applied_sync_standby_names, None);
-        assert!(!ha.is_leader());
+        assert!(
+            ha.is_leader(),
+            "a failed stop must not drop the leader lock"
+        );
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("node1"));
         assert!(ha.stop_pending);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn test_switchover_without_candidate_removes_conninfo() {
-        let (mut ha, dir, tx) = switchover_test_ha("c1-so-nocand", "old");
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("c1-so-nocand", "old");
 
         let resp = send_cmd(
             &mut ha,
@@ -2583,6 +2596,8 @@ mod tests {
         assert_eq!(ha.read_current_upstream(), None, "D3: no guessed upstream");
         assert!(!dir.join("pg-ha.rewind_check").exists());
         assert_eq!(ha.applied_sync_standby_names, None);
+        assert!(ha.is_leader());
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("node1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3199,7 +3214,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_switchover_write_failure_still_stops() {
-        let (mut ha, dir, tx) = switchover_test_ha("c2-so-write-fail", "old");
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("c2-so-write-fail", "old");
         std::fs::create_dir(dir.join("standby.signal")).unwrap();
 
         let resp = send_cmd(
@@ -3222,7 +3237,11 @@ mod tests {
             "{}",
             resp.message
         );
-        assert!(!ha.is_leader());
+        assert!(
+            ha.is_leader(),
+            "a failed stop must not drop the leader lock"
+        );
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("node1"));
         assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
         assert!(ha.stop_pending);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3230,7 +3249,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_switchover_stop_failure_sets_stop_pending() {
-        let (mut ha, dir, tx) = switchover_test_ha("c2-so-stop-fail", "old");
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("c2-so-stop-fail", "old");
 
         let resp = send_cmd(
             &mut ha,
@@ -3251,7 +3270,89 @@ mod tests {
             resp.message
         );
         assert!(ha.stop_pending);
+        assert!(ha.is_leader());
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("node1"));
         assert!(dir.join("standby.signal").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_lock_holder_with_pending_stop_retries_without_releasing() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "so-pending-retry",
+            dcs.clone(),
+            Some(false),
+            true,
+        );
+        ha.is_leader = true;
+        ha.stop_pending = true;
+        ha.cluster = cluster_led_by("test_node", None, "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("stop is still pending")),
+            "got: {result}"
+        );
+        assert!(ha.is_leader());
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        assert!(ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drain_renews_without_releasing_the_lock() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "shutdown-drain-renew",
+            dcs.clone(),
+            Some(false),
+            false,
+        );
+        ha.is_leader = true;
+        ha.cluster = cluster_led_by("test_node", None, "node2");
+        ha.extend_leader_lease(LeaseAnchor::now());
+
+        let fenced = ha
+            .drain_renewing_leader_lock(std::time::Duration::ZERO)
+            .await;
+
+        assert!(!fenced);
+        assert!(ha.is_leader());
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drain_fence_keeps_the_lock_when_renewal_fails() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        dcs.fail_leader_writes();
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "shutdown-drain-fence",
+            dcs.clone(),
+            Some(false),
+            false,
+        );
+        ha.is_leader = true;
+        ha.cluster = cluster_led_by("test_node", None, "node2");
+        ha.extend_leader_lease(LeaseAnchor::now());
+
+        let fenced = ha
+            .drain_renewing_leader_lock(std::time::Duration::ZERO)
+            .await;
+
+        assert!(fenced);
+        assert!(!ha.is_leader(), "the fence clears leadership");
+        assert_eq!(
+            lock_held_by(&dcs).as_deref(),
+            Some("test_node"),
+            "a failed renewal must not delete the lock"
+        );
+        assert!(ha.stop_pending);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5453,6 +5554,14 @@ mod tests {
                 "stop_after_demotion_write(",
                 what,
             );
+            if what == "switchover" {
+                assert_before(
+                    text,
+                    "stop_after_demotion_write(",
+                    "release_leader_lock_if_stopped(",
+                    "switchover releases the lock only after PostgreSQL has stopped",
+                );
+            }
             assert!(!text.contains(DIRECT_STOP), "{what}: direct stop");
         }
 

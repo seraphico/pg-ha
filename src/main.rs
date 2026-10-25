@@ -20,7 +20,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 use pg_ha_api::{AppState, AuthConfig};
 use pg_ha_core::cluster::{Member, MemberRole, MemberState};
 use pg_ha_core::config::Config;
-use pg_ha_core::dcs::DcsAdapter;
 use pg_ha_core::ha::Ha;
 use pg_ha_core::postgresql::Postgresql;
 use pg_ha_dcs::RaftDcs;
@@ -369,44 +368,45 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Phase 1: Stop accepting new connections
-    // (Already done — tokio::select! drops the proxy/API listeners above)
-    info!("Phase 1: Stopped accepting new connections");
+    // Phase 1: The proxy listeners are tasks spawned inside proxy.run(), so
+    // dropping this select does not close them. Drain waits out in-flight
+    // work; the leader lock is renewed for the whole wait so it cannot expire
+    // while PostgreSQL is still writable.
+    info!("Phase 1: Draining in-flight proxy connections");
 
-    // Phase 2: Drain existing proxy connections (wait for active transactions)
+    // Phase 2: Drain, renewing the leader lock every loop_wait.
     let drain_timeout = std::time::Duration::from_secs(config.shutdown.drain_timeout_secs);
     info!(
         timeout_secs = config.shutdown.drain_timeout_secs,
         "Phase 2: Draining active connections"
     );
-    tokio::time::sleep(drain_timeout).await;
-    // Note: spawned proxy connection tasks will continue until their TCP streams close
-    // or until PG is stopped in Phase 4. The 2s grace period allows in-flight queries
-    // to complete. For long transactions, PG's "fast" shutdown will terminate them.
+    if ha.drain_renewing_leader_lock(drain_timeout).await {
+        info!("Graceful shutdown complete (fenced: leader lock renewal failed during drain)");
+        return Ok(());
+    }
 
-    // Phase 3: Primary node responsibilities (only if this node holds the leader lock)
+    // Phase 3: CHECKPOINT while this node still holds the lock and PostgreSQL
+    // is still the primary. The lock is released only after the stop.
     if ha.is_leader() {
         info!("Phase 3: Leader shutdown — running CHECKPOINT");
         if let Err(e) = ha.postgresql().checkpoint().await {
             error!("CHECKPOINT during shutdown failed: {e} (continuing)");
         }
-
-        info!("Phase 3: Releasing leader lock in DCS");
-        if let Some(leader) = ha.cluster().leader.as_ref() {
-            if let Err(e) = dcs.delete_leader(leader).await {
-                error!("Failed to release leader lock: {e} (will expire via TTL)");
-            } else {
-                info!("Leader lock released — other nodes can elect new leader");
-            }
-        }
     } else {
-        info!("Phase 3: Not leader, skipping CHECKPOINT and lock release");
+        info!("Phase 3: Not leader, skipping CHECKPOINT");
     }
 
-    // Phase 4: Stop subsystems
-    info!("Phase 4: Stopping PostgreSQL (fast mode)");
+    // Phase 4: Stop PostgreSQL before releasing the leader lock.
+    info!("Phase 4: Stopping PostgreSQL before releasing the leader lock");
     if let Err(e) = ha.stop_postgres_for_shutdown().await {
         error!("Failed to stop PostgreSQL during shutdown: {e}");
+    }
+    if ha.is_leader() {
+        if ha.release_leader_lock_if_stopped().await {
+            info!("Leader lock released — other nodes can elect a new leader");
+        } else {
+            error!("Leader lock kept: PostgreSQL was not confirmed stopped, or the delete failed");
+        }
     }
 
     info!("Graceful shutdown complete");
@@ -850,8 +850,9 @@ mod tests {
     /// detecting the change and recreating/resetting the interval. On unfixed
     /// code, the interval is only created once at startup.
     /// Graceful shutdown stops PostgreSQL only through the HA engine, which
-    /// writes standby.signal first when PostgreSQL may be a writable primary
-    /// (the lock is released in Phase 3, before the stop).
+    /// writes standby.signal first when PostgreSQL may be a writable primary.
+    /// The leader lock is renewed during the drain and released only after
+    /// the stop.
     #[test]
     fn test_shutdown_stops_postgres_only_through_ha() {
         let source = include_str!("main.rs");
@@ -861,6 +862,21 @@ mod tests {
                    section 2.2b with a reason";
         assert_eq!(prod_code.matches(".stop(").count(), 0, "{msg}");
         assert!(prod_code.contains("stop_postgres_for_shutdown("), "{msg}");
+        // The lease-expired path stops once, before the drain. The normal
+        // path's stop is the later call: drain, then stop, then release.
+        let drain = prod_code
+            .find("drain_renewing_leader_lock(")
+            .expect("drain");
+        let stop = prod_code
+            .rfind("stop_postgres_for_shutdown(")
+            .expect("stop");
+        let release = prod_code
+            .find("release_leader_lock_if_stopped(")
+            .expect("release");
+        assert!(
+            drain < stop && stop < release,
+            "drain, then stop, then release"
+        );
     }
 
     /// Outside `run_cycle_bounded` the HA loop awaits only the tick and the
