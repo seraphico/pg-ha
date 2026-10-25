@@ -38,8 +38,11 @@ pub enum Request {
         prev_value: Option<String>,
         /// CAS: only succeed if current version equals this
         prev_version: Option<u64>,
-        /// Deterministic timestamp (millis since epoch), filled by Raft leader at proposal time.
-        /// Defaults to 0 for backward compatibility with existing log entries.
+        /// Milliseconds since the epoch. The Raft leader overwrites this with
+        /// its own clock before appending the entry (`stamp_leader_time`), so
+        /// a follower's clock cannot expire the leader lock. `0` remains only
+        /// for log entries written before that stamp existed; applying those
+        /// falls back to each node's wall clock.
         #[serde(default)]
         now: u64,
     },
@@ -300,19 +303,41 @@ impl KvStateMachine {
     }
 }
 
+/// Overwrite the request's clock with the Raft leader's.
+///
+/// Call this on the leader immediately before `client_write`, including when
+/// the request was forwarded by a follower. The follower's `now` is discarded.
+/// `Delete` carries no time and is returned unchanged.
+pub fn stamp_leader_time(request: Request, now: u64) -> Request {
+    match request {
+        Request::Set {
+            key,
+            value,
+            ttl,
+            prev_exist,
+            prev_value,
+            prev_version,
+            ..
+        } => Request::Set {
+            key,
+            value,
+            ttl,
+            prev_exist,
+            prev_value,
+            prev_version,
+            now,
+        },
+        Request::ExpireKeys { .. } => Request::ExpireKeys { now },
+        other => other,
+    }
+}
+
 /// Check if a key entry has expired based on its `expire_at` timestamp.
 ///
-/// **NOTE: Best-effort, node-local check.** This uses `current_millis()` (wall-clock
-/// time) which may differ slightly across nodes due to clock skew. In a multi-node
-/// Raft cluster, different nodes may briefly disagree on whether a key is expired.
-///
-/// This is acceptable for the pg-ha use case because:
-/// - HA decisions are based on the DCS leader lock (TTL typically 30s), not on
-///   individual key reads. Clock skew under NTP is typically < 100ms.
-/// - Authoritative, deterministic expiry is performed via `ExpireKeys` proposals
-///   driven by the Raft leader, which use a leader-provided `now` timestamp.
-/// - This local check only serves to avoid returning obviously-stale data on the
-///   read path (e.g., `get_cluster()`, `get_config_value()`).
+/// **NOTE: Best-effort, node-local check.** This uses the reading node's wall
+/// clock. A node whose clock is ahead may treat a key as already expired.
+/// Taking the leader lock does not trust that view: the compare-and-set is
+/// applied with the `now` the Raft leader wrote into the log.
 fn is_expired(entry: &KvEntry) -> bool {
     entry.expire_at.is_some_and(|exp| exp <= current_millis())
 }
@@ -686,5 +711,69 @@ mod tests {
         let entry = sm.get("/key").unwrap();
         assert_eq!(entry.created_at, created); // preserved
         assert!(entry.updated_at >= created); // updated
+    }
+
+    /// A follower whose clock is 8s ahead would send `now` past the lock's
+    /// expiry. The Raft leader's stamp is what gets applied, so the acquire
+    /// does not succeed while the holder's lease still covers the lock.
+    #[test]
+    fn fast_requester_clock_does_not_expire_a_live_lock() {
+        let holder_now = 1_700_000_000_000;
+        let mut sm = KvStateMachine::new();
+        assert_eq!(
+            sm.apply(
+                &Request::Set {
+                    key: "/leader".into(),
+                    value: "node1".into(),
+                    ttl: Some(30),
+                    prev_exist: Some(false),
+                    prev_value: None,
+                    prev_version: None,
+                    now: holder_now,
+                },
+                1,
+            ),
+            Response::Ok { version: 1 }
+        );
+
+        // 22s later for the holder. The requester's clock is 8s fast, so it
+        // already reads holder_now + 30s and would treat the lock as expired.
+        let leader_now = holder_now + 22_000;
+        let fast_now = holder_now + 30_000;
+        let acquire = Request::Set {
+            key: "/leader".into(),
+            value: "node2".into(),
+            ttl: Some(30),
+            prev_exist: Some(false),
+            prev_value: None,
+            prev_version: None,
+            now: fast_now,
+        };
+
+        let mut stolen = sm.clone();
+        assert_eq!(
+            stolen.apply(&acquire, 2),
+            Response::Ok { version: 2 },
+            "applying the requester clock directly does expire the lock"
+        );
+
+        let stamped = stamp_leader_time(acquire, leader_now);
+        assert_eq!(sm.apply(&stamped, 2), Response::NotChanged);
+        assert_eq!(
+            sm.apply(
+                &Request::Set {
+                    key: "/leader".into(),
+                    value: "node1-renewed".into(),
+                    ttl: Some(30),
+                    prev_exist: None,
+                    prev_value: Some("node1".into()),
+                    prev_version: None,
+                    now: leader_now,
+                },
+                3,
+            ),
+            Response::Ok { version: 3 },
+            "the original holder still owns the lock"
+        );
     }
 }

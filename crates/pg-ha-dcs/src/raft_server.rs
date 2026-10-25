@@ -86,6 +86,7 @@ async fn handle_client_write(
     State(raft): State<Arc<Raft>>,
     Json(req): Json<crate::state_machine::Request>,
 ) -> impl IntoResponse {
+    let req = crate::state_machine::stamp_leader_time(req, crate::state_machine::current_millis());
     match raft.client_write(req).await {
         Ok(resp) => (StatusCode::OK, Json(resp.data)).into_response(),
         Err(e) => (

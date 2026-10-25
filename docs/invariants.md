@@ -302,8 +302,7 @@
 | 分区节点重新加入 Raft 会引发 Raft 重选 | L4 / L5 | openraft 0.9 没有 pre-vote：分区节点的 term 在分区期间上涨，重新连上后迫使集群重选 Raft leader；重选期间当前锁持有者续锁失败而被降级（多一次 failover，timeline +1）。任务 3 在 docker 集群上复现分区场景时每次都出现，不在任务 3 处理 |
 | watchdog 未接入租约 | W2 / L5 | `watchdog.rs` 没有调用点，超时硬编码 30 秒。HA 循环被同步阻塞、tokio worker 被占满、进程被 SIGSTOP 或 VM 冻结时，leader 租约的围栏无法执行。待做：只在租约有效且本节点是 Primary 时喂狗，超时 = TTL − `safety_margin` |
 | 动态修改 `ttl` 不改变写入锁的 TTL | L5 / C1 | `RaftDcs` 的 TTL 和 DCS 写超时在启动时由静态 `ttl`、`retry_timeout` 固定（`raft_dcs.rs` `RaftDcs::new`，锁写入用 `ttl: Some(self.ttl)`）；动态配置只改 HA 内存里的值。leader 租约按实际写进锁的 TTL 计算。`PATCH /config` 的参数约束按动态值检查，所以同时调大 `ttl` 和 `loop_wait` 的请求会被接受，而锁的 TTL 和租约仍按静态 `ttl`：`loop_wait` 超过它时，健康的主库也会在两轮之间失锁或被围栏 |
-| TTL 过期按墙钟判断 | L5 | 状态机用墙钟判断锁是否过期（写入时用请求里的 `now`，读取时用读取节点的本地墙钟）。多数派一侧节点的墙钟比旧主快超过 `safety_margin`（减去约 0.1 秒）时，新主仍可能在旧主围栏前出现 |
-| `Request.now` 注释与实现不符 | — | `state_machine.rs` 中 `Request::Set` 的 `now` 字段注释说由 Raft leader 在提出时填写，实际是发起节点构造请求时取的墙钟（转发时也不改）。迟到提交与租约的分析按实现的语义（见 1a） |
+| TTL 过期仍受 Raft leader 墙钟影响 | L5 | 写入日志前由 Raft leader 用自己的时钟覆盖 `now`（`stamp_leader_time`），发起节点的时钟不再决定锁是否过期。本地读取仍用读取节点的墙钟，所以时钟快的节点可能在本地视图里认为锁已过期，但抢锁要经过 leader 的 `now`，在 leader 认为锁还在时会失败。Raft leader 的时钟比锁持有者快超过 `safety_margin`（减去约 0.1 秒）时，新主仍可能在旧主围栏前出现 |
 
 ---
 
@@ -311,6 +310,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-10-25 | 闭合「`Request.now` 注释与实现不符」：Raft leader 在 `client_write` 之前用自己的时钟覆盖 `Set` 和 `ExpireKeys` 的 `now`，转发来的请求也覆盖。发起节点时钟偏快不再能把还在租约内的锁判成过期。本地读取仍用读取节点的墙钟；Raft leader 与锁持有者之间的时钟差仍受 `safety_margin` 约束，第 9 节改记为「TTL 过期仍受 Raft leader 墙钟影响」 |
 | 2026-10-25 | 闭合「switchover 与优雅退出先释放锁再停库」和「关停 drain 期间不续锁」：switchover 与优雅关停都先停库，确认停掉后才 `delete_leader`；停库失败时锁留下，持锁的下一轮继续围栏。drain 期间每个 `loop_wait` 续锁，续锁失败则围栏且不释放锁。`handle_postgres_not_running` 仍忽略 `delete_leader` 的结果，第 9 节保留「switchover 释放锁失败被忽略」 |
 | 2026-10-25 | R19（锁持有者兼 Raft leader 被分区时续锁挂起，实测双可写约 58 秒；锁持有者是 Raft follower 时由 10 秒转发超时限住，docker 配置下实测余量只有 0.67 秒）：L5 增加时间界；1a 降级增加租约到期围栏入口、DCS 写上限 `retry_timeout` 与迟到提交的安全性说明，新增「leader 租约」小节（锚点、判定、检查点、有界周期、参数约束 `ttl ≥ loop_wait + retry_timeout + safety_margin`、pause 豁免、优雅关停）；P4 补充「或租约到期」；W2 改为目标并写明 watchdog 未接入；第 9 节新增 5 项（watchdog 未接入、动态 `ttl` 不改变锁的 TTL、TTL 按墙钟判断、`Request.now` 注释、关停 drain 期间不续锁）。第 9 节原来没有 R19 和 follower 转发余量的条目，二者由本项关闭，不再登记。实现分 2 个提交：第 1 个提交 DCS 写上限、参数约束、HA 循环定时器不补发错过的 tick；第 2 个提交 leader 租约、租约到期围栏与优雅关停的处理。第 2 个提交完成前，租约相关的条目以本文为目标语义。第 2 个提交：优雅关停在收到信号时（drain 之前）检查租约，不在 drain 之后检查（drain 默认 30 秒，长于默认租约 25 秒，之后检查会让健康主库的正常关停几乎都走围栏）；drain 期间不续锁的既有缺口登记到第 9 节；补充检查点和关停的日志文本 |
 | 2026-10-25 | 任务 3：1a 增加启动规则、降级先写 `standby.signal`（适用于所有停掉不持锁可写主的路径）、rewind 检查标记、`/timeline` 与带标记节点的选举规则、rewind 失败处理；R2 增加带标记节点 timeline 比较的例外说明；修正 P4 的 degraded 语义；第 9 节删除已闭合的「降级不写 standby.signal」，登记 5 项。实现分 5 个提交，完成前以本文为目标语义；第 5 个提交补充 rewind 失败日志里原因与数据目录大小的取法；并写明 pg_rewind 成功后 PG 启动失败进入保持时 rewind 检查标记已删除、删除保持文件后先以备库重试启动（连续 3 次失败后再 pg_rewind） |
