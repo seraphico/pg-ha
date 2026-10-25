@@ -464,7 +464,10 @@ impl RaftLogReader<TypeConfig> for Arc<MemStore> {
 
 impl RaftSnapshotBuilder<TypeConfig> for Arc<MemStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let inner = self.inner.read().await;
+        // Write lock: openraft discards the returned bytes and later calls
+        // get_current_snapshot, so the snapshot must be stored before this
+        // returns, and it must match the state machine it was built from.
+        let mut inner = self.inner.write().await;
 
         let data = serde_json::to_vec(&inner.state_machine).map_err(|e| {
             StorageError::from_io_error(
@@ -487,6 +490,11 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<MemStore> {
             last_membership: inner.last_membership.clone(),
             snapshot_id,
         };
+
+        inner.snapshot = Some(StoredSnapshot {
+            meta: meta.clone(),
+            data: data.clone(),
+        });
 
         Ok(Snapshot {
             meta,
@@ -1357,6 +1365,32 @@ mod tests {
             .append_to_log(vec![blank_entry(1)])
             .await
             .expect("append_to_log");
+    }
+
+    /// openraft keeps only the snapshot metadata from `build_snapshot` and later
+    /// reads the bytes back with `get_current_snapshot` (its test suite requires
+    /// this, and replication turns a missing snapshot into a fatal storage error).
+    #[tokio::test]
+    async fn build_snapshot_is_returned_by_get_current_snapshot() {
+        let mut store = Arc::new(MemStore::new());
+        store
+            .apply_to_state_machine(&[blank_entry(1), blank_entry(2)])
+            .await
+            .expect("apply");
+
+        let built = store.build_snapshot().await.expect("build snapshot");
+        let current = store
+            .get_current_snapshot()
+            .await
+            .expect("get snapshot")
+            .expect("built snapshot must stay stored for replication");
+
+        assert_eq!(current.meta, built.meta);
+        assert_eq!(
+            current.snapshot.into_inner(),
+            built.snapshot.into_inner(),
+            "stored snapshot bytes must match the snapshot that was built"
+        );
     }
 
     // ─── Helper functions ───
