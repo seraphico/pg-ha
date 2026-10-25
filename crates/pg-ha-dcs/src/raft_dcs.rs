@@ -19,7 +19,7 @@ use pg_ha_core::dcs::DcsAdapter;
 use pg_ha_core::error::{Error, Result};
 
 use crate::network::NetworkFactory;
-use crate::state_machine::{KvEntry, Request, Response, current_millis};
+use crate::state_machine::{KvEntry, Request, Response, current_millis, stamp_leader_time};
 use crate::store::{MemStore, NodeId, TypeConfig};
 
 /// DCS adapter built on top of embedded Raft
@@ -233,7 +233,8 @@ impl RaftDcs {
                 };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(3),
-                    self.raft.client_write(test_req),
+                    self.raft
+                        .client_write(stamp_leader_time(test_req, current_millis())),
                 )
                 .await
                 {
@@ -319,7 +320,13 @@ impl RaftDcs {
     }
 
     async fn propose_unbounded(&self, request: Request) -> Result<Response> {
-        let result = self.raft.client_write(request.clone()).await;
+        // Stamp only the copy this node appends. A forwarded request is stamped
+        // again by the leader in `handle_client_write`, so a follower's clock
+        // never becomes the log entry's `now`.
+        let result = self
+            .raft
+            .client_write(stamp_leader_time(request.clone(), current_millis()))
+            .await;
         match result {
             Ok(resp) => Ok(resp.data),
             Err(e) => {
