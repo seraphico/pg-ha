@@ -56,6 +56,27 @@ impl std::fmt::Display for CycleResult {
     }
 }
 
+/// The HA state the REST API serves about this node (H1/H2 inputs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiSnapshot {
+    pub role: MemberRole,
+    pub state: crate::cluster::MemberState,
+    pub pg_running: bool,
+    pub pg_in_recovery: Option<bool>,
+    pub is_leader: bool,
+    pub is_paused: bool,
+    pub pending_restart: bool,
+}
+
+/// Hook that writes an [`ApiSnapshot`] into the REST API state. The HA engine
+/// awaits it on demotion / fence paths, so the HTTP plane stops advertising
+/// primary before PostgreSQL stops and before any post-stop DCS write.
+pub type StatePublisher = Arc<
+    dyn Fn(ApiSnapshot) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// The HA decision engine
 pub struct Ha {
     config: Config,
@@ -116,6 +137,10 @@ pub struct Ha {
     /// The lease `run_cycle_bounded` races against: `leader_lease`, or None
     /// in pause mode (W1).
     fence_deadline_tx: tokio::sync::watch::Sender<Option<LeaderLease>>,
+
+    /// Publishes the REST API state from inside a cycle (demotion / fence
+    /// paths). None: only the HA loop publishes, after each cycle.
+    state_publisher: Option<StatePublisher>,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -152,8 +177,28 @@ impl Ha {
             rewind_hold_logged_at: None,
             leader_lease: None,
             fence_deadline_tx: tokio::sync::watch::Sender::new(None),
+            state_publisher: None,
         };
         (ha, cmd_tx)
+    }
+
+    /// Install the hook that publishes the REST API state from inside a
+    /// cycle (see [`StatePublisher`]).
+    pub fn set_state_publisher(&mut self, publisher: StatePublisher) {
+        self.state_publisher = Some(publisher);
+    }
+
+    /// The REST API state derived from the current HA state.
+    pub fn api_snapshot(&self) -> ApiSnapshot {
+        ApiSnapshot {
+            role: self.postgresql.role().clone(),
+            state: self.advertised_state(),
+            pg_running: self.postgresql.is_running(),
+            pg_in_recovery: self.postgresql.observed_in_recovery(),
+            is_leader: self.is_leader,
+            is_paused: self.is_paused,
+            pending_restart: self.pending_restart(),
+        }
     }
 
     /// Run one HA cycle, raced against the leader lease (L5 time bound).
@@ -1051,6 +1096,8 @@ mod tests {
         leader_write_delay: Mutex<std::time::Duration>,
         /// `ttl()`: the TTL written into the lock.
         lock_ttl: std::sync::atomic::AtomicU64,
+        /// Number of `touch_member` calls.
+        touch_count: std::sync::atomic::AtomicUsize,
     }
 
     impl MockDcs {
@@ -1067,6 +1114,7 @@ mod tests {
                 hang_leader_writes: std::sync::atomic::AtomicBool::new(false),
                 leader_write_delay: Mutex::new(std::time::Duration::ZERO),
                 lock_ttl: std::sync::atomic::AtomicU64::new(30),
+                touch_count: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -1090,6 +1138,7 @@ mod tests {
                 hang_leader_writes: std::sync::atomic::AtomicBool::new(false),
                 leader_write_delay: Mutex::new(std::time::Duration::ZERO),
                 lock_ttl: std::sync::atomic::AtomicU64::new(30),
+                touch_count: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -1194,6 +1243,8 @@ mod tests {
         }
 
         async fn touch_member(&self, data: &serde_json::Value) -> Result<bool> {
+            self.touch_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.last_member_data.lock().unwrap() = Some(data.clone());
             Ok(true)
         }
@@ -2696,6 +2747,67 @@ mod tests {
         assert_demoted_files(&dir, &ha, "demoted after losing the leader lock");
         assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
         assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H1 on demotion: the REST API state shows a non-primary before
+    /// PostgreSQL is stopped and before the post-stop `touch_member` is
+    /// awaited (on a minority Raft leader that write waits retry_timeout).
+    #[tokio::test]
+    async fn test_demotion_publishes_non_primary_before_stop_and_touch_member() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        dcs.fail_leader_writes();
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "test_node",
+            "h1-demote-publish",
+            dcs.clone(),
+            Some(false),
+            false,
+            Some(fake_pg_bin(FakeBin::PgCtlStopOk)),
+        );
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_leader = true;
+        ha.postgresql.set_role(MemberRole::Primary);
+        // (snapshot, touch_member calls so far) at every publish
+        let published: Arc<Mutex<Vec<(ApiSnapshot, usize)>>> = Arc::default();
+        let (rec, counter) = (published.clone(), dcs.clone());
+        ha.set_state_publisher(Arc::new(move |snapshot| {
+            let touched = counter
+                .touch_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            rec.lock().unwrap().push((snapshot, touched));
+            Box::pin(async {})
+        }));
+
+        // update_leader -> Err -> demote(): stop, then touch_member
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m.starts_with("demoted self")),
+            "got: {result}"
+        );
+        assert!(!ha.stop_pending, "fake pg_ctl stop succeeded");
+        assert_eq!(dcs.touch_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let published = published.lock().unwrap().clone();
+        let non_primary = |s: &ApiSnapshot| {
+            !s.is_leader && s.role != MemberRole::Primary && s.pg_in_recovery.is_none()
+        };
+        // Before the stop: PostgreSQL still running, nothing touched yet.
+        let (first, touched) = published.first().expect("published before the stop");
+        assert!(non_primary(first), "{first:?}");
+        assert!(first.pg_running, "published before the stop: {first:?}");
+        assert_eq!(*touched, 0);
+        // After the stop, still before touch_member.
+        assert!(
+            published
+                .iter()
+                .any(|(s, t)| non_primary(s) && !s.pg_running && *t == 0),
+            "{published:?}"
+        );
+        assert!(
+            published.iter().all(|(s, _)| non_primary(s)),
+            "{published:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -158,6 +158,22 @@ impl Ha {
         }
     }
 
+    /// Publish the REST API state of a node that is being demoted or fenced:
+    /// not the leader, not Primary, recovery state unobserved. `/primary` is
+    /// then 503 whatever the HA state still says until the cycle ends.
+    pub(super) async fn publish_not_primary(&self) {
+        let Some(publish) = self.state_publisher.as_ref() else {
+            return;
+        };
+        let mut snapshot = self.api_snapshot();
+        snapshot.is_leader = false;
+        if snapshot.role == MemberRole::Primary {
+            snapshot.role = MemberRole::Replica;
+        }
+        snapshot.pg_in_recovery = None;
+        publish(snapshot).await;
+    }
+
     /// Stop PostgreSQL on a demotion / fence path after standby.signal was
     /// written. A failed stop sets `stop_pending`, so later cycles keep fencing
     /// an unobserved server even though standby.signal now exists (A19). A
@@ -167,7 +183,13 @@ impl Ha {
         &mut self,
         mode: &str,
     ) -> crate::error::Result<()> {
-        if let Err(e) = self.postgresql.stop(mode).await {
+        // H1: the REST API stops advertising primary before PostgreSQL stops
+        // being writable, and again after the stop, before the post-stop DCS
+        // write (which may wait up to retry_timeout on a minority).
+        self.publish_not_primary().await;
+        let stopped = self.postgresql.stop(mode).await;
+        self.publish_not_primary().await;
+        if let Err(e) = stopped {
             self.stop_pending = true;
             error!(
                 "Failed to stop PostgreSQL after writing standby.signal: {e}; pg-ha keeps fencing it until it is confirmed stopped"
