@@ -43,6 +43,11 @@ impl Ha {
             return CycleResult::Follower("no action in pause mode (cluster has no leader)".into());
         }
 
+        // D5: a held node never campaigns (and is stopped if started by hand).
+        if let Some(r) = self.enforce_rewind_hold().await {
+            return r;
+        }
+
         // ─── May this node take part at all? (see `identity`) ───
         let identity = self.pg_identity();
         match election_stance(identity, self.stop_pending) {
@@ -144,40 +149,28 @@ impl Ha {
 
         // ─── Stale primary detection ───
         // If PG is observed as a primary AND we're not the healthiest node,
-        // this is a former primary that restarted after failover. It needs to rejoin
-        // as a replica even though we can't see the new leader in DCS yet.
+        // this is a former primary that restarted after failover. With no
+        // lock holder there is no ready pg_rewind source (A12), so it is only
+        // stopped (A22): it starts as a standby (with the rewind-check
+        // marker) and is rewound once a leader runs as a primary.
         if identity == PgIdentity::Primary
             && !self.is_healthiest_node()
             && !self.cluster.members.is_empty()
         {
-            // Prefer the leader member, then any primary-role member, then any running member
-            let source_member = self
-                .cluster
-                .leader
-                .as_ref()
-                .and_then(|l| self.cluster.get_member(&l.name))
-                .filter(|m| m.state == crate::cluster::MemberState::Running)
-                .or_else(|| {
-                    self.cluster.members.iter().find(|m| {
-                        m.name != self.config.name
-                            && m.role == crate::cluster::MemberRole::Primary
-                            && m.state == crate::cluster::MemberState::Running
-                    })
-                })
-                .or_else(|| {
-                    self.cluster.members.iter().find(|m| {
-                        m.name != self.config.name
-                            && m.state == crate::cluster::MemberState::Running
-                    })
-                });
-            if let Some(source) = source_member {
-                info!(
-                    source = %source.name,
-                    "Stale primary detected (no leader visible, not healthiest) — initiating rejoin"
-                );
-                let source_name = source.name.clone();
-                return self.rejoin_as_replica(&source_name).await;
+            info!(
+                "Stale primary detected (no leader visible, not healthiest) — stopping PostgreSQL; it will start as a standby and be rewound once a leader runs as a primary"
+            );
+            // No lock holder, so no upstream (D3).
+            if let Err(e) = self
+                .fence_primary("fast", "stopped as a stale primary", None)
+                .await
+            {
+                return CycleResult::Error(format!("stale primary: stop failed: {e}"));
             }
+            let _ = self.touch_member().await;
+            return CycleResult::Follower(
+                "stale primary: stopped PostgreSQL; it will start as a standby and be rewound once a leader runs as a primary".into(),
+            );
         }
 
         // ─── Normal election logic ───

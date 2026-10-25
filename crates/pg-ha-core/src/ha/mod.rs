@@ -93,7 +93,21 @@ pub struct Ha {
     /// Last (`/timeline`, own timeline) pair warned about as "recorded ahead",
     /// so the warning is not repeated every cycle.
     timeline_ahead_warned: Option<(u64, u64)>,
+
+    /// D5: held after a pg_rewind failure (A11). The hold file
+    /// (PGDATA/pg-ha.rewind_failed) is the source of truth; this flag covers
+    /// a failed write of that file.
+    rewind_hold: bool,
+    /// The hold file was written for the current hold (so its removal means
+    /// the operator released the hold).
+    rewind_hold_persisted: bool,
+    /// When the full hold ERROR was last logged (at most every
+    /// `REWIND_HOLD_LOG_INTERVAL`).
+    rewind_hold_logged_at: Option<std::time::Instant>,
 }
+
+/// How often the full rewind-hold ERROR is repeated while the node is held.
+const REWIND_HOLD_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Sender half for submitting commands to the HA engine
 pub type CommandSender = mpsc::Sender<(ManagementCommand, mpsc::Sender<CommandResponse>)>;
@@ -121,6 +135,9 @@ impl Ha {
             stop_pending: false,
             promote_timeline_target: None,
             timeline_ahead_warned: None,
+            rewind_hold: false,
+            rewind_hold_persisted: false,
+            rewind_hold_logged_at: None,
         };
         (ha, cmd_tx)
     }
@@ -587,34 +604,30 @@ impl Ha {
             return CycleResult::Follower("postgres is not running (paused)".into());
         }
 
+        // D5: a node held after a pg_rewind failure is never started.
+        if let Some(r) = self.enforce_rewind_hold().await {
+            return r;
+        }
+
         // If PG has failed to start multiple times (e.g., timeline mismatch after failover),
         // trigger a rejoin via pg_rewind instead of endlessly retrying start.
+        // Only against the lock holder (A12: rejoin_as_replica checks that it
+        // is ready); without a leader, keep starting it as a standby.
         if self.start_fail_count >= 3 && self.has_standby_signal() {
-            warn!(
-                fail_count = self.start_fail_count,
-                "PostgreSQL failed to start {} times — triggering rejoin via pg_rewind",
-                self.start_fail_count
-            );
+            let fail_count = self.start_fail_count;
             self.start_fail_count = 0;
-
-            // Find the current primary to rewind from
-            let leader_name = self.cluster.leader.as_ref().map(|l| l.name.clone());
+            let leader_name = self
+                .cluster
+                .leader
+                .as_ref()
+                .map(|l| l.name.clone())
+                .filter(|n| n != &self.config.name);
             if let Some(name) = leader_name {
+                warn!(
+                    fail_count,
+                    "PostgreSQL failed to start {fail_count} times — triggering rejoin via pg_rewind"
+                );
                 return self.rejoin_as_replica(&name).await;
-            } else {
-                // No leader visible — find any running member
-                let source = self
-                    .cluster
-                    .members
-                    .iter()
-                    .find(|m| {
-                        m.name != self.config.name
-                            && m.state == crate::cluster::MemberState::Running
-                    })
-                    .map(|m| m.name.clone());
-                if let Some(name) = source {
-                    return self.rejoin_as_replica(&name).await;
-                }
             }
         }
 
@@ -1143,6 +1156,7 @@ mod tests {
                     password: None,
                     dbname: "postgres".to_string(),
                 },
+                remove_data_directory_on_rewind_failure: false,
                 parameters: HashMap::new(),
             },
             restapi: RestApiConfig {
@@ -2905,12 +2919,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_rejoin_of_running_primary_writes_signal_and_marker_before_stop() {
-        let (mut ha, dir) = identity_test_ha(
+        // The source answers as a primary (psql stub), so the rejoin gets
+        // past the readiness check to the fenced stop.
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
             "node2",
             "c2-rejoin-fence",
             Arc::new(MockDcs::with_leader("node1")),
             Some(false),
             false,
+            Some(fake_pg_bin(FakeBin::RewindOk)),
         );
         ha.cluster = cluster_led_by("node1", None, "node2");
 
@@ -3065,13 +3082,37 @@ mod tests {
         /// pg_ctl: `stop` succeeds and removes postmaster.pid; anything else
         /// fails at once. Only for tests that never call start().
         PgCtlStopOk,
+        /// pg_rewind succeeds ("no rewind required"); psql answers `f`.
+        RewindOk,
+        /// pg_rewind fails with a WAL error; psql answers `f`.
+        RewindFail,
+        /// pg_rewind succeeds; psql answers `t` (source in recovery).
+        SourceInRecovery,
+        /// pg_rewind succeeds and leaves a postmaster.pid of the test process
+        /// (pg_ctl -w timed out while the postmaster keeps starting); psql `f`.
+        RewindOkThenRunning,
+        /// psql answers `f` once per counter file, then fails (the source
+        /// stopped during the local stop). The counter file is the
+        /// `application_name=` value at the end of the conn_url. pg_rewind
+        /// as `RewindOk`.
+        SourceStopsAfterFirstProbe,
     }
 
+    /// pg_rewind --target-pgdata <dir> ...: $2 is the data directory.
+    const FAKE_REWIND_OK: &str =
+        "touch \"$2/pg-ha-test.rewind_called\"\necho 'pg_rewind: no rewind required'\nexit 0\n";
+    const FAKE_PSQL_PRIMARY: &str = "echo f\nexit 0\n";
+
     impl FakeBin {
-        const ALL: [FakeBin; 3] = [
+        const ALL: [FakeBin; 8] = [
             FakeBin::ControldataInProduction,
             FakeBin::ControldataShutDownInRecovery,
             FakeBin::PgCtlStopOk,
+            FakeBin::RewindOk,
+            FakeBin::RewindFail,
+            FakeBin::SourceInRecovery,
+            FakeBin::RewindOkThenRunning,
+            FakeBin::SourceStopsAfterFirstProbe,
         ];
 
         fn dir_name(self) -> &'static str {
@@ -3079,6 +3120,11 @@ mod tests {
                 FakeBin::ControldataInProduction => "controldata-in-production",
                 FakeBin::ControldataShutDownInRecovery => "controldata-shut-down-in-recovery",
                 FakeBin::PgCtlStopOk => "pg-ctl-stop-ok",
+                FakeBin::RewindOk => "rewind-ok",
+                FakeBin::RewindFail => "rewind-fail",
+                FakeBin::SourceInRecovery => "source-in-recovery",
+                FakeBin::RewindOkThenRunning => "rewind-ok-then-running",
+                FakeBin::SourceStopsAfterFirstProbe => "source-stops-after-first-probe",
             }
         }
 
@@ -3098,6 +3144,34 @@ mod tests {
                     "pg_ctl",
                     "[ \"$1\" = stop ] || exit 1\nrm -f \"$3/postmaster.pid\"\nexit 0\n",
                 )],
+                FakeBin::RewindOk => {
+                    vec![("pg_rewind", FAKE_REWIND_OK), ("psql", FAKE_PSQL_PRIMARY)]
+                }
+                FakeBin::RewindFail => vec![
+                    (
+                        "pg_rewind",
+                        "touch \"$2/pg-ha-test.rewind_called\"\necho 'pg_rewind: error: could not find previous WAL record at 0/3000060' >&2\nexit 1\n",
+                    ),
+                    ("psql", FAKE_PSQL_PRIMARY),
+                ],
+                FakeBin::SourceInRecovery => {
+                    vec![("pg_rewind", FAKE_REWIND_OK), ("psql", "echo t\nexit 0\n")]
+                }
+                FakeBin::RewindOkThenRunning => vec![
+                    (
+                        "pg_rewind",
+                        "touch \"$2/pg-ha-test.rewind_called\"\necho \"$PPID\" > \"$2/postmaster.pid\"\nexit 0\n",
+                    ),
+                    ("psql", FAKE_PSQL_PRIMARY),
+                ],
+                // -X -tAq -w -d <conn_url> -c ...: $5 is the conn_url.
+                FakeBin::SourceStopsAfterFirstProbe => vec![
+                    ("pg_rewind", FAKE_REWIND_OK),
+                    (
+                        "psql",
+                        "m=\"${5##*application_name=}\"\n[ -e \"$m\" ] && exit 2\n: > \"$m\"\necho f\n",
+                    ),
+                ],
             }
         }
     }
@@ -4188,6 +4262,756 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ─────────────────── Rewind check (D4) and rewind failure hold (D5) ───────────────────
+
+    use crate::standby_config::REWIND_HOLD_FILE;
+
+    const HOLD_RESULT: &str = "PostgreSQL stopped after a pg_rewind failure; operator action required (see the ERROR log)";
+
+    fn rewind_called(dir: &std::path::Path) -> bool {
+        dir.join("pg-ha-test.rewind_called").exists()
+    }
+
+    fn put_marker(dir: &std::path::Path) {
+        crate::standby_config::create_rewind_check_marker(dir, "test").unwrap();
+    }
+
+    fn put_signal(dir: &std::path::Path) {
+        std::fs::write(dir.join("standby.signal"), "").unwrap();
+    }
+
+    fn put_hold(dir: &std::path::Path) {
+        crate::standby_config::write_rewind_hold(dir, "pg_rewind", "pg_rewind: error: test")
+            .unwrap();
+    }
+
+    /// node1 holds the lock and is a running primary at host=node1; node2 runs.
+    fn ready_cluster() -> Cluster {
+        cluster_led_by("node1", None, "node2")
+    }
+
+    fn is_error_starting(result: &CycleResult, prefix: &str) -> bool {
+        matches!(result, CycleResult::Error(m) if m.starts_with(prefix))
+    }
+
+    fn follower_containing(result: &CycleResult, text: &str) -> bool {
+        matches!(result, CycleResult::Follower(m) if m.contains(text))
+    }
+
+    #[tokio::test]
+    async fn test_marked_standby_with_ready_leader_runs_rewind_check() {
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-rewind-check",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        put_marker(&dir);
+        ha.cluster = ready_cluster();
+
+        let result = ha.process_healthy_cluster().await;
+
+        // Rejoin chosen, DCS check and live probe passed, then the stop of
+        // the standby failed (no pg_ctl): pg_rewind not reached.
+        assert!(is_error_starting(&result, "Rejoin stop failed"), "{result}");
+        assert_eq!(ha.postgresql().observed_in_recovery(), None);
+        assert!(marker(&dir).is_some());
+        assert!(!rewind_called(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rewind_skipped_when_source_answers_in_recovery() {
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-probe-in-recovery",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::SourceInRecovery)),
+        );
+        put_marker(&dir);
+        ha.cluster = ready_cluster();
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            follower_containing(
+                &result,
+                "not running pg_rewind: node1 does not answer as a primary yet (it is in recovery)"
+            ),
+            "{result}"
+        );
+        assert_eq!(
+            ha.postgresql().observed_in_recovery(),
+            Some(true),
+            "not stopped"
+        );
+        assert!(!rewind_called(&dir));
+        assert!(!dir.join(REWIND_HOLD_FILE).exists());
+        assert!(marker(&dir).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rewind_skipped_when_source_unreachable() {
+        // No psql in bin_dir: the probe gives no answer.
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-probe-unreachable",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+            None,
+        );
+        put_marker(&dir);
+        ha.cluster = ready_cluster();
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            follower_containing(
+                &result,
+                "does not answer as a primary yet (connection or query failed)"
+            ),
+            "{result}"
+        );
+        assert_eq!(
+            ha.postgresql().observed_in_recovery(),
+            Some(true),
+            "not stopped"
+        );
+        assert!(!rewind_called(&dir));
+        assert!(!dir.join(REWIND_HOLD_FILE).exists());
+        assert!(marker(&dir).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rewind_skipped_when_source_stops_during_local_stop() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c5-probe2",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(fake_pg_bin(FakeBin::SourceStopsAfterFirstProbe)),
+        );
+        put_signal(&dir);
+        put_marker(&dir);
+        let counter = dir.join("probe-count");
+        let url = format!(
+            "host=node1 port=5432 application_name={}",
+            counter.display()
+        );
+        ha.cluster = cluster_led_by("node1", Some(&url), "node2");
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(counter.exists(), "first probe answered");
+        assert!(
+            follower_containing(&result, "does not answer as a primary yet")
+                && follower_containing(&result, "PostgreSQL stopped"),
+            "{result}"
+        );
+        assert!(!rewind_called(&dir));
+        assert!(!dir.join(REWIND_HOLD_FILE).exists());
+        assert!(marker(&dir).is_some());
+        assert!(!ha.rewind_hold);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_primary_rejoin_fenced_when_source_probe_fails() {
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-primary-probe-fails",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+            Some(fake_pg_bin(FakeBin::SourceInRecovery)),
+        );
+        ha.cluster = ready_cluster();
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(is_error_starting(&result, "Rejoin stop failed"), "{result}");
+        assert!(dir.join("standby.signal").is_file());
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(m.contains("leader not ready for pg_rewind"), "{m}");
+        assert!(ha.stop_pending);
+        assert!(!rewind_called(&dir));
+        assert!(!dir.join(REWIND_HOLD_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rewind_then_slow_start_is_not_a_failure() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c5-slow-start",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(fake_pg_bin(FakeBin::RewindOkThenRunning)),
+        );
+        put_signal(&dir);
+        put_marker(&dir);
+        ha.cluster = ready_cluster();
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(rewind_called(&dir));
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m == "rejoined via pg_rewind; PostgreSQL still starting"),
+            "{result}"
+        );
+        assert_eq!(marker(&dir), None, "marker removed after pg_rewind");
+        assert!(!dir.join(REWIND_HOLD_FILE).exists());
+        assert!(!ha.rewind_hold);
+        assert_eq!(ha.postgresql().state(), PgState::Starting);
+        assert!(dir.join("PG_VERSION").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_marked_standby_waits_for_leader_running_as_primary() {
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-wait-leader",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        put_marker(&dir);
+        // node1 holds the lock but its member record says replica.
+        ha.cluster = leader_cluster("node1", "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            follower_containing(
+                &result,
+                "rewind-check marker present; waiting for node1 to run as a primary before pg_rewind"
+            ),
+            "{result}"
+        );
+        assert_eq!(
+            ha.postgresql().observed_in_recovery(),
+            Some(true),
+            "not stopped"
+        );
+        assert!(!rewind_called(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_unmarked_standby_follows() {
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-unmarked",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        ha.cluster = ready_cluster();
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            follower_containing(&result, "no action. I am (node2), a secondary"),
+            "{result}"
+        );
+        assert!(!rewind_called(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_primary_rejoin_stops_when_leader_not_ready() {
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-primary-not-ready",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        ha.cluster = leader_cluster("node1", "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(is_error_starting(&result, "Rejoin stop failed"), "{result}");
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert!(!rewind_called(&dir));
+        assert!(dir.join("standby.signal").is_file());
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(m.contains("leader not ready for pg_rewind"), "{m}");
+        assert!(ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rejoin_refuses_source_that_is_not_the_lock_holder() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c5-not-lock-holder",
+            Arc::new(MockDcs::new()),
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        let mut cluster = ready_cluster();
+        cluster.leader = None;
+        ha.cluster = cluster;
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(
+            follower_containing(&result, "not the leader-lock holder"),
+            "{result}"
+        );
+        assert!(!rewind_called(&dir));
+        assert!(!dir.join(REWIND_HOLD_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_stale_primary_is_stopped_not_rewound() {
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-stale",
+            dcs.clone(),
+            Some(false),
+            false,
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        ha.cluster = unlocked(
+            vec![running_member("node2", 1), running_member("node1", 100)],
+            None,
+        );
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            is_error_starting(&result, "stale primary: stop failed"),
+            "{result}"
+        );
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert!(!rewind_called(&dir));
+        assert_eq!(lock_held_by(&dcs), None);
+        assert!(dir.join("standby.signal").is_file());
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(m.contains("stopped as a stale primary"), "{m}");
+        assert!(ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_fail_count_without_leader_does_not_rewind() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c5-fail-count-no-leader",
+            Arc::new(MockDcs::new()),
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        put_signal(&dir);
+        ha.start_fail_count = 3;
+        ha.cluster = unlocked(
+            vec![running_member("node1", 100), running_member("node2", 50)],
+            None,
+        );
+
+        let _ = ha.handle_postgres_not_running().await;
+
+        assert_start_attempted(&ha, 1);
+        assert!(!rewind_called(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_fail_count_with_ready_leader_rewinds() {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            "c5-fail-count-leader",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        put_signal(&dir);
+        put_marker(&dir);
+        ha.start_fail_count = 3;
+        ha.cluster = ready_cluster();
+
+        let _ = ha.handle_postgres_not_running().await;
+
+        assert!(rewind_called(&dir));
+        assert_eq!(marker(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stopped node2 with standby.signal and the marker, node1 ready.
+    fn rewind_test_ha(label: &str, kind: FakeBin) -> (Ha, PathBuf, CommandSender) {
+        let (mut ha, dir, tx) = stopped_pg_test_ha(
+            "node2",
+            label,
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(fake_pg_bin(kind)),
+        );
+        put_signal(&dir);
+        put_marker(&dir);
+        ha.cluster = ready_cluster();
+        (ha, dir, tx)
+    }
+
+    #[tokio::test]
+    async fn test_rewind_failure_holds_node_by_default() {
+        let (mut ha, dir, _tx) = rewind_test_ha("c5-hold", FakeBin::RewindFail);
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m == HOLD_RESULT && m.contains("operator action required")),
+            "{result}"
+        );
+        assert!(rewind_called(&dir));
+        let hold = std::fs::read_to_string(dir.join(REWIND_HOLD_FILE)).expect("hold file");
+        assert!(
+            hold.starts_with(
+                "pg_rewind failed: pg_rewind: error: could not find previous WAL record at 0/3000060\n"
+            ),
+            "{hold}"
+        );
+        assert!(marker(&dir).is_some(), "marker kept");
+        assert!(dir.join("PG_VERSION").exists(), "data directory kept");
+        assert_eq!(ha.postgresql().state(), PgState::Unknown, "not started");
+        assert!(ha.rewind_hold && ha.rewind_hold_persisted);
+        assert!(ha.rewind_hold_logged_at.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rewind_failure_rebuilds_when_enabled() {
+        let (mut ha, dir, _tx) = rewind_test_ha("c5-rebuild", FakeBin::RewindFail);
+        ha.config.postgresql.remove_data_directory_on_rewind_failure = true;
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(
+            is_error_starting(&result, "Rejoin failed: rewind=")
+                && matches!(result, CycleResult::Error(ref m) if m.contains(", basebackup=")),
+            "{result}"
+        );
+        assert!(!dir.join("PG_VERSION").exists(), "data directory emptied");
+        assert!(!dir.join(REWIND_HOLD_FILE).exists());
+        assert!(!ha.rewind_hold);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_successful_rewind_removes_marker_then_holds_on_start_failure() {
+        let (mut ha, dir, _tx) = rewind_test_ha("c5-start-fails", FakeBin::RewindOk);
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(rewind_called(&dir));
+        assert_eq!(marker(&dir), None, "marker removed after pg_rewind");
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m == HOLD_RESULT),
+            "{result}"
+        );
+        let hold = std::fs::read_to_string(dir.join(REWIND_HOLD_FILE)).expect("hold file");
+        assert!(
+            hold.starts_with("Starting PostgreSQL after pg_rewind failed"),
+            "{hold}"
+        );
+        assert!(dir.join("PG_VERSION").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_held_node_is_not_started() {
+        let (mut ha, dir, _tx) = rewind_test_ha("c5-held-not-started", FakeBin::RewindOk);
+        put_hold(&dir);
+
+        let result = ha.handle_postgres_not_running().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m == HOLD_RESULT),
+            "{result}"
+        );
+        assert_not_started(&ha);
+        assert!(!rewind_called(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hold_survives_agent_restart() {
+        let (ha, dir, _tx) = rewind_test_ha("c5-hold-restart", FakeBin::RewindOk);
+        put_hold(&dir);
+        let config = ha.config.clone();
+        drop(ha);
+
+        // A new agent: the in-memory hold flags start out false.
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, _tx2) = Ha::new(config, Arc::new(MockDcs::with_leader("node1")), pg);
+        ha.cluster = ready_cluster();
+        assert!(!ha.rewind_hold);
+
+        let result = ha.handle_postgres_not_running().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m == HOLD_RESULT),
+            "{result}"
+        );
+        assert_not_started(&ha);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_deleting_hold_file_allows_one_retry() {
+        let (mut ha, dir, _tx) = rewind_test_ha("c5-hold-retry", FakeBin::RewindFail);
+        let _ = ha.rejoin_as_replica("node1").await;
+        assert!(dir.join(REWIND_HOLD_FILE).is_file());
+
+        std::fs::remove_file(dir.join(REWIND_HOLD_FILE)).unwrap();
+        // (a) the operator released the hold
+        assert!(!ha.refresh_rewind_hold());
+        assert!(!ha.rewind_hold);
+        // (b) started again as a standby
+        let _ = ha.handle_postgres_not_running().await;
+        assert_eq!(ha.postgresql().state(), PgState::Starting);
+        // (c) one more pg_rewind, which fails and holds again
+        std::fs::remove_file(dir.join("pg-ha-test.rewind_called")).unwrap();
+        let result = ha.rejoin_as_replica("node1").await;
+        assert!(rewind_called(&dir), "pg_rewind ran again");
+        assert!(dir.join(REWIND_HOLD_FILE).is_file(), "{result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hold_file_write_failure_keeps_memory_hold() {
+        let (mut ha, dir, _tx) = rewind_test_ha("c5-hold-eisdir", FakeBin::RewindFail);
+        std::fs::create_dir(dir.join(REWIND_HOLD_FILE)).unwrap();
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(rewind_called(&dir), "a directory is not a hold file");
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("operator action required")),
+            "{result}"
+        );
+        assert!(ha.rewind_hold && !ha.rewind_hold_persisted);
+        assert!(dir.join("PG_VERSION").exists());
+        std::fs::remove_dir(dir.join(REWIND_HOLD_FILE)).unwrap();
+        assert!(ha.refresh_rewind_hold(), "the in-memory hold stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_held_node_rebuilds_when_enabled_and_leader_ready() {
+        let (mut ha, dir, _tx) = rewind_test_ha("c5-held-rebuild", FakeBin::RewindFail);
+        put_hold(&dir);
+        ha.config.postgresql.remove_data_directory_on_rewind_failure = true;
+
+        let result = ha.handle_postgres_not_running().await;
+
+        assert!(
+            is_error_starting(&result, "Rejoin failed: rewind="),
+            "{result}"
+        );
+        assert!(!dir.join("PG_VERSION").exists(), "data directory emptied");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_held_node_waits_when_enabled_and_leader_not_ready() {
+        let (mut ha, dir, _tx) = rewind_test_ha("c5-held-wait", FakeBin::RewindFail);
+        put_hold(&dir);
+        ha.config.postgresql.remove_data_directory_on_rewind_failure = true;
+        ha.cluster = unlocked(
+            vec![running_member("node1", 100), running_member("node2", 50)],
+            None,
+        );
+
+        let result = ha.handle_postgres_not_running().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m == "rewind hold: waiting for a leader running as a primary to rebuild from"),
+            "{result}"
+        );
+        assert_not_started(&ha);
+        assert!(!rewind_called(&dir));
+        assert!(dir.join("PG_VERSION").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hold_gate_in_rejoin_stops_running_pg() {
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-hold-gate",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        put_hold(&dir);
+        ha.cluster = ready_cluster();
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(
+            is_error_starting(&result, "rewind hold: stop failed"),
+            "{result}"
+        );
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert!(!rewind_called(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_held_node_started_manually_is_stopped_before_election() {
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir) =
+            identity_test_ha("node2", "c5-held-election", dcs.clone(), Some(true), true);
+        put_hold(&dir);
+        put_marker(&dir);
+        ha.cluster = unlocked(vec![running_member("node2", 100)], None);
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            is_error_starting(&result, "rewind hold: stop failed"),
+            "{result}"
+        );
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert_eq!(lock_held_by(&dcs), None);
+        assert!(!ha.stop_pending, "a standby is stopped directly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_held_node_started_manually_is_stopped_when_following() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c5-held-follow",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+        );
+        put_hold(&dir);
+        ha.cluster = ready_cluster();
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            is_error_starting(&result, "rewind hold: stop failed"),
+            "{result}"
+        );
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_held_primary_started_manually_is_fenced() {
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir) =
+            identity_test_ha("node2", "c5-held-primary", dcs.clone(), Some(false), false);
+        put_hold(&dir);
+        ha.cluster = unlocked(vec![running_member("node2", 100)], None);
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            is_error_starting(&result, "rewind hold: stop failed"),
+            "{result}"
+        );
+        assert!(dir.join("standby.signal").is_file());
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(m.contains("held after a pg_rewind failure"), "{m}");
+        assert!(ha.stop_pending);
+        assert_eq!(lock_held_by(&dcs), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_held_node_already_stopped_reports_hold() {
+        let (mut ha, dir, _tx) = rewind_test_ha("c5-held-stopped", FakeBin::RewindOk);
+        put_hold(&dir);
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m == HOLD_RESULT),
+            "{result}"
+        );
+        assert!(!rewind_called(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reinitialize_clears_hold() {
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-reinit-hold",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+            None,
+        );
+        put_hold(&dir);
+        ha.rewind_hold = true;
+        ha.rewind_hold_persisted = true;
+        ha.is_leader = false;
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Reinitialize).await;
+
+        assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(!ha.rewind_hold);
+        assert!(!ha.refresh_rewind_hold());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_restart_rejected_while_held() {
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-restart-held",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+            None,
+        );
+        put_hold(&dir);
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Restart).await;
+
+        assert_eq!(resp.status, CommandStatus::Rejected);
+        assert_eq!(
+            resp.message,
+            "PostgreSQL is held after a pg_rewind failure; use POST /reinitialize (see the ERROR log)"
+        );
+        assert_eq!(
+            ha.postgresql().observed_in_recovery(),
+            Some(true),
+            "not stopped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_hold_message_is_rate_limited() {
+        let (mut ha, dir, _tx) = rewind_test_ha("c5-hold-rate", FakeBin::RewindOk);
+        put_hold(&dir);
+        assert!(ha.refresh_rewind_hold());
+
+        let _ = ha.report_rewind_hold().await;
+        let first = ha.rewind_hold_logged_at.expect("logged");
+        let _ = ha.report_rewind_hold().await;
+
+        assert_eq!(ha.rewind_hold_logged_at, Some(first), "not logged again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ─────────────────── Source-order checks for the stop paths ───────────────────
     // Stops fail in tests (no pg_ctl), so file assertions alone cannot show
     // that the standby config was written before the stop. These pin it.
@@ -4320,6 +5144,30 @@ mod tests {
 
         let rejoin = body(follow_rs, "async fn rejoin_as_replica");
         assert_before(rejoin, "fence_primary(", DIRECT_STOP, "rejoin");
+        // Step 0b (source not ready): a primary is fenced before any stop.
+        let not_ready = section(follow_rs, "// Step 0b:", &["// Step 1: Stop PostgreSQL"]);
+        assert!(not_ready.contains("fence_primary("), "rejoin step 0b");
+        assert!(
+            !not_ready.contains(DIRECT_STOP),
+            "rejoin step 0b: direct stop"
+        );
+
+        // A22: a stale primary is fenced, not stopped directly or rewound.
+        let stale = section(
+            election_rs,
+            "// ─── Stale primary detection ───",
+            &["// ─── Normal election logic ───"],
+        );
+        assert!(stale.contains("fence_primary("), "stale primary");
+        assert!(!stale.contains(DIRECT_STOP), "stale primary: direct stop");
+        assert!(
+            !stale.contains("rejoin_as_replica("),
+            "stale primary: rewind"
+        );
+
+        // D5: a held primary is fenced; only a standby is stopped directly.
+        let held = body(helpers_rs, "async fn stop_held_postgres");
+        assert_before(held, "fence_primary(", DIRECT_STOP, "stop_held_postgres");
 
         let reinit = body(commands_rs, "async fn handle_reinitialize_command");
         assert_before(reinit, "fence_primary(", DIRECT_STOP, "reinitialize");
@@ -4347,18 +5195,21 @@ mod tests {
         assert_eq!(not_running.matches(START).count(), 1);
         assert_before(not_running, "prepare_standby_start(", START, "start rule");
 
-        // Rejoin: both starts follow a write that returns on failure.
-        let rejoin = body(follow_rs, "async fn rejoin_as_replica");
-        assert_eq!(rejoin.matches(START).count(), 2);
-        for start in rejoin.match_indices(START).map(|(i, _)| i) {
-            let before = &rejoin[..start];
-            let write = before
-                .rfind("self.write_standby_config(")
-                .expect("rejoin: a write before every start");
-            assert!(
-                before[write..].contains("Rejoin: not starting PostgreSQL"),
-                "rejoin: a failed write must return before the start"
-            );
+        // Rejoin and its rebuild fallback: each start follows a write that
+        // returns on failure.
+        for name in ["async fn rejoin_as_replica", "async fn rebuild_from_leader"] {
+            let text = body(follow_rs, name);
+            assert_eq!(text.matches(START).count(), 1, "{name}");
+            for start in text.match_indices(START).map(|(i, _)| i) {
+                let before = &text[..start];
+                let write = before
+                    .rfind("self.write_standby_config(")
+                    .expect("rejoin: a write before every start");
+                assert!(
+                    before[write..].contains("Rejoin: not starting PostgreSQL"),
+                    "{name}: a failed write must return before the start"
+                );
+            }
         }
 
         // POST /restart: the start comes after the prepared stop.
@@ -4372,13 +5223,14 @@ mod tests {
         // follow.rs: rejoin of a non-primary, reconfigure_replica (2);
         // commands.rs: POST /restart while holding the lock, POST /reinitialize
         // of a non-primary;
-        // helpers.rs: stop_after_demotion_write, shutdown of a standby.
+        // helpers.rs: stop_after_demotion_write, shutdown of a standby,
+        // stop_held_postgres of a non-primary.
         let files = [
             ("mod.rs", include_str!("mod.rs"), 0),
             ("follow.rs", include_str!("follow.rs"), 3),
             ("election.rs", include_str!("election.rs"), 0),
             ("commands.rs", include_str!("commands.rs"), 2),
-            ("helpers.rs", include_str!("helpers.rs"), 2),
+            ("helpers.rs", include_str!("helpers.rs"), 3),
             ("identity.rs", include_str!("identity.rs"), 0),
         ];
         for (name, src, expected) in files {

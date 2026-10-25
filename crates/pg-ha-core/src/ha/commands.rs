@@ -204,6 +204,12 @@ impl Ha {
     }
 
     async fn handle_restart_command(&mut self) -> CommandResponse {
+        // D5: a held node stays stopped until the operator reinitializes it.
+        if self.refresh_rewind_hold() {
+            return CommandResponse::rejected(
+                "PostgreSQL is held after a pg_rewind failure; use POST /reinitialize (see the ERROR log)",
+            );
+        }
         info!("Restarting PostgreSQL (requested via API)");
         // D1: pg-ha starts PostgreSQL as a primary only while holding the
         // leader lock. `is_leader` is last cycle's value (commands run before
@@ -264,6 +270,8 @@ impl Ha {
         if let Err(e) = self.postgresql.remove_data_directory() {
             return CommandResponse::error(format!("Remove data dir failed: {e}"));
         }
+        // The hold file went with the data directory (D5).
+        self.clear_rewind_hold();
         CommandResponse::accepted("Node reinitialized, will clone on next cycle")
     }
 }

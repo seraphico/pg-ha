@@ -143,6 +143,11 @@ pub struct PostgresqlConfig {
     /// Replication user connection parameters
     pub replication: ConnectionParams,
 
+    /// When pg_rewind fails (or PostgreSQL does not start after it), delete the
+    /// data directory and rebuild it with pg_basebackup. Off by default: the node
+    /// is stopped and left to the operator (same name as Patroni's option).
+    #[serde(default)]
+    pub remove_data_directory_on_rewind_failure: bool,
     /// Additional PostgreSQL parameters to set in postgresql.conf
     #[serde(default)]
     pub parameters: HashMap<String, String>,
@@ -539,6 +544,7 @@ impl Config {
                     password: Some("secret".to_string()),
                     dbname: "postgres".to_string(),
                 },
+                remove_data_directory_on_rewind_failure: false,
                 parameters: HashMap::from([
                     ("max_connections".to_string(), "100".to_string()),
                     ("wal_level".to_string(), "replica".to_string()),
@@ -694,6 +700,23 @@ proxy:
         assert!(config.tags.nofailover);
         assert_eq!(config.tags.failover_priority, 0);
         assert_eq!(config.tags.replicatefrom, Some("node2".to_string()));
+    }
+
+    #[test]
+    fn test_remove_data_directory_on_rewind_failure_defaults_off() {
+        let config = Config::from_yaml(MINIMAL_YAML).unwrap();
+        assert!(!config.postgresql.remove_data_directory_on_rewind_failure);
+    }
+
+    #[test]
+    fn test_remove_data_directory_on_rewind_failure_can_be_enabled() {
+        let yaml = MINIMAL_YAML.replace(
+            "  bin_dir: /usr/bin\n",
+            "  bin_dir: /usr/bin\n  remove_data_directory_on_rewind_failure: true\n",
+        );
+        assert_ne!(yaml, MINIMAL_YAML);
+        let config = Config::from_yaml(&yaml).unwrap();
+        assert!(config.postgresql.remove_data_directory_on_rewind_failure);
     }
 
     #[test]

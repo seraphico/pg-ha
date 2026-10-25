@@ -87,6 +87,10 @@ pub(crate) enum FollowerAction {
     Rejoin,
     /// A standby pg-ha configured: keep following the upstream.
     Follow,
+    /// A standby pg-ha configured that may hold WAL beyond a fork point
+    /// (pg-ha.rewind_check): verify with pg_rewind against the leader before
+    /// following it (D4).
+    RewindCheck,
     /// Recovery pg-ha did not create: touch nothing, report to the operator.
     HandOff,
     /// Unobserved and no `standby.signal`, so nothing proves it is not a
@@ -102,9 +106,18 @@ pub(crate) enum FollowerAction {
 /// path failed and PostgreSQL was not confirmed stopped since. The signal was
 /// written on a server that may be writable, so it no longer proves the
 /// server is read-only: an unobserved server is fenced again (A19).
-pub(crate) fn follower_action(identity: PgIdentity, stop_pending: bool) -> FollowerAction {
+///
+/// `has_rewind_marker` (D4) only decides whether a managed standby runs a
+/// rewind check before following; it never changes the identity or any other
+/// row.
+pub(crate) fn follower_action(
+    identity: PgIdentity,
+    stop_pending: bool,
+    has_rewind_marker: bool,
+) -> FollowerAction {
     match identity {
         PgIdentity::Primary => FollowerAction::Rejoin,
+        PgIdentity::ManagedStandby if has_rewind_marker => FollowerAction::RewindCheck,
         PgIdentity::ManagedStandby => FollowerAction::Follow,
         PgIdentity::UnmanagedRecovery => FollowerAction::HandOff,
         PgIdentity::Unknown {
@@ -321,6 +334,104 @@ pub(crate) fn should_warn_timeline_ahead(last: Option<(u64, u64)>, k: u64, tl: u
     last != Some((k, tl))
 }
 
+/// A12, DCS part: the rewind source is this cycle's lock holder and its
+/// member record says running primary. Cheap; used where no live probe runs.
+pub(crate) fn leader_ready_in_dcs(
+    lock_holder: Option<&str>,
+    source: &str,
+    source_member: Option<&crate::cluster::Member>,
+) -> bool {
+    lock_holder == Some(source)
+        && source_member
+            .is_some_and(|m| m.state == MemberState::Running && m.role == MemberRole::Primary)
+}
+
+/// A12: ready for pg_rewind = the DCS part AND a live probe of the source
+/// answered `pg_is_in_recovery() = false` (`Some(true)`). `None` = probe not
+/// run, failed or timed out; `Some(false)` = the source is in recovery.
+pub(crate) fn leader_ready_for_rewind(
+    lock_holder: Option<&str>,
+    source: &str,
+    source_member: Option<&crate::cluster::Member>,
+    source_answers_as_primary: Option<bool>,
+) -> bool {
+    leader_ready_in_dcs(lock_holder, source, source_member)
+        && source_answers_as_primary == Some(true)
+}
+
+/// Why the rewind source is not ready, for logs and cycle messages.
+pub(crate) fn rewind_source_not_ready_reason(dcs_ready: bool, probe: Option<bool>) -> &'static str {
+    match (dcs_ready, probe) {
+        (false, _) => "is not the leader-lock holder running as a primary yet",
+        (true, Some(false)) => "does not answer as a primary yet (it is in recovery)",
+        (true, None) => "does not answer as a primary yet (connection or query failed)",
+        (true, Some(true)) => "",
+    }
+}
+
+/// Outcome of the start after a successful pg_rewind (A28).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterRewindStart {
+    /// pg_ctl start -w succeeded.
+    Started,
+    /// pg_ctl gave up waiting but the postmaster is running (still replaying
+    /// to the consistent point): not a failure.
+    StillStarting,
+    /// PostgreSQL is not running: the start after pg_rewind failed.
+    Failed,
+}
+
+pub(crate) fn after_rewind_start(start_ok: bool, running_after: bool) -> AfterRewindStart {
+    match (start_ok, running_after) {
+        (true, _) => AfterRewindStart::Started,
+        (false, true) => AfterRewindStart::StillStarting,
+        (false, false) => AfterRewindStart::Failed,
+    }
+}
+
+/// What a node does given the rewind hold (D5, A11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldNodeAction {
+    /// Not held: carry on.
+    NotHeld,
+    /// Held, rebuilding disabled: keep PostgreSQL stopped and report.
+    Hold,
+    /// Held, rebuilding enabled, leader ready: rebuild from it.
+    Rebuild,
+    /// Held, rebuilding enabled, no ready leader: stay stopped and wait.
+    WaitForLeader,
+}
+
+pub(crate) fn held_node_action(
+    hold: bool,
+    rebuild_enabled: bool,
+    leader_ready: bool,
+) -> HeldNodeAction {
+    match (hold, rebuild_enabled, leader_ready) {
+        (false, _, _) => HeldNodeAction::NotHeld,
+        (true, false, _) => HeldNodeAction::Hold,
+        (true, true, true) => HeldNodeAction::Rebuild,
+        (true, true, false) => HeldNodeAction::WaitForLeader,
+    }
+}
+
+/// Is the node held? The hold file is the source of truth; the in-memory flag
+/// only covers a failed file write (`persisted == false`). Returns (held,
+/// operator_removed): `operator_removed` = the file pg-ha wrote is gone, so
+/// the in-memory state must be cleared (A11, M2).
+pub(crate) fn rewind_hold_state(
+    file_exists: bool,
+    in_memory: bool,
+    persisted: bool,
+) -> (bool, bool) {
+    match (file_exists, in_memory, persisted) {
+        (true, _, _) => (true, false),
+        (false, true, false) => (true, false),
+        (false, true, true) => (false, true),
+        (false, false, _) => (false, false),
+    }
+}
+
 /// Bring the recorded role in line with the observation.
 ///
 /// A server observed in recovery is not a primary, whatever pg-ha did before.
@@ -436,21 +547,55 @@ mod tests {
     #[test]
     fn follower_table() {
         use FollowerAction::*;
+        // (identity, stop_pending, marker, expected)
         let table = [
-            (PgIdentity::Primary, false, Rejoin),
-            (PgIdentity::Primary, true, Rejoin),
-            (PgIdentity::ManagedStandby, false, Follow),
-            (PgIdentity::ManagedStandby, true, Follow),
-            (PgIdentity::UnmanagedRecovery, false, HandOff),
-            (PgIdentity::UnmanagedRecovery, true, HandOff),
-            (UNKNOWN_NO_SIGNAL, false, Fence),
-            (UNKNOWN_NO_SIGNAL, true, Fence),
-            (UNKNOWN_SIGNAL, false, Wait),
-            (UNKNOWN_SIGNAL, true, Fence),
+            (PgIdentity::Primary, false, false, Rejoin),
+            (PgIdentity::Primary, false, true, Rejoin),
+            (PgIdentity::Primary, true, false, Rejoin),
+            (PgIdentity::Primary, true, true, Rejoin),
+            (PgIdentity::ManagedStandby, false, false, Follow),
+            (PgIdentity::ManagedStandby, false, true, RewindCheck),
+            (PgIdentity::ManagedStandby, true, false, Follow),
+            (PgIdentity::ManagedStandby, true, true, RewindCheck),
+            (PgIdentity::UnmanagedRecovery, false, false, HandOff),
+            (PgIdentity::UnmanagedRecovery, false, true, HandOff),
+            (PgIdentity::UnmanagedRecovery, true, false, HandOff),
+            (PgIdentity::UnmanagedRecovery, true, true, HandOff),
+            (UNKNOWN_NO_SIGNAL, false, false, Fence),
+            (UNKNOWN_NO_SIGNAL, false, true, Fence),
+            (UNKNOWN_NO_SIGNAL, true, false, Fence),
+            (UNKNOWN_NO_SIGNAL, true, true, Fence),
+            (UNKNOWN_SIGNAL, false, false, Wait),
+            (UNKNOWN_SIGNAL, false, true, Wait),
+            (UNKNOWN_SIGNAL, true, false, Fence),
+            (UNKNOWN_SIGNAL, true, true, Fence),
         ];
-        assert_eq!(table.len(), ALL_IDENTITIES.len() * 2);
-        for (id, pending, expected) in table {
-            assert_eq!(follower_action(id, pending), expected, "{id:?} {pending}");
+        assert_eq!(table.len(), ALL_IDENTITIES.len() * 4);
+        for (id, pending, marker, expected) in table {
+            assert_eq!(
+                follower_action(id, pending, marker),
+                expected,
+                "{id:?} {pending} {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_only_turns_follow_into_rewind_check() {
+        for id in ALL_IDENTITIES {
+            for pending in [false, true] {
+                let without = follower_action(id, pending, false);
+                let with = follower_action(id, pending, true);
+                if id == PgIdentity::ManagedStandby {
+                    assert_eq!(
+                        (without, with),
+                        (FollowerAction::Follow, FollowerAction::RewindCheck)
+                    );
+                } else {
+                    assert_eq!(without, with, "{id:?} {pending}");
+                    assert_ne!(with, FollowerAction::RewindCheck, "{id:?} {pending}");
+                }
+            }
         }
     }
 
@@ -458,7 +603,11 @@ mod tests {
     fn unmanaged_recovery_is_never_rewound_or_campaigned() {
         let id = PgIdentity::UnmanagedRecovery;
         for s in [false, true] {
-            assert_ne!(follower_action(id, s), FollowerAction::Rejoin);
+            for marker in [false, true] {
+                let action = follower_action(id, s, marker);
+                assert_ne!(action, FollowerAction::Rejoin);
+                assert_ne!(action, FollowerAction::RewindCheck);
+            }
             assert_eq!(election_stance(id, s), ElectionStance::StandAside);
         }
         assert_ne!(leader_action(id), LeaderAction::Promote);
@@ -488,15 +637,22 @@ mod tests {
     #[test]
     fn stop_pending_only_changes_unknown_and_primary_election() {
         for id in ALL_IDENTITIES {
-            let follower_changes = follower_action(id, false) != follower_action(id, true);
-            assert_eq!(
-                follower_changes,
-                matches!(id, PgIdentity::Unknown { .. })
-                    && follower_action(id, false) != FollowerAction::Fence,
-                "{id:?}"
-            );
-            if follower_changes {
-                assert_eq!(follower_action(id, true), FollowerAction::Fence, "{id:?}");
+            for marker in [false, true] {
+                let follower_changes =
+                    follower_action(id, false, marker) != follower_action(id, true, marker);
+                assert_eq!(
+                    follower_changes,
+                    matches!(id, PgIdentity::Unknown { .. })
+                        && follower_action(id, false, marker) != FollowerAction::Fence,
+                    "{id:?} {marker}"
+                );
+                if follower_changes {
+                    assert_eq!(
+                        follower_action(id, true, marker),
+                        FollowerAction::Fence,
+                        "{id:?} {marker}"
+                    );
+                }
             }
             let election_changes = election_stance(id, false) != election_stance(id, true);
             assert_eq!(
@@ -516,7 +672,13 @@ mod tests {
             let id = PgIdentity::Unknown {
                 has_standby_signal: s,
             };
-            assert_eq!(follower_action(id, true), FollowerAction::Fence, "{id:?}");
+            for marker in [false, true] {
+                assert_eq!(
+                    follower_action(id, true, marker),
+                    FollowerAction::Fence,
+                    "{id:?}"
+                );
+            }
             assert_eq!(election_stance(id, true), ElectionStance::Fence, "{id:?}");
         }
     }
@@ -903,6 +1065,226 @@ mod tests {
                 should_warn_timeline_ahead(last, k, tl),
                 expected,
                 "{last:?} {k} {tl}"
+            );
+        }
+    }
+
+    // ─── D4 / D5: rewind check, source readiness, rewind hold ───
+
+    fn dcs_member(state: MemberState, role: MemberRole) -> crate::cluster::Member {
+        crate::cluster::Member {
+            state,
+            role,
+            ..member_tl("node1", Some(1))
+        }
+    }
+
+    /// The 7 DCS situations of the plan's readiness table, with whether the
+    /// DCS part says ready.
+    fn dcs_cases() -> Vec<(
+        &'static str,
+        Option<&'static str>,
+        Option<crate::cluster::Member>,
+        bool,
+    )> {
+        vec![
+            (
+                "no lock holder",
+                None,
+                Some(dcs_member(MemberState::Running, MemberRole::Primary)),
+                false,
+            ),
+            (
+                "lock holder is another node",
+                Some("node3"),
+                Some(dcs_member(MemberState::Running, MemberRole::Primary)),
+                false,
+            ),
+            ("no member record", Some("node1"), None, false),
+            (
+                "running primary",
+                Some("node1"),
+                Some(dcs_member(MemberState::Running, MemberRole::Primary)),
+                true,
+            ),
+            (
+                "running replica",
+                Some("node1"),
+                Some(dcs_member(MemberState::Running, MemberRole::Replica)),
+                false,
+            ),
+            (
+                "stopped primary",
+                Some("node1"),
+                Some(dcs_member(MemberState::Stopped, MemberRole::Primary)),
+                false,
+            ),
+            (
+                "unknown primary",
+                Some("node1"),
+                Some(dcs_member(MemberState::Unknown, MemberRole::Primary)),
+                false,
+            ),
+        ]
+    }
+
+    const PROBES: [Option<bool>; 3] = [None, Some(false), Some(true)];
+
+    #[test]
+    fn leader_ready_in_dcs_table() {
+        let cases = dcs_cases();
+        assert_eq!(cases.len(), 7);
+        for (what, holder, member, expected) in cases {
+            assert_eq!(
+                leader_ready_in_dcs(holder, "node1", member.as_ref()),
+                expected,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn leader_ready_for_rewind_table() {
+        let mut cells = 0;
+        for (what, holder, member, dcs_ready) in dcs_cases() {
+            for probe in PROBES {
+                let expected = dcs_ready && probe == Some(true);
+                assert_eq!(
+                    leader_ready_for_rewind(holder, "node1", member.as_ref(), probe),
+                    expected,
+                    "{what} {probe:?}"
+                );
+                cells += 1;
+            }
+        }
+        assert_eq!(cells, 21);
+        // The only ready cell.
+        assert!(leader_ready_for_rewind(
+            Some("node1"),
+            "node1",
+            Some(&dcs_member(MemberState::Running, MemberRole::Primary)),
+            Some(true)
+        ));
+    }
+
+    #[test]
+    fn ready_for_rewind_implies_ready_in_dcs() {
+        for (what, holder, member, _) in dcs_cases() {
+            for probe in PROBES {
+                if leader_ready_for_rewind(holder, "node1", member.as_ref(), probe) {
+                    assert!(
+                        leader_ready_in_dcs(holder, "node1", member.as_ref()),
+                        "{what} {probe:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rewind_source_not_ready_reason_table() {
+        let table = [
+            (
+                false,
+                None,
+                "is not the leader-lock holder running as a primary yet",
+            ),
+            (
+                false,
+                Some(false),
+                "is not the leader-lock holder running as a primary yet",
+            ),
+            (
+                false,
+                Some(true),
+                "is not the leader-lock holder running as a primary yet",
+            ),
+            (
+                true,
+                Some(false),
+                "does not answer as a primary yet (it is in recovery)",
+            ),
+            (
+                true,
+                None,
+                "does not answer as a primary yet (connection or query failed)",
+            ),
+            (true, Some(true), ""),
+        ];
+        for (dcs_ready, probe, expected) in table {
+            assert_eq!(
+                rewind_source_not_ready_reason(dcs_ready, probe),
+                expected,
+                "{dcs_ready} {probe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn after_rewind_start_table() {
+        use AfterRewindStart::*;
+        let table = [
+            (true, true, Started),
+            (true, false, Started),
+            (false, true, StillStarting),
+            (false, false, Failed),
+        ];
+        for (start_ok, running, expected) in table {
+            assert_eq!(
+                after_rewind_start(start_ok, running),
+                expected,
+                "{start_ok} {running}"
+            );
+        }
+    }
+
+    #[test]
+    fn held_node_action_table() {
+        use HeldNodeAction::*;
+        let table = [
+            (false, false, false, NotHeld),
+            (false, false, true, NotHeld),
+            (false, true, false, NotHeld),
+            (false, true, true, NotHeld),
+            (true, false, false, Hold),
+            (true, false, true, Hold),
+            (true, true, true, Rebuild),
+            (true, true, false, WaitForLeader),
+        ];
+        for (hold, rebuild, ready, expected) in table {
+            assert_eq!(
+                held_node_action(hold, rebuild, ready),
+                expected,
+                "{hold} {rebuild} {ready}"
+            );
+        }
+    }
+
+    #[test]
+    fn held_node_never_rebuilds_when_disabled() {
+        for ready in [false, true] {
+            assert_eq!(held_node_action(true, false, ready), HeldNodeAction::Hold);
+        }
+    }
+
+    #[test]
+    fn rewind_hold_state_table() {
+        // (file_exists, in_memory, persisted) -> (held, operator_removed)
+        let table = [
+            (true, false, false, (true, false)),
+            (true, false, true, (true, false)),
+            (true, true, false, (true, false)),
+            (true, true, true, (true, false)),
+            (false, true, false, (true, false)),
+            (false, true, true, (false, true)),
+            (false, false, false, (false, false)),
+            (false, false, true, (false, false)),
+        ];
+        for (file, mem, persisted, expected) in table {
+            assert_eq!(
+                rewind_hold_state(file, mem, persisted),
+                expected,
+                "{file} {mem} {persisted}"
             );
         }
     }

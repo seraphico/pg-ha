@@ -186,10 +186,155 @@ pub(crate) fn has_rewind_check_marker(data_dir: &Path) -> bool {
 /// Remove pg-ha's own state files copied from another node by pg_basebackup
 /// (A16): they describe the source, not this node. A missing file is fine.
 pub(crate) fn remove_node_state_files(data_dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(data_dir.join(REWIND_CHECK_MARKER)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
+    for name in [REWIND_CHECK_MARKER, REWIND_HOLD_FILE] {
+        match std::fs::remove_file(data_dir.join(name)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
     }
+    Ok(())
+}
+
+/// Rewind hold file (D5): pg_rewind (or the start after it) failed and
+/// rebuilding is disabled, so the node stays stopped until the operator acts.
+pub(crate) const REWIND_HOLD_FILE: &str = "pg-ha.rewind_failed";
+
+/// Create PGDATA/pg-ha.rewind_failed (first line `<what> failed: <cause>`,
+/// then the UTC time), fsync the file and the data directory. Overwrites.
+pub(crate) fn write_rewind_hold(data_dir: &Path, what: &str, cause: &str) -> std::io::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut file = File::create(data_dir.join(REWIND_HOLD_FILE))?;
+    file.write_all(format!("{what} failed: {cause}\ncreated: {}\n", format_utc(now)).as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    fsync_dir(data_dir)
+}
+
+/// (what, cause) recorded in the hold file, if it is readable and has the
+/// format `write_rewind_hold` writes.
+pub(crate) fn read_rewind_hold(data_dir: &Path) -> Option<(String, String)> {
+    let content = std::fs::read_to_string(data_dir.join(REWIND_HOLD_FILE)).ok()?;
+    let (what, cause) = content.lines().next()?.split_once(" failed: ")?;
+    Some((what.trim().to_string(), cause.trim().to_string()))
+}
+
+/// Whether PGDATA/pg-ha.rewind_failed exists as a regular file (same rule as
+/// [`has_rewind_check_marker`]).
+pub(crate) fn has_rewind_hold(data_dir: &Path) -> bool {
+    std::fs::symlink_metadata(data_dir.join(REWIND_HOLD_FILE)).is_ok_and(|m| m.is_file())
+}
+
+/// One-line failure cause for the hold message, from a pg_rewind / pg_ctl
+/// error text. pg_rewind runs with --progress, so its stderr also holds
+/// progress lines: keep the `error:` / `fatal:` lines when there are any,
+/// otherwise every non-empty line. Lines are joined with " | ".
+pub(crate) fn failure_cause(text: &str) -> String {
+    let text = text.strip_prefix("pg_rewind failed: ").unwrap_or(text);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let errors: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| {
+            let l = l.to_ascii_lowercase();
+            l.contains("error:") || l.contains("fatal:")
+        })
+        .collect();
+    let chosen = if errors.is_empty() { lines } else { errors };
+    if chosen.is_empty() {
+        "no error output".to_string()
+    } else {
+        chosen.join(" | ")
+    }
+}
+
+/// Total size of the files under a data directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirSize {
+    pub bytes: u64,
+    /// false when some entries could not be read (the size is a lower bound).
+    pub complete: bool,
+}
+
+/// Sum of file sizes under `data_dir` (symlinks are not followed). Entries
+/// that cannot be read (permission denied, vanished) are skipped and the
+/// result is marked incomplete. None only when the walk exceeds `budget`.
+pub(crate) fn data_dir_size(data_dir: &Path, budget: std::time::Duration) -> Option<DirSize> {
+    let started = std::time::Instant::now();
+    let mut size = DirSize {
+        bytes: 0,
+        complete: true,
+    };
+    let mut pending = vec![data_dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        if started.elapsed() >= budget {
+            return None;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            size.complete = false;
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                size.complete = false;
+                continue;
+            };
+            match std::fs::symlink_metadata(entry.path()) {
+                Ok(m) if m.is_dir() => pending.push(entry.path()),
+                Ok(m) if m.is_file() => size.bytes += m.len(),
+                Ok(_) => {}
+                Err(_) => size.complete = false,
+            }
+        }
+    }
+    Some(size)
+}
+
+/// "1.2 GiB", "at least 1.2 GiB" (incomplete), "size unknown" (None).
+pub(crate) fn format_size(size: Option<DirSize>) -> String {
+    let Some(size) = size else {
+        return "size unknown".to_string();
+    };
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    let text = if size.bytes < 1024 {
+        format!("{} B", size.bytes)
+    } else {
+        let mut value = size.bytes as f64 / 1024.0;
+        let mut unit = 0;
+        while value >= 1024.0 && unit < UNITS.len() - 1 {
+            value /= 1024.0;
+            unit += 1;
+        }
+        format!("{value:.1} {}", UNITS[unit])
+    };
+    if size.complete {
+        text
+    } else {
+        format!("at least {text}")
+    }
+}
+
+/// The ERROR pg-ha logs while a node is held after a pg_rewind failure (D5):
+/// the cause, the node state, the operator actions and the rebuild cost.
+/// `what` is "pg_rewind" or "Starting PostgreSQL after pg_rewind".
+pub(crate) fn rewind_hold_message(what: &str, cause: &str, data_dir: &Path, size: &str) -> String {
+    let dir = data_dir.display();
+    format!(
+        "{what} failed; PostgreSQL is stopped and its data directory is kept (pg-ha did not \
+         delete or rebuild it). Cause: {cause}. Data directory: {dir} ({size}). pg-ha will not \
+         start, rewind or rebuild this node on its own. Operator action required: call POST \
+         /reinitialize on this node to delete the local data and copy it again from the primary \
+         with pg_basebackup (a full copy, about {size}); or set \
+         postgresql.remove_data_directory_on_rewind_failure: true and restart pg-ha to let it \
+         rebuild automatically. If the cause was temporary, delete {dir}/{REWIND_HOLD_FILE} to \
+         let pg-ha retry pg_rewind once (no pg-ha restart needed)."
+    )
 }
 
 /// Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (proleptic Gregorian, UTC).
@@ -662,6 +807,181 @@ mod tests {
         // Nothing to remove is not an error.
         remove_node_state_files(&dir).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_node_state_files_drops_copied_hold_file() {
+        let dir = temp_data_dir("state-files-hold");
+        write_rewind_hold(&dir, "pg_rewind", "copied").unwrap();
+        create_rewind_check_marker(&dir, "copied").unwrap();
+        remove_node_state_files(&dir).unwrap();
+        assert!(!dir.join(REWIND_HOLD_FILE).exists());
+        assert!(!dir.join(REWIND_CHECK_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewind_hold_write_read_exists() {
+        let dir = temp_data_dir("hold");
+        assert!(!has_rewind_hold(&dir));
+        assert_eq!(read_rewind_hold(&dir), None);
+        write_rewind_hold(&dir, "pg_rewind", "pg_rewind: error: WAL gone").unwrap();
+        assert!(has_rewind_hold(&dir));
+        let content = std::fs::read_to_string(dir.join(REWIND_HOLD_FILE)).unwrap();
+        assert!(
+            content.starts_with("pg_rewind failed: pg_rewind: error: WAL gone\ncreated: "),
+            "{content}"
+        );
+        assert_eq!(
+            read_rewind_hold(&dir),
+            Some((
+                "pg_rewind".to_string(),
+                "pg_rewind: error: WAL gone".to_string()
+            ))
+        );
+        write_rewind_hold(&dir, "Starting PostgreSQL after pg_rewind", "x").unwrap();
+        assert_eq!(
+            read_rewind_hold(&dir),
+            Some((
+                "Starting PostgreSQL after pg_rewind".to_string(),
+                "x".to_string()
+            ))
+        );
+        // A file in another format: present, but no recorded cause.
+        std::fs::write(dir.join(REWIND_HOLD_FILE), "operator note\n").unwrap();
+        assert!(has_rewind_hold(&dir));
+        assert_eq!(read_rewind_hold(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewind_hold_requires_a_regular_file() {
+        let dir = temp_data_dir("hold-dir");
+        std::fs::create_dir(dir.join(REWIND_HOLD_FILE)).unwrap();
+        assert!(!has_rewind_hold(&dir), "a directory is not a hold file");
+        assert!(write_rewind_hold(&dir, "pg_rewind", "x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failure_cause_table() {
+        let table = [
+            (
+                "pg_rewind failed: pg_rewind: error: could not find previous WAL record at 0/3000060\n",
+                "pg_rewind: error: could not find previous WAL record at 0/3000060",
+            ),
+            (
+                "pg_rewind failed: pg_rewind: connected to server\npg_rewind: servers diverged at WAL location 0/3000000 on timeline 1\npg_rewind: error: could not open file \"x\": No such file or directory\n",
+                "pg_rewind: error: could not open file \"x\": No such file or directory",
+            ),
+            (
+                "pg_rewind failed: a: error: one\nb: fatal: two\n",
+                "a: error: one | b: fatal: two",
+            ),
+            (
+                "pg_ctl start failed: pg_ctl: could not start server\nExamine the log output.\n",
+                "pg_ctl start failed: pg_ctl: could not start server | Examine the log output.",
+            ),
+            ("pg_rewind failed: ", "no error output"),
+            (
+                "No such file or directory (os error 2)",
+                "No such file or directory (os error 2)",
+            ),
+        ];
+        for (text, expected) in table {
+            assert_eq!(failure_cause(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn data_dir_size_sums_known_files() {
+        let dir = temp_data_dir("size");
+        std::fs::write(dir.join("a"), vec![0u8; 1000]).unwrap();
+        std::fs::create_dir(dir.join("base")).unwrap();
+        std::fs::write(dir.join("base").join("b"), vec![0u8; 2500]).unwrap();
+        let size = data_dir_size(&dir, std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            size,
+            DirSize {
+                bytes: 3500,
+                complete: true
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_dir_size_skips_unreadable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_data_dir("size-unreadable");
+        std::fs::write(dir.join("a"), vec![0u8; 1000]).unwrap();
+        let locked = dir.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("hidden"), vec![0u8; 50]).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let size = data_dir_size(&dir, std::time::Duration::from_secs(5));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let size = size.expect("a size, even when incomplete");
+        assert!(size.bytes >= 1000, "{size:?}");
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!size.complete, "{size:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_dir_size_gives_up_after_budget() {
+        let dir = temp_data_dir("size-budget");
+        assert_eq!(data_dir_size(&dir, std::time::Duration::ZERO), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_size_table() {
+        let full = |bytes| {
+            Some(DirSize {
+                bytes,
+                complete: true,
+            })
+        };
+        let table = [
+            (full(0), "0 B"),
+            (full(1023), "1023 B"),
+            (full(1024), "1.0 KiB"),
+            (full(1536 * 1024), "1.5 MiB"),
+            (full(1_288_490_189), "1.2 GiB"),
+            (
+                Some(DirSize {
+                    bytes: 1_288_490_189,
+                    complete: false,
+                }),
+                "at least 1.2 GiB",
+            ),
+            (None, "size unknown"),
+        ];
+        for (size, expected) in table {
+            assert_eq!(format_size(size), expected, "{size:?}");
+        }
+    }
+
+    #[test]
+    fn rewind_hold_message_states_cause_state_actions_and_cost() {
+        let dir = Path::new("/var/lib/postgresql/16/data");
+        let msg = rewind_hold_message("pg_rewind", "pg_rewind: error: WAL gone", dir, "412.0 GiB");
+        assert_eq!(
+            msg,
+            "pg_rewind failed; PostgreSQL is stopped and its data directory is kept (pg-ha did \
+             not delete or rebuild it). Cause: pg_rewind: error: WAL gone. Data directory: \
+             /var/lib/postgresql/16/data (412.0 GiB). pg-ha will not start, rewind or rebuild \
+             this node on its own. Operator action required: call POST /reinitialize on this \
+             node to delete the local data and copy it again from the primary with pg_basebackup \
+             (a full copy, about 412.0 GiB); or set \
+             postgresql.remove_data_directory_on_rewind_failure: true and restart pg-ha to let \
+             it rebuild automatically. If the cause was temporary, delete \
+             /var/lib/postgresql/16/data/pg-ha.rewind_failed to let pg-ha retry pg_rewind once \
+             (no pg-ha restart needed)."
+        );
     }
 
     #[test]

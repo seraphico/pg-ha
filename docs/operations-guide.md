@@ -709,12 +709,12 @@ pg_rewind 失败（例如新主上已经回收了需要的 WAL），或 pg_rewin
 - 日志有一条 ERROR（之后每 60 秒最多重复一次），例如：
 
   ```text
-  ERROR pg_rewind failed; PostgreSQL is stopped and its data directory is kept (pg-ha did not delete or rebuild it). Cause: pg_rewind: error: could not open file "/var/lib/postgresql/16/data/pg_wal/000000010000000000000003": No such file or directory. Data directory: /var/lib/postgresql/16/data (412 GiB). pg-ha will not start, rewind or rebuild this node on its own. Operator action required: call POST /reinitialize on this node to delete the local data and copy it again from the primary with pg_basebackup (a full copy, about 412 GiB); or set postgresql.remove_data_directory_on_rewind_failure: true and restart pg-ha to let it rebuild automatically. If the cause was temporary, delete /var/lib/postgresql/16/data/pg-ha.rewind_failed to let pg-ha retry pg_rewind once (no pg-ha restart needed).
+  ERROR pg_rewind failed; PostgreSQL is stopped and its data directory is kept (pg-ha did not delete or rebuild it). Cause: pg_rewind: error: could not open file "/var/lib/postgresql/16/data/pg_wal/000000010000000000000003": No such file or directory. Data directory: /var/lib/postgresql/16/data (412.0 GiB). pg-ha will not start, rewind or rebuild this node on its own. Operator action required: call POST /reinitialize on this node to delete the local data and copy it again from the primary with pg_basebackup (a full copy, about 412.0 GiB); or set postgresql.remove_data_directory_on_rewind_failure: true and restart pg-ha to let it rebuild automatically. If the cause was temporary, delete /var/lib/postgresql/16/data/pg-ha.rewind_failed to let pg-ha retry pg_rewind once (no pg-ha restart needed).
   ```
 
-  PostgreSQL 启动失败时开头是 `Starting PostgreSQL after pg_rewind failed; ...`，其余相同。每个 cycle 的结果是 `PostgreSQL stopped after a pg_rewind failure; operator action required (see the ERROR log)`。
+  PostgreSQL 启动失败时开头是 `Starting PostgreSQL after pg_rewind failed; ...`，其余相同。每个 cycle 的结果是 `PostgreSQL stopped after a pg_rewind failure; operator action required (see the ERROR log)`。`Cause` 取 pg_rewind 输出里的 `error:` / `fatal:` 行（没有这类行时取全部输出），多行用 ` | ` 连接。大小是数据目录下文件的总和，统计限时 2 秒：超时显示 `size unknown`，有读不了的子目录时显示 `at least <大小>`。
 - `/patroni` 的 `state` 为 `stopped`；`/primary`、`/replica` 均为 503；该节点不参选。
-- PGDATA 里有 `pg-ha.rewind_failed` 和 `pg-ha.rewind_check`；没有自动 pg_basebackup（日志里没有 `Running pg_basebackup`）。
+- PGDATA 里的标记文件：pg_rewind 失败时有 `pg-ha.rewind_failed` 和 `pg-ha.rewind_check`；pg_rewind 成功但随后 PostgreSQL 起不来时只有 `pg-ha.rewind_failed`（`pg-ha.rewind_check` 在 rewind 成功后已删除）。两种情况都没有自动 pg_basebackup（日志里没有 `Running pg_basebackup`）。
 - 其他节点正常服务。
 - 保持期间有人手工启动 PostgreSQL，pg-ha 会再把它停掉。
 
@@ -733,7 +733,7 @@ postgresql:
   remove_data_directory_on_rewind_failure: true
 ```
 
-然后重启 pg-ha。打开后，pg_rewind 失败时 pg-ha 删除数据目录并 pg_basebackup（WARN `pg_rewind failed: <错误> — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup`）。默认 `false`，因为全量重建会删除本地数据、耗时与库大小成正比，自动执行可能在业务高峰把一次暂时性故障变成长时间的复制。配置项说明见部署指南。
+然后重启 pg-ha。打开后，pg_rewind 失败时 pg-ha 删除数据目录并 pg_basebackup（WARN `pg_rewind failed: <错误> — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup`；pg_rewind 成功但随后 PostgreSQL 起不来时是 `PostgreSQL failed to start after pg_rewind: <错误> — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup`）。已经处于保持状态的节点在打开选项并重启 pg-ha 后，等 leader 以主库运行时先再试一次 pg_rewind，失败再重建。默认 `false`，因为全量重建会删除本地数据、耗时与库大小成正比，自动执行可能在业务高峰把一次暂时性故障变成长时间的复制。配置项说明见部署指南。
 
 **处理 3（暂时性原因，重试一次）：** 原因是暂时性的（网络中断、主库刚切换），且 pg_rewind 在改动目录之前就失败（例如连接错误）时，删除保持文件：
 
@@ -741,7 +741,7 @@ postgresql:
 sudo -u postgres rm /var/lib/postgresql/16/data/pg-ha.rewind_failed
 ```
 
-不用重启 pg-ha。日志出现 `Rewind hold file /var/lib/postgresql/16/data/pg-ha.rewind_failed was removed; pg-ha will retry pg_rewind`，pg-ha 以备库启动它，在 leader 就绪后重试一次 pg_rewind；再失败就重新停库保持。pg_rewind 在复制阶段失败时目录可能已不可用，这种情况用处理 1。
+不用重启 pg-ha。日志出现 `Rewind hold file /var/lib/postgresql/16/data/pg-ha.rewind_failed was removed; pg-ha will retry pg_rewind`，pg-ha 以备库启动它。pg_rewind 失败的情况：在 leader 就绪后重试一次 pg_rewind，再失败就重新停库保持。pg_rewind 成功但 PostgreSQL 起不来的情况：pg-ha 先以备库重试启动，连续 3 次启动失败后才对 leader 再跑一次 pg_rewind。pg_rewind 在复制阶段失败时目录可能已不可用，这种情况用处理 1。
 
 **不算失败的情况**（pg-ha 不进入保持，不需要处理）：
 

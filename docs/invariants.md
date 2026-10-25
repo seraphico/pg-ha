@@ -128,14 +128,16 @@
 #### pg_rewind 失败
 
 - pg_rewind 必须执行，并且自动执行。
-- pg_rewind 失败，或 pg_rewind 成功但随后 PG 启动失败时，默认（`postgresql.remove_data_directory_on_rewind_failure: false`）：PG 保持停止；数据目录不删除也不重建；标记保留；写 `PGDATA/pg-ha.rewind_failed`；不参选；不自动重试。进入保持时 pg-ha 先确认 PG 已停，再记一条 ERROR，之后每 60 秒最多重复一次：
+- pg_rewind 失败，或 pg_rewind 成功但随后 PG 启动失败时，默认（`postgresql.remove_data_directory_on_rewind_failure: false`）：PG 保持停止；数据目录不删除也不重建；写 `PGDATA/pg-ha.rewind_failed`；不参选；不自动重试。rewind 检查标记：pg_rewind 失败时保留；pg_rewind 成功后 PG 启动失败时，标记已在 rewind 成功后删除，只留 `pg-ha.rewind_failed`。进入保持时 pg-ha 先确认 PG 已停，再记一条 ERROR，之后每 60 秒最多重复一次：
 
   ```text
   <pg_rewind | Starting PostgreSQL after pg_rewind> failed; PostgreSQL is stopped and its data directory is kept (pg-ha did not delete or rebuild it). Cause: <原因>. Data directory: <dir> (<大小>). pg-ha will not start, rewind or rebuild this node on its own. Operator action required: call POST /reinitialize on this node to delete the local data and copy it again from the primary with pg_basebackup (a full copy, about <大小>); or set postgresql.remove_data_directory_on_rewind_failure: true and restart pg-ha to let it rebuild automatically. If the cause was temporary, delete <dir>/pg-ha.rewind_failed to let pg-ha retry pg_rewind once (no pg-ha restart needed).
   ```
 
+  `<原因>` 取自 pg_rewind（或 `pg_ctl start`）的错误输出，只保留 `error:` / `fatal:` 行（没有时保留全部），多行用 ` | ` 连接；`<大小>` 是数据目录下文件大小之和，限时 2 秒统计，超时为 `size unknown`，有读不了的子目录时为 `at least <大小>`。
+
   日志写「data directory is kept」而不是「unchanged」：pg_rewind 在复制阶段失败时可能已经改动了目录，pg-ha 只能保证自己没有删除或重建它。这也是保持期间不自动启动的原因。
-- 处理：`POST /reinitialize`；或打开该选项后重启 pg-ha；原因是暂时性的、且 pg_rewind 在改动目录之前就失败（例如连接错误）时，删除 `pg-ha.rewind_failed`：不需要重启 pg-ha（日志 `Rewind hold file <dir>/pg-ha.rewind_failed was removed; pg-ha will retry pg_rewind`），下一轮以备库启动该节点，看到 leader 就绪后再跑一次 pg_rewind，再失败就重新进入保持。
+- 处理：`POST /reinitialize`；或打开该选项后重启 pg-ha；原因是暂时性的、且 pg_rewind 在改动目录之前就失败（例如连接错误）时，删除 `pg-ha.rewind_failed`：不需要重启 pg-ha（日志 `Rewind hold file <dir>/pg-ha.rewind_failed was removed; pg-ha will retry pg_rewind`），下一轮以备库启动该节点。pg_rewind 失败的情况（标记还在）：看到 leader 就绪后再跑一次 pg_rewind，再失败就重新进入保持。pg_rewind 成功后启动失败的情况（标记已删）：先以备库重试启动，连续 3 次启动失败后才对 leader 再跑一次 pg_rewind。
 - 保持期间 PG 被人手工启动也会被 pg-ha 停掉。保持状态记在 `pg-ha.rewind_failed` 里，跨 pg-ha 重启有效；这个文件写失败时保持只在内存里，持续到 pg-ha 重启（ERROR `Could not write <dir>/pg-ha.rewind_failed (...); the hold lasts until pg-ha restarts`）。
 - 打开选项时恢复旧行为：删除数据目录后 pg_basebackup（WARN `pg_rewind failed: <错误> — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup`）。
 - 不算失败的情况：源未就绪（上一小节）；pg_rewind 成功后 `pg_ctl start -w` 等待超时、但 postmaster 仍在运行（备库回放到一致点之前不接受连接，大库上常见），只 WARN `PostgreSQL is still starting after pg_rewind (...); not treating this as a failure`，下一轮按观测继续。「PG 启动失败」只指 postmaster 没有起来。
@@ -288,7 +290,7 @@
 
 | 日期 | 说明 |
 |------|------|
-| 2026-10-25 | 任务 3：1a 增加启动规则、降级先写 `standby.signal`（适用于所有停掉不持锁可写主的路径）、rewind 检查标记、`/timeline` 与带标记节点的选举规则、rewind 失败处理；R2 增加带标记节点 timeline 比较的例外说明；修正 P4 的 degraded 语义；第 9 节删除已闭合的「降级不写 standby.signal」，登记 5 项。实现分 5 个提交，完成前以本文为目标语义 |
+| 2026-10-25 | 任务 3：1a 增加启动规则、降级先写 `standby.signal`（适用于所有停掉不持锁可写主的路径）、rewind 检查标记、`/timeline` 与带标记节点的选举规则、rewind 失败处理；R2 增加带标记节点 timeline 比较的例外说明；修正 P4 的 degraded 语义；第 9 节删除已闭合的「降级不写 standby.signal」，登记 5 项。实现分 5 个提交，完成前以本文为目标语义；第 5 个提交补充 rewind 失败日志里原因与数据目录大小的取法；并写明 pg_rewind 成功后 PG 启动失败进入保持时 rewind 检查标记已删除、删除保持文件后先以备库重试启动（连续 3 次失败后再 pg_rewind） |
 | 2026-10-21 | 新增 1a 身份判定：「是否为主」以 `pg_is_in_recovery()` 观测为准；只 promote pg-ha 配置的备库，非 pg-ha 造成的恢复交运维；写明 H1 / H2 逐条判定与 `/health` 语义；第 9 节登记两个已知缺口 |
 | 2026-10-21 | P4 闭合为持有：Raft 存储落盘失败返回 `StorageError`，节点 Raft 停止而非继续推进；写明 degraded 语义与人工恢复方式 |
 | 2026-09-11 | S5 闭合为持有：sync 模式下 Failover/Switchover 强制 `/sync` 成员资格；空名单不晋升 |

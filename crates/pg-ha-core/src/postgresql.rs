@@ -37,6 +37,24 @@ const PG_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// stuck server cannot stall the HA loop.
 const RECOVERY_OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Upper bound for the live check of a pg_rewind source (psql also gets
+/// PGCONNECT_TIMEOUT=5).
+const SOURCE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pure: exit status + stdout of the `SELECT pg_is_in_recovery()` probe ->
+/// Some(true) = answers as a primary, Some(false) = in recovery, None = no
+/// usable answer.
+pub(crate) fn parse_recovery_probe(success: bool, stdout: &str) -> Option<bool> {
+    if !success {
+        return None;
+    }
+    match stdout.trim() {
+        "f" => Some(true),
+        "t" => Some(false),
+        _ => None,
+    }
+}
+
 /// Manages a local PostgreSQL instance lifecycle
 pub struct Postgresql {
     config: PostgresqlConfig,
@@ -140,6 +158,10 @@ impl Postgresql {
 
     fn pg_controldata_bin(&self) -> PathBuf {
         self.config.bin_dir.join("pg_controldata")
+    }
+
+    fn psql_bin(&self) -> PathBuf {
+        self.config.bin_dir.join("psql")
     }
 
     fn data_dir_str(&self) -> &str {
@@ -421,6 +443,60 @@ impl Postgresql {
             error!(%stderr, "pg_rewind failed");
             Err(Error::Postgres(format!("pg_rewind failed: {stderr}")))
         }
+    }
+
+    /// Live check of a pg_rewind source: run
+    /// `psql -X -tAq -w -d <conn_url> -c "SELECT pg_is_in_recovery()"` with
+    /// PGCONNECT_TIMEOUT=5 under a 10 s limit (the child is killed on
+    /// timeout). Some(true) = it answers as a primary, Some(false) = it is in
+    /// recovery, None = no usable answer.
+    pub async fn source_answers_as_primary(&self, conn_url: &str) -> Option<bool> {
+        let probe = Command::new(self.psql_bin())
+            .args([
+                "-X",
+                "-tAq",
+                "-w",
+                "-d",
+                conn_url,
+                "-c",
+                "SELECT pg_is_in_recovery()",
+            ])
+            .env("PGCONNECT_TIMEOUT", "5")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let output = match tokio::time::timeout(SOURCE_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                warn!(source = %redact_connstr(conn_url), "Live check of the pg_rewind source failed: {e}");
+                return None;
+            }
+            Err(_) => {
+                warn!(
+                    source = %redact_connstr(conn_url),
+                    "Live check of the pg_rewind source failed: no answer within {SOURCE_PROBE_TIMEOUT:?}"
+                );
+                return None;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let answer = parse_recovery_probe(output.status.success(), &stdout);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let first = stderr.lines().next().unwrap_or("").trim();
+            warn!(
+                source = %redact_connstr(conn_url),
+                "Live check of the pg_rewind source failed: psql exited with {}: {first}",
+                output.status
+            );
+        } else if answer.is_none() {
+            warn!(
+                source = %redact_connstr(conn_url),
+                "Live check of the pg_rewind source failed: unexpected answer {:?}",
+                stdout.trim()
+            );
+        }
+        answer
     }
 
     // ─────────────────────── Introspection ───────────────────────
@@ -895,6 +971,7 @@ mod tests {
                 password: Some("replpass".to_string()),
                 dbname: "postgres".to_string(),
             },
+            remove_data_directory_on_rewind_failure: false,
             parameters: Default::default(),
         }
     }
@@ -989,6 +1066,35 @@ mod tests {
         pg.set_observed_in_recovery(Some(true));
         let _ = pg.start().await;
         assert_eq!(pg.observed_in_recovery(), None, "start");
+    }
+
+    #[test]
+    fn parse_recovery_probe_table() {
+        let table = [
+            (true, "f\n", Some(true)),
+            (true, " t ", Some(false)),
+            (true, "", None),
+            (true, "x", None),
+            (false, "f", None),
+        ];
+        for (success, stdout, expected) in table {
+            assert_eq!(
+                parse_recovery_probe(success, stdout),
+                expected,
+                "{success} {stdout:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_probe_without_psql_is_none() {
+        let mut config = test_config();
+        config.bin_dir = PathBuf::from("/nonexistent/pg-ha-test-bin");
+        let pg = Postgresql::new(config);
+        assert_eq!(
+            pg.source_answers_as_primary("host=node1 port=5432").await,
+            None
+        );
     }
 
     #[test]

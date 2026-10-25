@@ -6,7 +6,11 @@ use tracing::{error, info, warn};
 use crate::error::Result;
 use crate::standby_config;
 
-use super::{Ha, identity};
+use super::{CycleResult, Ha, identity};
+
+/// Cycle result while a node is held after a pg_rewind failure (D5).
+const REWIND_HOLD_RESULT: &str =
+    "PostgreSQL stopped after a pg_rewind failure; operator action required (see the ERROR log)";
 
 impl Ha {
     /// Writes standby.signal + primary_conninfo (None removes it) and forgets
@@ -209,6 +213,179 @@ impl Ha {
         } else {
             self.postgresql.stop("fast").await
         }
+    }
+
+    // ─── D5: rewind hold ───
+
+    /// Is the node held after a pg_rewind failure (A11)? The hold file is the
+    /// source of truth; the in-memory flag only covers a failed file write.
+    /// Notices an operator deleting the file and clears the in-memory state.
+    pub(super) fn refresh_rewind_hold(&mut self) -> bool {
+        let data_dir = &self.config.postgresql.data_dir;
+        let (held, operator_removed) = identity::rewind_hold_state(
+            standby_config::has_rewind_hold(data_dir),
+            self.rewind_hold,
+            self.rewind_hold_persisted,
+        );
+        if operator_removed {
+            info!(
+                "Rewind hold file {}/{} was removed; pg-ha will retry pg_rewind",
+                data_dir.display(),
+                standby_config::REWIND_HOLD_FILE
+            );
+            self.clear_rewind_hold();
+        }
+        held
+    }
+
+    pub(super) fn clear_rewind_hold(&mut self) {
+        self.rewind_hold = false;
+        self.rewind_hold_persisted = false;
+        self.rewind_hold_logged_at = None;
+    }
+
+    /// D5: pg_rewind (or the start after it) failed and rebuilding is
+    /// disabled. Persist the hold, make sure PostgreSQL is not running, and
+    /// log the operator message only once it is really stopped.
+    pub(super) async fn enter_rewind_hold(&mut self, what: &str, cause: &str) -> CycleResult {
+        let cause = standby_config::failure_cause(cause);
+        self.rewind_hold = true;
+        let data_dir = self.config.postgresql.data_dir.clone();
+        let (dir, file_what, file_cause) = (data_dir.clone(), what.to_string(), cause.clone());
+        let written = tokio::task::spawn_blocking(move || {
+            standby_config::write_rewind_hold(&dir, &file_what, &file_cause)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|r| r);
+        match written {
+            Ok(()) => self.rewind_hold_persisted = true,
+            Err(e) => {
+                error!(
+                    "Could not write {}/{} ({e}); the hold lasts until pg-ha restarts",
+                    data_dir.display(),
+                    standby_config::REWIND_HOLD_FILE
+                );
+                self.rewind_hold_persisted = false;
+            }
+        }
+        // The message says "PostgreSQL is stopped": make it true first. If the
+        // stop fails, the next cycle stops it again and then logs the message
+        // (rewind_hold_logged_at is still None).
+        if let Err(e) = self.stop_held_postgres().await {
+            return CycleResult::Error(format!("rewind hold: stop failed: {e}"));
+        }
+        self.log_rewind_hold(what, &cause).await;
+        let _ = self.touch_member().await;
+        CycleResult::Error(REWIND_HOLD_RESULT.into())
+    }
+
+    /// Re-log the hold message at most every REWIND_HOLD_LOG_INTERVAL, with
+    /// the cause from the hold file; touch_member.
+    pub(super) async fn report_rewind_hold(&mut self) -> CycleResult {
+        let due = self
+            .rewind_hold_logged_at
+            .is_none_or(|at| at.elapsed() >= super::REWIND_HOLD_LOG_INTERVAL);
+        if due {
+            let (what, cause) = standby_config::read_rewind_hold(&self.config.postgresql.data_dir)
+                .unwrap_or_else(|| {
+                    (
+                        "pg_rewind".to_string(),
+                        "see the earlier ERROR log".to_string(),
+                    )
+                });
+            self.log_rewind_hold(&what, &cause).await;
+        }
+        let _ = self.touch_member().await;
+        CycleResult::Error(REWIND_HOLD_RESULT.into())
+    }
+
+    /// The full D5 ERROR (the data directory size is computed with a 2 s
+    /// budget, only when the message is logged).
+    async fn log_rewind_hold(&mut self, what: &str, cause: &str) {
+        let data_dir = self.config.postgresql.data_dir.clone();
+        let dir = data_dir.clone();
+        let size = tokio::task::spawn_blocking(move || {
+            standby_config::data_dir_size(&dir, std::time::Duration::from_secs(2))
+        })
+        .await
+        .ok()
+        .flatten();
+        error!(
+            "{}",
+            standby_config::rewind_hold_message(
+                what,
+                cause,
+                &data_dir,
+                &standby_config::format_size(size)
+            )
+        );
+        self.rewind_hold_logged_at = Some(std::time::Instant::now());
+    }
+
+    /// One check for every place a held node could start, follow or
+    /// campaign. None = not held; Some(result) = the cycle ends here.
+    pub(super) async fn enforce_rewind_hold(&mut self) -> Option<CycleResult> {
+        if !self.refresh_rewind_hold() {
+            return None;
+        }
+        let leader = self
+            .cluster
+            .leader
+            .as_ref()
+            .map(|l| l.name.clone())
+            .filter(|n| n != &self.config.name);
+        // DCS part only: Rebuild goes through rejoin_as_replica, which runs
+        // the live probe before touching anything.
+        let ready = leader
+            .as_deref()
+            .is_some_and(|n| identity::leader_ready_in_dcs(Some(n), n, self.cluster.get_member(n)));
+        let rebuild_enabled = self
+            .config
+            .postgresql
+            .remove_data_directory_on_rewind_failure;
+        match (
+            identity::held_node_action(true, rebuild_enabled, ready),
+            leader,
+        ) {
+            (identity::HeldNodeAction::NotHeld, _) => None,
+            (identity::HeldNodeAction::Hold, _) => Some(self.hold_stop_and_report().await),
+            (identity::HeldNodeAction::Rebuild, Some(leader)) => {
+                Some(self.rejoin_as_replica(&leader).await)
+            }
+            (identity::HeldNodeAction::Rebuild | identity::HeldNodeAction::WaitForLeader, _) => {
+                if let Err(e) = self.stop_held_postgres().await {
+                    return Some(CycleResult::Error(format!("rewind hold: stop failed: {e}")));
+                }
+                let _ = self.touch_member().await;
+                Some(CycleResult::Error(
+                    "rewind hold: waiting for a leader running as a primary to rebuild from".into(),
+                ))
+            }
+        }
+    }
+
+    /// Stop a running PostgreSQL on a held node. A writable primary goes
+    /// through fence_primary (signal + marker first, stop_pending on
+    /// failure); a read-only standby is stopped directly. Ok when not running.
+    async fn stop_held_postgres(&mut self) -> crate::error::Result<()> {
+        if !self.postgresql.is_running() {
+            return Ok(());
+        }
+        if self.pg_identity() == identity::PgIdentity::Primary {
+            self.fence_primary("fast", "stopped while held after a pg_rewind failure", None)
+                .await
+        } else {
+            self.postgresql.stop("fast").await
+        }
+    }
+
+    /// The Hold branch, shared by rejoin step 0a and enforce_rewind_hold.
+    pub(super) async fn hold_stop_and_report(&mut self) -> CycleResult {
+        if let Err(e) = self.stop_held_postgres().await {
+            return CycleResult::Error(format!("rewind hold: stop failed: {e}"));
+        }
+        self.report_rewind_hold().await
     }
 
     /// Forget what was applied to synchronous_standby_names so the next
