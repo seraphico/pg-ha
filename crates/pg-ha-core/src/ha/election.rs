@@ -1,7 +1,7 @@
 //! Election logic: unhealthy cluster processing, healthiest node determination,
 //! stale primary detection, and failover key / designated candidate handling.
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::cluster::SyncState;
 
@@ -42,7 +42,7 @@ impl Ha {
 
         // ─── May this node take part at all? (see `identity`) ───
         let identity = self.pg_identity();
-        match election_stance(identity) {
+        match election_stance(identity, self.stop_pending) {
             ElectionStance::Participate => {}
             ElectionStance::StandAside => {
                 error!(
@@ -53,6 +53,21 @@ impl Ha {
                 return CycleResult::Error(
                     "PostgreSQL in unmanaged recovery; not taking part in the election".into(),
                 );
+            }
+            ElectionStance::Fence => {
+                warn!(
+                    "A previous stop after writing standby.signal failed and PostgreSQL may still \
+                     be writable — stopping it again before any election"
+                );
+                return match self
+                    .fence_primary("fast", "stopped again after a failed demotion stop", None)
+                    .await
+                {
+                    Ok(()) => CycleResult::Follower(
+                        "stopped PostgreSQL: a demotion stop had failed".into(),
+                    ),
+                    Err(e) => CycleResult::Error(format!("Fence stop failed: {e}")),
+                };
             }
             ElectionStance::Wait => {
                 let _ = self.touch_member().await;

@@ -78,6 +78,12 @@ pub struct Ha {
     /// Last successfully applied `synchronous_standby_names` value.
     /// Used to skip redundant ALTER SYSTEM + reload every HA cycle.
     applied_sync_standby_names: Option<String>,
+
+    /// A stop after writing standby.signal on a demotion / fence path failed
+    /// and PostgreSQL was not confirmed stopped since (A19). While set, an
+    /// unobserved server is fenced again every cycle, and a primary is fenced
+    /// instead of campaigning.
+    stop_pending: bool,
 }
 
 /// Sender half for submitting commands to the HA engine
@@ -103,6 +109,7 @@ impl Ha {
             pending_switchover: None,
             start_fail_count: 0,
             applied_sync_standby_names: None,
+            stop_pending: false,
         };
         (ha, cmd_tx)
     }
@@ -158,6 +165,8 @@ impl Ha {
 
         // Step 4: Check if PostgreSQL is running
         if !self.postgresql.is_running() {
+            // Confirmed stopped: a pending demotion stop is no longer pending.
+            self.stop_pending = false;
             return self.handle_postgres_not_running().await;
         }
 
@@ -479,15 +488,33 @@ impl Ha {
         }
     }
 
-    /// Demote from primary — stop PostgreSQL to prevent split-brain
+    /// Demote from primary — stop PostgreSQL to prevent split-brain.
+    ///
+    /// standby.signal and the rewind-check marker are written first (D2), and
+    /// primary_conninfo is removed because the new leader is unknown (D3). A
+    /// failed write still stops PostgreSQL (L5 first) and reports an error.
     async fn demote(&mut self) -> CycleResult {
-        warn!("Demoting: stopping PostgreSQL immediately");
-        if let Err(e) = self.postgresql.stop("immediate").await {
-            error!("Failed to stop PostgreSQL during demotion: {e}");
-        }
-        self.postgresql.set_role(MemberRole::Replica);
+        warn!("Demoting: writing standby.signal, then stopping PostgreSQL immediately");
         self.reset_sync_cache();
-        CycleResult::Follower("demoted self because failed to update leader lock in DCS".into())
+        let written = self
+            .prepare_demotion(None, Some("demoted after losing the leader lock"))
+            .await;
+        if let Err(e) = &written {
+            error!(
+                "Failed to write standby configuration before demotion: {e}; stopping PostgreSQL anyway"
+            );
+        }
+        // A failed stop is logged and recorded in stop_pending.
+        let _ = self.stop_after_demotion_write("immediate").await;
+        self.postgresql.set_role(MemberRole::Replica);
+        match written {
+            Ok(()) => CycleResult::Follower(
+                "demoted self because failed to update leader lock in DCS".into(),
+            ),
+            Err(e) => CycleResult::Error(format!(
+                "demoted self because failed to update leader lock in DCS, but standby configuration could not be written: {e}"
+            )),
+        }
     }
 
     /// Handle case when PostgreSQL is not running
@@ -642,11 +669,24 @@ impl Ha {
                     );
                     self.is_leader = false;
                     self.reset_sync_cache();
-                    if let Err(e) = self.postgresql.stop("fast").await {
-                        error!("Failed to stop PG during DCS error demotion: {e}");
+                    let written = self
+                        .prepare_demotion(None, Some("demoted because the DCS is unreachable"))
+                        .await;
+                    if let Err(e) = &written {
+                        error!(
+                            "Failed to write standby configuration before DCS-error demotion: {e}; stopping PostgreSQL anyway"
+                        );
                     }
+                    let _ = self.stop_after_demotion_write("fast").await;
                     self.postgresql.set_role(MemberRole::Replica);
-                    CycleResult::Error("DCS unreachable: demoted to prevent split-brain".into())
+                    match written {
+                        Ok(()) => CycleResult::Error(
+                            "DCS unreachable: demoted to prevent split-brain".into(),
+                        ),
+                        Err(e) => CycleResult::Error(format!(
+                            "DCS unreachable: demoted to prevent split-brain, but standby configuration could not be written: {e}"
+                        )),
+                    }
                 }
 
                 crate::failsafe::FailsafeResult::NotAllConfirmed { failed } => {
@@ -656,16 +696,32 @@ impl Ha {
                     );
                     self.is_leader = false;
                     self.reset_sync_cache();
-                    if let Err(e) = self.postgresql.stop("fast").await {
-                        error!("Failed to stop PG during DCS error demotion:{e}");
+                    let written = self
+                        .prepare_demotion(None, Some("demoted because the DCS is unreachable"))
+                        .await;
+                    if let Err(e) = &written {
+                        error!(
+                            "Failed to write standby configuration before DCS-error demotion: {e}; stopping PostgreSQL anyway"
+                        );
                     }
+                    let _ = self.stop_after_demotion_write("fast").await;
                     self.postgresql.set_role(MemberRole::Replica);
-                    CycleResult::Error(format!(
-                        "DCS unreachable: failsafe failed ({failed:?}), demoted"
-                    ))
+                    match written {
+                        Ok(()) => CycleResult::Error(format!(
+                            "DCS unreachable: failsafe failed ({failed:?}), demoted"
+                        )),
+                        Err(e) => CycleResult::Error(format!(
+                            "DCS unreachable: failsafe failed ({failed:?}), demoted, but standby configuration could not be written: {e}"
+                        )),
+                    }
                 }
             }
         } else {
+            // A demotion stop failed earlier: keep trying to stop PostgreSQL
+            // even while the DCS is unreachable (A19).
+            if self.stop_pending && self.postgresql.is_running() {
+                let _ = self.stop_after_demotion_write("fast").await;
+            }
             CycleResult::Error("DCS unreachable".into())
         }
     }
@@ -821,6 +877,8 @@ mod tests {
         cluster: Mutex<Cluster>,
         leader_held_by: Mutex<Option<String>>,
         last_failover_value: Mutex<Option<String>>,
+        /// When set, leader-lock writes return Err (a DCS write failure).
+        fail_leader_writes: std::sync::atomic::AtomicBool,
     }
 
     impl MockDcs {
@@ -829,6 +887,7 @@ mod tests {
                 cluster: Mutex::new(Cluster::empty()),
                 leader_held_by: Mutex::new(None),
                 last_failover_value: Mutex::new(None),
+                fail_leader_writes: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -844,11 +903,29 @@ mod tests {
                 cluster: Mutex::new(cluster),
                 leader_held_by: Mutex::new(Some(name.to_string())),
                 last_failover_value: Mutex::new(None),
+                fail_leader_writes: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
         fn set_cluster(&self, cluster: Cluster) {
             *self.cluster.lock().unwrap() = cluster;
+        }
+
+        fn fail_leader_writes(&self) {
+            self.fail_leader_writes
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn leader_writes_fail(&self) -> Result<()> {
+            if self
+                .fail_leader_writes
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::Dcs(
+                    "injected DCS write failure".into(),
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -859,6 +936,7 @@ mod tests {
         }
 
         async fn attempt_to_acquire_leader(&self) -> Result<bool> {
+            self.leader_writes_fail()?;
             let mut held = self.leader_held_by.lock().unwrap();
             if held.is_none() {
                 *held = Some("test_node".to_string());
@@ -875,6 +953,7 @@ mod tests {
         }
 
         async fn update_leader(&self, _leader: &Leader) -> Result<bool> {
+            self.leader_writes_fail()?;
             let held = self.leader_held_by.lock().unwrap();
             Ok(held.as_deref() == Some("test_node"))
         }
@@ -1355,21 +1434,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_healthy_cluster_follower() {
-        let config = test_config("node2");
+        let mut config = test_config("node2");
+        // A data dir of its own (never the shared test_config default), non-empty.
+        let dir = std::env::temp_dir().join(format!(
+            "pg-ha-test-healthy-follower-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("PG_VERSION"), "16").unwrap();
+        config.postgresql.data_dir = dir.clone();
         // Leader is "node1", we are "node2"
         let dcs = Arc::new(MockDcs::with_leader("node1"));
         let pg = Postgresql::new(config.postgresql.clone());
         let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
 
-        // Manually mark data dir as non-empty by creating it
-        let _ = std::fs::create_dir_all(&ha.postgresql().config().data_dir);
-        let _ = std::fs::write(ha.postgresql().config().data_dir.join("PG_VERSION"), "16");
-
         let result = ha.run_cycle().await;
         let _ = format!("{result}");
 
         // Clean up
-        let _ = std::fs::remove_dir_all(&ha.postgresql().config().data_dir);
+        let _ = std::fs::remove_dir_all(&dir);
 
         // PG is not running, so we'll try to start it or report it's down
         // The key assertion: we should NOT try to become leader
@@ -1775,7 +1858,9 @@ mod tests {
     }
     #[tokio::test]
     async fn test_handle_dcs_error_with_failsafe_disabled_demotes() {
-        let config = test_config("node1");
+        let mut config = test_config("node1");
+        // Missing data dir: the standby config cannot be written.
+        config.postgresql.data_dir = missing_data_dir("dcs-err-disabled");
         let dcs = Arc::new(MockDcs::with_leader("node1"));
         let pg = Postgresql::new(config.postgresql.clone());
         let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
@@ -1790,11 +1875,13 @@ mod tests {
         // Should demote because failsafe is disabled
         assert!(!ha.is_leader());
         assert!(msg.contains("demoted"));
+        assert!(msg.contains("could not be written"), "{msg}");
     }
 
     #[tokio::test]
     async fn test_handle_dcs_error_with_failsafe_enabled_no_members_demotes() {
-        let config = test_config("node1");
+        let mut config = test_config("node1");
+        config.postgresql.data_dir = missing_data_dir("dcs-err-no-members");
         let dcs = Arc::new(MockDcs::with_leader("node1"));
         let pg = Postgresql::new(config.postgresql.clone());
         let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
@@ -1808,6 +1895,7 @@ mod tests {
 
         assert!(!ha.is_leader());
         assert!(msg.contains("failsafe failed"));
+        assert!(msg.contains("could not be written"), "{msg}");
     }
 
     #[tokio::test]
@@ -2208,19 +2296,26 @@ mod tests {
         )
         .await;
 
-        assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+        // No pg_ctl: the stop fails and is reported (the lock is released).
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(
+            resp.message
+                .starts_with("Switchover initiated, but stopping PostgreSQL failed"),
+            "{}",
+            resp.message
+        );
         assert!(dir.join("standby.signal").exists());
         assert!(auto_conf(&dir).contains(SYNC_LINE));
         assert_eq!(ha.read_current_upstream().as_deref(), Some("node2"));
         assert_eq!(ha.applied_sync_standby_names, None);
         assert!(!ha.is_leader());
+        assert!(ha.stop_pending);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn test_switchover_without_candidate_only_writes_signal() {
+    async fn test_switchover_without_candidate_removes_conninfo() {
         let (mut ha, dir, tx) = switchover_test_ha("c1-so-nocand", "old");
-        let before = auto_conf(&dir);
 
         let resp = send_cmd(
             &mut ha,
@@ -2233,11 +2328,723 @@ mod tests {
         )
         .await;
 
-        assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(
+            resp.message
+                .starts_with("Switchover initiated, but stopping PostgreSQL failed"),
+            "{}",
+            resp.message
+        );
         assert!(dir.join("standby.signal").exists());
-        assert_eq!(auto_conf(&dir), before, "auto.conf is not touched");
-        assert_eq!(ha.read_current_upstream().as_deref(), Some("old"));
+        assert!(auto_conf(&dir).contains(SYNC_LINE));
+        assert_eq!(ha.read_current_upstream(), None, "D3: no guessed upstream");
+        assert!(!dir.join("pg-ha.rewind_check").exists());
         assert_eq!(ha.applied_sync_standby_names, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────── Demotion writes standby.signal first (D2, D3) ───────────────────
+
+    use crate::standby_config::REWIND_CHECK_MARKER;
+
+    /// A data dir path that does not exist and is never created (M2: tests
+    /// never touch the shared `test_config` default).
+    fn missing_data_dir(label: &str) -> PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("pg-ha-test-missing-{label}-{}", std::process::id()));
+        assert!(!p.exists(), "{} must not exist", p.display());
+        p
+    }
+
+    fn marker(dir: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(dir.join(REWIND_CHECK_MARKER)).ok()
+    }
+
+    /// Cluster where `leader` holds the lock and is reachable at
+    /// `host=<leader> port=5432` (`conn_url` overrides it).
+    fn cluster_led_by(leader: &str, conn_url: Option<&str>, other: &str) -> Cluster {
+        let url = conn_url.map_or_else(|| format!("host={leader} port=5432"), str::to_string);
+        Cluster {
+            leader: Some(Leader {
+                name: leader.to_string(),
+                version: 1,
+            }),
+            members: vec![
+                Member {
+                    role: MemberRole::Primary,
+                    ..member_at(leader, &url)
+                },
+                running_member(other, 50),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn assert_demoted_files(dir: &std::path::Path, ha: &Ha, reason: &str) {
+        assert!(dir.join("standby.signal").is_file());
+        let m = marker(dir).expect("rewind-check marker");
+        assert!(m.contains(reason), "{m}");
+        assert_eq!(ha.read_current_upstream(), None, "D3: conninfo removed");
+        assert!(
+            auto_conf(dir).contains(SYNC_LINE),
+            "ALTER SYSTEM lines kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_demote_on_lock_loss_writes_signal_marker_and_removes_conninfo() {
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "c2-demote",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+        );
+        preset_auto_conf(&dir, "old");
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_leader = true;
+
+        // update_leader → Ok(false) → demote()
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m.starts_with("demoted self")),
+            "got: {result}"
+        );
+        assert_demoted_files(&dir, &ha, "demoted after losing the leader lock");
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert!(ha.stop_pending, "no pg_ctl: the stop failed");
+        assert!(!ha.is_leader());
+        assert_eq!(ha.postgresql().role(), &MemberRole::Replica);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_demote_on_dcs_error_during_renewal_writes_signal() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        dcs.fail_leader_writes();
+        let (mut ha, dir) = identity_test_ha("test_node", "c2-demote-err", dcs, Some(false), false);
+        preset_auto_conf(&dir, "old");
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_leader = true;
+
+        // update_leader → Err → demote()
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m.starts_with("demoted self")),
+            "got: {result}"
+        );
+        assert_demoted_files(&dir, &ha, "demoted after losing the leader lock");
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_demote_write_failure_still_stops() {
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "c2-demote-write-fail",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+        );
+        // A directory named standby.signal cannot be opened for writing.
+        std::fs::create_dir(dir.join("standby.signal")).unwrap();
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_leader = true;
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m)
+                if m.contains("standby configuration could not be written")),
+            "got: {result}"
+        );
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn dcs_error_demotion(label: &str, failsafe_enabled: bool) -> (Ha, PathBuf, String) {
+        let (mut ha, dir) = identity_test_ha(
+            "node1",
+            label,
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+        );
+        preset_auto_conf(&dir, "old");
+        ha.is_leader = true;
+        ha.failsafe.set_enabled(failsafe_enabled);
+        let result = ha.handle_dcs_error().await;
+        (ha, dir, format!("{result}"))
+    }
+
+    #[tokio::test]
+    async fn test_handle_dcs_error_disabled_writes_signal_and_marker() {
+        let (ha, dir, msg) = dcs_error_demotion("c2-dcs-disabled", false).await;
+        assert!(msg.contains("demoted to prevent split-brain"), "{msg}");
+        assert!(!msg.contains("could not be written"), "{msg}");
+        assert_demoted_files(&dir, &ha, "demoted because the DCS is unreachable");
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_dcs_error_not_all_confirmed_writes_signal_and_marker() {
+        let (ha, dir, msg) = dcs_error_demotion("c2-dcs-not-all", true).await;
+        assert!(msg.contains("failsafe failed"), "{msg}");
+        assert!(!msg.contains("could not be written"), "{msg}");
+        assert_demoted_files(&dir, &ha, "demoted because the DCS is unreachable");
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_fence_writes_signal_with_leader_conninfo() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c2-fence",
+            Arc::new(MockDcs::with_leader("node1")),
+            None,
+            false,
+        );
+        ha.cluster = cluster_led_by("node1", None, "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        let fenced = match &result {
+            CycleResult::Follower(m) => m.starts_with("stopped PostgreSQL"),
+            CycleResult::Error(m) => m.starts_with("Fence stop failed"),
+            _ => false,
+        };
+        assert!(fenced, "got: {result}");
+        assert!(dir.join("standby.signal").is_file());
+        assert_eq!(ha.read_current_upstream().as_deref(), Some("node1"));
+        assert_eq!(marker(&dir), None, "A6: the fence writes no marker");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_fence_with_hostless_leader_conn_url_removes_conninfo() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c2-fence-hostless",
+            Arc::new(MockDcs::with_leader("node1")),
+            None,
+            false,
+        );
+        preset_auto_conf(&dir, "old");
+        ha.cluster = cluster_led_by("node1", Some(""), "node2");
+
+        let _ = ha.process_healthy_cluster().await;
+
+        assert!(dir.join("standby.signal").is_file());
+        assert_eq!(ha.read_current_upstream(), None, "never guess an upstream");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_fence_write_failure_still_stops() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c2-fence-write-fail",
+            Arc::new(MockDcs::with_leader("node1")),
+            None,
+            false,
+        );
+        ha.cluster = cluster_led_by("node1", None, "node2");
+        // standby.signal can be written, the auto.conf temp file cannot.
+        std::fs::create_dir(dir.join("postgresql.auto.conf.pg-ha.tmp")).unwrap();
+        ha.postgresql.set_observed_in_recovery(None);
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("Fence stop failed")),
+            "got: {result}"
+        );
+        assert_eq!(ha.postgresql().observed_in_recovery(), None);
+        assert!(ha.stop_pending);
+        assert!(dir.join("standby.signal").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_fence_retried_after_stop_failure_even_with_signal() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c2-fence-retry",
+            Arc::new(MockDcs::with_leader("node1")),
+            None,
+            false,
+        );
+        ha.cluster = cluster_led_by("node1", None, "node2");
+
+        let first = ha.process_healthy_cluster().await;
+        assert!(
+            matches!(first, CycleResult::Error(ref m) if m.starts_with("Fence stop failed")),
+            "got: {first}"
+        );
+        assert!(dir.join("standby.signal").is_file());
+        assert!(ha.stop_pending);
+
+        // standby.signal now exists, but it was written on a server that may
+        // be writable: fence again instead of waiting.
+        ha.postgresql.set_observed_in_recovery(None);
+        let second = ha.process_healthy_cluster().await;
+        assert!(
+            matches!(second, CycleResult::Error(ref m) if m.starts_with("Fence stop failed")),
+            "got: {second}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_demote_stop_failure_then_unobserved_is_fenced() {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "c2-demote-fence",
+            dcs.clone(),
+            Some(false),
+            false,
+        );
+        ha.cluster = leader_cluster("test_node", "node2");
+
+        let _ = ha.process_healthy_cluster().await;
+        assert!(ha.stop_pending, "no pg_ctl: the demotion stop failed");
+
+        // Another node holds the lock; PostgreSQL is unobserved.
+        ha.cluster = leader_cluster("node1", "test_node");
+        ha.postgresql.set_observed_in_recovery(None);
+        let result = ha.process_healthy_cluster().await;
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("Fence stop failed")),
+            "got: {result}"
+        );
+
+        // No leader at all: fenced at the election entry, no campaign.
+        *dcs.leader_held_by.lock().unwrap() = None;
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![running_member("test_node", 1)],
+            ..Default::default()
+        };
+        ha.postgresql.set_observed_in_recovery(None);
+        let result = ha.process_unhealthy_cluster().await;
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("Fence stop failed")),
+            "got: {result}"
+        );
+        assert_eq!(lock_held_by(&dcs), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_primary_with_pending_stop_is_fenced_not_campaigned() {
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "c2-primary-pending",
+            dcs.clone(),
+            Some(false),
+            false,
+        );
+        ha.stop_pending = true;
+        // Only member: it would be the healthiest node.
+        ha.cluster = Cluster {
+            leader: None,
+            members: vec![running_member("test_node", 1)],
+            ..Default::default()
+        };
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("Fence stop failed")),
+            "got: {result}"
+        );
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert_eq!(lock_held_by(&dcs), None, "must not campaign");
+        assert!(dir.join("standby.signal").is_file());
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(
+            m.contains("stopped again after a failed demotion stop"),
+            "{m}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_stop_pending_cleared_when_pg_not_running() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c2-pending-cleared",
+            Arc::new(MockDcs::with_leader("node1")),
+            None,
+            true,
+        );
+        std::fs::write(dir.join("PG_VERSION"), "16").unwrap();
+        std::fs::remove_file(dir.join("postmaster.pid")).unwrap();
+        ha.stop_pending = true;
+
+        let _ = ha.run_cycle().await;
+
+        assert!(!ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_dcs_error_as_follower_retries_pending_stop() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c2-dcs-follower-retry",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+        );
+        ha.stop_pending = true;
+
+        let result = ha.handle_dcs_error().await;
+
+        assert_eq!(format!("{result}"), "Error: DCS unreachable");
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop retried");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_switchover_write_failure_still_stops() {
+        let (mut ha, dir, tx) = switchover_test_ha("c2-so-write-fail", "old");
+        std::fs::create_dir(dir.join("standby.signal")).unwrap();
+
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Switchover {
+                leader: Some("node1".into()),
+                candidate: Some("node2".into()),
+                scheduled_at: None,
+            },
+        )
+        .await;
+
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(
+            resp.message.contains("stopping PostgreSQL failed")
+                && resp
+                    .message
+                    .contains("writing standby configuration also failed"),
+            "{}",
+            resp.message
+        );
+        assert!(!ha.is_leader());
+        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
+        assert!(ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_switchover_stop_failure_sets_stop_pending() {
+        let (mut ha, dir, tx) = switchover_test_ha("c2-so-stop-fail", "old");
+
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Switchover {
+                leader: None,
+                candidate: None,
+                scheduled_at: None,
+            },
+        )
+        .await;
+
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(
+            resp.message.contains("stopping PostgreSQL failed")
+                && !resp.message.contains("also failed"),
+            "{}",
+            resp.message
+        );
+        assert!(ha.stop_pending);
+        assert!(dir.join("standby.signal").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rejoin_of_running_primary_writes_signal_and_marker_before_stop() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c2-rejoin-fence",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+        );
+        ha.cluster = cluster_led_by("node1", None, "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("Rejoin stop failed")),
+            "got: {result}"
+        );
+        assert!(dir.join("standby.signal").is_file());
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(m.contains("stopped for pg_rewind"), "{m}");
+        assert_eq!(ha.read_current_upstream().as_deref(), Some("node1"));
+        assert!(ha.stop_pending);
+        assert_eq!(ha.postgresql().observed_in_recovery(), None);
+
+        // Unobserved next cycle: fenced again, not "waiting".
+        ha.postgresql.set_observed_in_recovery(None);
+        let result = ha.process_healthy_cluster().await;
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("Fence stop failed")),
+            "got: {result}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reinitialize_of_running_primary_keeps_data_when_stop_fails() {
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c2-reinit-primary",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+            None,
+        );
+        std::fs::write(dir.join("PG_VERSION"), "16").unwrap();
+        ha.is_leader = false;
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Reinitialize).await;
+
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(
+            resp.message
+                .starts_with("Reinitialize: stopping PostgreSQL failed"),
+            "{}",
+            resp.message
+        );
+        assert!(dir.join("PG_VERSION").exists(), "data directory kept");
+        assert!(dir.join("standby.signal").is_file());
+        assert!(marker(&dir).is_some());
+        assert!(ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reinitialize_of_standby_still_removes_data() {
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c2-reinit-standby",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            true,
+            None,
+        );
+        std::fs::write(dir.join("PG_VERSION"), "16").unwrap();
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Reinitialize).await;
+
+        assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+        assert_eq!(resp.message, "Node reinitialized, will clone on next cycle");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_fences_running_primary() {
+        let (mut ha, dir) = identity_test_ha(
+            "node1",
+            "c2-shutdown-primary",
+            Arc::new(MockDcs::new()),
+            Some(false),
+            false,
+        );
+        preset_auto_conf(&dir, "old");
+
+        // observe_recovery() cannot reach port 1: Unknown{signal:false}.
+        assert!(ha.stop_postgres_for_shutdown().await.is_err());
+
+        assert!(dir.join("standby.signal").is_file());
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(m.contains("stopped by graceful shutdown"), "{m}");
+        assert_eq!(ha.read_current_upstream(), None);
+        assert!(ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_of_stopped_postgres_is_noop() {
+        let (mut ha, dir) = identity_test_ha(
+            "node1",
+            "c2-shutdown-stopped",
+            Arc::new(MockDcs::new()),
+            Some(false),
+            false,
+        );
+        std::fs::remove_file(dir.join("postmaster.pid")).unwrap();
+
+        assert!(ha.stop_postgres_for_shutdown().await.is_ok());
+
+        assert!(!dir.join("standby.signal").exists());
+        assert_eq!(marker(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────── Source-order checks for the stop paths ───────────────────
+    // Stops fail in tests (no pg_ctl), so file assertions alone cannot show
+    // that the standby config was written before the stop. These pin it.
+
+    /// Production part of a source file (before the first `#[cfg(test)]`).
+    fn production(src: &str) -> &str {
+        src.split("#[cfg(test)]").next().unwrap_or(src)
+    }
+
+    /// From the first `start` to the earliest of `ends` after it (or the end
+    /// of the production part).
+    fn section<'a>(src: &'a str, start: &str, ends: &[&str]) -> &'a str {
+        let src = production(src);
+        let from = src
+            .find(start)
+            .unwrap_or_else(|| panic!("`{start}` not found"));
+        let rest = &src[from + start.len()..];
+        let len = ends
+            .iter()
+            .filter_map(|e| rest.find(e))
+            .min()
+            .unwrap_or(rest.len());
+        &src[from..from + start.len() + len]
+    }
+
+    /// A method body: up to the next method of any visibility.
+    fn body<'a>(src: &'a str, start: &str) -> &'a str {
+        const METHOD_STARTS: [&str; 8] = [
+            "\n    fn ",
+            "\n    async fn ",
+            "\n    pub fn ",
+            "\n    pub async fn ",
+            "\n    pub(super) fn ",
+            "\n    pub(super) async fn ",
+            "\n    pub(crate) fn ",
+            "\n    pub(crate) async fn ",
+        ];
+        section(src, start, &METHOD_STARTS)
+    }
+
+    fn assert_before(text: &str, first: &str, second: &str, what: &str) {
+        let a = text
+            .find(first)
+            .unwrap_or_else(|| panic!("{what}: no `{first}`"));
+        let b = text
+            .find(second)
+            .unwrap_or_else(|| panic!("{what}: no `{second}`"));
+        assert!(a < b, "{what}: `{first}` must come before `{second}`");
+    }
+
+    const DIRECT_STOP: &str = ".postgresql.stop(";
+
+    #[test]
+    fn body_stops_at_any_method_visibility() {
+        let src = "impl X {\n    fn a() {\n        one();\n    }\n    pub async fn b() {\n        self.postgresql.stop(\"fast\");\n    }\n}\n";
+        let a = body(src, "fn a");
+        assert!(a.contains("one()"));
+        assert!(!a.contains(DIRECT_STOP), "{a}");
+        for vis in ["pub ", "pub(super) ", "pub(crate) ", ""] {
+            for asyncness in ["async ", ""] {
+                let src =
+                    format!("    fn a() {{}}\n    {vis}{asyncness}fn b() {{ x{DIRECT_STOP} }}\n");
+                assert!(
+                    !body(&src, "fn a").contains(DIRECT_STOP),
+                    "{vis}{asyncness}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_demotion_paths_write_config_before_stop() {
+        let mod_rs = include_str!("mod.rs");
+        let follow_rs = include_str!("follow.rs");
+        let election_rs = include_str!("election.rs");
+        let commands_rs = include_str!("commands.rs");
+        let helpers_rs = include_str!("helpers.rs");
+
+        // Paths that write through prepare_demotion, then stop.
+        let demote = body(mod_rs, "async fn demote");
+        let disabled = section(
+            mod_rs,
+            "FailsafeResult::Disabled =>",
+            &["FailsafeResult::NotAllConfirmed"],
+        );
+        let not_all = section(mod_rs, "FailsafeResult::NotAllConfirmed {", &["} else {"]);
+        let fence = section(follow_rs, "FollowerAction::Fence =>", &["FollowerAction::"]);
+        let switchover = body(commands_rs, "async fn handle_switchover_command");
+        let fence_primary = body(helpers_rs, "async fn fence_primary");
+        for (what, text) in [
+            ("demote", demote),
+            ("handle_dcs_error Disabled", disabled),
+            ("handle_dcs_error NotAllConfirmed", not_all),
+            ("follower Fence", fence),
+            ("switchover", switchover),
+            ("fence_primary", fence_primary),
+        ] {
+            assert_before(
+                text,
+                "prepare_demotion(",
+                "stop_after_demotion_write(",
+                what,
+            );
+            assert!(!text.contains(DIRECT_STOP), "{what}: direct stop");
+        }
+
+        // Paths that stop through fence_primary.
+        let election_fence = section(
+            election_rs,
+            "ElectionStance::Fence =>",
+            &["ElectionStance::"],
+        );
+        assert!(election_fence.contains("fence_primary("));
+        assert!(!election_fence.contains(DIRECT_STOP), "election Fence");
+
+        let shutdown = body(helpers_rs, "async fn stop_postgres_for_shutdown");
+        assert_before(shutdown, "fence_primary(", DIRECT_STOP, "shutdown");
+
+        let rejoin = body(follow_rs, "async fn rejoin_as_replica");
+        assert_before(rejoin, "fence_primary(", DIRECT_STOP, "rejoin");
+
+        let reinit = body(commands_rs, "async fn handle_reinitialize_command");
+        assert_before(reinit, "fence_primary(", DIRECT_STOP, "reinitialize");
+    }
+
+    #[test]
+    fn test_stop_call_sites_are_audited() {
+        // Direct stops left in production code (plan section 2.2b):
+        // follow.rs: rejoin of a non-primary, reconfigure_replica (2);
+        // commands.rs: POST /restart, POST /reinitialize of a non-primary;
+        // helpers.rs: stop_after_demotion_write, shutdown of a standby.
+        let files = [
+            ("mod.rs", include_str!("mod.rs"), 0),
+            ("follow.rs", include_str!("follow.rs"), 3),
+            ("election.rs", include_str!("election.rs"), 0),
+            ("commands.rs", include_str!("commands.rs"), 2),
+            ("helpers.rs", include_str!("helpers.rs"), 2),
+            ("identity.rs", include_str!("identity.rs"), 0),
+        ];
+        for (name, src, expected) in files {
+            assert_eq!(
+                production(src).matches(DIRECT_STOP).count(),
+                expected,
+                "{name}: a new direct PostgreSQL stop: use fence_primary / \
+                 stop_after_demotion_write, or add it to the audited table in plan \
+                 section 2.2b with a reason"
+            );
+        }
     }
 }

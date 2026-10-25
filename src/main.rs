@@ -406,7 +406,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Phase 4: Stop subsystems
     info!("Phase 4: Stopping PostgreSQL (fast mode)");
-    if let Err(e) = ha.postgresql_mut().stop("fast").await {
+    if let Err(e) = ha.stop_postgres_for_shutdown().await {
         error!("Failed to stop PostgreSQL during shutdown: {e}");
     }
 
@@ -802,6 +802,20 @@ mod tests {
     /// Verifies that the HA loop code handles dynamic `loop_wait` changes by
     /// detecting the change and recreating/resetting the interval. On unfixed
     /// code, the interval is only created once at startup.
+    /// Graceful shutdown stops PostgreSQL only through the HA engine, which
+    /// writes standby.signal first when PostgreSQL may be a writable primary
+    /// (the lock is released in Phase 3, before the stop).
+    #[test]
+    fn test_shutdown_stops_postgres_only_through_ha() {
+        let source = include_str!("main.rs");
+        let prod_code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let msg = "a new direct PostgreSQL stop: use fence_primary / \
+                   stop_after_demotion_write, or add it to the audited table in plan \
+                   section 2.2b with a reason";
+        assert_eq!(prod_code.matches(".stop(").count(), 0, "{msg}");
+        assert!(prod_code.contains("stop_postgres_for_shutdown("), "{msg}");
+    }
+
     #[test]
     fn test_bug_condition_loop_wait_dynamic_update() {
         let source = include_str!("main.rs");

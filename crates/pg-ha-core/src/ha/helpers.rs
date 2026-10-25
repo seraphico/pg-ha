@@ -1,12 +1,12 @@
 //! Helper methods: member heartbeat, standby signal detection, reconfiguration guard,
 //! upstream reading, and lock ownership verification.
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::error::Result;
 use crate::standby_config;
 
-use super::Ha;
+use super::{Ha, identity};
 
 impl Ha {
     /// Writes standby.signal + primary_conninfo (None removes it) and forgets
@@ -51,6 +51,103 @@ impl Ha {
             None => info!("Wrote standby configuration without primary_conninfo"),
         }
         Ok(())
+    }
+
+    /// Before stopping PostgreSQL on a demotion path (D2): create the
+    /// rewind-check marker when `rewind_check_reason` is set, then write
+    /// standby.signal and set primary_conninfo to `upstream_conn_url`, or
+    /// remove it when None (D3: never keep a guess). Both steps are attempted
+    /// (standby.signal is what keeps L5); the first error is returned. Never
+    /// stops PostgreSQL.
+    pub(super) async fn prepare_demotion(
+        &mut self,
+        upstream_conn_url: Option<String>,
+        rewind_check_reason: Option<&'static str>,
+    ) -> std::io::Result<()> {
+        let mut first_error = None;
+        if let Some(reason) = rewind_check_reason {
+            let data_dir = self.config.postgresql.data_dir.clone();
+            let created = tokio::task::spawn_blocking(move || {
+                standby_config::create_rewind_check_marker(&data_dir, reason)
+            })
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|r| r);
+            match created {
+                Ok(()) => info!("Created rewind-check marker: {reason}"),
+                Err(e) => first_error = Some(e),
+            }
+        }
+        if let Err(e) = self
+            .write_standby_config(upstream_conn_url.as_deref())
+            .await
+        {
+            first_error.get_or_insert(e);
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Stop PostgreSQL on a demotion / fence path after standby.signal was
+    /// written. A failed stop sets `stop_pending`, so later cycles keep fencing
+    /// an unobserved server even though standby.signal now exists (A19). A
+    /// successful stop is published at once (bounded by `loop_wait`, so an
+    /// unreachable DCS cannot stall the HA loop or graceful shutdown).
+    pub(super) async fn stop_after_demotion_write(
+        &mut self,
+        mode: &str,
+    ) -> crate::error::Result<()> {
+        if let Err(e) = self.postgresql.stop(mode).await {
+            self.stop_pending = true;
+            error!(
+                "Failed to stop PostgreSQL after writing standby.signal: {e}; pg-ha keeps fencing it until it is confirmed stopped"
+            );
+            return Err(e);
+        }
+        self.stop_pending = false;
+        let limit = std::time::Duration::from_secs(self.config.loop_wait.max(1));
+        match tokio::time::timeout(limit, self.touch_member()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Failed to publish member state after stopping PostgreSQL: {e}"),
+            Err(_) => warn!("Failed to publish member state after stopping PostgreSQL: timed out"),
+        }
+        Ok(())
+    }
+
+    /// Stop a PostgreSQL that may be a writable primary without the leader
+    /// lock (D2): write standby.signal (+ rewind-check marker) first, then
+    /// stop; a failed stop sets `stop_pending` so later cycles keep fencing it.
+    pub(super) async fn fence_primary(
+        &mut self,
+        mode: &'static str,
+        reason: &'static str,
+        upstream_conn_url: Option<String>,
+    ) -> crate::error::Result<()> {
+        self.reset_sync_cache();
+        if let Err(e) = self.prepare_demotion(upstream_conn_url, Some(reason)).await {
+            error!(
+                "Failed to write standby configuration before stopping PostgreSQL: {e}; stopping it anyway"
+            );
+        }
+        self.stop_after_demotion_write(mode).await
+    }
+
+    /// Graceful shutdown, Phase 4 (src/main.rs): stop PostgreSQL. The lock was
+    /// released in Phase 3, so a primary here is writable without the lock (D2,
+    /// A27): write standby.signal + marker first through `fence_primary`.
+    pub async fn stop_postgres_for_shutdown(&mut self) -> crate::error::Result<()> {
+        if !self.postgresql.is_running() {
+            return Ok(());
+        }
+        self.postgresql.observe_recovery().await;
+        if identity::shutdown_needs_fence(self.pg_identity()) {
+            self.fence_primary("fast", "stopped by graceful shutdown", None)
+                .await
+        } else {
+            self.postgresql.stop("fast").await
+        }
     }
 
     /// Forget what was applied to synchronous_standby_names so the next

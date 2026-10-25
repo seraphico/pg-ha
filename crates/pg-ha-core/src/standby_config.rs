@@ -160,6 +160,46 @@ pub(crate) fn write_standby_config(
     fsync_dir(data_dir)
 }
 
+/// Rewind-check marker (D4): this node may hold WAL beyond a fork point and
+/// must be verified with pg_rewind before it follows a leader.
+pub(crate) const REWIND_CHECK_MARKER: &str = "pg-ha.rewind_check";
+
+/// Create PGDATA/pg-ha.rewind_check (content: reason + UTC time), fsync the
+/// file and the data directory. Idempotent (overwrites).
+pub(crate) fn create_rewind_check_marker(data_dir: &Path, reason: &str) -> std::io::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut file = File::create(data_dir.join(REWIND_CHECK_MARKER))?;
+    file.write_all(format!("reason: {reason}\ncreated: {}\n", format_utc(now)).as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    fsync_dir(data_dir)
+}
+
+/// Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (proleptic Gregorian, UTC).
+fn format_utc(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    let rem = unix_secs % 86_400;
+    // Days since 1970-01-01 to civil date (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
 /// libpq conninfo value: quoted when empty or containing whitespace, `'` or
 /// `\`; inside quotes `\` and `'` are backslash-escaped.
 fn libpq_quote(value: &str) -> String {
@@ -556,5 +596,43 @@ mod tests {
         assert!(ensure_standby_signal(&dir).is_err());
 
         assert!(!dir.exists(), "nothing may be created");
+    }
+
+    #[test]
+    fn marker_is_created_and_fsynced() {
+        let dir = temp_data_dir("marker");
+        create_rewind_check_marker(&dir, "demoted after losing the leader lock").unwrap();
+        let content = std::fs::read_to_string(dir.join(REWIND_CHECK_MARKER)).unwrap();
+        assert!(
+            content.contains("reason: demoted after losing the leader lock\n"),
+            "{content}"
+        );
+        assert!(content.contains("created: "), "{content}");
+        // Idempotent: a second call overwrites.
+        create_rewind_check_marker(&dir, "second").unwrap();
+        let content = std::fs::read_to_string(dir.join(REWIND_CHECK_MARKER)).unwrap();
+        assert!(content.starts_with("reason: second\n"), "{content}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_fails_for_missing_dir() {
+        let dir =
+            std::env::temp_dir().join(format!("pg-ha-sc-marker-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(create_rewind_check_marker(&dir, "x").is_err());
+        assert!(!dir.exists(), "nothing may be created");
+    }
+
+    #[test]
+    fn format_utc_table() {
+        for (secs, expected) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (1_709_251_199, "2024-02-29T23:59:59Z"),
+            (4_102_444_800, "2100-01-01T00:00:00Z"),
+        ] {
+            assert_eq!(format_utc(secs), expected, "{secs}");
+        }
     }
 }

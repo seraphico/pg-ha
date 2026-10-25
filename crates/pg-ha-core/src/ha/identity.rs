@@ -5,7 +5,7 @@
 //!
 //! - the `pg_is_in_recovery()` observation taken this cycle, and
 //! - whether `standby.signal` exists (pg-ha writes it for every standby it
-//!   configures: clone, rejoin, switchover demotion).
+//!   configures: clone, rejoin, and every demotion before it stops PostgreSQL).
 //!
 //! It is never derived from the in-memory role, which only records what pg-ha
 //! did earlier. The rule behind the tables below:
@@ -97,7 +97,11 @@ pub(crate) enum FollowerAction {
     Wait,
 }
 
-pub(crate) fn follower_action(identity: PgIdentity) -> FollowerAction {
+/// `stop_pending`: a stop after writing standby.signal on a demotion / fence
+/// path failed and PostgreSQL was not confirmed stopped since. The signal was
+/// written on a server that may be writable, so it no longer proves the
+/// server is read-only: an unobserved server is fenced again (A19).
+pub(crate) fn follower_action(identity: PgIdentity, stop_pending: bool) -> FollowerAction {
     match identity {
         PgIdentity::Primary => FollowerAction::Rejoin,
         PgIdentity::ManagedStandby => FollowerAction::Follow,
@@ -107,7 +111,13 @@ pub(crate) fn follower_action(identity: PgIdentity) -> FollowerAction {
         } => FollowerAction::Fence,
         PgIdentity::Unknown {
             has_standby_signal: true,
-        } => FollowerAction::Wait,
+        } => {
+            if stop_pending {
+                FollowerAction::Fence
+            } else {
+                FollowerAction::Wait
+            }
+        }
     }
 }
 
@@ -121,13 +131,29 @@ pub(crate) enum ElectionStance {
     StandAside,
     /// Cannot observe: skip this cycle.
     Wait,
+    /// A demotion stop failed and PostgreSQL may still be writable (observed
+    /// primary, or unobserved): stop it again (L5) and skip the election.
+    Fence,
 }
 
-pub(crate) fn election_stance(identity: PgIdentity) -> ElectionStance {
+/// `stop_pending` as in [`follower_action`]. A primary pg-ha already decided
+/// to stop must not campaign: a failed lock acquisition does not stop it.
+pub(crate) fn election_stance(identity: PgIdentity, stop_pending: bool) -> ElectionStance {
     match identity {
+        PgIdentity::Primary | PgIdentity::Unknown { .. } if stop_pending => ElectionStance::Fence,
         PgIdentity::Primary | PgIdentity::ManagedStandby => ElectionStance::Participate,
         PgIdentity::UnmanagedRecovery => ElectionStance::StandAside,
         PgIdentity::Unknown { .. } => ElectionStance::Wait,
+    }
+}
+
+/// Graceful shutdown (A27): must the stop go through `fence_primary`? Yes
+/// unless PostgreSQL is observed in recovery: the lock was released first, so
+/// a primary (or a server pg-ha cannot observe) may be writable without it.
+pub(crate) fn shutdown_needs_fence(identity: PgIdentity) -> bool {
+    match identity {
+        PgIdentity::Primary | PgIdentity::Unknown { .. } => true,
+        PgIdentity::ManagedStandby | PgIdentity::UnmanagedRecovery => false,
     }
 }
 
@@ -236,48 +262,115 @@ mod tests {
         }
     }
 
+    const UNKNOWN_NO_SIGNAL: PgIdentity = PgIdentity::Unknown {
+        has_standby_signal: false,
+    };
+    const UNKNOWN_SIGNAL: PgIdentity = PgIdentity::Unknown {
+        has_standby_signal: true,
+    };
+
     #[test]
     fn follower_table() {
         use FollowerAction::*;
-        assert_eq!(follower_action(PgIdentity::Primary), Rejoin);
-        assert_eq!(follower_action(PgIdentity::ManagedStandby), Follow);
-        assert_eq!(follower_action(PgIdentity::UnmanagedRecovery), HandOff);
-        assert_eq!(
-            follower_action(PgIdentity::Unknown {
-                has_standby_signal: false
-            }),
-            Fence
-        );
-        assert_eq!(
-            follower_action(PgIdentity::Unknown {
-                has_standby_signal: true
-            }),
-            Wait
-        );
+        let table = [
+            (PgIdentity::Primary, false, Rejoin),
+            (PgIdentity::Primary, true, Rejoin),
+            (PgIdentity::ManagedStandby, false, Follow),
+            (PgIdentity::ManagedStandby, true, Follow),
+            (PgIdentity::UnmanagedRecovery, false, HandOff),
+            (PgIdentity::UnmanagedRecovery, true, HandOff),
+            (UNKNOWN_NO_SIGNAL, false, Fence),
+            (UNKNOWN_NO_SIGNAL, true, Fence),
+            (UNKNOWN_SIGNAL, false, Wait),
+            (UNKNOWN_SIGNAL, true, Fence),
+        ];
+        assert_eq!(table.len(), ALL_IDENTITIES.len() * 2);
+        for (id, pending, expected) in table {
+            assert_eq!(follower_action(id, pending), expected, "{id:?} {pending}");
+        }
     }
 
     #[test]
     fn unmanaged_recovery_is_never_rewound_or_campaigned() {
         let id = PgIdentity::UnmanagedRecovery;
-        assert_ne!(follower_action(id), FollowerAction::Rejoin);
-        assert_eq!(election_stance(id), ElectionStance::StandAside);
+        for s in [false, true] {
+            assert_ne!(follower_action(id, s), FollowerAction::Rejoin);
+            assert_eq!(election_stance(id, s), ElectionStance::StandAside);
+        }
         assert_ne!(leader_action(id), LeaderAction::Promote);
     }
 
     #[test]
     fn election_table() {
         use ElectionStance::*;
-        assert_eq!(election_stance(PgIdentity::Primary), Participate);
-        assert_eq!(election_stance(PgIdentity::ManagedStandby), Participate);
-        assert_eq!(election_stance(PgIdentity::UnmanagedRecovery), StandAside);
-        for s in [false, true] {
-            assert_eq!(
-                election_stance(PgIdentity::Unknown {
-                    has_standby_signal: s
-                }),
-                Wait
-            );
+        let table = [
+            (PgIdentity::Primary, false, Participate),
+            (PgIdentity::Primary, true, Fence),
+            (PgIdentity::ManagedStandby, false, Participate),
+            (PgIdentity::ManagedStandby, true, Participate),
+            (PgIdentity::UnmanagedRecovery, false, StandAside),
+            (PgIdentity::UnmanagedRecovery, true, StandAside),
+            (UNKNOWN_NO_SIGNAL, false, Wait),
+            (UNKNOWN_NO_SIGNAL, true, Fence),
+            (UNKNOWN_SIGNAL, false, Wait),
+            (UNKNOWN_SIGNAL, true, Fence),
+        ];
+        assert_eq!(table.len(), ALL_IDENTITIES.len() * 2);
+        for (id, pending, expected) in table {
+            assert_eq!(election_stance(id, pending), expected, "{id:?} {pending}");
         }
+    }
+
+    #[test]
+    fn stop_pending_only_changes_unknown_and_primary_election() {
+        for id in ALL_IDENTITIES {
+            let follower_changes = follower_action(id, false) != follower_action(id, true);
+            assert_eq!(
+                follower_changes,
+                matches!(id, PgIdentity::Unknown { .. })
+                    && follower_action(id, false) != FollowerAction::Fence,
+                "{id:?}"
+            );
+            if follower_changes {
+                assert_eq!(follower_action(id, true), FollowerAction::Fence, "{id:?}");
+            }
+            let election_changes = election_stance(id, false) != election_stance(id, true);
+            assert_eq!(
+                election_changes,
+                matches!(id, PgIdentity::Unknown { .. } | PgIdentity::Primary),
+                "{id:?}"
+            );
+            if election_changes {
+                assert_eq!(election_stance(id, true), ElectionStance::Fence, "{id:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_with_stop_pending_is_always_fenced() {
+        for s in [false, true] {
+            let id = PgIdentity::Unknown {
+                has_standby_signal: s,
+            };
+            assert_eq!(follower_action(id, true), FollowerAction::Fence, "{id:?}");
+            assert_eq!(election_stance(id, true), ElectionStance::Fence, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn shutdown_needs_fence_table() {
+        for id in ALL_IDENTITIES {
+            let expected = match id {
+                PgIdentity::Primary | PgIdentity::Unknown { .. } => true,
+                PgIdentity::ManagedStandby | PgIdentity::UnmanagedRecovery => false,
+            };
+            assert_eq!(shutdown_needs_fence(id), expected, "{id:?}");
+        }
+        assert!(shutdown_needs_fence(PgIdentity::Primary));
+        assert!(shutdown_needs_fence(UNKNOWN_NO_SIGNAL));
+        assert!(shutdown_needs_fence(UNKNOWN_SIGNAL));
+        assert!(!shutdown_needs_fence(PgIdentity::ManagedStandby));
+        assert!(!shutdown_needs_fence(PgIdentity::UnmanagedRecovery));
     }
 
     #[test]

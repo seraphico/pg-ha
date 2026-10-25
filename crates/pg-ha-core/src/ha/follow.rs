@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 use crate::cascading::CascadeManager;
 use crate::cluster::MemberRole;
 
-use super::identity::{FollowerAction, follower_action};
+use super::identity::{FollowerAction, PgIdentity, follower_action};
 use super::{CycleResult, Ha};
 
 impl Ha {
@@ -39,7 +39,7 @@ impl Ha {
         // ─── What is this node, given that another node holds the lock? ───
         // Decided from this cycle's observation (see `identity`).
         let identity = self.pg_identity();
-        match follower_action(identity) {
+        match follower_action(identity, self.stop_pending) {
             FollowerAction::Rejoin => {
                 // Old primary that lost the lock (S4): convert it via pg_rewind.
                 info!(
@@ -66,18 +66,45 @@ impl Ha {
                 ));
             }
             FollowerAction::Fence => {
-                warn!(
-                    "Cannot observe PostgreSQL recovery state and there is no standby.signal, while \
-                     {} holds the leader lock — stopping PostgreSQL so it cannot serve writes",
-                    lock_owner
-                );
-                if let Err(e) = self.postgresql.stop("fast").await {
-                    error!("Failed to stop PostgreSQL while fencing: {e}");
+                let retry = self.stop_pending;
+                if retry {
+                    warn!(
+                        "A previous stop after writing standby.signal failed and PostgreSQL is \
+                         unobserved, while {} holds the leader lock — stopping PostgreSQL again",
+                        lock_owner
+                    );
+                } else {
+                    warn!(
+                        "Cannot observe PostgreSQL recovery state and there is no standby.signal, while \
+                         {} holds the leader lock — stopping PostgreSQL so it cannot serve writes",
+                        lock_owner
+                    );
+                }
+                // Write standby.signal first (D2); the lock holder is the
+                // known upstream.
+                let upstream = self
+                    .cluster
+                    .get_member(lock_owner)
+                    .map(|m| m.conn_url.clone());
+                let written = self.prepare_demotion(upstream, None).await;
+                if let Err(e) = &written {
+                    error!(
+                        "Failed to write standby configuration before stopping PostgreSQL: {e}; stopping it anyway"
+                    );
+                }
+                if let Err(e) = self.stop_after_demotion_write("fast").await {
                     return CycleResult::Error(format!("Fence stop failed: {e}"));
                 }
-                return CycleResult::Follower(
-                    "stopped PostgreSQL: recovery state unobserved and no standby.signal".into(),
-                );
+                if let Err(e) = written {
+                    return CycleResult::Error(format!(
+                        "Fence: stopped PostgreSQL, but standby configuration could not be written: {e}"
+                    ));
+                }
+                return CycleResult::Follower(if retry {
+                    "stopped PostgreSQL: a demotion stop had failed".into()
+                } else {
+                    "stopped PostgreSQL: recovery state unobserved and no standby.signal".into()
+                });
             }
             FollowerAction::Wait => {
                 let _ = self.touch_member().await;
@@ -172,10 +199,21 @@ impl Ha {
             }
         };
 
-        // Step 1: Stop PostgreSQL (only if it's running)
+        // Step 1: Stop PostgreSQL (only if it's running). A primary without
+        // the lock may be writable: write standby.signal + marker first (D2).
         if self.postgresql.is_running() {
             info!("Stopping PostgreSQL for rejoin (pg_rewind)");
-            if let Err(e) = self.postgresql.stop("fast").await {
+            let stopped = if self.pg_identity() == PgIdentity::Primary {
+                self.fence_primary(
+                    "fast",
+                    "stopped for pg_rewind while running as a primary without the leader lock",
+                    Some(leader_connstr.clone()),
+                )
+                .await
+            } else {
+                self.postgresql.stop("fast").await
+            };
+            if let Err(e) = stopped {
                 error!("Failed to stop PostgreSQL for rejoin: {e}");
                 return CycleResult::Error(format!("Rejoin stop failed: {e}"));
             }

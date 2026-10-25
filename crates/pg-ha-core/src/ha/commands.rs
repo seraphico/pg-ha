@@ -5,10 +5,10 @@ use tracing::{error, info};
 
 use crate::cluster::MemberRole;
 use crate::commands::{CommandResponse, ManagementCommand};
-use crate::standby_config;
 
 use super::Ha;
 use super::election::sync_failover_allowed;
+use super::identity::PgIdentity;
 
 impl Ha {
     /// Process pending management commands from the API
@@ -125,36 +125,40 @@ impl Ha {
         self.is_leader = false;
         self.reset_sync_cache();
 
-        // Stop PostgreSQL to ensure clean demotion
-        let _ = self.postgresql.stop("fast").await;
-        self.postgresql.set_role(MemberRole::Replica);
-
-        // Write standby.signal so this node is recognized as a replica on next
-        // cycle (prevents it from re-acquiring the lock as a stale primary).
-        // With a candidate, point primary_conninfo at it so PG streams from the
-        // new primary when it restarts.
+        // Write standby.signal before stopping PostgreSQL (D2), so this node
+        // restarts as a standby. With a candidate, point primary_conninfo at
+        // it; without one the new leader is unknown, so primary_conninfo is
+        // removed (D3).
         let candidate_conn_url = candidate
             .as_deref()
             .and_then(|c| self.cluster.get_member(c))
             .map(|m| m.conn_url.clone());
-        match candidate_conn_url {
-            Some(conn_url) => {
-                if let Err(e) = self.write_standby_config(Some(&conn_url)).await {
-                    error!("Failed to write standby configuration: {e}");
-                }
+        let write_error = self.prepare_demotion(candidate_conn_url, None).await.err();
+        if let Some(we) = &write_error {
+            error!(
+                "Failed to write standby configuration before stopping PostgreSQL: {we}; stopping it anyway"
+            );
+        }
+        let stop_error = self.stop_after_demotion_write("fast").await.err();
+        self.postgresql.set_role(MemberRole::Replica);
+
+        // A failed stop comes first: PostgreSQL may still be writable.
+        match (write_error, stop_error) {
+            (None, None) => {}
+            (None, Some(e)) => {
+                return CommandResponse::error(format!(
+                    "Switchover initiated, but stopping PostgreSQL failed: {e}; pg-ha keeps fencing it"
+                ));
             }
-            None => {
-                let dir = self.config.postgresql.data_dir.clone();
-                self.reset_sync_cache();
-                match tokio::task::spawn_blocking(move || {
-                    standby_config::ensure_standby_signal(&dir)
-                })
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => error!("Failed to write standby.signal: {e}"),
-                    Err(e) => error!("Failed to write standby.signal: {e}"),
-                }
+            (Some(we), Some(e)) => {
+                return CommandResponse::error(format!(
+                    "Switchover initiated, but stopping PostgreSQL failed: {e}; pg-ha keeps fencing it; writing standby configuration also failed: {we}"
+                ));
+            }
+            (Some(we), None) => {
+                return CommandResponse::error(format!(
+                    "Switchover initiated and PostgreSQL stopped, but writing standby configuration failed: {we}"
+                ));
             }
         }
 
@@ -202,7 +206,25 @@ impl Ha {
             return CommandResponse::rejected("Cannot reinitialize the leader node");
         }
         info!("Reinitializing node (requested via API)");
-        let _ = self.postgresql.stop("immediate").await;
+        if self.postgresql.is_running() && self.pg_identity() == PgIdentity::Primary {
+            // A primary without the lock may be writable: write
+            // standby.signal + marker first, and never delete the data
+            // directory under a server that could not be stopped.
+            if let Err(e) = self
+                .fence_primary(
+                    "immediate",
+                    "stopped for reinitialize while running as a primary without the leader lock",
+                    None,
+                )
+                .await
+            {
+                return CommandResponse::error(format!(
+                    "Reinitialize: stopping PostgreSQL failed: {e}; data directory not removed (pg-ha keeps fencing it)"
+                ));
+            }
+        } else {
+            let _ = self.postgresql.stop("immediate").await;
+        }
         if let Err(e) = self.postgresql.remove_data_directory() {
             return CommandResponse::error(format!("Remove data dir failed: {e}"));
         }
