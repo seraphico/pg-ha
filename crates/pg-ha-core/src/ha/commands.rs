@@ -1,13 +1,14 @@
 //! Command processing: switchover, failover, restart, and reinitialize commands
 //! received from the management API.
 
-use tracing::info;
+use tracing::{error, info};
 
 use crate::cluster::MemberRole;
 use crate::commands::{CommandResponse, ManagementCommand};
+use crate::standby_config;
 
-use super::election::sync_failover_allowed;
 use super::Ha;
+use super::election::sync_failover_allowed;
 
 impl Ha {
     /// Process pending management commands from the API
@@ -122,48 +123,39 @@ impl Ha {
             let _ = self.dcs.delete_leader(leader).await;
         }
         self.is_leader = false;
+        self.reset_sync_cache();
 
         // Stop PostgreSQL to ensure clean demotion
         let _ = self.postgresql.stop("fast").await;
         self.postgresql.set_role(MemberRole::Replica);
 
-        // Write standby.signal so this node is recognized as a replica on next cycle
-        // (prevents it from re-acquiring the lock as a stale primary)
-        let standby_signal = self.config.postgresql.data_dir.join("standby.signal");
-        let _ = std::fs::write(&standby_signal, "");
-
-        // Write primary_conninfo pointing to the candidate (new primary)
-        // so when PG restarts it streams from the correct source
-        if let Some(ref cand_name) = candidate
-            && let Some(cand_member) = self.cluster.get_member(cand_name)
-        {
-            let mut host = "127.0.0.1".to_string();
-            let mut port = "5432".to_string();
-            for part in cand_member.conn_url.split_whitespace() {
-                if let Some(val) = part.strip_prefix("host=") {
-                    host = val.to_string();
-                }
-                if let Some(val) = part.strip_prefix("port=") {
-                    port = val.to_string();
+        // Write standby.signal so this node is recognized as a replica on next
+        // cycle (prevents it from re-acquiring the lock as a stale primary).
+        // With a candidate, point primary_conninfo at it so PG streams from the
+        // new primary when it restarts.
+        let candidate_conn_url = candidate
+            .as_deref()
+            .and_then(|c| self.cluster.get_member(c))
+            .map(|m| m.conn_url.clone());
+        match candidate_conn_url {
+            Some(conn_url) => {
+                if let Err(e) = self.write_standby_config(Some(&conn_url)).await {
+                    error!("Failed to write standby configuration: {e}");
                 }
             }
-            let repl_user = &self.config.postgresql.replication.username;
-            let repl_pass = self
-                .config
-                .postgresql
-                .replication
-                .password
-                .as_deref()
-                .unwrap_or("");
-            let conninfo = format!(
-                "host={host} port={port} user={repl_user} password={repl_pass} application_name={}",
-                self.config.name
-            );
-            let auto_conf = self.config.postgresql.data_dir.join("postgresql.auto.conf");
-            let content = format!(
-                "# pg-ha managed (switchover demotion)\nprimary_conninfo = '{conninfo}'\nrecovery_target_timeline = 'latest'\n"
-            );
-            let _ = std::fs::write(&auto_conf, content);
+            None => {
+                let dir = self.config.postgresql.data_dir.clone();
+                self.reset_sync_cache();
+                match tokio::task::spawn_blocking(move || {
+                    standby_config::ensure_standby_signal(&dir)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => error!("Failed to write standby.signal: {e}"),
+                    Err(e) => error!("Failed to write standby.signal: {e}"),
+                }
+            }
         }
 
         CommandResponse::accepted("Switchover initiated, leader lock released")

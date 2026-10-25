@@ -21,6 +21,7 @@ use crate::config::{BootstrapConfig, Config, InitdbOption};
 use crate::dcs::DcsAdapter;
 use crate::error::{Error, Result};
 use crate::postgresql::Postgresql;
+use crate::standby_config;
 
 /// Orchestrates the bootstrap flow for new PostgreSQL clusters.
 pub struct Bootstrap<'a> {
@@ -142,8 +143,26 @@ impl<'a> Bootstrap<'a> {
             Ok(()) => {
                 // Write replication config for standby
                 self.write_pg_config();
-                // Configure as a streaming standby
-                self.write_standby_config(&source.conn_url);
+                // Configure as a streaming standby (standby.signal +
+                // primary_conninfo; other postgresql.auto.conf lines are kept)
+                let conninfo = standby_config::build_primary_conninfo(
+                    &source.conn_url,
+                    &self.config.postgresql.replication,
+                    &self.config.name,
+                );
+                if conninfo.is_none() {
+                    error!(
+                        "Clone source {} has no host= in its conn_url; writing standby.signal without primary_conninfo",
+                        source.name
+                    );
+                }
+                match standby_config::write_standby_config(
+                    &self.config.postgresql.data_dir,
+                    conninfo.as_deref(),
+                ) {
+                    Ok(()) => info!(source = %source.name, "Configured as streaming standby"),
+                    Err(e) => error!("Failed to write standby configuration after clone: {e}"),
+                }
                 BootstrapResult::ClonedAsReplica
             }
             Err(e) => {
@@ -336,62 +355,6 @@ impl<'a> Bootstrap<'a> {
         if let Err(e) = std::fs::write(&hba_path, hba_content) {
             warn!("Failed to write pg_hba.conf: {e}");
         }
-    }
-
-    /// Configure PostgreSQL as a streaming standby replica.
-    ///
-    /// Creates `standby.signal` and writes `primary_conninfo` to `postgresql.auto.conf`.
-    /// Required for PG 12+ to start in recovery mode after pg_basebackup.
-    fn write_standby_config(&self, source_connstr: &str) {
-        let data_dir = &self.config.postgresql.data_dir;
-
-        // Create standby.signal (empty file tells PG to start in standby mode)
-        let standby_signal = data_dir.join("standby.signal");
-        if let Err(e) = std::fs::write(&standby_signal, "") {
-            warn!("Failed to create standby.signal: {e}");
-        }
-
-        // Build primary_conninfo from source connection string
-        // The source_connstr is in libpq format: "host=X port=Y dbname=Z user=W password=P"
-        // We need to ensure it has the replication user
-        let repl_user = &self.config.postgresql.replication.username;
-        let repl_pass = self
-            .config
-            .postgresql
-            .replication
-            .password
-            .as_deref()
-            .unwrap_or("");
-
-        // Parse host and port from source_connstr
-        let mut host = "127.0.0.1".to_string();
-        let mut port = "5432".to_string();
-        for part in source_connstr.split_whitespace() {
-            if let Some(val) = part.strip_prefix("host=") {
-                host = val.to_string();
-            } else if let Some(val) = part.strip_prefix("port=") {
-                port = val.to_string();
-            }
-        }
-
-        let primary_conninfo = format!(
-            "host={host} port={port} user={repl_user} password={repl_pass} application_name={}",
-            self.config.name
-        );
-
-        // Write to postgresql.auto.conf (PG reads this after postgresql.conf)
-        let auto_conf_path = data_dir.join("postgresql.auto.conf");
-        let auto_conf_content = format!(
-            "# pg-ha managed standby configuration\nprimary_conninfo = '{primary_conninfo}'\nrecovery_target_timeline = 'latest'\n"
-        );
-        if let Err(e) = std::fs::write(&auto_conf_path, auto_conf_content) {
-            warn!("Failed to write postgresql.auto.conf: {e}");
-        }
-
-        info!(
-            primary_conninfo = %crate::postgresql::redact_connstr(&primary_conninfo),
-            "Configured as streaming standby"
-        );
     }
 
     /// Clean up partial data directory on bootstrap failure.

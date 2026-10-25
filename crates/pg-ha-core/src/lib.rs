@@ -25,6 +25,7 @@ pub mod history;
 pub mod postgresql;
 pub mod slots;
 pub mod standby_cluster;
+pub(crate) mod standby_config;
 pub mod sync;
 pub mod watchdog;
 

@@ -351,6 +351,7 @@ impl Ha {
             }
         }
         self.is_leader = false;
+        self.reset_sync_cache();
         let _ = self.touch_member().await;
         CycleResult::Error(format!(
             "released leader lock: PostgreSQL in unmanaged recovery ({cause}); operator action required"
@@ -485,6 +486,7 @@ impl Ha {
             error!("Failed to stop PostgreSQL during demotion: {e}");
         }
         self.postgresql.set_role(MemberRole::Replica);
+        self.reset_sync_cache();
         CycleResult::Follower("demoted self because failed to update leader lock in DCS".into())
     }
 
@@ -500,6 +502,7 @@ impl Ha {
                 let _ = self.dcs.delete_leader(leader).await;
             }
             self.is_leader = false;
+            self.reset_sync_cache();
         }
 
         if self.is_paused {
@@ -608,6 +611,8 @@ impl Ha {
                 BootstrapResult::ClonedAsReplica => match self.postgresql.start().await {
                     Ok(()) => {
                         self.postgresql.set_role(MemberRole::Replica);
+                        // The clone's postgresql.auto.conf came from the source.
+                        self.reset_sync_cache();
                         CycleResult::Follower("cloned and started as replica".into())
                     }
                     Err(e) => CycleResult::Error(format!("Start after clone failed: {e}")),
@@ -636,6 +641,7 @@ impl Ha {
                         "DCS unreachable while holding leader lock - demoting to prevent split-brain"
                     );
                     self.is_leader = false;
+                    self.reset_sync_cache();
                     if let Err(e) = self.postgresql.stop("fast").await {
                         error!("Failed to stop PG during DCS error demotion: {e}");
                     }
@@ -649,6 +655,7 @@ impl Ha {
                         "DCS unreachable and failsafe check failed - demoting"
                     );
                     self.is_leader = false;
+                    self.reset_sync_cache();
                     if let Err(e) = self.postgresql.stop("fast").await {
                         error!("Failed to stop PG during DCS error demotion:{e}");
                     }
@@ -1381,17 +1388,49 @@ mod tests {
         in_recovery: Option<bool>,
         standby_signal: bool,
     ) -> (Ha, PathBuf) {
+        let (ha, data_dir, _cmd_tx) =
+            identity_test_ha_with_cmd(name, label, dcs, in_recovery, standby_signal, None);
+        (ha, data_dir)
+    }
+
+    /// A bin_dir that never exists, so no test can run a real PostgreSQL tool
+    /// even on a host with /usr/bin/pg_ctl.
+    fn no_bin_dir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("pg-ha-no-bin-{}", std::process::id()));
+        assert!(!p.exists(), "{} must not exist", p.display());
+        p
+    }
+
+    /// Like `identity_test_ha`, but keeps the command sender and takes the
+    /// PostgreSQL bin_dir (None: `no_bin_dir()`).
+    fn identity_test_ha_with_cmd(
+        name: &str,
+        label: &str,
+        dcs: Arc<MockDcs>,
+        in_recovery: Option<bool>,
+        standby_signal: bool,
+        bin_dir: Option<PathBuf>,
+    ) -> (Ha, PathBuf, CommandSender) {
         let mut config = test_config(name);
         config.postgresql.port = 1;
+        config.postgresql.bin_dir = bin_dir.unwrap_or_else(no_bin_dir);
         let (pg, data_dir) = with_fake_running_pg(&config, label);
         config.postgresql.data_dir = data_dir.clone();
         let _ = std::fs::remove_file(data_dir.join("standby.signal"));
         if standby_signal {
             std::fs::write(data_dir.join("standby.signal"), "").unwrap();
         }
-        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+        let (mut ha, cmd_tx) = Ha::new(config, dcs, pg);
         ha.postgresql.set_observed_in_recovery(in_recovery);
-        (ha, data_dir)
+        (ha, data_dir, cmd_tx)
+    }
+
+    /// Send one management command and run it, like the HA loop does.
+    async fn send_cmd(ha: &mut Ha, tx: &CommandSender, cmd: ManagementCommand) -> CommandResponse {
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        tx.send((cmd, reply_tx)).await.unwrap();
+        ha.process_commands().await;
+        reply_rx.recv().await.unwrap()
     }
 
     fn leader_cluster(leader: &str, other: &str) -> Cluster {
@@ -1896,5 +1935,309 @@ mod tests {
         let resp = reply_rx.recv().await.unwrap();
         assert_eq!(resp.status, CommandStatus::Accepted);
         assert!(dcs.last_failover_value.lock().unwrap().is_some());
+    }
+
+    // ─────────────────── Standby config writer and sync cache (D7) ───────────────────
+
+    const SYNC_LINE: &str = "synchronous_standby_names = 'FIRST 1 (node2)'";
+
+    fn applied_sync() -> Option<String> {
+        Some("FIRST 1 (node2)".to_string())
+    }
+
+    fn auto_conf(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("postgresql.auto.conf")).unwrap_or_default()
+    }
+
+    fn preset_auto_conf(dir: &std::path::Path, upstream_host: &str) {
+        std::fs::write(
+            dir.join("postgresql.auto.conf"),
+            format!("{SYNC_LINE}\nprimary_conninfo = 'host={upstream_host} port=5432'\n"),
+        )
+        .unwrap();
+    }
+
+    fn member_at(name: &str, conn_url: &str) -> Member {
+        Member {
+            conn_url: conn_url.to_string(),
+            ..running_member(name, 50)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_demote_resets_applied_sync_standby_names() {
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "c1-demote-sync",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+        );
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_leader = true;
+        ha.applied_sync_standby_names = applied_sync();
+
+        // update_leader → Ok(false) (node1 holds the lock) → demote()
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m.starts_with("demoted self")),
+            "got: {result}"
+        );
+        assert_eq!(ha.applied_sync_standby_names, None);
+        assert!(!ha.is_leader());
+        assert_eq!(ha.postgresql().role(), &MemberRole::Replica);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_dcs_error_resets_sync_cache() {
+        // Disabled failsafe → Disabled branch; enabled with no members →
+        // NotAllConfirmed branch. Both leave the primary role.
+        for (failsafe_enabled, expected) in [(false, "demoted"), (true, "failsafe failed")] {
+            let label = format!("c1-dcs-error-sync-{failsafe_enabled}");
+            let (mut ha, dir) = identity_test_ha(
+                "node1",
+                &label,
+                Arc::new(MockDcs::with_leader("node1")),
+                Some(false),
+                false,
+            );
+            ha.is_leader = true;
+            ha.failsafe.set_enabled(failsafe_enabled);
+            ha.applied_sync_standby_names = applied_sync();
+
+            let result = ha.handle_dcs_error().await;
+
+            assert!(format!("{result}").contains(expected), "got: {result}");
+            assert_eq!(ha.applied_sync_standby_names, None, "{label}");
+            assert!(!ha.is_leader());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dcs_error_without_leadership_keeps_sync_cache() {
+        let (mut ha, dir) = identity_test_ha(
+            "node1",
+            "c1-dcs-error-follower",
+            Arc::new(MockDcs::with_leader("node2")),
+            Some(true),
+            true,
+        );
+        ha.applied_sync_standby_names = applied_sync();
+
+        let _ = ha.handle_dcs_error().await;
+
+        assert_eq!(ha.applied_sync_standby_names, applied_sync());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_releasing_lock_in_unmanaged_recovery_resets_sync_cache() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "c1-relinquish-sync",
+            dcs.clone(),
+            Some(true),
+            false,
+        );
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.applied_sync_standby_names = applied_sync();
+
+        let _ = ha.process_healthy_cluster().await;
+
+        assert_eq!(lock_held_by(&dcs), None);
+        assert_eq!(ha.applied_sync_standby_names, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_releasing_lock_when_postgres_not_running_resets_sync_cache() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "c1-not-running-sync", dcs.clone(), None, true);
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_leader = true;
+        ha.applied_sync_standby_names = applied_sync();
+
+        // No pg_ctl: the start attempt after releasing the lock fails.
+        let _ = ha.handle_postgres_not_running().await;
+
+        assert_eq!(lock_held_by(&dcs), None);
+        assert!(!ha.is_leader());
+        assert_eq!(ha.applied_sync_standby_names, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_write_standby_config_preserves_auto_conf_and_resets_sync_cache() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c1-write-ok",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            false,
+        );
+        preset_auto_conf(&dir, "old");
+        ha.applied_sync_standby_names = applied_sync();
+
+        ha.write_standby_config(Some("host=node1 port=5433 dbname=postgres user=postgres"))
+            .await
+            .unwrap();
+
+        assert!(dir.join("standby.signal").exists());
+        let content = auto_conf(&dir);
+        assert!(content.contains(SYNC_LINE), "{content}");
+        assert!(
+            content.contains(
+                "primary_conninfo = 'host=node1 port=5433 user=replicator application_name=node2'"
+            ),
+            "{content}"
+        );
+        assert_eq!(ha.read_current_upstream().as_deref(), Some("node1"));
+        assert_eq!(ha.applied_sync_standby_names, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_write_standby_config_with_hostless_upstream_removes_conninfo() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c1-write-hostless",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            false,
+        );
+        preset_auto_conf(&dir, "old");
+
+        ha.write_standby_config(Some("port=5432 dbname=postgres"))
+            .await
+            .unwrap();
+
+        assert!(dir.join("standby.signal").exists());
+        assert!(auto_conf(&dir).contains(SYNC_LINE));
+        assert_eq!(ha.read_current_upstream(), None, "never guess 127.0.0.1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_write_standby_config_failure_still_resets_sync_cache() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c1-write-fail",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(true),
+            false,
+        );
+        preset_auto_conf(&dir, "old");
+        // A directory named standby.signal cannot be opened for writing.
+        std::fs::create_dir(dir.join("standby.signal")).unwrap();
+        ha.applied_sync_standby_names = applied_sync();
+
+        let result = ha.write_standby_config(Some("host=node1 port=5432")).await;
+
+        assert!(result.is_err());
+        assert_eq!(ha.applied_sync_standby_names, None);
+        assert_eq!(ha.read_current_upstream().as_deref(), Some("old"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reconfigure_replica_keeps_auto_conf_lines() {
+        let (mut ha, dir) = identity_test_ha(
+            "node2",
+            "c1-reconfigure",
+            Arc::new(MockDcs::with_leader("node3")),
+            Some(true),
+            true,
+        );
+        preset_auto_conf(&dir, "node1");
+        ha.applied_sync_standby_names = applied_sync();
+
+        // No pg_ctl: the restart after the rewrite fails and is only logged.
+        ha.reconfigure_replica("host=node3 port=5432").await;
+
+        let content = auto_conf(&dir);
+        assert!(content.contains(SYNC_LINE), "{content}");
+        assert_eq!(ha.read_current_upstream().as_deref(), Some("node3"));
+        assert!(dir.join("standby.signal").exists());
+        assert_eq!(ha.applied_sync_standby_names, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn switchover_test_ha(label: &str, upstream_host: &str) -> (Ha, PathBuf, CommandSender) {
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node1",
+            label,
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+            None,
+        );
+        preset_auto_conf(&dir, upstream_host);
+        ha.is_leader = true;
+        ha.applied_sync_standby_names = applied_sync();
+        ha.cluster = Cluster {
+            leader: Some(Leader {
+                name: "node1".into(),
+                version: 1,
+            }),
+            members: vec![
+                member_at("node1", "host=node1 port=5432"),
+                member_at("node2", "host=node2 port=5432"),
+            ],
+            ..Default::default()
+        };
+        (ha, dir, tx)
+    }
+
+    #[tokio::test]
+    async fn test_switchover_with_candidate_keeps_auto_conf_lines() {
+        let (mut ha, dir, tx) = switchover_test_ha("c1-so-cand", "old");
+
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Switchover {
+                leader: Some("node1".into()),
+                candidate: Some("node2".into()),
+                scheduled_at: None,
+            },
+        )
+        .await;
+
+        assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+        assert!(dir.join("standby.signal").exists());
+        assert!(auto_conf(&dir).contains(SYNC_LINE));
+        assert_eq!(ha.read_current_upstream().as_deref(), Some("node2"));
+        assert_eq!(ha.applied_sync_standby_names, None);
+        assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_switchover_without_candidate_only_writes_signal() {
+        let (mut ha, dir, tx) = switchover_test_ha("c1-so-nocand", "old");
+        let before = auto_conf(&dir);
+
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Switchover {
+                leader: Some("node1".into()),
+                candidate: None,
+                scheduled_at: None,
+            },
+        )
+        .await;
+
+        assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+        assert!(dir.join("standby.signal").exists());
+        assert_eq!(auto_conf(&dir), before, "auto.conf is not touched");
+        assert_eq!(ha.read_current_upstream().as_deref(), Some("old"));
+        assert_eq!(ha.applied_sync_standby_names, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

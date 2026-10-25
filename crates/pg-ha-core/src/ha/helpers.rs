@@ -1,13 +1,65 @@
 //! Helper methods: member heartbeat, standby signal detection, reconfiguration guard,
 //! upstream reading, and lock ownership verification.
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::error::Result;
+use crate::standby_config;
 
 use super::Ha;
 
 impl Ha {
+    /// Writes standby.signal + primary_conninfo (None removes it) and forgets
+    /// the applied synchronous_standby_names (D7). Runs in spawn_blocking.
+    ///
+    /// An upstream conn_url without `host=` is treated as an unknown leader:
+    /// primary_conninfo is removed rather than pointed at a guessed address.
+    pub(super) async fn write_standby_config(
+        &mut self,
+        upstream_conn_url: Option<&str>,
+    ) -> std::io::Result<()> {
+        self.reset_sync_cache();
+
+        let upstream = upstream_conn_url.and_then(|url| {
+            let built = standby_config::build_primary_conninfo(
+                url,
+                &self.config.postgresql.replication,
+                &self.config.name,
+            )
+            .zip(standby_config::conn_url_host_port(url));
+            if built.is_none() {
+                warn!(
+                    "Upstream conn_url has no host=; treating the leader as unknown and removing primary_conninfo"
+                );
+            }
+            built
+        });
+        let (conninfo, host_port) = match upstream {
+            Some((conninfo, host_port)) => (Some(conninfo), Some(host_port)),
+            None => (None, None),
+        };
+
+        let data_dir = self.config.postgresql.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            standby_config::write_standby_config(&data_dir, conninfo.as_deref())
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+
+        match host_port {
+            Some((host, port)) => info!(host = %host, port = %port, "Wrote standby configuration"),
+            None => info!("Wrote standby configuration without primary_conninfo"),
+        }
+        Ok(())
+    }
+
+    /// Forget what was applied to synchronous_standby_names so the next
+    /// primary term re-applies it (ALTER SYSTEM content may have been replaced
+    /// by a clone or pg_rewind, and the node may have been a standby since).
+    pub(super) fn reset_sync_cache(&mut self) {
+        self.applied_sync_standby_names = None;
+    }
+
     /// Update member info in DCS (heartbeat)
     pub(super) async fn touch_member(&self) -> Result<()> {
         // Use the raft self_addr host for conn_url (it's the reachable address)

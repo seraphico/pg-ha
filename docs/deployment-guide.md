@@ -4,7 +4,7 @@
 
 | 组件 | 最低版本 | 说明 |
 |------|---------|------|
-| PostgreSQL | 14+ | 需要 `pg_ctl`、`pg_basebackup`、`pg_rewind`。Docker 使用官方 `postgres` 镜像标签；`make up` 默认 16 |
+| PostgreSQL | 14+ | 需要 `pg_ctl`、`pg_basebackup`、`pg_rewind`、`pg_controldata`、`psql`。Docker 使用官方 `postgres` 镜像标签；`make up` 默认 16 |
 | Rust | 1.88+ 稳定版 | `edition = "2024"`，并使用已稳定的 if-let chains。不需要 nightly |
 | Docker | 24.0+ | 容器化部署 |
 | Docker Compose | v2.20+ | 多节点编排 |
@@ -266,7 +266,7 @@ retry_timeout: <u64>               # DCS/PG 操作重试超时秒数 (默认: 10
 # ─── PostgreSQL 配置 (必填) ───
 postgresql:
   data_dir: <path>                 # PGDATA 路径 (必填)
-  bin_dir: <path>                  # PG 工具目录 (必填, 含 pg_ctl 等)
+  bin_dir: <path>                  # PG 工具目录 (必填, 须含 pg_ctl、pg_rewind、pg_basebackup、pg_controldata、psql；psql 用于 pg_rewind 前确认源以主库应答)
   listen: <string>                 # PG 监听地址 (默认: "0.0.0.0")
   port: <u16>                      # PG 端口 (默认: 5432)
   superuser:                       # 超级用户连接参数 (必填)
@@ -277,6 +277,7 @@ postgresql:
     username: <string>             # 用户名 (必填)
     password: <string>             # 密码 (可选)
     dbname: <string>               # 数据库名 (默认: "postgres")
+  remove_data_directory_on_rewind_failure: <bool>  # pg_rewind 失败时删除数据目录并用 pg_basebackup 重建 (默认: false；false 时节点停库等运维，见运维指南场景 3)
   parameters:                      # PG 参数 (可选, map<string, string>)
     <param_name>: <value>
 
