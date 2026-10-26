@@ -124,6 +124,15 @@ impl Ha {
             return CommandResponse::accepted("Switchover scheduled");
         }
 
+        // No candidate: the election excludes this leader. Demoting when no
+        // other member may campaign would leave the cluster with no primary
+        // and a /failover key that only a successful acquisition clears.
+        if candidate.is_none() && !self.has_switchover_successor() {
+            return CommandResponse::rejected(
+                "No other running member can take over; refusing switchover without a candidate",
+            );
+        }
+
         // Execute immediate switchover. The leader lock stays until PostgreSQL
         // has stopped, so another node cannot promote while this one is still
         // writable (L5). standby.signal is written before the stop (D2).
