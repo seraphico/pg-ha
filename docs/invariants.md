@@ -72,7 +72,7 @@
 
 **pg-ha 只在持有 leader lock 时以主库方式启动 PostgreSQL；其他情况一律以备库启动。**
 
-- HA 循环只在一处启动 PG：`handle_postgres_not_running`。启动前若本节点不持锁（包括刚在这里因 PG 未运行而释放锁之后），先写 `standby.signal` 并 fsync 文件和目录；leader 已知、不是自己、且它的成员 `conn_url` 带 `host=` 时，同时把 `primary_conninfo` 指向它；leader 未知时保留 `postgresql.auto.conf` 里已有的 `primary_conninfo`。日志 `Starting PostgreSQL as a standby (not holding the leader lock)`。
+- HA 循环只在一处启动 PG：`handle_postgres_not_running`。本节点在视图里仍持锁时先 `delete_leader`。删除返回错误就不启动（日志 `Not starting PostgreSQL: the leader lock may still be ours (<错误>). Releasing it again next cycle`），下一轮重试：锁可能还是自己的，先以备库起来再看到自己的锁会被 promote，撤销 switchover。CAS 表明锁已不是自己的，或删除成功之后，才写 `standby.signal` 并 fsync 文件和目录；leader 已知、不是自己、且它的成员 `conn_url` 带 `host=` 时，同时把 `primary_conninfo` 指向它；leader 未知时保留 `postgresql.auto.conf` 里已有的 `primary_conninfo`。日志 `Starting PostgreSQL as a standby (not holding the leader lock)`。
 - 写不成就不启动，返回错误，下一轮重试：停着的 PG 不丢数据，以可写主起来的 PG 违反 L5。日志 `Not starting PostgreSQL: could not write the standby configuration (<错误>). pg-ha starts PostgreSQL as a primary only while holding the leader lock; retrying next cycle`。
 - 启动前读 `pg_controldata` 的 `Database cluster state`，判断上次是否以主库运行，决定是否写 rewind 检查标记（见下文）。写标记失败同样不启动。
 
@@ -96,7 +96,7 @@
 - 降级停库成功后，节点立即发布一次成员状态（`state=stopped`），让其他节点尽快看到它已停。发布有时限（不超过 `loop_wait`），DCS 不可达时不会拖住 HA 循环或关停。
 - **租约到期围栏**（与 `demote()` 并列的降级入口，见下一小节）：leader 租约到期时不再等任何 DCS 调用返回，丢弃本轮 HA 周期，先写 `standby.signal` 和 rewind 检查标记（原因 `leader lease expired before renewal`），再 `pg_ctl stop -m immediate`，并把本节点记为不持锁。停库失败时按上文 `stop_pending` 规则每轮继续围栏。
 - **DCS 写有上限**：每次 DCS 写（`RaftDcs` 的 `propose`，包括本地 Raft 提交和转发给 Raft leader 两条路径）最多等 `retry_timeout` 秒，超时返回 `Error::Timeout`，调用方按写失败处理（续锁超时即降级）。日志 WARN `DCS write timed out after <n>s (retry_timeout); treating it as failed`。原因：openraft 0.9 没有 check-quorum，失去多数派的 Raft leader 不会退位，它的 `client_write` 要等网络恢复才返回。
-- **超时后迟到提交是安全的**：放弃的写仍可能在之后提交。(1) 本节点是失去多数派的 Raft leader：多数派选出新 leader 后，这条未提交的日志在恢复时被截断，不会提交；只有分区短于多数派重选时间时，它才可能在原 term 里提交。(2) 本节点是 Raft follower：请求已交给 leader，可能在 HA 放弃后提交。续锁是 CAS（`prev_value` = 本节点名）：新主已写锁时它失败；锁已按真实时间过期但没人抢时，状态机用请求里的旧 `now` 判断，会把锁续到这次请求的时刻 + TTL。这不会产生两个锁持有者：抢锁同样是 CAS，二者在 Raft 日志里有先后，后到的一方失败；promote 只发生在持锁路径。被续上的锁只是让多数派多等一段时间；本节点此时已经降级（续锁失败或租约到期），下一轮看到锁仍是自己的，就按 1a 身份表以备库 promote（timeline +1），与「释放锁失败后以备库拿回锁」是同一条路径，没有别人 promote 过，所以数据没有分叉。迟到提交只会让锁在 DCS 里活得更久，而租约锚在最后一次**成功**的请求上，所以不会让旧主多写。
+- **超时后迟到提交是安全的**：放弃的写仍可能在之后提交。(1) 本节点是失去多数派的 Raft leader：多数派选出新 leader 后，这条未提交的日志在恢复时被截断，不会提交；只有分区短于多数派重选时间时，它才可能在原 term 里提交。(2) 本节点是 Raft follower：请求已交给 leader，可能在 HA 放弃后提交。续锁是 CAS（`prev_value` = 本节点名）：新主已写锁时它失败；锁已按真实时间过期但没人抢时，状态机用请求里的旧 `now` 判断，会把锁续到这次请求的时刻 + TTL。这不会产生两个锁持有者：抢锁同样是 CAS，二者在 Raft 日志里有先后，后到的一方失败；promote 只发生在持锁路径。被续上的锁只是让多数派多等一段时间；本节点此时已经降级（续锁失败或租约到期）。下一轮 PostgreSQL 仍停着且视图里锁还是自己的，先删除锁：删除失败就不启动，下一轮再试，不会在锁还可能是自己的时候以备库起来再被 promote。删除成功或 CAS 表明锁已不是自己的，才以备库启动。没有别人在本节点仍持锁时 promote 过，所以数据没有分叉。迟到提交只会让锁在 DCS 里活得更久，而租约锚在最后一次**成功**的请求上，所以不会让旧主多写。
 
 #### leader 租约（L5 的时间界）
 
@@ -307,7 +307,6 @@
 |----|---------|------|
 | Failsafe 持久化 | P3 | 架构列出 `/failsafe`；实现仍有「未读 key」类缺口 |
 | Member `conn_url` 含密码 | R3 | 落盘与最小密钥面目标冲突，需先裁定再改 |
-| switchover 释放锁失败被忽略 | S1 | 停库成功后 `delete_leader` 失败会返回错误并留下锁。PG 已经不在跑时的释放（`handle_postgres_not_running`）仍忽略 `delete_leader` 的结果；连续失败时旧主重启后仍持锁，会 promote 自己，撤销 switchover |
 | 选举不比较 timeline | S2 / S4 | `is_healthiest_node` 只比较 WAL 位置（`ha/election.rs` 中 peer 的 timeline 未使用）；任务 3 只对带 rewind 检查标记的节点按 `/timeline` 把关，一般节点的 timeline 感知选举另开项 |
 | 带标记、等待 rewind 检查的备库对外是健康副本 | H2 / S4 | 带 `pg-ha.rewind_check` 的 ManagedStandby 在 leader 未就绪、分区期间、恢复后 pg_rewind 之前以只读备库运行，`/replica` 200，RO 客户端可能读到只存在于分叉历史上的数据（见 1a「rewind 检查标记」）。候选修法：带标记的节点 `/replica` 返回 503 |
 | 分区节点重新加入 Raft 会引发 Raft 重选 | L4 / L5 | openraft 0.9 没有 pre-vote：分区节点的 term 在分区期间上涨，重新连上后迫使集群重选 Raft leader；重选期间当前锁持有者续锁失败而被降级（多一次 failover，timeline +1）。任务 3 在 docker 集群上复现分区场景时每次都出现，不在任务 3 处理 |
@@ -323,6 +322,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-10-26 | 闭合「switchover 释放锁失败被忽略」：PostgreSQL 已停且视图里锁仍是自己的，`delete_leader` 返回错误时不启动，下一轮重试。CAS 表明锁已不是自己的，或删除成功之后，才以备库启动。避免锁还在自己手里时以备库起来再被 promote，撤销 switchover。启动规则与迟到续锁的说明同步；第 9 节删除该项 |
 | 2026-10-26 | 闭合「无 candidate 的 switchover 不排除旧 leader」：选举在没有可参选的 candidate 时排除 `/failover.leader`，其他节点也不把该节点算进「谁最健康」（它的 WAL 最高，且 timeline 仍等于 `/timeline`，rewind 检查标记拦不住）。指定 candidate 且其仍可参选时行为不变；手动 failover 不写 `leader`，不排除。没有其他合格节点时 `POST /switchover` 在降级前拒绝，避免写下无人能完成的 `/failover`。S1 写明这条规则；第 9 节删除该项 |
 | 2026-10-26 | 闭合「优雅关停收尾不受租约限制」和「关停时停库失败照样退出」：drain 之后 CHECKPOINT 和停库与最后一次续锁的租约赛跑（`Ha::graceful_shutdown`），截止时间先到即按租约到期围栏，不释放锁；停库先 `-m fast`，失败再试一次 `-m immediate`；PG 可能可写却停不掉时进程不退出，继续跑 HA 循环（续锁、每轮重试停库、每轮 ERROR 给出手工停库命令），再收到信号也只立即重试。H1 增加「且不在优雅关停中」：REST API 在关停期间继续服务，`/primary` 从信号起 503。关停开始后不再启动 PG，HA 循环发现 PG 已停时不释放锁也不启动，管理命令被拒绝；drain 期间 pause 下续锁失败不围栏（W1）。观测在 recovery 的 PG 停不掉时，只有不持锁且有 `standby.signal` 的备库允许退出；持锁的 recovery 和没有 `standby.signal` 的 recovery 设 `stop_pending`、不退出，关停中不持锁的周期只再停库（不参选、不跟随、不 promote）。L5 写明关停收尾受时间界约束，「不覆盖」补充 SIGKILL。第 9 节新增「停库一直失败时锁一直被占」「主库正常关停期间写不可用」 |
 | 2026-10-25 | 闭合「`Request.now` 注释与实现不符」：Raft leader 在 `client_write` 之前用自己的时钟覆盖 `Set` 和 `ExpireKeys` 的 `now`，转发来的请求也覆盖。发起节点时钟偏快不再能把还在租约内的锁判成过期。本地读取仍用读取节点的墙钟；Raft leader 与锁持有者之间的时钟差仍受 `safety_margin` 约束，第 9 节改记为「TTL 过期仍受 Raft leader 墙钟影响」 |

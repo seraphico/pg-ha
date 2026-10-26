@@ -201,7 +201,7 @@ curl -u admin:secret -X DELETE http://localhost:8008/switchover
 3. 续一次 leader lock（命令执行期间 HA 循环不跑）；续锁失败则按租约到期围栏，返回 error `Switchover aborted: leader lock renewal failed; ...`
 4. 写入 `standby.signal` 并 fsync；有 candidate 时把 `postgresql.auto.conf` 的 `primary_conninfo` 指到候选，没有时删除 `primary_conninfo`；`postgresql.auto.conf` 的其他设置保留
 5. `pg_ctl stop -m fast`，角色改为 Replica
-6. 确认停库后才删除本节点 leader lock。停库失败时锁留下，返回 error `Switchover initiated, but stopping PostgreSQL failed: ...; pg-ha keeps fencing it and holds the leader lock`，之后每轮续锁并重试停库（见下文「switchover 卡住」）
+6. 确认停库后才删除本节点 leader lock。停库失败时锁留下，返回 error `Switchover initiated, but stopping PostgreSQL failed: ...; pg-ha keeps fencing it and holds the leader lock`，之后每轮续锁并重试停库（见下文「switchover 卡住」）。删除锁失败时也留下锁，并且不启动 PostgreSQL（`Not starting PostgreSQL: the leader lock may still be ours ...`），下一轮重试删除；确认锁已不是自己的之后才以备库启动
 
 ```mermaid
 sequenceDiagram
