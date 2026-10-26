@@ -68,7 +68,7 @@ flowchart TD
     STALE -->|否| FAILOVER{有 failover key 指定 candidate?}
     FAILOVER -->|是 我是candidate| ACQUIRE[尝试获取 leader lock]
     FAILOVER -->|是 我不是| DEFER[让步给 candidate<br/>candidate 带标记且不能参选时按无 candidate 处理]
-    FAILOVER -->|否| HEALTH{is_healthiest_node?<br/>不计入不能参选的带标记 peer<br/>也不计入 switchover 点名退位的旧主}
+    FAILOVER -->|否| HEALTH{is_healthiest_node?<br/>先比 timeline 再比 LSN<br/>不计入不能参选的带标记 peer<br/>也不计入 switchover 点名退位的旧主}
     HEALTH -->|是| ACQUIRE
     HEALTH -->|否| WAIT[等待选举结果]
     ACQUIRE -->|成功| PROMOTE[ManagedStandby: promote 前写 /timeline<br/>pg_ctl promote<br/>重新观测确认后记为主]

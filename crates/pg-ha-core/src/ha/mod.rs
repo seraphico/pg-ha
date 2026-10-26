@@ -4759,7 +4759,8 @@ mod tests {
         assert!(ha.is_leader());
         assert!(lock_held_by(&dcs).is_some());
 
-        // Control: the same peer without the marker wins on WAL.
+        // The same peer without the marker is on an older timeline. Its higher
+        // LSN is not comparable, so it does not win.
         ha.cluster = unlocked(
             vec![
                 member_with_tl("node1", 900, 1),
@@ -4767,6 +4768,71 @@ mod tests {
             ],
             Some(2),
         );
+        assert!(ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_higher_timeline_beats_a_larger_lsn_on_an_older_timeline() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) = identity_test_ha("node2", "tl-before-lsn", dcs, Some(true), true);
+        ha.cluster = unlocked(
+            vec![
+                member_with_tl("node1", 900, 2),
+                member_with_tl("node2", 100, 3),
+            ],
+            Some(3),
+        );
+
+        assert!(ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_older_timeline_loses_despite_a_larger_lsn() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) = identity_test_ha("node1", "tl-older-lsn", dcs, Some(true), true);
+        ha.cluster = unlocked(
+            vec![
+                member_with_tl("node1", 900, 2),
+                member_with_tl("node2", 100, 3),
+            ],
+            Some(3),
+        );
+
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_missing_timeline_cannot_beat_a_published_timeline_on_lsn() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) = identity_test_ha("node2", "tl-missing-peer", dcs, Some(true), true);
+        let unpublished = Member {
+            timeline: None,
+            ..running_member("node1", 900)
+        };
+        ha.cluster = unlocked(vec![unpublished, member_with_tl("node2", 100, 3)], Some(3));
+
+        assert!(ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_node_without_a_published_timeline_loses_to_one_that_has_it() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(2));
+        let (mut ha, dir) = identity_test_ha("node1", "tl-missing-self", dcs, Some(true), true);
+        ha.cluster = unlocked(
+            vec![
+                Member {
+                    timeline: None,
+                    ..running_member("node1", 900)
+                },
+                member_with_tl("node2", 100, 2),
+            ],
+            Some(2),
+        );
+
         assert!(!ha.is_healthiest_node());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4800,7 +4866,8 @@ mod tests {
                         ..member_with_tl("node1", if peer_wal_higher { 900 } else { 100 }, peer_tl)
                     };
                     ha.cluster = unlocked(vec![peer, member_with_tl("node2", 500, 2)], Some(2));
-                    let expected = (peer_marked && peer_tl < 2) || !peer_wal_higher;
+                    // A lower timeline never wins on LSN. Same timeline: higher LSN wins.
+                    let expected = peer_tl < 2 || !peer_wal_higher;
                     assert_eq!(
                         ha.is_healthiest_node(),
                         expected,
