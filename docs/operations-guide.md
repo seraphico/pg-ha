@@ -191,9 +191,10 @@ curl -u admin:secret -X DELETE http://localhost:8008/switchover
 
 1. 校验候选（含同步复制资格）
 2. 把 `{leader, candidate}` 写入 DCS `/failover`
-3. 删除本节点 leader lock
+3. 续一次 leader lock（命令执行期间 HA 循环不跑）；续锁失败则按租约到期围栏，返回 error `Switchover aborted: leader lock renewal failed; ...`
 4. 写入 `standby.signal` 并 fsync；有 candidate 时把 `postgresql.auto.conf` 的 `primary_conninfo` 指到候选，没有时删除 `primary_conninfo`；`postgresql.auto.conf` 的其他设置保留
 5. `pg_ctl stop -m fast`，角色改为 Replica
+6. 确认停库后才删除本节点 leader lock。停库失败时锁留下，返回 error `Switchover initiated, but stopping PostgreSQL failed: ...; pg-ha keeps fencing it and holds the leader lock`，之后每轮续锁并重试停库（见下文「switchover 卡住」）
 
 ```mermaid
 sequenceDiagram
@@ -207,8 +208,9 @@ sequenceDiagram
     API->>HA: ManagementCommand::Switchover
     Note over HA: sync 开启时 candidate 必须属于 /sync<br/>否则 409，不写 key、不 demote
     HA->>DCS: 写入 /failover
-    HA->>DCS: 删除 leader lock
+    HA->>DCS: 续锁一次
     HA->>HA: 写 standby.signal（+ primary_conninfo），然后 pg_ctl stop -m fast
+    HA->>DCS: 停库成功后删除 leader lock
     API-->>Admin: 200 accepted，leader lock released
     New->>DCS: 读到未持锁 + failover key
     Note over New: 再校验自身 sync 资格后才抢锁
@@ -402,6 +404,7 @@ ttl >= loop_wait + retry_timeout + watchdog.safety_margin，且 retry_timeout >=
 | ERROR `Leader lease expired before the lock renewal completed; fencing PostgreSQL (immediate stop) without waiting for the DCS` | 租约到期，本轮 HA 周期被放弃，PostgreSQL 以 `immediate` 模式停库 |
 | ERROR `Leader lease expired before pg_ctl promote; fencing PostgreSQL (immediate stop)` / `Leader lease expired before reporting the leader role; fencing PostgreSQL (immediate stop)` | 续锁返回成功，但返回时租约已经到期（续锁写太慢），不 promote、不报告主库，按失去锁围栏 |
 | ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)` | 关停时租约已到期，直接围栏停库 |
+| ERROR `Leader lease expired before CHECKPOINT and the PostgreSQL stop finished during shutdown; fencing PostgreSQL (immediate stop) and keeping the leader lock` | 关停收尾（CHECKPOINT + 停库）没在最后一次续锁的租约内完成，围栏停库，不释放锁 |
 | INFO `Created rewind-check marker: leader lease expired before renewal` | 围栏停库前写了 `standby.signal` 和 rewind 检查标记；之后按启动规则以备库启动，看到新 leader 后先 pg_rewind |
 
 健康集群里如果出现租约围栏，通常是 PG 或 DCS 太慢，一轮续锁来不及在 `ttl − safety_margin` 内完成，可以调大 `ttl`。
@@ -617,18 +620,67 @@ kill -SIGTERM $(pidof pg-ha)
 docker stop pg-ha-node1
 ```
 
-pg-ha 收到 SIGTERM 或 SIGINT 后：
+pg-ha 收到第一个 SIGTERM 或 SIGINT 后（`Ha::graceful_shutdown`）：
 
-1. `tokio::select!` 结束，API 和 Proxy 不再 accept
-2. 等待 `shutdown.drain_timeout_secs`（默认 30 秒）。这只是 sleep，不会主动关掉已有 TCP
-3. 若本节点持有 leader lock：`CHECKPOINT`，然后删除 leader lock
-4. `pg_ctl stop -m fast`
+1. HA 循环停止。REST API 继续服务，但 `/primary` 从这一刻起一律 503，其他节点的 Proxy 不再把新写路由到本节点；`/patroni`、`/cluster` 照实报告角色和锁，`/liveness` 在 drain 期间会变 503（没有 HA 周期）。Proxy 的监听任务也还在 accept。pg-ha 从此不再启动 PostgreSQL，管理命令（switchover、restart 等）一律被拒绝：`Graceful shutdown in progress; command rejected`。
+2. 若本节点记为持锁而 leader 租约已经到期（例如本节点被分区），跳过 drain、CHECKPOINT 和删除锁，直接写 `standby.signal` 和标记，再 `pg_ctl stop -m immediate`（ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)`）。
+3. drain：等待 `shutdown.drain_timeout_secs`（默认 30 秒）。只等待，不会主动关掉已有 TCP。持锁时每个 `loop_wait` 续一次锁，最后一次在 drain 结束时；续锁失败就立即围栏（`immediate` 停库），不 CHECKPOINT、不删除锁。pause 下续锁失败只记 WARN，不围栏，drain 继续。
+4. CHECKPOINT（只在持锁时）和停库，两步合起来必须在最后一次续锁的租约内完成：`ttl − safety_margin`，默认 25 秒，docker 开发集群 10 秒（日志 INFO 写明剩余秒数）。停库先 `pg_ctl stop -m fast`，失败再试一次 `-m immediate`。时间到了还没完成，就丢下剩余步骤，按租约到期围栏（`standby.signal` + rewind 检查标记，再 `-m immediate`），锁不删除，等 TTL 过期。
+5. 确认 PostgreSQL 已停之后才删除 leader lock（一次 DCS 写，最多等 `retry_timeout` 秒）。删除成功后，其他节点在各自下一个 HA cycle（不超过 `loop_wait`）里可以选举；删除失败则要等到 lock TTL。
+6. PostgreSQL 可能可写却停不掉时，pg-ha **不退出**，见下文「关停卡住」。pg-ha 绝不在 PostgreSQL 还可能可写时带着锁退出。
 
-删除 leader lock 是一次 DCS 写，最多等 `retry_timeout` 秒。收到信号时 leader 租约已经到期（例如本节点被分区），pg-ha 跳过 drain、CHECKPOINT 和删除锁，直接写 `standby.signal` 和标记，再 `pg_ctl stop -m immediate`（日志 ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)`）。租约有效时按上面的顺序关停。注意 drain 期间不续锁：`drain_timeout_secs` 长于 `ttl − safety_margin`（默认 30 > 25）时，锁可能在 drain 期间过期，其他节点可能在本节点停库前 promote（[invariants.md](invariants.md) 第 9 节）。
+停库前，若 PG 以主库运行（或观测不到），pg-ha 先写 `standby.signal` 和 rewind 检查标记（日志 `Created rewind-check marker: stopped by graceful shutdown`）、删除 `primary_conninfo`，再停库。下次启动时 pg-ha 按启动规则以备库启动它；它上次是主库的话，要经选举 promote 才重新成为主（timeline +1），或在别人持锁时先做一次 rewind 检查再跟随。关停时 PostgreSQL 不应答的备库也会被这样处理：它会被删除 `primary_conninfo`，下次启动后由跟随路径重新配置上游（多一次重启），并多一次 rewind 检查。观测在 recovery 的 PostgreSQL 停不掉时：本节点持锁，或没有 `standby.signal`（如 `recovery.signal` 的归档 / 时间点恢复，恢复结束时会自己 promote），都算可能可写，pg-ha 不退出（见「关停卡住」），每轮只再停库，不 promote，也不给没有 `standby.signal` 的 recovery 补写 signal；只有不持锁、有 `standby.signal` 的备库停不掉时，pg-ha 记 ERROR `PostgreSQL (a standby with standby.signal, not the leader lock holder) could not be stopped; exiting, nothing promotes it` 后退出。
 
-锁删除成功后，其他节点在各自下一个 HA cycle（不超过 `loop_wait`）里可以选举。删除失败则要等到 lock TTL。systemd 的 `TimeoutStopSec` 需要盖住 drain、CHECKPOINT 和 `pg_ctl stop`，示例见部署指南（120 秒）。
+**先 switchover 再停主库。** 直接停主库时，drain + CHECKPOINT + 停库整段时间（默认 30 秒以上）都没有可写主：锁被续着，别的节点不接管，`/primary` 处处 503。switchover 之后再停旧主（现在是 Replica）没有这段写不可用；做不到时，可把主库的 `drain_timeout_secs` 调短。
 
-Phase 4 停库前，若 PG 以主库运行（或观测不到），pg-ha 先写 `standby.signal` 和 rewind 检查标记（日志 `Created rewind-check marker: stopped by graceful shutdown`）、删除 `primary_conninfo`，再 `pg_ctl stop -m fast`。下次启动时 pg-ha 按启动规则以备库启动它；它上次是主库的话，要经选举 promote 才重新成为主（timeline +1），或在别人持锁时先做一次 rewind 检查再跟随。关停时 PostgreSQL 不应答的备库也会被这样处理：它会被删除 `primary_conninfo`，下次启动后由跟随路径重新配置上游（多一次重启），并多一次 rewind 检查。
+**systemd `TimeoutStopSec`** 必须大于 `drain_timeout_secs` + CHECKPOINT + 停库 + 删除锁的时间：持锁节点的 CHECKPOINT + 停库不超过 `ttl − safety_margin`，不持锁的节点停库最多约 2 × 60 秒（`pg_ctl stop -w` 的等待，快速一次、立即一次），删除锁最多 `retry_timeout`。默认配置下 30 + 25 + 10 = 65 秒，不持锁节点 30 + 120 秒，部署指南的示例用 180 秒。超时后 systemd 发 SIGKILL，pg-ha 被杀，上面的规则就无法执行：`KillMode=mixed` 时 SIGKILL 会杀掉 unit cgroup 里的所有进程，包括 pg-ha 启动的 PostgreSQL（它崩溃而不是留着可写）；PostgreSQL 不在 pg-ha 的 cgroup 里时会继续可写，锁过期后没人围栏它。Docker 同理：`docker stop -t <秒>` 要大于上面的时间，容器的 PID 1 是 pg-ha，它被杀时 PostgreSQL 一起被杀。停不掉 PostgreSQL 时 pg-ha 会一直不退出，systemd / Docker 最终会 SIGKILL 它，所以出现「关停卡住」的 ERROR 时要在超时前按下面的步骤处理。
+
+关停相关日志：
+
+| 日志 | 含义 |
+|------|------|
+| INFO `Draining in-flight connections (the leader lock is renewed every loop_wait)` | drain 开始 |
+| ERROR `Leader lock renewal failed during shutdown drain; fencing PostgreSQL (immediate stop) and not releasing the lock` | drain 期间续锁失败，围栏停库，不删除锁 |
+| WARN `Leader lock renewal failed during shutdown drain in pause mode; not fencing (pause mode), continuing the shutdown` | pause 下续锁失败，不围栏，继续关停 |
+| INFO `Shutdown drain finished; leader lock renewed. CHECKPOINT and the PostgreSQL stop must finish within <n>s (leader lease), otherwise PostgreSQL is fenced` | drain 结束，CHECKPOINT + 停库的时间预算 |
+| WARN `pg_ctl stop -m fast failed during shutdown (...); retrying once with -m immediate` | 快速停库失败，改用立即停库再试一次 |
+| ERROR `Leader lease expired before CHECKPOINT and the PostgreSQL stop finished during shutdown; fencing PostgreSQL (immediate stop) and keeping the leader lock` | 收尾超出租约，围栏停库，锁不删除 |
+| INFO `Leader lock released after PostgreSQL stopped` | 停库后删除了锁 |
+| ERROR `Leader lock kept: the delete failed or was rejected; it expires after its TTL` | PostgreSQL 已停，删除锁失败，等 TTL 过期 |
+| ERROR `Graceful shutdown could not stop PostgreSQL; pg-ha keeps running instead of exiting ...` | 关停卡住，见下文，每个 `loop_wait` 重复一次 |
+| WARN `Graceful shutdown: PostgreSQL is still running without the leader lock; stopping it again (immediate)` | 关停卡住且本节点不持锁：这一轮只再停一次库，不参选、不跟随、不 promote |
+| ERROR `PostgreSQL (a standby with standby.signal, not the leader lock holder) could not be stopped; exiting, nothing promotes it` | 不持锁、有 `standby.signal` 的备库停不掉，pg-ha 退出，备库留着运行，需要手工停 |
+| WARN `Received SIGTERM during graceful shutdown; pg-ha exits only after PostgreSQL has stopped` | 关停期间又收到信号：不退出，只让下一轮立即重试停库 |
+| INFO `Graceful shutdown complete: <结果>` | pg-ha 退出 |
+
+#### 关停卡住（PostgreSQL 停不掉）
+
+现象：
+
+- 每个 `loop_wait` 一条 ERROR：`Graceful shutdown could not stop PostgreSQL; pg-ha keeps running instead of exiting while PostgreSQL may be writable (it keeps renewing the leader lock while it holds it, so no other node promotes). Stop PostgreSQL manually as the PostgreSQL OS user: <bin_dir>/pg_ctl stop -D <data_dir> -m immediate; pg-ha then releases the lock and exits`
+- pg-ha 进程（容器）不退出；本节点还持锁时，`/cluster` 仍显示它是 leader，所有节点的 `/primary` 都是 503，集群没有可写主，也不会换主。
+- 再发 SIGTERM / SIGINT 不会让它退出，只会让下一轮立即重试停库。
+
+这是故意的：pg-ha 一退出，锁就会过期，别的节点会 promote，而这台 PostgreSQL 还可能可写，没人再围栏它。处理：
+
+```bash
+# 1. 看 PostgreSQL 为什么停不掉
+tail -n 100 $PGDATA/pg_log.log
+# 2. 以 PostgreSQL 的 OS 用户手工停库（ERROR 里给出了完整命令）
+sudo -u postgres /usr/lib/postgresql/16/bin/pg_ctl stop -D $PGDATA -m immediate
+#    pg_ctl 本身不能用时：
+sudo -u postgres kill -QUIT $(head -1 $PGDATA/postmaster.pid)
+# 3. pg-ha 在一个 loop_wait 内发现 PostgreSQL 已停，删除锁并退出
+#    （日志 Leader lock released after PostgreSQL stopped，然后 Graceful shutdown complete）
+```
+
+不要在 PostgreSQL 还在跑时 `kill -9` pg-ha。
+
+#### switchover 卡住
+
+现象：`POST /switchover` 返回 error `Switchover initiated, but stopping PostgreSQL failed: ...; pg-ha keeps fencing it and holds the leader lock`；之后每轮日志 WARN `PostgreSQL stop is still pending; holding the leader lock and fencing again`，`/cluster` 仍显示旧主持锁，候选不会 promote，`/primary` 处处 503。pg-ha 每轮续锁并重试 `pg_ctl stop -m fast`，保证这台可能可写的 PostgreSQL 停掉之前没有别的节点 promote。
+
+处理与「关停卡住」相同：看 `$PGDATA/pg_log.log`，以 PostgreSQL 的 OS 用户执行 `pg_ctl stop -D $PGDATA -m immediate`（或 `kill -QUIT`）。下一轮 pg-ha 发现 PostgreSQL 已停，释放锁，候选按 `/failover` 接管；旧主之后以备库启动并做 rewind 检查。
 
 ### 计划维护操作顺序
 

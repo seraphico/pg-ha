@@ -280,13 +280,14 @@ impl Ha {
     }
 
     /// Graceful shutdown, checked when the shutdown signal arrives (before
-    /// the drain, src/main.rs). When this node still believes it holds the
-    /// lock but the leader lease has already expired, the lock may belong to
-    /// another node by now: fence PostgreSQL at once (standby.signal + marker,
-    /// then an immediate stop) and return true, so the caller skips the drain,
-    /// CHECKPOINT and lock release. Otherwise (no lock, valid lease, or pause
-    /// mode, W1) returns false and the normal shutdown sequence runs.
-    pub async fn shutdown_fence_if_lease_expired(&mut self) -> bool {
+    /// the drain, `graceful_shutdown`). When this node still believes it holds
+    /// the lock but the leader lease has already expired, the lock may belong
+    /// to another node by now: fence PostgreSQL at once (standby.signal +
+    /// marker, then an immediate stop) and return true, so the caller skips
+    /// the drain, CHECKPOINT and lock release. Otherwise (no lock, valid
+    /// lease, or pause mode, W1) returns false and the normal shutdown
+    /// sequence runs.
+    pub(super) async fn shutdown_fence_if_lease_expired(&mut self) -> bool {
         if !self.is_leader || !self.lease_lost() {
             return false;
         }
@@ -332,10 +333,12 @@ impl Ha {
 
     /// Sleep for `drain`, renewing the leader lock every `loop_wait` so it
     /// cannot expire while PostgreSQL is still up. The HA loop is already
-    /// stopped (src/main.rs). Returns true when a renewal failed and
-    /// PostgreSQL was fenced; the caller must not checkpoint or release the
-    /// lock.
-    pub async fn drain_renewing_leader_lock(&mut self, drain: std::time::Duration) -> bool {
+    /// stopped (`graceful_shutdown`). The last renewal happens right before
+    /// it returns, so its lease bounds what follows. Returns true when a
+    /// renewal failed and PostgreSQL was fenced; the caller must not
+    /// checkpoint or release the lock. In pause mode a failed renewal does
+    /// not fence (W1): the drain goes on and the next slice retries.
+    pub(super) async fn drain_renewing_leader_lock(&mut self, drain: std::time::Duration) -> bool {
         if !self.is_leader {
             tokio::time::sleep(drain).await;
             return false;
@@ -343,11 +346,17 @@ impl Ha {
         let deadline = tokio::time::Instant::now() + drain;
         loop {
             if !self.renew_held_lock().await {
-                error!(
-                    "Leader lock renewal failed during shutdown drain; fencing PostgreSQL (immediate stop) and not releasing the lock"
-                );
-                let _ = self.fence_for_lost_lease().await;
-                return true;
+                if self.is_paused {
+                    warn!(
+                        "Leader lock renewal failed during shutdown drain in pause mode; not fencing (pause mode), continuing the shutdown"
+                    );
+                } else {
+                    error!(
+                        "Leader lock renewal failed during shutdown drain; fencing PostgreSQL (immediate stop) and not releasing the lock"
+                    );
+                    let _ = self.fence_for_lost_lease().await;
+                    return true;
+                }
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
@@ -362,7 +371,7 @@ impl Ha {
     /// Delete the leader lock only after PostgreSQL has stopped. False when it
     /// is still running or the delete did not succeed; the lock stays so
     /// another node cannot promote over a writable primary.
-    pub async fn release_leader_lock_if_stopped(&mut self) -> bool {
+    pub(super) async fn release_leader_lock_if_stopped(&mut self) -> bool {
         if self.postgresql.is_running() {
             error!("Not releasing the leader lock: PostgreSQL is still running");
             return false;
@@ -393,21 +402,58 @@ impl Ha {
         }
     }
 
-    /// Graceful shutdown, after the drain (src/main.rs): stop PostgreSQL while
-    /// this node still holds the leader lock. A primary gets standby.signal
-    /// first (D2), then the caller releases the lock only if the stop
-    /// succeeded.
-    pub async fn stop_postgres_for_shutdown(&mut self) -> crate::error::Result<()> {
+    /// Graceful shutdown, after the drain (`graceful_shutdown`, raced against
+    /// the leader lease): stop PostgreSQL while this node still holds the
+    /// leader lock. A primary gets standby.signal first (D2). `-m fast`
+    /// first; when it fails and PostgreSQL still runs, once more with
+    /// `-m immediate`. The caller releases the lock only if PostgreSQL is
+    /// stopped. A failed stop sets `stop_pending` (so pg-ha keeps running and
+    /// keeps stopping it) except for a standby pg-ha may leave running
+    /// (`identity::shutdown_may_leave_running`).
+    pub(super) async fn stop_postgres_for_shutdown(&mut self) -> crate::error::Result<()> {
         if !self.postgresql.is_running() {
             return Ok(());
         }
         self.postgresql.observe_recovery().await;
-        if identity::shutdown_needs_fence(self.pg_identity()) {
+        self.stop_observed_postgres_for_shutdown().await
+    }
+
+    /// `stop_postgres_for_shutdown` after the recovery observation.
+    pub(super) async fn stop_observed_postgres_for_shutdown(&mut self) -> crate::error::Result<()> {
+        let observed = self.pg_identity();
+        let fence = identity::shutdown_needs_fence(observed);
+        let fast = if fence {
             self.fence_primary("fast", "stopped by graceful shutdown", None)
                 .await
         } else {
             self.postgresql.stop("fast").await
+        };
+        let Err(e) = fast else {
+            return Ok(());
+        };
+        if !self.postgresql.is_running() {
+            return Ok(());
         }
+        warn!("pg_ctl stop -m fast failed during shutdown ({e}); retrying once with -m immediate");
+        if fence {
+            // standby.signal is already written; keeps stop_pending semantics.
+            return self.stop_after_demotion_write("immediate").await;
+        }
+        let immediate = self.postgresql.stop("immediate").await;
+        if immediate.is_err()
+            && self.postgresql.is_running()
+            && !identity::shutdown_may_leave_running(observed, self.is_leader)
+        {
+            // A lock holder in recovery may be promoted, and unmanaged
+            // recovery ends in a promotion of its own: pg-ha keeps running
+            // and keeps stopping it instead of promoting it.
+            self.stop_pending = true;
+            error!(
+                "Failed to stop PostgreSQL ({}) during shutdown; pg-ha keeps stopping it until it is confirmed stopped",
+                observed.describe()
+            );
+        }
+        immediate
     }
 
     // ─── D5: rewind hold ───

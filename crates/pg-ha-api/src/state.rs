@@ -64,6 +64,9 @@ pub struct NodeState {
     /// not observed (PostgreSQL stopped, query failed, or a start / stop /
     /// promote ran since). At most one HA cycle old.
     pub pg_in_recovery: Option<bool>,
+    /// Graceful shutdown in progress: `/primary` is 503 from the signal on,
+    /// while the other endpoints keep reporting the real state.
+    pub shutting_down: bool,
 }
 
 impl AppState {
@@ -88,6 +91,7 @@ impl AppState {
                 dcs_last_seen: None,
                 failsafe_active: false,
                 pg_in_recovery: None,
+                shutting_down: false,
             })),
             dcs: None,
             lease_timing: None,
@@ -124,6 +128,7 @@ impl AppState {
                 dcs_last_seen: None,
                 failsafe_active: false,
                 pg_in_recovery: None,
+                shutting_down: false,
             })),
             dcs: Some(dcs),
             lease_timing: Some(lease_timing),
@@ -170,19 +175,23 @@ impl NodeState {
         self.is_leader = snapshot.is_leader;
         self.is_paused = snapshot.is_paused;
         self.pending_restart = snapshot.pending_restart;
+        self.shutting_down = snapshot.shutting_down;
     }
 
-    /// H1: `/primary` is 200 exactly when this node holds the leader lock and
-    /// PostgreSQL is a healthy primary. Each clause is required:
+    /// H1: `/primary` is 200 exactly when this node holds the leader lock,
+    /// PostgreSQL is a healthy primary, and no graceful shutdown is in
+    /// progress. Each clause is required:
     /// - `is_leader`: holds the leader lock
     /// - `state == Running`: PostgreSQL is running and pg-ha vouches for it
     /// - `role == Primary`: the HA loop confirmed and recorded the primary role
     /// - `pg_in_recovery == Some(false)`: observed out of recovery (writable)
+    /// - `!shutting_down`: not draining / stopping for a graceful shutdown
     pub fn is_primary_with_lock(&self) -> bool {
         self.is_leader
             && self.state == MemberState::Running
             && self.role == MemberRole::Primary
             && self.pg_in_recovery == Some(false)
+            && !self.shutting_down
     }
 
     /// H2: a healthy replica is running, recorded as a replica, and observed

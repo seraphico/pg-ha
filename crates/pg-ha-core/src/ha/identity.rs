@@ -162,13 +162,25 @@ pub(crate) fn election_stance(identity: PgIdentity, stop_pending: bool) -> Elect
 }
 
 /// Graceful shutdown (A27): must the stop go through `fence_primary`? Yes
-/// unless PostgreSQL is observed in recovery: the lock was released first, so
-/// a primary (or a server pg-ha cannot observe) may be writable without it.
+/// unless PostgreSQL is observed in recovery: if the stop fails or the lease
+/// runs out, the lock expires while a primary (or a server pg-ha cannot
+/// observe) may still be writable, so standby.signal must already be there.
 pub(crate) fn shutdown_needs_fence(identity: PgIdentity) -> bool {
     match identity {
         PgIdentity::Primary | PgIdentity::Unknown { .. } => true,
         PgIdentity::ManagedStandby | PgIdentity::UnmanagedRecovery => false,
     }
+}
+
+/// Graceful shutdown: may pg-ha exit when the stop failed (fast and
+/// immediate) and PostgreSQL still runs? Only for a standby pg-ha configured
+/// (in recovery with `standby.signal`) that does not hold the leader lock:
+/// nothing promotes it once pg-ha is gone. A lock holder in recovery may be
+/// promoted (pg-ha would promote it, or a promote is in flight), and
+/// recovery pg-ha did not create (`recovery.signal`) ends in a promotion of
+/// its own, so both keep pg-ha running and stopping it (decision 3).
+pub(crate) fn shutdown_may_leave_running(identity: PgIdentity, is_leader: bool) -> bool {
+    !is_leader && identity == PgIdentity::ManagedStandby
 }
 
 /// D1: does the last recorded cluster state say this data directory last ran
@@ -697,6 +709,22 @@ mod tests {
         assert!(shutdown_needs_fence(UNKNOWN_SIGNAL));
         assert!(!shutdown_needs_fence(PgIdentity::ManagedStandby));
         assert!(!shutdown_needs_fence(PgIdentity::UnmanagedRecovery));
+    }
+
+    #[test]
+    fn shutdown_may_leave_running_table() {
+        for id in ALL_IDENTITIES {
+            assert!(!shutdown_may_leave_running(id, true), "lock holder {id:?}");
+            assert_eq!(
+                shutdown_may_leave_running(id, false),
+                id == PgIdentity::ManagedStandby,
+                "{id:?}"
+            );
+        }
+        assert!(!shutdown_may_leave_running(
+            PgIdentity::UnmanagedRecovery,
+            false
+        ));
     }
 
     #[test]

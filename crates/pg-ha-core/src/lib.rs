@@ -43,7 +43,7 @@ pub use dynamic_config::{
     PostgresqlDynamicConfig, classify_pg_param, detect_changes, patch_config,
 };
 pub use error::{Error, Result};
-pub use ha::{ApiSnapshot, CommandSender, CycleResult, Ha, StatePublisher};
+pub use ha::{ApiSnapshot, CommandSender, CycleResult, Ha, ShutdownOutcome, StatePublisher};
 pub use history::{History, HistoryEntry, HistoryEventType};
 pub use postgresql::{PgState, Postgresql, WalStatus, parse_lsn};
 pub use slots::SlotManager;

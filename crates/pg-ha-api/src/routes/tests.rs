@@ -70,7 +70,7 @@ async fn status_of(state: AppState, uri: &str) -> StatusCode {
 #[tokio::test]
 async fn test_primary_requires_every_h1_clause() {
     type Breaker = fn(&mut crate::state::NodeState);
-    let cases: [(&str, Breaker); 6] = [
+    let cases: [(&str, Breaker); 7] = [
         ("lock not held", |s| s.is_leader = false),
         ("process stopped", |s| s.state = MemberState::Stopped),
         ("not vouched (unmanaged / unknown)", |s| {
@@ -81,6 +81,7 @@ async fn test_primary_requires_every_h1_clause() {
         }),
         ("observed in recovery", |s| s.pg_in_recovery = Some(true)),
         ("recovery state not observed", |s| s.pg_in_recovery = None),
+        ("graceful shutdown in progress", |s| s.shutting_down = true),
     ];
     for (name, breaker) in cases {
         let state = test_state();

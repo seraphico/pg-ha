@@ -10,7 +10,7 @@ pg-ha is a Rust-based PostgreSQL HA solution providing complete feature parity w
 - **No HAProxy** — built-in TCP proxy with active health checking
 - **Single binary deployment** — one process per node, zero external services required
 - **TLS encrypted** — Raft RPC communication secured with TLS/mTLS
-- **Graceful shutdown** — CHECKPOINT + leader lock release before exit for fast failover
+- **Graceful shutdown** — drain (renewing the leader lock), CHECKPOINT + stop bounded by the leader lease, lock release only after PostgreSQL stopped
 
 ## Documentation
 

@@ -20,6 +20,14 @@ impl Ha {
     /// Process pending management commands from the API
     pub(super) async fn process_commands(&mut self) {
         while let Ok((cmd, reply_tx)) = self.cmd_rx.try_recv() {
+            if self.shutting_down {
+                let _ = reply_tx
+                    .send(CommandResponse::rejected(
+                        "Graceful shutdown in progress; command rejected",
+                    ))
+                    .await;
+                continue;
+            }
             let response = match cmd {
                 ManagementCommand::Switchover {
                     leader,

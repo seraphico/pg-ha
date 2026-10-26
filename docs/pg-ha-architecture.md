@@ -413,7 +413,7 @@ curl -X POST http://localhost:8008/failover
 
 ## 优雅关停流程
 
-pg-ha 收到 `SIGTERM` 或 `SIGINT` 信号后，执行分阶段优雅关停，确保数据安全和快速故障转移。
+pg-ha 收到第一个 `SIGTERM` 或 `SIGINT` 后调用 `Ha::graceful_shutdown`（`crates/pg-ha-core/src/ha/shutdown.rs`，`src/main.rs` 只调用它）。规则：drain 期间续锁；CHECKPOINT + 停库受 leader 租约限制；停库之后才释放锁；PostgreSQL 还可能可写时绝不带着锁退出。
 
 ```mermaid
 sequenceDiagram
@@ -424,54 +424,64 @@ sequenceDiagram
     participant OTHER as 其他节点
 
     OS->>PGHA: SIGTERM / SIGINT
-
-    Note over PGHA: Phase 1: 信号接收
-    PGHA->>PGHA: 停止 HA 循环 (tokio::select! 退出)
-
-    Note over PGHA: Phase 2: Leader 特殊处理
-    alt 当前节点是 Leader
-        PGHA->>PG: CHECKPOINT (刷盘)
-        PG-->>PGHA: OK
-        PGHA->>DCS: delete_leader(lock) 释放 Leader Lock
-        DCS-->>PGHA: OK
-        Note over DCS: Leader Lock 立即释放
+    PGHA->>PGHA: HA 循环停止；REST API、Proxy 继续服务
+    Note over PGHA: /primary 一律 503，不再启动 PG，管理命令被拒绝
+    alt 持锁但租约已到期
+        PGHA->>PG: standby.signal + 标记，pg_ctl stop -m immediate
+        Note over PGHA: 不 drain、不 CHECKPOINT、不释放锁
+    else 租约有效
+        loop drain（drain_timeout_secs），每个 loop_wait
+            PGHA->>DCS: update_leader（续锁）
+            Note over PGHA: 续锁失败：immediate 围栏，不释放锁（pause 下只 WARN）
+        end
+        par 与最后一次续锁的租约赛跑
+            PGHA->>PG: CHECKPOINT（持锁时）
+            PGHA->>PG: standby.signal + 标记，pg_ctl stop -m fast
+            PGHA->>PG: 失败时再试一次 pg_ctl stop -m immediate
+        end
+        alt PG 已停
+            PGHA->>DCS: delete_leader（CAS，最多等 retry_timeout）
+            PGHA->>OS: exit(0)
+        else 租约先到期
+            PGHA->>PG: standby.signal + 标记，pg_ctl stop -m immediate
+            Note over PGHA: 不释放锁，锁按 TTL 过期
+            PGHA->>OS: exit(0)
+        else PG 可能可写且停不掉
+            loop 每个 loop_wait：正常 HA 循环
+                PGHA->>DCS: 续锁（持锁时）
+                PGHA->>PG: 重试 pg_ctl stop（持锁 -m fast，不持锁 -m immediate）
+                Note over PGHA: ERROR：给出手工停库命令；再来的信号只让下一轮立即运行
+            end
+            Note over PG: 运维手工停库
+            PGHA->>DCS: delete_leader
+            PGHA->>OS: exit(0)
+        end
     end
 
-    Note over PGHA: Phase 3: 停止 PostgreSQL
-    PGHA->>PG: pg_ctl stop -m fast
-    PG->>PG: 断开客户端连接
-    PG->>PG: 完成 WAL 刷盘
-    PG-->>PGHA: 退出
-
-    Note over PGHA: Phase 4: 进程退出
-    PGHA->>OS: exit(0)
-
-    Note over OTHER: 故障转移触发
-    OTHER->>DCS: get_cluster() → unlocked
-    OTHER->>OTHER: is_healthiest_node()?
+    Note over OTHER: 锁释放或过期之后
     OTHER->>DCS: attempt_to_acquire_leader()
     OTHER->>OTHER: pg_ctl promote
-    Note over OTHER: 新 Primary 就绪
 ```
 
 **关键设计决策：**
 
-1. **Leader 主动释放锁**：不等待 TTL 过期，立即释放 Leader Lock，使其他节点能在秒级内完成故障转移
-2. **CHECKPOINT 在释放锁之前**：确保所有已提交事务的 WAL 已刷盘，避免数据丢失
-3. **fast 模式停止 PG**：立即断开客户端连接，但允许正在进行的 WAL 写入完成
-4. **信号处理的 tokio::select!**：与 HA 循环、API 服务器、Proxy 并行监听，任一退出触发关停
-5. **租约已到期时直接围栏**：释放锁这次 DCS 写最多等 `retry_timeout`；如果收到信号时（drain 之前）leader 租约已经到期，跳过 drain、CHECKPOINT 和释放锁，直接写 `standby.signal` 后 `pg_ctl stop -m immediate`。drain 期间不续锁，是已登记的缺口（invariants.md 第 9 节）
+1. **停库之后才释放锁**：锁一直在本节点手里，直到确认 PostgreSQL 已停。先删锁会让别的节点在本节点还可写时 promote。
+2. **drain 期间续锁**：`drain_timeout_secs`（默认 30 秒）长于默认租约（25 秒），不续锁的话锁会在 drain 期间过期。续锁失败就按失去锁围栏（pause 下除外，W1）。
+3. **收尾受租约限制**：最后一次续锁在 drain 结束时，它的租约（`ttl − safety_margin`）限住 CHECKPOINT 和停库，赛跑方式与 `run_cycle_bounded` 相同。截止时间先到就按租约到期围栏，不释放锁，所以锁过期、别的节点 promote 之前本节点已经不可写（L5 时间界）。
+4. **fast，失败再 immediate**：`-m fast` 断开客户端、做关机检查点；它失败且 PG 还在跑时再试一次 `-m immediate`。两次都在租约赛跑之内。
+5. **停不掉就不退出**：退出后锁会过期，没人再围栏这台可能可写的 PostgreSQL。pg-ha 继续跑正常 HA 循环（续锁、按 `stop_pending` 每轮重试停库），每轮 ERROR 给出手工停库命令，确认停库后再释放锁退出。再收到 SIGTERM / SIGINT 也不退出。观测在 recovery 的 PostgreSQL 也算可能可写，除非它不持锁且有 `standby.signal`：持锁的 recovery（pg-ha 会 promote 它）和没有 `standby.signal` 的 recovery（`recovery.signal`，结束时自己 promote）停不掉时同样不退出，HA 循环只重试停库，不 promote；关停中不持锁时每轮只再 `-m immediate` 停库，不参选、不跟随。只有不持锁、有 `standby.signal` 的备库停不掉时记 ERROR 后退出。REST API 由单独的任务服务，这段时间一直可用，`/primary` 保持 503。
+6. **SIGKILL 不在覆盖范围内**：systemd `TimeoutStopSec` 或 `docker stop -t` 到期后 pg-ha 被杀，上述规则无法执行，所以超时必须大于 drain + CHECKPOINT + 停库的时间（见运维指南）。停主库前先 switchover。
 
-**时间线：**
+**时间线（默认配置；docker 开发集群 `ttl` 15、`loop_wait` 5）：**
 
 | 阶段 | 耗时 | 说明 |
 |------|------|------|
-| Phase 1 | < 1ms | 信号接收，select! 退出 |
-| Phase 2 | 1-5s | CHECKPOINT + 释放锁 |
-| Phase 3 | 1-3s | pg_ctl stop fast |
-| Phase 4 | 即时 | exit(0) |
-| 故障转移 | 1-2s | 其他节点检测到 unlocked 并 promote |
-| **总计** | **3-10s** | 从信号到新 Primary 就绪 |
+| 信号 | < 1ms | HA 循环停止，`/primary` 变 503 |
+| drain | `drain_timeout_secs`（30s） | 只等待，每个 `loop_wait` 续锁 |
+| CHECKPOINT + 停库 | 通常数秒，上限 `ttl − safety_margin`（25s，docker 10s） | 超过上限即围栏 |
+| 释放锁 | ≤ `retry_timeout` | 只在停库之后 |
+| 故障转移 | ≤ `loop_wait` + promote | 其他节点看到 unlocked 后选举、promote |
+| **写不可用合计** | **约 30-45s** | 从信号到新 Primary 就绪；先 switchover 可避免 |
 
 ## 日志系统
 

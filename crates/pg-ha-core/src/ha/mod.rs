@@ -29,9 +29,11 @@ mod follow;
 mod helpers;
 pub(crate) mod identity;
 mod lease;
+mod shutdown;
 
 use identity::{LeaderAction, PgIdentity};
 use lease::{LeaderLease, LeaseAnchor};
+pub use shutdown::ShutdownOutcome;
 
 /// Rewind-check marker reason written by the lease-expiry fence.
 const LEASE_EXPIRED_REASON: &str = "leader lease expired before renewal";
@@ -66,6 +68,8 @@ pub struct ApiSnapshot {
     pub is_leader: bool,
     pub is_paused: bool,
     pub pending_restart: bool,
+    /// Graceful shutdown in progress (`/primary` is 503 from the signal on).
+    pub shutting_down: bool,
 }
 
 /// Hook that writes an [`ApiSnapshot`] into the REST API state. The HA engine
@@ -141,6 +145,11 @@ pub struct Ha {
     /// Publishes the REST API state from inside a cycle (demotion / fence
     /// paths). None: only the HA loop publishes, after each cycle.
     state_publisher: Option<StatePublisher>,
+
+    /// Graceful shutdown began (`Ha::graceful_shutdown`): PostgreSQL is
+    /// never started again, management commands are rejected, and a cycle
+    /// that finds PostgreSQL stopped neither releases the lock nor starts it.
+    shutting_down: bool,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -178,6 +187,7 @@ impl Ha {
             leader_lease: None,
             fence_deadline_tx: tokio::sync::watch::Sender::new(None),
             state_publisher: None,
+            shutting_down: false,
         };
         (ha, cmd_tx)
     }
@@ -198,6 +208,7 @@ impl Ha {
             is_leader: self.is_leader,
             is_paused: self.is_paused,
             pending_restart: self.pending_restart(),
+            shutting_down: self.shutting_down,
         }
     }
 
@@ -298,6 +309,13 @@ impl Ha {
         if !self.postgresql.is_running() {
             // Confirmed stopped: a pending demotion stop is no longer pending.
             self.stop_pending = false;
+            if self.shutting_down {
+                // The shutdown releases the lock (after this check) and
+                // exits; nothing here may delete the lock or start PostgreSQL.
+                return CycleResult::Follower(
+                    "PostgreSQL stopped; graceful shutdown finishing".into(),
+                );
+            }
             return self.handle_postgres_not_running().await;
         }
 
@@ -307,6 +325,20 @@ impl Ha {
         self.postgresql.observe_recovery().await;
         let role = identity::reconcile_role(self.postgresql.role().clone(), self.pg_identity());
         self.postgresql.set_role(role);
+
+        // Step 4c: a graceful shutdown could not stop PostgreSQL. Without the
+        // lock nothing below may campaign, follow or promote: only stop it
+        // again. The lock holder renews first (step 5) and then stops it.
+        if self.shutting_down && self.stop_pending && !self.is_lock_owner() {
+            warn!(
+                "Graceful shutdown: PostgreSQL is still running without the leader lock; stopping it again (immediate)"
+            );
+            let _ = self.stop_after_demotion_write("immediate").await;
+            return CycleResult::Error(
+                "graceful shutdown: PostgreSQL stop is still pending (not holding the leader lock)"
+                    .into(),
+            );
+        }
 
         // Step 5: Main decision branch
         if self.cluster.is_unlocked() {
@@ -1799,8 +1831,21 @@ mod tests {
         standby_signal: bool,
         bin_dir: Option<PathBuf>,
     ) -> (Ha, PathBuf, CommandSender) {
+        identity_test_ha_on_port(name, label, dcs, in_recovery, standby_signal, bin_dir, 1)
+    }
+
+    /// `identity_test_ha_with_cmd` with PostgreSQL at 127.0.0.1:`port`.
+    fn identity_test_ha_on_port(
+        name: &str,
+        label: &str,
+        dcs: Arc<MockDcs>,
+        in_recovery: Option<bool>,
+        standby_signal: bool,
+        bin_dir: Option<PathBuf>,
+        port: u16,
+    ) -> (Ha, PathBuf, CommandSender) {
         let mut config = test_config(name);
-        config.postgresql.port = 1;
+        config.postgresql.port = port;
         config.postgresql.bin_dir = bin_dir.unwrap_or_else(no_bin_dir);
         let (pg, data_dir) = with_fake_running_pg(&config, label);
         config.postgresql.data_dir = data_dir.clone();
@@ -3647,6 +3692,15 @@ mod tests {
         /// `application_name=` value at the end of the conn_url. pg_rewind
         /// as `RewindOk`.
         SourceStopsAfterFirstProbe,
+        /// pg_ctl stop: `-m fast` hangs (sleeps 30 s); `-m immediate`
+        /// removes postmaster.pid and succeeds. Every stop mode is appended
+        /// to `pg-ha-test.stop_modes` (see `stop_modes`).
+        PgCtlFastStopHangs,
+        /// pg_ctl stop: `-m fast` fails; `-m immediate` removes
+        /// postmaster.pid and succeeds. Modes recorded.
+        PgCtlFastStopFails,
+        /// pg_ctl stop: every mode fails. Modes recorded.
+        PgCtlStopFails,
     }
 
     /// pg_rewind --target-pgdata <dir> ...: $2 is the data directory.
@@ -3655,7 +3709,7 @@ mod tests {
     const FAKE_PSQL_PRIMARY: &str = "echo f\nexit 0\n";
 
     impl FakeBin {
-        const ALL: [FakeBin; 8] = [
+        const ALL: [FakeBin; 11] = [
             FakeBin::ControldataInProduction,
             FakeBin::ControldataShutDownInRecovery,
             FakeBin::PgCtlStopOk,
@@ -3664,6 +3718,9 @@ mod tests {
             FakeBin::SourceInRecovery,
             FakeBin::RewindOkThenRunning,
             FakeBin::SourceStopsAfterFirstProbe,
+            FakeBin::PgCtlFastStopHangs,
+            FakeBin::PgCtlFastStopFails,
+            FakeBin::PgCtlStopFails,
         ];
 
         fn dir_name(self) -> &'static str {
@@ -3676,6 +3733,9 @@ mod tests {
                 FakeBin::SourceInRecovery => "source-in-recovery",
                 FakeBin::RewindOkThenRunning => "rewind-ok-then-running",
                 FakeBin::SourceStopsAfterFirstProbe => "source-stops-after-first-probe",
+                FakeBin::PgCtlFastStopHangs => "pg-ctl-fast-stop-hangs",
+                FakeBin::PgCtlFastStopFails => "pg-ctl-fast-stop-fails",
+                FakeBin::PgCtlStopFails => "pg-ctl-stop-fails",
             }
         }
 
@@ -3723,6 +3783,19 @@ mod tests {
                         "m=\"${5##*application_name=}\"\n[ -e \"$m\" ] && exit 2\n: > \"$m\"\necho f\n",
                     ),
                 ],
+                // stop -D <dir> -m <mode> -w: $3 is the data directory, $5 the mode.
+                FakeBin::PgCtlFastStopHangs => vec![(
+                    "pg_ctl",
+                    "[ \"$1\" = stop ] || exit 1\necho \"$5\" >> \"$3/pg-ha-test.stop_modes\"\n[ \"$5\" = fast ] && exec sleep 30\nrm -f \"$3/postmaster.pid\"\nexit 0\n",
+                )],
+                FakeBin::PgCtlFastStopFails => vec![(
+                    "pg_ctl",
+                    "[ \"$1\" = stop ] || exit 1\necho \"$5\" >> \"$3/pg-ha-test.stop_modes\"\n[ \"$5\" = fast ] && exit 1\nrm -f \"$3/postmaster.pid\"\nexit 0\n",
+                )],
+                FakeBin::PgCtlStopFails => vec![(
+                    "pg_ctl",
+                    "[ \"$1\" = stop ] || exit 1\necho \"$5\" >> \"$3/pg-ha-test.stop_modes\"\nexit 1\n",
+                )],
             }
         }
     }
@@ -5563,6 +5636,482 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ─────────────────── Graceful shutdown bounded by the lease ───────────────────
+
+    /// The lock holder (observed primary, lease taken now) with PostgreSQL at
+    /// 127.0.0.1:`port` and the given fake bin_dir (None: `no_bin_dir()`).
+    fn shutdown_test_ha(
+        label: &str,
+        dcs: Arc<MockDcs>,
+        bin: Option<FakeBin>,
+        port: u16,
+    ) -> (Ha, PathBuf, CommandSender) {
+        dcs.set_cluster(leader_cluster("test_node", "node2"));
+        let (mut ha, dir, tx) = identity_test_ha_on_port(
+            "test_node",
+            label,
+            dcs,
+            Some(false),
+            false,
+            bin.map(fake_pg_bin),
+            port,
+        );
+        let _ = std::fs::remove_file(dir.join(STOP_MODES));
+        preset_auto_conf(&dir, "old");
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_leader = true;
+        ha.postgresql.set_role(MemberRole::Primary);
+        ha.extend_leader_lease(LeaseAnchor::now());
+        (ha, dir, tx)
+    }
+
+    const STOP_MODES: &str = "pg-ha-test.stop_modes";
+
+    /// The `-m` modes the fake pg_ctl was called with, in order.
+    fn stop_modes(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join(STOP_MODES))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A port that accepts connections and never answers, so CHECKPOINT
+    /// (tokio_postgres::connect has no timeout) never returns.
+    async fn silent_pg_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        port
+    }
+
+    fn pid_file_exists(dir: &std::path::Path) -> bool {
+        dir.join("postmaster.pid").exists()
+    }
+
+    /// Decision 1: CHECKPOINT never returns. At the lease deadline of the
+    /// last drain renewal (ttl 30 - safety_margin 5) the tail is dropped and
+    /// PostgreSQL fenced as on lease expiry; the lock is not released.
+    #[tokio::test(start_paused = true)]
+    async fn test_graceful_shutdown_fences_when_checkpoint_outlasts_the_lease() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let port = silent_pg_port().await;
+        let (mut ha, dir, _tx) = shutdown_test_ha(
+            "shutdown-slow-checkpoint",
+            dcs.clone(),
+            Some(FakeBin::PgCtlStopOk),
+            port,
+        );
+        let start = tokio::time::Instant::now();
+
+        let outcome = ha.graceful_shutdown(std::time::Duration::ZERO).await;
+
+        let elapsed = start.elapsed();
+        assert_eq!(outcome, ShutdownOutcome::Fenced);
+        assert!(
+            elapsed >= std::time::Duration::from_secs(25)
+                && elapsed <= std::time::Duration::from_secs(26),
+            "{elapsed:?}"
+        );
+        assert_demoted_files(&dir, &ha, LEASE_EXPIRED_REASON);
+        assert!(!pid_file_exists(&dir), "immediate stop ran");
+        assert!(!ha.stop_pending);
+        assert!(!ha.is_leader());
+        assert_eq!(ha.leader_lease, None);
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Decision 1: `pg_ctl stop -m fast` hangs past the lease (2 s here):
+    /// fenced with `-m immediate`, lock kept. Real time: the stop is a child
+    /// process, and a paused clock would jump to the deadline while waiting
+    /// on it.
+    #[tokio::test]
+    async fn test_graceful_shutdown_fences_when_fast_stop_outlasts_the_lease() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        dcs.lock_ttl.store(3, std::sync::atomic::Ordering::SeqCst);
+        let (mut ha, dir, _tx) = shutdown_test_ha(
+            "shutdown-slow-stop",
+            dcs.clone(),
+            Some(FakeBin::PgCtlFastStopHangs),
+            1,
+        );
+        ha.config.watchdog.safety_margin = 1;
+        ha.extend_leader_lease(LeaseAnchor::now());
+        let start = std::time::Instant::now();
+
+        let outcome = ha.graceful_shutdown(std::time::Duration::ZERO).await;
+
+        assert_eq!(outcome, ShutdownOutcome::Fenced);
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(6), "{elapsed:?}");
+        assert_eq!(stop_modes(&dir), ["fast", "immediate"]);
+        assert_demoted_files(&dir, &ha, LEASE_EXPIRED_REASON);
+        assert!(!pid_file_exists(&dir));
+        assert!(!ha.is_leader());
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Decision 2: the fast stop fails, the immediate retry stops
+    /// PostgreSQL, then the lock is released.
+    #[tokio::test]
+    async fn test_graceful_shutdown_retries_immediate_after_failed_fast_stop() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir, _tx) = shutdown_test_ha(
+            "shutdown-fast-fails",
+            dcs.clone(),
+            Some(FakeBin::PgCtlFastStopFails),
+            1,
+        );
+
+        let outcome = ha.graceful_shutdown(std::time::Duration::ZERO).await;
+
+        assert_eq!(outcome, ShutdownOutcome::Released);
+        assert_eq!(stop_modes(&dir), ["fast", "immediate"]);
+        assert!(!pid_file_exists(&dir));
+        assert!(!ha.stop_pending);
+        assert_eq!(lock_held_by(&dcs), None);
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(m.contains("stopped by graceful shutdown"), "{m}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Decision 3: both stops fail. The shutdown reports KeepRunning and
+    /// keeps the lock; the HA loop keeps renewing it and retries the stop,
+    /// never deletes the lock unchecked or starts PostgreSQL, and the
+    /// shutdown finishes once PostgreSQL is stopped by hand.
+    #[tokio::test]
+    async fn test_graceful_shutdown_keeps_running_when_both_stops_fail() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir, _tx) = shutdown_test_ha(
+            "shutdown-stop-fails",
+            dcs.clone(),
+            Some(FakeBin::PgCtlStopFails),
+            1,
+        );
+
+        let outcome = ha.graceful_shutdown(std::time::Duration::ZERO).await;
+
+        assert_eq!(outcome, ShutdownOutcome::KeepRunning);
+        assert_eq!(stop_modes(&dir), ["fast", "immediate"]);
+        assert!(pid_file_exists(&dir));
+        assert!(ha.postgresql().is_running());
+        assert!(ha.stop_pending);
+        assert!(ha.is_leader());
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        assert_eq!(ha.continue_shutdown().await, ShutdownOutcome::KeepRunning);
+
+        // The keep-running loop: renew, then retry the stop.
+        let result = ha.run_cycle_bounded().await;
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("stop is still pending")),
+            "got: {result}"
+        );
+        assert_eq!(stop_modes(&dir), ["fast", "immediate", "fast"]);
+        assert!(ha.is_leader());
+        assert!(ha.leader_lease.is_some(), "renewed");
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        assert_eq!(ha.continue_shutdown().await, ShutdownOutcome::KeepRunning);
+
+        // The operator stopped PostgreSQL: the cycle neither deletes the lock
+        // nor starts PostgreSQL; the shutdown then releases the lock.
+        std::fs::remove_file(dir.join("postmaster.pid")).unwrap();
+        let result = ha.run_cycle_bounded().await;
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m.contains("graceful shutdown")),
+            "got: {result}"
+        );
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        assert_ne!(ha.postgresql().state(), PgState::Starting, "not started");
+        assert!(!ha.stop_pending);
+        assert_eq!(ha.continue_shutdown().await, ShutdownOutcome::Released);
+        assert_eq!(lock_held_by(&dcs), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shutdown state `begin_shutdown` sets, for tests that start at the
+    /// stop (`stop_observed_postgres_for_shutdown` keeps the preset
+    /// observation; the fake server on port 1 cannot answer one).
+    fn mark_shutting_down(ha: &mut Ha) {
+        ha.shutting_down = true;
+        ha.postgresql.block_starts();
+    }
+
+    /// Decision 3, lock holder in recovery (standby.signal, e.g. a promote
+    /// that failed or was cut off by the signal): both stops fail, so pg-ha
+    /// keeps running with the lock; the next cycle renews and stops it again
+    /// instead of promoting it, and nothing releases the lock.
+    #[tokio::test]
+    async fn test_graceful_shutdown_lock_holder_in_recovery_keeps_running() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir, _tx) = shutdown_test_ha(
+            "shutdown-holder-in-recovery",
+            dcs.clone(),
+            Some(FakeBin::PgCtlStopFails),
+            1,
+        );
+        std::fs::write(dir.join("standby.signal"), "").unwrap();
+        ha.postgresql.set_observed_in_recovery(Some(true));
+        ha.postgresql.set_role(MemberRole::Replica);
+        assert_eq!(ha.pg_identity(), PgIdentity::ManagedStandby);
+        mark_shutting_down(&mut ha);
+
+        assert!(ha.stop_observed_postgres_for_shutdown().await.is_err());
+
+        assert_eq!(stop_modes(&dir), ["fast", "immediate"]);
+        assert!(ha.stop_pending);
+        assert_eq!(ha.continue_shutdown().await, ShutdownOutcome::KeepRunning);
+        assert!(ha.is_leader());
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+
+        let result = ha.run_cycle_bounded().await;
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("stop is still pending")),
+            "got: {result}"
+        );
+        assert_eq!(stop_modes(&dir), ["fast", "immediate", "fast"]);
+        assert_eq!(ha.promote_timeline_target, None, "no promote");
+        assert!(ha.is_leader());
+        assert!(ha.leader_lease.is_some(), "renewed");
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        assert_eq!(ha.continue_shutdown().await, ShutdownOutcome::KeepRunning);
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Decision 3, recovery pg-ha did not create (no standby.signal, e.g.
+    /// recovery.signal) without the lock: it ends in a promotion of its own,
+    /// so a failed stop keeps pg-ha running. The next cycle only stops it
+    /// again (no follow, no election, no standby.signal written); once it is
+    /// stopped the shutdown finishes without touching the other node's lock.
+    #[tokio::test]
+    async fn test_graceful_shutdown_unmanaged_recovery_keeps_running() {
+        let dcs = Arc::new(MockDcs::with_leader("node2"));
+        dcs.set_cluster(leader_cluster("node2", "test_node"));
+        let (mut ha, dir, _tx) = identity_test_ha_on_port(
+            "test_node",
+            "shutdown-unmanaged-recovery",
+            dcs.clone(),
+            Some(true),
+            false,
+            Some(fake_pg_bin(FakeBin::PgCtlStopFails)),
+            1,
+        );
+        let _ = std::fs::remove_file(dir.join(STOP_MODES));
+        ha.cluster = leader_cluster("node2", "test_node");
+        assert_eq!(ha.pg_identity(), PgIdentity::UnmanagedRecovery);
+        mark_shutting_down(&mut ha);
+
+        assert!(ha.stop_observed_postgres_for_shutdown().await.is_err());
+
+        assert_eq!(stop_modes(&dir), ["fast", "immediate"]);
+        assert!(ha.stop_pending);
+        assert_eq!(ha.continue_shutdown().await, ShutdownOutcome::KeepRunning);
+
+        let result = ha.run_cycle_bounded().await;
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("stop is still pending")),
+            "got: {result}"
+        );
+        assert_eq!(stop_modes(&dir), ["fast", "immediate", "immediate"]);
+        assert!(!ha.is_leader());
+        assert_eq!(ha.promote_timeline_target, None, "no promote");
+        assert!(!dir.join("standby.signal").exists(), "recovery untouched");
+        assert_eq!(ha.continue_shutdown().await, ShutdownOutcome::KeepRunning);
+
+        std::fs::remove_file(dir.join("postmaster.pid")).unwrap();
+        let result = ha.run_cycle_bounded().await;
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m.contains("graceful shutdown")),
+            "got: {result}"
+        );
+        assert_eq!(ha.continue_shutdown().await, ShutdownOutcome::Released);
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("node2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a standby pg-ha configured that does not hold the lock may be
+    /// left running: nothing promotes it once pg-ha exits.
+    #[tokio::test]
+    async fn test_graceful_shutdown_leaves_non_holder_managed_standby() {
+        let dcs = Arc::new(MockDcs::with_leader("node2"));
+        dcs.set_cluster(leader_cluster("node2", "test_node"));
+        let (mut ha, dir, _tx) = identity_test_ha_on_port(
+            "test_node",
+            "shutdown-managed-standby",
+            dcs.clone(),
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::PgCtlStopFails)),
+            1,
+        );
+        let _ = std::fs::remove_file(dir.join(STOP_MODES));
+        ha.cluster = leader_cluster("node2", "test_node");
+        mark_shutting_down(&mut ha);
+
+        assert!(ha.stop_observed_postgres_for_shutdown().await.is_err());
+
+        assert_eq!(stop_modes(&dir), ["fast", "immediate"]);
+        assert!(!ha.stop_pending);
+        assert_eq!(
+            ha.continue_shutdown().await,
+            ShutdownOutcome::StandbyLeftRunning
+        );
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("node2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Decision 4 (W1): in pause mode a failed renewal during the drain does
+    /// not fence; the drain goes on (every renewal fails) and the shutdown
+    /// stops PostgreSQL normally.
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_drain_in_pause_mode_does_not_fence_on_renewal_failure() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir, _tx) = shutdown_test_ha(
+            "shutdown-drain-paused",
+            dcs.clone(),
+            Some(FakeBin::PgCtlStopOk),
+            1,
+        );
+        ha.is_paused = true;
+        dcs.fail_leader_writes();
+        let start = tokio::time::Instant::now();
+
+        let outcome = ha
+            .graceful_shutdown(std::time::Duration::from_secs(25))
+            .await;
+
+        assert!(start.elapsed() >= std::time::Duration::from_secs(25));
+        assert_eq!(outcome, ShutdownOutcome::Released);
+        assert!(!pid_file_exists(&dir));
+        let m = marker(&dir).expect("rewind-check marker");
+        assert!(m.contains("stopped by graceful shutdown"), "{m}");
+        assert!(!m.contains(LEASE_EXPIRED_REASON), "{m}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/primary` turns 503 at the signal: the first snapshot is published
+    /// before anything is stopped, and every snapshot says shutting_down.
+    #[tokio::test]
+    async fn test_graceful_shutdown_publishes_shutting_down_first() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir, _tx) = shutdown_test_ha(
+            "shutdown-publish",
+            dcs.clone(),
+            Some(FakeBin::PgCtlStopOk),
+            1,
+        );
+        let published: Arc<Mutex<Vec<ApiSnapshot>>> = Arc::default();
+        let rec = published.clone();
+        ha.set_state_publisher(Arc::new(move |snapshot| {
+            rec.lock().unwrap().push(snapshot);
+            Box::pin(async {})
+        }));
+
+        let outcome = ha.graceful_shutdown(std::time::Duration::ZERO).await;
+
+        assert_eq!(outcome, ShutdownOutcome::Released);
+        let published = published.lock().unwrap().clone();
+        let first = published.first().expect("published at the signal");
+        assert!(
+            first.shutting_down && first.pg_running && first.is_leader,
+            "{first:?}"
+        );
+        assert!(published.iter().all(|s| s.shutting_down), "{published:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Management commands are rejected once the shutdown began, including
+    /// one queued during the drain; none of them stops or starts PostgreSQL.
+    #[tokio::test]
+    async fn test_commands_rejected_during_graceful_shutdown() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir, tx) = shutdown_test_ha(
+            "shutdown-commands",
+            dcs.clone(),
+            Some(FakeBin::PgCtlStopFails),
+            1,
+        );
+        let (queued_tx, mut queued_rx) = mpsc::channel(1);
+        tx.send((ManagementCommand::Restart, queued_tx))
+            .await
+            .unwrap();
+
+        let outcome = ha.graceful_shutdown(std::time::Duration::ZERO).await;
+
+        assert_eq!(outcome, ShutdownOutcome::KeepRunning);
+        let queued = queued_rx.recv().await.expect("queued command answered");
+        assert_eq!(queued.status, CommandStatus::Rejected, "{}", queued.message);
+        assert!(queued.message.contains("Graceful shutdown in progress"));
+        let modes = stop_modes(&dir);
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Restart).await;
+
+        assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert!(resp.message.contains("Graceful shutdown in progress"));
+        assert_eq!(stop_modes(&dir), modes, "no stop by the command");
+        assert_ne!(ha.postgresql().state(), PgState::Starting);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lease already expired at the signal and the fence's immediate stop
+    /// fails (no pg_ctl): KeepRunning, the lock is not touched.
+    #[tokio::test(start_paused = true)]
+    async fn test_graceful_shutdown_with_expired_lease_and_failed_fence_keeps_running() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = lease_test_ha("shutdown-expired-stuck", dcs.clone());
+        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+
+        let outcome = ha.graceful_shutdown(std::time::Duration::ZERO).await;
+
+        assert_eq!(outcome, ShutdownOutcome::KeepRunning);
+        assert_lease_fenced(&dir, &ha);
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_graceful_shutdown_order() {
+        let shutdown_rs = include_str!("shutdown.rs");
+        let main_path = body(shutdown_rs, "pub async fn graceful_shutdown");
+        let steps = [
+            "begin_shutdown(",
+            "shutdown_fence_if_lease_expired(",
+            "drain_renewing_leader_lock(",
+            "stop_postgres_within_lease(",
+            "finish_shutdown(",
+        ];
+        for pair in steps.windows(2) {
+            assert_before(main_path, pair[0], pair[1], "graceful_shutdown");
+        }
+        let race = body(shutdown_rs, "async fn stop_postgres_within_lease");
+        assert_before(race, "biased;", "checkpoint_and_stop()", "lease race");
+        assert_before(
+            race,
+            "checkpoint_and_stop()",
+            "fence_for_lost_lease(",
+            "lease race",
+        );
+        let finish = body(shutdown_rs, "async fn finish_shutdown");
+        assert_before(
+            finish,
+            "is_running()",
+            "release_leader_lock_if_stopped(",
+            "release only after the stop",
+        );
+        let fenced = body(shutdown_rs, "async fn outcome_after_fence");
+        assert!(
+            !fenced.contains("release_leader_lock_if_stopped("),
+            "a fenced shutdown never releases the lock"
+        );
+    }
+
     // ─────────────────── Source-order checks for the stop paths ───────────────────
     // Stops fail in tests (no pg_ctl), so file assertions alone cannot show
     // that the standby config was written before the stop. These pin it.
@@ -5698,7 +6247,7 @@ mod tests {
             "marked primary: direct stop"
         );
 
-        let shutdown = body(helpers_rs, "async fn stop_postgres_for_shutdown");
+        let shutdown = body(helpers_rs, "async fn stop_observed_postgres_for_shutdown");
         assert_before(shutdown, "fence_primary(", DIRECT_STOP, "shutdown");
 
         let rejoin = body(follow_rs, "async fn rejoin_as_replica");
@@ -5782,15 +6331,16 @@ mod tests {
         // follow.rs: rejoin of a non-primary, reconfigure_replica (2);
         // commands.rs: POST /restart while holding the lock, POST /reinitialize
         // of a non-primary;
-        // helpers.rs: stop_after_demotion_write, shutdown of a standby,
-        // stop_held_postgres of a non-primary.
+        // helpers.rs: stop_after_demotion_write, shutdown of a standby (fast,
+        // then immediate), stop_held_postgres of a non-primary.
         let files = [
             ("mod.rs", include_str!("mod.rs"), 0),
             ("follow.rs", include_str!("follow.rs"), 3),
             ("election.rs", include_str!("election.rs"), 0),
             ("commands.rs", include_str!("commands.rs"), 2),
-            ("helpers.rs", include_str!("helpers.rs"), 3),
+            ("helpers.rs", include_str!("helpers.rs"), 4),
             ("identity.rs", include_str!("identity.rs"), 0),
+            ("shutdown.rs", include_str!("shutdown.rs"), 0),
         ];
         for (name, src, expected) in files {
             assert_eq!(

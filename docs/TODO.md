@@ -22,7 +22,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 - Raft RPC TLS（`raft.tls`；开发用 `docker-compose.yml` 已挂载证书）。服务端目前只使用 `cert`/`key`，`require_client_cert` 未接入
 - Raft 日志 append-only WAL（`raft_log.wal`，超过 4 MiB 压缩）+ `hard_state.json` / `state_machine.json` / `membership.json`
 - Watchdog（Linux `/dev/watchdog`，防 zombie primary）
-- 优雅停机：等待 `shutdown.drain_timeout_secs` → Leader 上 CHECKPOINT → 释放 leader lock → `pg_ctl stop -m fast`
+- 优雅停机：等待 `shutdown.drain_timeout_secs`（期间续锁）→ Leader 上 CHECKPOINT + 停库（`-m fast`，失败再 `-m immediate`），受 leader 租约限制 → 停库后才释放 leader lock；停不掉时不退出
 - Prometheus metrics、文本或 JSON 日志（`log_format` 或 `PG_HA_LOG_FORMAT`）
 - Docker Compose 3 节点开发集群、`make up` / `make test`
 - 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）

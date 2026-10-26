@@ -20,7 +20,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use pg_ha_api::{AppState, AuthConfig};
 use pg_ha_core::cluster::{Member, MemberRole, MemberState};
 use pg_ha_core::config::Config;
-use pg_ha_core::ha::Ha;
+use pg_ha_core::ha::{Ha, ShutdownOutcome};
 use pg_ha_core::postgresql::Postgresql;
 use pg_ha_dcs::RaftDcs;
 use pg_ha_proxy::{PgBackend, PgProxy};
@@ -276,6 +276,25 @@ async fn main() -> anyhow::Result<()> {
         config.restapi.port,
     ));
 
+    // REST API server: spawned so it keeps serving during graceful shutdown
+    // (/primary is 503 from the signal on, the other endpoints stay truthful).
+    let api_listener = match tokio::net::TcpListener::bind(api_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(%api_addr, "Failed to bind REST API: {e}");
+            std::process::exit(1);
+        }
+    };
+    info!(%api_addr, "REST API listening");
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(api_listener, api_router).await {
+            error!("REST API server fatal error: {e}");
+            std::process::exit(1);
+        }
+    });
+
+    let mut signals = ShutdownSignals::new()?;
+
     tokio::select! {
         // HA Loop
         _ = async {
@@ -283,57 +302,7 @@ async fn main() -> anyhow::Result<()> {
             let mut interval = ha_interval(current_loop_wait);
             loop {
                 interval.tick().await;
-                let result = ha.run_cycle_bounded().await;
-                info!("{result}");
-
-                // Detect dynamic loop_wait change and recreate interval
-                let new_loop_wait = ha.config().loop_wait;
-                if new_loop_wait != current_loop_wait {
-                    info!(
-                        old = current_loop_wait,
-                        new = new_loop_wait,
-                        "loop_wait changed, recreating interval"
-                    );
-                    current_loop_wait = new_loop_wait;
-                    interval = ha_interval(current_loop_wait);
-                }
-
-                // Track DCS last seen: if the cycle didn't return an error about DCS,
-                // we consider DCS as reachable
-                let dcs_ok = !matches!(&result, pg_ha_core::CycleResult::Error(msg) if msg.contains("DCS"));
-
-                // Update shared API state (state: same derivation as the
-                // state published to DCS)
-                let snapshot = ha.api_snapshot();
-                app_state_clone.update(|s| {
-                    s.apply_ha_snapshot(&snapshot);
-                    s.last_loop_at = Some(Instant::now());
-                    if dcs_ok {
-                        s.dcs_last_seen = Some(Instant::now());
-                    }
-                }).await;
-
-                // Hand the members to the proxy refresher task. Never await the
-                // refresh here: its DNS lookups have no timeout, and the HA loop
-                // must not await anything unbounded outside run_cycle_bounded
-                // (docs/invariants.md 1a, "leader 租约").
-                members_tx.send_replace(ha.cluster().members.clone());
-            }
-        } => {}
-
-        // REST API server
-        _ = async {
-            let listener = match tokio::net::TcpListener::bind(api_addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    error!(%api_addr, "Failed to bind REST API: {e}");
-                    std::process::exit(1);
-                }
-            };
-            info!(%api_addr, "REST API listening");
-            if let Err(e) = axum::serve(listener, api_router).await {
-                error!("REST API server fatal error: {e}");
-                std::process::exit(1);
+                ha_cycle(&mut ha, &mut current_loop_wait, &mut interval, &app_state_clone, &members_tx).await;
             }
         } => {}
 
@@ -341,79 +310,143 @@ async fn main() -> anyhow::Result<()> {
         _ = proxy.run() => {}
 
         // Signal handling (SIGINT and SIGTERM)
-        _ = async {
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate()
-            ).expect("Failed to register SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received SIGINT");
-                }
-                _ = sigterm.recv() => {
-                    info!("Received SIGTERM");
-                }
-            }
-        } => {}
+        sig = signals.recv() => {
+            info!("Received {sig}");
+        }
     }
 
     // ─── Graceful Shutdown Sequence ───
-    info!("Initiating graceful shutdown...");
-
-    // Leader lease already expired (e.g. partitioned): the lock may belong to
-    // another node by now. Fence at once and skip drain, CHECKPOINT and lock
-    // release (docs/invariants.md 1a, "leader 租约").
-    if ha.shutdown_fence_if_lease_expired().await {
-        // No-op when the immediate stop succeeded; otherwise one more try.
-        if let Err(e) = ha.stop_postgres_for_shutdown().await {
-            error!("Failed to stop PostgreSQL during shutdown: {e}");
+    // The proxy listeners are tasks spawned inside proxy.run(), so dropping
+    // the select does not close them; the REST API keeps serving. Further
+    // signals never make pg-ha exit while PostgreSQL may be writable: they
+    // only make a stuck shutdown retry the stop at once.
+    let retry_now = Arc::new(tokio::sync::Notify::new());
+    let notify = retry_now.clone();
+    tokio::spawn(async move {
+        loop {
+            let sig = signals.recv().await;
+            warn!(
+                "Received {sig} during graceful shutdown; pg-ha exits only after PostgreSQL has stopped"
+            );
+            notify.notify_one();
         }
-        info!("Graceful shutdown complete (fenced: leader lease expired)");
-        return Ok(());
-    }
+    });
 
-    // Phase 1: The proxy listeners are tasks spawned inside proxy.run(), so
-    // dropping this select does not close them. Drain waits out in-flight
-    // work; the leader lock is renewed for the whole wait so it cannot expire
-    // while PostgreSQL is still writable.
-    info!("Phase 1: Draining in-flight proxy connections");
-
-    // Phase 2: Drain, renewing the leader lock every loop_wait.
-    let drain_timeout = std::time::Duration::from_secs(config.shutdown.drain_timeout_secs);
-    info!(
-        timeout_secs = config.shutdown.drain_timeout_secs,
-        "Phase 2: Draining active connections"
-    );
-    if ha.drain_renewing_leader_lock(drain_timeout).await {
-        info!("Graceful shutdown complete (fenced: leader lock renewal failed during drain)");
-        return Ok(());
+    let drain = std::time::Duration::from_secs(config.shutdown.drain_timeout_secs);
+    let mut outcome = ha.graceful_shutdown(drain).await;
+    if outcome == ShutdownOutcome::KeepRunning {
+        outcome =
+            keep_running_until_stopped(&mut ha, &app_state_clone, &members_tx, &retry_now).await;
     }
-
-    // Phase 3: CHECKPOINT while this node still holds the lock and PostgreSQL
-    // is still the primary. The lock is released only after the stop.
-    if ha.is_leader() {
-        info!("Phase 3: Leader shutdown — running CHECKPOINT");
-        if let Err(e) = ha.postgresql().checkpoint().await {
-            error!("CHECKPOINT during shutdown failed: {e} (continuing)");
-        }
-    } else {
-        info!("Phase 3: Not leader, skipping CHECKPOINT");
-    }
-
-    // Phase 4: Stop PostgreSQL before releasing the leader lock.
-    info!("Phase 4: Stopping PostgreSQL before releasing the leader lock");
-    if let Err(e) = ha.stop_postgres_for_shutdown().await {
-        error!("Failed to stop PostgreSQL during shutdown: {e}");
-    }
-    if ha.is_leader() {
-        if ha.release_leader_lock_if_stopped().await {
-            info!("Leader lock released — other nodes can elect a new leader");
-        } else {
-            error!("Leader lock kept: PostgreSQL was not confirmed stopped, or the delete failed");
-        }
-    }
-
-    info!("Graceful shutdown complete");
+    info!("Graceful shutdown complete: {outcome}");
     Ok(())
+}
+
+/// SIGTERM and SIGINT, registered once for the whole process lifetime, so no
+/// signal is lost between the first one and the shutdown sequence.
+struct ShutdownSignals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> anyhow::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate())
+                .map_err(|e| anyhow::anyhow!("Failed to register SIGTERM handler: {e}"))?,
+            int: signal(SignalKind::interrupt())
+                .map_err(|e| anyhow::anyhow!("Failed to register SIGINT handler: {e}"))?,
+        })
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+        }
+    }
+}
+
+/// One HA loop iteration after the tick: the bounded cycle, then the API
+/// state and the proxy member list.
+async fn ha_cycle(
+    ha: &mut Ha,
+    current_loop_wait: &mut u64,
+    interval: &mut tokio::time::Interval,
+    app_state: &AppState,
+    members_tx: &tokio::sync::watch::Sender<Vec<Member>>,
+) {
+    let result = ha.run_cycle_bounded().await;
+    info!("{result}");
+
+    // Detect dynamic loop_wait change and recreate interval
+    let new_loop_wait = ha.config().loop_wait;
+    if new_loop_wait != *current_loop_wait {
+        info!(
+            old = *current_loop_wait,
+            new = new_loop_wait,
+            "loop_wait changed, recreating interval"
+        );
+        *current_loop_wait = new_loop_wait;
+        *interval = ha_interval(new_loop_wait);
+    }
+
+    // Track DCS last seen: if the cycle didn't return an error about DCS,
+    // we consider DCS as reachable
+    let dcs_ok = !matches!(&result, pg_ha_core::CycleResult::Error(msg) if msg.contains("DCS"));
+
+    // Update shared API state (state: same derivation as the state published
+    // to DCS)
+    let snapshot = ha.api_snapshot();
+    app_state
+        .update(|s| {
+            s.apply_ha_snapshot(&snapshot);
+            s.last_loop_at = Some(Instant::now());
+            if dcs_ok {
+                s.dcs_last_seen = Some(Instant::now());
+            }
+        })
+        .await;
+
+    // Hand the members to the proxy refresher task. Never await the refresh
+    // here: its DNS lookups have no timeout, and the HA loop must not await
+    // anything unbounded outside run_cycle_bounded (docs/invariants.md 1a,
+    // "leader 租约").
+    members_tx.send_replace(ha.cluster().members.clone());
+}
+
+/// The shutdown could not stop a PostgreSQL that may be writable: keep
+/// running the normal HA loop (it keeps renewing the lock while this node
+/// holds it and retries the stop every cycle through `stop_pending`) until
+/// PostgreSQL is stopped, then finish the shutdown. A further SIGTERM /
+/// SIGINT runs the next cycle at once.
+async fn keep_running_until_stopped(
+    ha: &mut Ha,
+    app_state: &AppState,
+    members_tx: &tokio::sync::watch::Sender<Vec<Member>>,
+    retry_now: &tokio::sync::Notify,
+) -> ShutdownOutcome {
+    // Keep-running loop
+    let mut current_loop_wait = ha.config().loop_wait;
+    let mut interval = ha_interval(current_loop_wait);
+    // The shutdown just tried to stop PostgreSQL: wait one loop_wait.
+    interval.reset();
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                ha_cycle(ha, &mut current_loop_wait, &mut interval, app_state, members_tx).await;
+                // Awaits the lock delete only after PostgreSQL stopped.
+                let outcome = ha.continue_shutdown().await;
+                if outcome != ShutdownOutcome::KeepRunning {
+                    return outcome;
+                }
+            }
+            _ = retry_now.notified() => {
+                interval.reset_immediately();
+            }
+        }
+    }
 }
 
 /// HA loop timer. After a cycle that overran `loop_wait`, the next cycle
@@ -852,10 +885,11 @@ mod tests {
     /// Verifies that the HA loop code handles dynamic `loop_wait` changes by
     /// detecting the change and recreating/resetting the interval. On unfixed
     /// code, the interval is only created once at startup.
-    /// Graceful shutdown stops PostgreSQL only through the HA engine, which
-    /// writes standby.signal first when PostgreSQL may be a writable primary.
-    /// The leader lock is renewed during the drain and released only after
-    /// the stop.
+    /// Graceful shutdown stops PostgreSQL only through the HA engine
+    /// (`Ha::graceful_shutdown`): drain with renewal, CHECKPOINT + stop
+    /// raced against the leader lease, lock release after the stop. main.rs
+    /// only calls it and, while PostgreSQL cannot be stopped, keeps the HA
+    /// loop running with `continue_shutdown`.
     #[test]
     fn test_shutdown_stops_postgres_only_through_ha() {
         let source = include_str!("main.rs");
@@ -864,53 +898,96 @@ mod tests {
                    stop_after_demotion_write, or add it to the audited table in plan \
                    section 2.2b with a reason";
         assert_eq!(prod_code.matches(".stop(").count(), 0, "{msg}");
-        assert!(prod_code.contains("stop_postgres_for_shutdown("), "{msg}");
-        // The lease-expired path stops once, before the drain. The normal
-        // path's stop is the later call: drain, then stop, then release.
-        let drain = prod_code
-            .find("drain_renewing_leader_lock(")
-            .expect("drain");
-        let stop = prod_code
-            .rfind("stop_postgres_for_shutdown(")
-            .expect("stop");
-        let release = prod_code
-            .find("release_leader_lock_if_stopped(")
-            .expect("release");
-        assert!(
-            drain < stop && stop < release,
-            "drain, then stop, then release"
+        assert!(prod_code.contains("ha.graceful_shutdown(drain).await"));
+        assert!(prod_code.contains("ha.continue_shutdown().await"));
+        for inside_core in [
+            "drain_renewing_leader_lock(",
+            "stop_postgres_for_shutdown(",
+            "release_leader_lock_if_stopped(",
+            ".checkpoint(",
+        ] {
+            assert!(
+                !prod_code.contains(inside_core),
+                "{inside_core} belongs inside Ha::graceful_shutdown"
+            );
+        }
+        // Only KeepRunning stays in the process; every other outcome exits.
+        let after = prod_code
+            .split("let mut outcome = ha.graceful_shutdown(drain).await;")
+            .nth(1)
+            .expect("graceful_shutdown call");
+        assert_before_text(
+            after,
+            "if outcome == ShutdownOutcome::KeepRunning {",
+            "keep_running_until_stopped(",
         );
+    }
+
+    fn assert_before_text(text: &str, first: &str, second: &str) {
+        let a = text.find(first).unwrap_or_else(|| panic!("no `{first}`"));
+        let b = text.find(second).unwrap_or_else(|| panic!("no `{second}`"));
+        assert!(a < b, "`{first}` must come before `{second}`");
+    }
+
+    fn awaits_in(text: &str) -> Vec<&str> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| l.contains(".await"))
+            .collect()
     }
 
     /// Outside `run_cycle_bounded` the HA loop awaits only the tick and the
     /// API state write lock (handlers hold it only for local reads); nothing
     /// there races the leader lease (docs/invariants.md 1a). Anything else,
-    /// such as the proxy refresh's DNS lookups, belongs on another task.
+    /// such as the proxy refresh's DNS lookups, belongs on another task. The
+    /// keep-running loop of a stuck shutdown adds only `continue_shutdown`,
+    /// which awaits the lock delete only after PostgreSQL stopped.
     #[test]
     fn test_ha_loop_awaits_nothing_unbounded_outside_the_bounded_cycle() {
         let source = include_str!("main.rs");
         let prod_code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let msg = "a new await in the HA loop is not raced against the leader lease: \
+                   move it into run_cycle_bounded or onto another task";
         let ha_loop = prod_code
             .split("// HA Loop")
             .nth(1)
-            .and_then(|s| s.split("// REST API server").next())
+            .and_then(|s| s.split("// TCP Proxy").next())
             .expect("HA loop arm not found");
-        let awaits: Vec<&str> = ha_loop
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.contains(".await"))
-            .collect();
         assert_eq!(
-            awaits,
+            awaits_in(ha_loop),
             vec![
                 "interval.tick().await;",
-                "let result = ha.run_cycle_bounded().await;",
-                "}).await;",
+                "ha_cycle(&mut ha, &mut current_loop_wait, &mut interval, &app_state_clone, &members_tx).await;",
             ],
-            "a new await in the HA loop is not raced against the leader lease: \
-             move it into run_cycle_bounded or onto another task"
+            "{msg}"
         );
-        assert!(ha_loop.contains("app_state_clone.update("));
+        let cycle = prod_code
+            .split("async fn ha_cycle(")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("ha_cycle not found");
+        assert_eq!(
+            awaits_in(cycle),
+            vec!["let result = ha.run_cycle_bounded().await;", ".await;"],
+            "{msg}"
+        );
+        // The only other await: the API state write lock.
+        assert!(cycle.contains("app_state\n        .update(|s| {"));
+        let keep_running = prod_code
+            .split("// Keep-running loop")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("keep-running loop not found");
+        assert_eq!(
+            awaits_in(keep_running),
+            vec![
+                "ha_cycle(ha, &mut current_loop_wait, &mut interval, app_state, members_tx).await;",
+                "let outcome = ha.continue_shutdown().await;",
+            ],
+            "{msg}"
+        );
+        assert!(keep_running.contains("_ = interval.tick() => {"));
+        assert!(keep_running.contains("_ = retry_now.notified() => {"));
     }
 
     /// The proxy refresher applies the published member list and ends when the
