@@ -1,6 +1,6 @@
 [package]
 name = "pg-ha"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "PostgreSQL High Availability with built-in Raft consensus and load balancing"
 license = "Apache-2.0"
@@ -15,6 +15,9 @@ members = [
     "crates/pg-ha-api",
     "crates/pg-ha-ctl",
 ]
+
+[workspace.package]
+version = "0.1.16"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

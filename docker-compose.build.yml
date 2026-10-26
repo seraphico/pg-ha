@@ -6,7 +6,7 @@
 
 services:
   builder:
-    image: rust:1.88-bookworm
+    image: rust:1.99.1-bookworm
     platform: ${DOCKER_PLATFORM:-linux/amd64}
     working_dir: /app
     volumes:

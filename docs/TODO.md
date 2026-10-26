@@ -13,7 +13,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 - **REST API** — axum 实现的健康检查和管理端点（默认端口 8008，明文 HTTP）
 - **TCP Proxy** — 读写分离代理（RW:6432, RO:6433），带主动 HTTP 健康检查、fall/rise 和每后端 `maxconn`
 
-**当前版本**：0.1.0  
+**当前版本**：0.1.16（与 git tag `v0.1.16` 一致）  
 **代码结构**：Cargo workspace，`edition = "2024"`。核心 crate：`pg-ha-core`（HA 逻辑）、`pg-ha-dcs`（Raft）、`pg-ha-proxy`（代理）、`pg-ha-api`（REST）、`pg-ha-ctl`（CLI）
 
 **已实现的关键能力**：
@@ -199,6 +199,6 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
    - `make up` — 编译并启动 3 节点 Docker 集群（默认 PostgreSQL 16；`PG_VERSION` 传给官方 `postgres` 镜像）
    - `./tests/e2e/run_tests.sh` — E2E（不是 `make e2e`）
 4. **工具链**：
-   - Rust **稳定版 1.88+**（`edition = "2024"`，代码使用已稳定的 if-let chains）。CI release 使用 `dtolnay/rust-toolchain@stable`
+   - Rust **1.99.1**（`rust-toolchain.toml`、Docker 构建镜像 `rust:1.99.1-bookworm`、CI release 使用 `dtolnay/rust-toolchain@1.99.1`）。`edition = "2024"`，代码使用已稳定的 if-let chains。不跟浮动的 `stable`
    - openraft 0.9
    - 日志用 `tracing`；错误用 `thiserror` / `anyhow`
