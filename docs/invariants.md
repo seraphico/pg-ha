@@ -145,7 +145,7 @@
 - 选举规则：带 rewind 检查标记的节点，只有在**自身成员记录的 timeline ≥ `/timeline`** 时才参选；否则不参选，等看到 leader 后 rewind（INFO `Not taking part in the election: rewind-check marker present and this node's timeline <own> is behind the cluster timeline <cluster>; waiting for a leader to rewind against`）。key 不存在（升级来的集群）时改为与其他成员发布的 timeline 比较，并 WARN `No /timeline key in DCS; comparing this node's timeline with the timelines members published. The evidence is incomplete`。自身 timeline 还没发布时本轮不参选。
 - 成员记录的 timeline 来自 `pg_control_checkpoint()`，在副本上、以及 promote 后 checkpoint 完成之前的主库上可能落后于实际 timeline，所以这个比较只会更严格。用成员发布值而不是本地值，是因为其他节点判断这个节点能否参选时只能看到发布值，两边必须得出同一结论。
 - 带标记、不能参选的节点如果正以主库运行，先停库（L5，先写 `standby.signal` 和标记）。
-- 其他节点用同一规则判断带标记的 peer：不能参选的 peer 不计入「谁最健康」的比较，避免所有节点都让位给一个不会参选的节点。`POST /switchover`、`POST /failover` 拒绝带标记的 candidate（409，`Candidate '<c>' has a rewind-check marker (not yet verified with pg_rewind)`）。`/failover` 里已经指定的 candidate 之后才带上标记、且按此规则不能参选时，其他节点 WARN `Designated candidate <c> has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated`，按没有指定 candidate 继续选举。
+- 其他节点用同一规则判断带标记的 peer：不能参选的 peer 不计入「谁最健康」的比较，避免所有节点都让位给一个不会参选的节点。`POST /switchover`、`POST /failover` 拒绝带标记的 candidate（409，`Candidate '<c>' has a rewind-check marker (not yet verified with pg_rewind)`）。`/failover` 里已经指定的 candidate 之后才带上标记、且按此规则不能参选时，其他节点 WARN `Designated candidate <c> has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated`，按没有指定 candidate 继续选举（仍排除 `/failover.leader`，见 S1）。
 - 不带标记的节点自己不加 timeline 检查（一般的 timeline 感知选举见第 9 节）。
 - 后果：如果只剩带标记且 timeline 落后的节点，集群不会自动选出主库。运维确认接受数据丢失后，可删除该节点的 `pg-ha.rewind_check` 让它参选。
 
@@ -200,11 +200,13 @@
 
 | ID | 陈述 | 状态 |
 |----|------|------|
-| S1 | **Switchover**：在候选可接位的前提下，旧主降级并释放 lock → 新主获取 lock 并 promote → 副本 upstream 指向新主；完成后 L\* 与 H\* 成立。 | 持有 |
+| S1 | **Switchover**：在候选可接位的前提下，旧主降级并释放 lock → 新主获取 lock 并 promote → 副本 upstream 指向新主；完成后 L\* 与 H\* 成立。不指定 candidate 时，新主是除 `/failover.leader` 以外最健康的合格节点；该 leader 不参选，其他节点也不把它算进「谁最健康」。 | 持有 |
 | S2 | **Failover**：在 lock 过期或主库确认不可用后，仅合格候选参与选举；胜出者 promote 并写入 lock；完成后 L\* 与 H\* 成立。 | 持有 |
 | S3 | 切换完成后，`GET /cluster`、成员 role/state、以及 history 中的事件与真实拓扑一致。 | 持有 |
 | S4 | 旧 Primary 回归：不得形成双主；须走检测 → rewind / basebackup / rejoin 故事，最终成为指向当前 leader 的 Replica（或维护态）。 | 持有 |
 | S5 | 当 `synchronous_mode` 启用时，Failover / Switchover 候选必须属于 DCS `/sync.sync_standby`；`/sync` 缺失、空或为 `*` 时任何节点均不得晋升。`synchronous_mode_strict` 仅影响写阻塞，不参与选举。 | 持有 |
+
+**无 candidate 的 switchover**（S1）：`/failover` 为 `{"leader": "<旧主>", "candidate": null}`。旧主停库后以备库启动，WAL 往往最高，且 timeline 仍等于 `/timeline`，rewind 检查标记不会把它排除在选举之外。因此选举不按 WAL 把锁还给它：`failover.leader` 不抢锁（日志 `Not taking part in the election: this node is the leader switchover asked to step down`），其他节点比较「谁最健康」时跳过它。指定了 candidate 且该 candidate 仍可参选时，只有 candidate 抢锁，不额外排除。手动 failover 不写 `leader`，不排除任何人。没有其他合格节点时 `POST /switchover` 在降级之前拒绝（409，`No other running member can take over; refusing switchover without a candidate`），不写 `/failover`、不停库。`/failover` 只在有人抢到锁之后清除；没有合格节点却已经写下 key 时（例如受理之后唯一的副本停了），集群保持无主，直到出现合格节点或 key 被清掉。
 
 **相关**：架构「Failover 时序」「选举流程」；运维「手动 Switchover / Failover」；架构同步复制章节「当前范围与限制」。
 
@@ -306,7 +308,6 @@
 | Failsafe 持久化 | P3 | 架构列出 `/failsafe`；实现仍有「未读 key」类缺口 |
 | Member `conn_url` 含密码 | R3 | 落盘与最小密钥面目标冲突，需先裁定再改 |
 | switchover 释放锁失败被忽略 | S1 | 停库成功后 `delete_leader` 失败会返回错误并留下锁。PG 已经不在跑时的释放（`handle_postgres_not_running`）仍忽略 `delete_leader` 的结果；连续失败时旧主重启后仍持锁，会 promote 自己，撤销 switchover |
-| 无 candidate 的 switchover 不排除旧 leader | S1 | failover key 为 `{"leader": old, "candidate": null}`，选举只看 `candidate`（`ha/election.rs` `process_unhealthy_cluster`），不看 `Failover.leader`（`cluster.rs`）；旧主带 `standby.signal` 参选，WAL 往往打平或最高，可能重新当选，switchover 被悄悄撤销 |
 | 选举不比较 timeline | S2 / S4 | `is_healthiest_node` 只比较 WAL 位置（`ha/election.rs` 中 peer 的 timeline 未使用）；任务 3 只对带 rewind 检查标记的节点按 `/timeline` 把关，一般节点的 timeline 感知选举另开项 |
 | 带标记、等待 rewind 检查的备库对外是健康副本 | H2 / S4 | 带 `pg-ha.rewind_check` 的 ManagedStandby 在 leader 未就绪、分区期间、恢复后 pg_rewind 之前以只读备库运行，`/replica` 200，RO 客户端可能读到只存在于分叉历史上的数据（见 1a「rewind 检查标记」）。候选修法：带标记的节点 `/replica` 返回 503 |
 | 分区节点重新加入 Raft 会引发 Raft 重选 | L4 / L5 | openraft 0.9 没有 pre-vote：分区节点的 term 在分区期间上涨，重新连上后迫使集群重选 Raft leader；重选期间当前锁持有者续锁失败而被降级（多一次 failover，timeline +1）。任务 3 在 docker 集群上复现分区场景时每次都出现，不在任务 3 处理 |
@@ -322,6 +323,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-10-26 | 闭合「无 candidate 的 switchover 不排除旧 leader」：选举在没有可参选的 candidate 时排除 `/failover.leader`，其他节点也不把该节点算进「谁最健康」（它的 WAL 最高，且 timeline 仍等于 `/timeline`，rewind 检查标记拦不住）。指定 candidate 且其仍可参选时行为不变；手动 failover 不写 `leader`，不排除。没有其他合格节点时 `POST /switchover` 在降级前拒绝，避免写下无人能完成的 `/failover`。S1 写明这条规则；第 9 节删除该项 |
 | 2026-10-26 | 闭合「优雅关停收尾不受租约限制」和「关停时停库失败照样退出」：drain 之后 CHECKPOINT 和停库与最后一次续锁的租约赛跑（`Ha::graceful_shutdown`），截止时间先到即按租约到期围栏，不释放锁；停库先 `-m fast`，失败再试一次 `-m immediate`；PG 可能可写却停不掉时进程不退出，继续跑 HA 循环（续锁、每轮重试停库、每轮 ERROR 给出手工停库命令），再收到信号也只立即重试。H1 增加「且不在优雅关停中」：REST API 在关停期间继续服务，`/primary` 从信号起 503。关停开始后不再启动 PG，HA 循环发现 PG 已停时不释放锁也不启动，管理命令被拒绝；drain 期间 pause 下续锁失败不围栏（W1）。观测在 recovery 的 PG 停不掉时，只有不持锁且有 `standby.signal` 的备库允许退出；持锁的 recovery 和没有 `standby.signal` 的 recovery 设 `stop_pending`、不退出，关停中不持锁的周期只再停库（不参选、不跟随、不 promote）。L5 写明关停收尾受时间界约束，「不覆盖」补充 SIGKILL。第 9 节新增「停库一直失败时锁一直被占」「主库正常关停期间写不可用」 |
 | 2026-10-25 | 闭合「`Request.now` 注释与实现不符」：Raft leader 在 `client_write` 之前用自己的时钟覆盖 `Set` 和 `ExpireKeys` 的 `now`，转发来的请求也覆盖。发起节点时钟偏快不再能把还在租约内的锁判成过期。本地读取仍用读取节点的墙钟；Raft leader 与锁持有者之间的时钟差仍受 `safety_margin` 约束，第 9 节改记为「TTL 过期仍受 Raft leader 墙钟影响」 |
 | 2026-10-25 | 闭合「switchover 与优雅退出先释放锁再停库」和「关停 drain 期间不续锁」：switchover 与优雅关停都先停库，确认停掉后才 `delete_leader`；停库失败时锁留下，持锁的下一轮继续围栏。drain 期间每个 `loop_wait` 续锁，续锁失败则围栏且不释放锁。`handle_postgres_not_running` 仍忽略 `delete_leader` 的结果，第 9 节保留「switchover 释放锁失败被忽略」 |

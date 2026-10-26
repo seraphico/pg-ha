@@ -4817,6 +4817,228 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Switchover with no candidate: `{leader, candidate: null}`. The former
+    /// leader comes back as a standby at the cluster timeline (its rewind-check
+    /// marker does not keep it out) and with the highest WAL.
+    fn nocandidate_switchover(former: Member, other: Member) -> Cluster {
+        Cluster {
+            leader: None,
+            timeline: Some(3),
+            failover: Some(Failover {
+                leader: Some("node1".into()),
+                candidate: None,
+                scheduled_at: None,
+            }),
+            members: vec![former, other],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_switchover_without_candidate_former_leader_does_not_take_the_lock() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) =
+            identity_test_ha("node1", "so-nocand-old", dcs.clone(), Some(true), true);
+        write_marker(&dir);
+        ha.cluster = nocandidate_switchover(
+            marked_member("node1", 5000, 3),
+            member_with_tl("node2", 4000, 3),
+        );
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            !ha.is_leader(),
+            "the leader switchover stepped down must not acquire the lock again"
+        );
+        assert_eq!(lock_held_by(&dcs), None);
+        assert_eq!(
+            follower_msg(&result),
+            "switchover asked this node to step down; not taking part in the election"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_switchover_without_candidate_replica_wins_despite_former_leaders_wal() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) =
+            identity_test_ha("node2", "so-nocand-new", dcs.clone(), Some(true), true);
+        ha.cluster = nocandidate_switchover(
+            marked_member("node1", 5000, 3),
+            member_with_tl("node2", 4000, 3),
+        );
+
+        let _ = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            ha.is_leader(),
+            "a replica must be able to win; deferring to the stepped-down leader leaves the cluster with no primary"
+        );
+        assert!(lock_held_by(&dcs).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_ineligible_candidate_does_not_return_the_lock_to_the_former_leader() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) = identity_test_ha("node2", "so-a25-old", dcs.clone(), Some(true), true);
+        ha.cluster = Cluster {
+            leader: None,
+            timeline: Some(3),
+            failover: Some(Failover {
+                leader: Some("node1".into()),
+                candidate: Some("node3".into()),
+                scheduled_at: None,
+            }),
+            members: vec![
+                marked_member("node1", 5000, 3),
+                member_with_tl("node2", 4000, 3),
+                marked_member("node3", 9000, 1),
+            ],
+            ..Default::default()
+        };
+
+        let _ = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            ha.is_leader(),
+            "an ineligible candidate falls through to an election that still excludes the stepped-down leader"
+        );
+        assert!(lock_held_by(&dcs).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_manual_failover_without_leader_still_follows_wal() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) =
+            identity_test_ha("node1", "fo-no-leader-field", dcs.clone(), Some(true), true);
+        ha.cluster = Cluster {
+            leader: None,
+            timeline: Some(3),
+            failover: Some(Failover {
+                leader: None,
+                candidate: None,
+                scheduled_at: None,
+            }),
+            members: vec![
+                member_with_tl("node1", 5000, 3),
+                member_with_tl("node2", 4000, 3),
+            ],
+            ..Default::default()
+        };
+
+        let _ = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            ha.is_leader(),
+            "a manual failover does not name a leader to exclude"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_designated_candidate_still_wins_when_former_leader_has_more_wal() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) =
+            identity_test_ha("node3", "so-cand-wins", dcs.clone(), Some(true), true);
+        ha.cluster = Cluster {
+            leader: None,
+            timeline: Some(3),
+            failover: Some(Failover {
+                leader: Some("node1".into()),
+                candidate: Some("node3".into()),
+                scheduled_at: None,
+            }),
+            members: vec![
+                member_with_tl("node1", 9000, 3),
+                member_with_tl("node2", 4000, 3),
+                member_with_tl("node3", 1000, 3),
+            ],
+            ..Default::default()
+        };
+
+        let _ = ha.process_unhealthy_cluster().await;
+
+        assert!(ha.is_leader());
+        assert!(lock_held_by(&dcs).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_former_leader_still_primary_is_fenced_not_reselected() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node1",
+            "so-nocand-primary",
+            dcs.clone(),
+            Some(false),
+            false,
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        ha.cluster = nocandidate_switchover(
+            member_with_tl("node1", 5000, 3),
+            member_with_tl("node2", 4000, 3),
+        );
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            is_error_starting(&result, "stale primary: stop failed"),
+            "{result}"
+        );
+        assert!(!ha.is_leader());
+        assert_eq!(lock_held_by(&dcs), None);
+        assert!(dir.join("standby.signal").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_switchover_without_candidate_rejected_when_nobody_else_can_take_over() {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node1",
+            "so-nocand-alone",
+            dcs.clone(),
+            Some(false),
+            false,
+            None,
+        );
+        ha.is_leader = true;
+        let mut stopped = running_member("node2", 100);
+        stopped.state = MemberState::Stopped;
+        ha.cluster = Cluster {
+            leader: Some(Leader {
+                name: "node1".into(),
+                version: 1,
+            }),
+            members: vec![running_member("node1", 5000), stopped],
+            ..Default::default()
+        };
+
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Switchover {
+                leader: Some("node1".into()),
+                candidate: None,
+                scheduled_at: None,
+            },
+        )
+        .await;
+
+        assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert_eq!(
+            resp.message,
+            "No other running member can take over; refusing switchover without a candidate"
+        );
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        assert!(ha.is_leader());
+        assert!(!dir.join("standby.signal").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     const MARKED_CANDIDATE_MSG: &str =
         "Candidate 'node2' has a rewind-check marker (not yet verified with pg_rewind)";
 

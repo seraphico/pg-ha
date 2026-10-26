@@ -177,35 +177,26 @@ impl Ha {
         // Replicas (with standby.signal) participate normally in elections.
         // They can become the new primary if they are the healthiest node.
 
-        // Check if there's a pending switchover/failover request with a designated candidate.
-        // If so, only the candidate should attempt to acquire the lock.
-        let designated_candidate = self
+        // A designated candidate is the only node that may acquire the lock.
+        // A25: one that has the marker and may not campaign is ignored, and
+        // the election continues as if no candidate were designated — which
+        // still excludes the leader the switchover asked to step down.
+        let raw_candidate = self
             .cluster
             .failover
             .as_ref()
-            .and_then(|f| f.candidate.as_deref());
-        // A25: a designated candidate that has the marker and may not take
-        // part in the election would leave the cluster without a leader.
-        let designated_candidate = designated_candidate.filter(|c| {
-            let may = self.cluster.get_member(c).map(|m| {
-                identity::peer_may_campaign(
-                    m.rewind_check,
-                    m.timeline,
-                    self.cluster.timeline,
-                    identity::max_timeline_excluding(&self.cluster.members, &m.name),
-                )
-            });
-            let honour = identity::honour_designated_candidate(*c == self.config.name, may);
-            if !honour {
-                warn!(
-                    candidate = %c,
-                    "Designated candidate {c} has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated"
-                );
-            }
-            honour
-        });
+            .and_then(|f| f.candidate.clone());
+        let designated_candidate = self.honoured_candidate().map(str::to_owned);
+        if let Some(c) = raw_candidate.as_deref()
+            && designated_candidate.is_none()
+        {
+            warn!(
+                candidate = %c,
+                "Designated candidate {c} has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated"
+            );
+        }
 
-        let should_attempt = if let Some(candidate) = designated_candidate {
+        let should_attempt = if let Some(candidate) = designated_candidate.as_deref() {
             if candidate == self.config.name {
                 let allowed = sync_failover_allowed(
                     &self.config.name,
@@ -231,6 +222,11 @@ impl Ha {
             } else {
                 false
             }
+        } else if self.excluded_switchover_leader() == Some(self.config.name.as_str()) {
+            info!(
+                "Not taking part in the election: this node is the leader switchover asked to step down"
+            );
+            false
         } else {
             self.is_healthiest_node()
         };
@@ -253,7 +249,7 @@ impl Ha {
             }
         } else {
             self.is_leader = false;
-            match designated_candidate {
+            match designated_candidate.as_deref() {
                 Some(candidate) if candidate == self.config.name => CycleResult::Follower(
                     "designated candidate is not sync-eligible — not acquiring lock".into(),
                 ),
@@ -261,10 +257,77 @@ impl Ha {
                     "deferring to designated candidate ({candidate})"
                 )),
                 None => {
-                    CycleResult::Follower("not the healthiest node, waiting for election".into())
+                    if self.excluded_switchover_leader() == Some(self.config.name.as_str()) {
+                        CycleResult::Follower(
+                            "switchover asked this node to step down; not taking part in the election"
+                                .into(),
+                        )
+                    } else {
+                        CycleResult::Follower(
+                            "not the healthiest node, waiting for election".into(),
+                        )
+                    }
                 }
             }
         }
+    }
+
+    /// Designated candidate this node will defer to. `None` when the key has
+    /// no candidate, or the candidate is in the member list and the marked-node
+    /// rule says it will not campaign (A25). A missing member is still honoured.
+    fn honoured_candidate(&self) -> Option<&str> {
+        let candidate = self.cluster.failover.as_ref()?.candidate.as_deref()?;
+        let may = self.cluster.get_member(candidate).map(|m| {
+            identity::peer_may_campaign(
+                m.rewind_check,
+                m.timeline,
+                self.cluster.timeline,
+                identity::max_timeline_excluding(&self.cluster.members, &m.name),
+            )
+        });
+        identity::honour_designated_candidate(candidate == self.config.name, may)
+            .then_some(candidate)
+    }
+
+    /// Leader a switchover named when this election is not reserved for a
+    /// honoured candidate. Peers must not defer to it, and it must not
+    /// acquire the lock: its WAL is the highest and its timeline still
+    /// matches `/timeline`, so neither the healthiest-node comparison nor
+    /// the rewind-check marker keeps it out.
+    fn excluded_switchover_leader(&self) -> Option<&str> {
+        if self.honoured_candidate().is_some() {
+            return None;
+        }
+        self.cluster
+            .failover
+            .as_ref()
+            .and_then(|f| f.leader.as_deref())
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Would the election that follows a no-candidate switchover have someone
+    /// other than this node who is allowed to campaign? Checked before
+    /// demotion: the stepped-down leader is excluded, so "no" means the
+    /// cluster would be left with no one who may take the lock.
+    pub(super) fn has_switchover_successor(&self) -> bool {
+        let sync_mode = self
+            .dynamic_config_state
+            .last_config
+            .synchronous_mode
+            .unwrap_or(false);
+        self.cluster.members.iter().any(|member| {
+            member.name != self.config.name
+                && !member.is_nofailover()
+                && member.failover_priority() != 0
+                && member.state == crate::cluster::MemberState::Running
+                && sync_failover_allowed(&member.name, sync_mode, self.cluster.sync_state.as_ref())
+                && identity::peer_may_campaign(
+                    member.rewind_check,
+                    member.timeline,
+                    self.cluster.timeline,
+                    identity::max_timeline_excluding(&self.cluster.members, &member.name),
+                )
+        })
     }
 
     /// Determine if this node is the healthiest and should attempt promotion.
@@ -272,7 +335,9 @@ impl Ha {
     /// A node is "healthiest" if:
     /// - It is not tagged nofailover and failover_priority > 0
     /// - It has PostgreSQL running
-    /// - It has the highest WAL position among all eligible candidates
+    /// - It is not the leader a no-candidate switchover asked to step down
+    /// - It has the highest WAL position among eligible candidates (that
+    ///   leader is not compared: peers must not defer to it)
     /// - In case of tie: higher failover_priority wins, then alphabetical name
     pub(super) fn is_healthiest_node(&self) -> bool {
         // Self-check first (cheap)
@@ -296,7 +361,15 @@ impl Ha {
             return false;
         }
 
-        // Get our info from cluster membership (published via touch_member)
+        // Owned so the member loop can borrow `self.cluster` afterwards.
+        // A switchover with no honoured candidate names this leader so it
+        // cannot win on WAL: it was the primary, and its timeline still
+        // equals `/timeline`, so the rewind-check marker does not exclude it.
+        let excluded_leader = self.excluded_switchover_leader().map(str::to_owned);
+        if excluded_leader.as_deref() == Some(self.config.name.as_str()) {
+            return false;
+        }
+
         let my_name = &self.config.name;
         let my_member = self.cluster.get_member(my_name);
         let my_wal = my_member.and_then(|m| m.wal_position).unwrap_or(0);
@@ -305,6 +378,9 @@ impl Ha {
         // Compare against all other members
         for member in &self.cluster.members {
             if member.name == *my_name {
+                continue;
+            }
+            if excluded_leader.as_deref() == Some(member.name.as_str()) {
                 continue;
             }
             // Skip ineligible members

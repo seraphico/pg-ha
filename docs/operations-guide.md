@@ -150,7 +150,8 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
   -H 'Content-Type: application/json' \
   -d '{"leader": "node1", "candidate": "node2"}'
 
-# 不指定 candidate（自动选择最健康的 Replica；sync 开启时仍须落在 /sync 名单内才能晋升）
+# 不指定 candidate（在除本节点以外的运行成员里选最健康的；本节点不参选。
+# sync 开启时继任者仍须落在 /sync 名单内。没有合格继任者时 409，不降级）
 curl -u admin:secret -X POST http://localhost:8008/switchover \
   -H 'Content-Type: application/json' \
   -d '{"leader": "node1"}'
@@ -179,7 +180,13 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
 {"status": "rejected", "message": "Candidate 'node2' has a rewind-check marker (not yet verified with pg_rewind)"}
 ```
 
-请求受理之后 candidate 才带上标记、且按 [invariants.md](invariants.md) 1a 的规则不能参选时，其他节点打 WARN `Designated candidate <c> has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated`，按没有指定 candidate 选举。
+请求受理之后 candidate 才带上标记、且按 [invariants.md](invariants.md) 1a 的规则不能参选时，其他节点打 WARN `Designated candidate <c> has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated`，按没有指定 candidate 选举：仍排除 `/failover` 里的 `leader`，不把锁还给刚退下来的旧主。
+
+不指定 candidate、且除本节点外没有处于 running、允许 failover、并且（sync 开启时）属于 `/sync` 的成员时，返回 409，不写 `/failover`、不停库：
+
+```json
+{"status": "rejected", "message": "No other running member can take over; refusing switchover without a candidate"}
+```
 
 **取消已计划的 switchover：**
 
