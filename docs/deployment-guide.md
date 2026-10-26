@@ -5,7 +5,7 @@
 | 组件 | 最低版本 | 说明 |
 |------|---------|------|
 | PostgreSQL | 14+ | 需要 `pg_ctl`、`pg_basebackup`、`pg_rewind`、`pg_controldata`、`psql`。Docker 使用官方 `postgres` 镜像标签；`make up` 默认 16 |
-| Rust | 1.88+ 稳定版 | `edition = "2024"`，并使用已稳定的 if-let chains。不需要 nightly |
+| Rust | 1.99.1 | 由 `rust-toolchain.toml` 固定。`edition = "2024"`，并使用已稳定的 if-let chains。不需要 nightly。Docker 构建镜像与 CI 使用同一版本 |
 | Docker | 24.0+ | 容器化部署 |
 | Docker Compose | v2.20+ | 多节点编排 |
 | 操作系统 | Linux (amd64/arm64) / macOS | 生产环境推荐 Linux |

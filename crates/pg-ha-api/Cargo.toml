@@ -1,6 +1,6 @@
 [package]
 name = "pg-ha-api"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "REST API for health checks and cluster management"
 

@@ -1,6 +1,6 @@
 [package]
 name = "pg-ha-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Core HA logic: state machine, leader election, PostgreSQL lifecycle"
 
