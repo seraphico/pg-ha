@@ -258,6 +258,14 @@ async fn main() -> anyhow::Result<()> {
 
     let app_state_clone = app_state.clone();
 
+    // Demotion / fence paths publish the API state from inside the cycle, so
+    // /primary is 503 before PostgreSQL stops (not only after the cycle).
+    let publish_state = app_state.clone();
+    ha.set_state_publisher(Arc::new(move |snapshot| {
+        let state = publish_state.clone();
+        Box::pin(async move { state.update(|s| s.apply_ha_snapshot(&snapshot)).await })
+    }));
+
     // Proxy backends are refreshed on their own task, fed with the latest
     // member list after each HA cycle. The task ends when the HA loop (the
     // sender) is dropped.
@@ -294,16 +302,11 @@ async fn main() -> anyhow::Result<()> {
                 // we consider DCS as reachable
                 let dcs_ok = !matches!(&result, pg_ha_core::CycleResult::Error(msg) if msg.contains("DCS"));
 
-                // Update shared API state
+                // Update shared API state (state: same derivation as the
+                // state published to DCS)
+                let snapshot = ha.api_snapshot();
                 app_state_clone.update(|s| {
-                    s.role = ha.postgresql().role().clone();
-                    // Same derivation as the state published to DCS.
-                    s.state = ha.advertised_state();
-                    s.pg_running = ha.postgresql().is_running();
-                    s.pg_in_recovery = ha.postgresql().observed_in_recovery();
-                    s.is_leader = ha.is_leader();
-                    s.is_paused = ha.is_paused();
-                    s.pending_restart = ha.pending_restart();
+                    s.apply_ha_snapshot(&snapshot);
                     s.last_loop_at = Some(Instant::now());
                     if dcs_ok {
                         s.dcs_last_seen = Some(Instant::now());

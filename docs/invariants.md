@@ -179,6 +179,7 @@
 - `/primary` 200 ⟺ 持有 leader lock ∧ `state = running` ∧ `role = primary` ∧ 观测不在 recovery。观测缺失时为 503。
 - `/replica` 200 ⟺ `state = running` ∧ `role = replica` ∧ 观测在 recovery（再叠加 `lag` 阈值）。观测为不在 recovery 的节点，不论记录的 role 是什么，都不作为副本对外服务。
 - `/health` 只反映 PG 进程是否运行，与 HA 身份无关。
+- 降级 / 围栏不等本轮 cycle 结束：`stop_after_demotion_write` 在停库前、停库后（停库后的 `touch_member` 之前）各发布一次 API 状态（不持锁、role 非 primary、观测缺失），所以 `/primary` 不晚于 PG 不可写变成 503。停库后的 DCS 写在少数派上可能等满 `retry_timeout`，不影响这一点（`Ha::set_state_publisher`，测试 `test_demotion_publishes_non_primary_before_stop_and_touch_member`）。
 
 **稳态检查**：运维指南中 Primary / Replica / sync / async 的 curl 示例；三节点交叉探测 H3；`GET /patroni` 的 `pg_in_recovery` 字段即本节点最近一次观测。
 

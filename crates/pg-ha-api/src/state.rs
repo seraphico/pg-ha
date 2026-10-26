@@ -2,6 +2,7 @@
 //!
 //! Updated by the HA loop each cycle, read by API handlers.
 
+use pg_ha_core::ApiSnapshot;
 use pg_ha_core::cluster::{MemberRole, MemberState};
 use pg_ha_core::config::LeaseTiming;
 use pg_ha_core::dcs::DcsAdapter;
@@ -159,6 +160,18 @@ impl AppState {
 }
 
 impl NodeState {
+    /// Copy the HA-derived fields (role, state, PostgreSQL status, lock,
+    /// pause, pending restart) from the HA engine.
+    pub fn apply_ha_snapshot(&mut self, snapshot: &ApiSnapshot) {
+        self.role = snapshot.role.clone();
+        self.state = snapshot.state.clone();
+        self.pg_running = snapshot.pg_running;
+        self.pg_in_recovery = snapshot.pg_in_recovery;
+        self.is_leader = snapshot.is_leader;
+        self.is_paused = snapshot.is_paused;
+        self.pending_restart = snapshot.pending_restart;
+    }
+
     /// H1: `/primary` is 200 exactly when this node holds the leader lock and
     /// PostgreSQL is a healthy primary. Each clause is required:
     /// - `is_leader`: holds the leader lock
