@@ -57,13 +57,19 @@ impl LeaderLease {
         self.expired_at(Instant::now(), SystemTime::now())
     }
 
-    fn until_next_check(&self) -> Duration {
+    /// Time left until the lease expires on the earlier of both clocks
+    /// (zero once expired).
+    pub(crate) fn remaining(&self) -> Duration {
         let mono = self.mono_deadline.saturating_duration_since(Instant::now());
         let wall = self
             .wall_deadline
             .duration_since(SystemTime::now())
             .unwrap_or(Duration::ZERO);
-        mono.min(wall).min(LEASE_POLL_INTERVAL)
+        mono.min(wall)
+    }
+
+    fn until_next_check(&self) -> Duration {
+        self.remaining().min(LEASE_POLL_INTERVAL)
     }
 }
 
@@ -149,6 +155,28 @@ mod tests {
             elapsed >= Duration::from_secs(14) && elapsed < Duration::from_millis(14_100),
             "{elapsed:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remaining_counts_down_on_both_clocks() {
+        let lease = LeaderLease::new(LeaseAnchor::now(), 15, 5);
+        let left = lease.remaining();
+        assert!(
+            left <= Duration::from_secs(10) && left > Duration::from_millis(9_900),
+            "{left:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let left = lease.remaining();
+        assert!(
+            left <= Duration::from_secs(6) && left > Duration::from_millis(5_900),
+            "{left:?}"
+        );
+        // Wall clock ahead of the monotonic clock: the earlier deadline wins.
+        let (mono, wall) = (Instant::now(), SystemTime::now());
+        let lease = LeaderLease::new(anchor_at(mono, wall - Duration::from_secs(8)), 15, 5);
+        assert!(lease.remaining() <= Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(lease.remaining(), Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]

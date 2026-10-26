@@ -69,6 +69,9 @@ pub struct Postgresql {
     /// or pg-ha has since run an action that can change the recovery state
     /// (start / stop / promote), which invalidates the previous observation.
     in_recovery: Option<bool>,
+    /// Set once graceful shutdown begins: `start()` refuses to run, so
+    /// pg-ha never starts PostgreSQL again before it exits.
+    starts_blocked: bool,
 }
 
 /// Internal PostgreSQL process state
@@ -135,7 +138,14 @@ impl Postgresql {
             role: MemberRole::Uninitialized,
             state: PgState::Unknown,
             in_recovery: None,
+            starts_blocked: false,
         }
+    }
+
+    /// Graceful shutdown began: from now on `start()` fails without doing
+    /// anything (one check for every start path).
+    pub fn block_starts(&mut self) {
+        self.starts_blocked = true;
     }
 
     // ─────────────────────── Path helpers ───────────────────────
@@ -250,6 +260,12 @@ impl Postgresql {
 
     /// Start PostgreSQL using pg_ctl start
     pub async fn start(&mut self) -> Result<()> {
+        if self.starts_blocked {
+            warn!("Not starting PostgreSQL: graceful shutdown in progress");
+            return Err(Error::Postgres(
+                "graceful shutdown in progress: not starting PostgreSQL".into(),
+            ));
+        }
         info!("Starting PostgreSQL");
         self.state = PgState::Starting;
         self.in_recovery = None;
@@ -974,6 +990,25 @@ mod tests {
             remove_data_directory_on_rewind_failure: false,
             parameters: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_start_refused_after_block_starts() {
+        let data_dir =
+            std::env::temp_dir().join(format!("pg-ha-test-block-starts-{}", std::process::id()));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut config = test_config();
+        config.data_dir = data_dir.clone();
+        config.bin_dir = std::env::temp_dir().join(format!(
+            "pg-ha-test-block-starts-no-bin-{}",
+            std::process::id()
+        ));
+        let mut pg = Postgresql::new(config);
+        pg.block_starts();
+        let err = pg.start().await.expect_err("start must be refused");
+        assert!(err.to_string().contains("graceful shutdown"), "{err}");
+        assert_eq!(pg.state(), PgState::Unknown, "start() did nothing");
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]

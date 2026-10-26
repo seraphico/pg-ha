@@ -172,7 +172,7 @@ raft:
 log_format: json                    # text（默认）或 json
 
 shutdown:
-  drain_timeout_secs: 30            # SIGTERM 后、CHECKPOINT 之前的等待秒数
+  drain_timeout_secs: 30            # SIGTERM 后、CHECKPOINT 之前的等待秒数，期间每个 loop_wait 续锁
 
 proxy:
   rw_listen: 0.0.0.0
@@ -212,8 +212,10 @@ Group=pgha
 ExecStart=/usr/local/bin/pg-ha /etc/pg-ha/pg-ha.yml
 Restart=on-failure
 RestartSec=5s
-# drain_timeout_secs（默认 30）+ CHECKPOINT + pg_ctl stop，30 秒不够
-TimeoutStopSec=120s
+# 必须大于 drain_timeout_secs（默认 30）+ CHECKPOINT + pg_ctl stop（持锁时不超过 ttl − safety_margin，
+# 不持锁时最多约 2 × 60 秒）+ retry_timeout；否则 systemd SIGKILL pg-ha，关停的安全规则无法执行
+# （见运维指南「Graceful Shutdown 流程」）
+TimeoutStopSec=180s
 KillMode=mixed
 KillSignal=SIGTERM
 
@@ -316,7 +318,7 @@ proxy:
 # ─── 日志与停机 (可选) ───
 log_format: <string>               # "text"（默认）或 "json"。也可被 PG_HA_LOG_FORMAT 覆盖
 shutdown:
-  drain_timeout_secs: <u64>        # SIGTERM 后等待秒数，然后才 CHECKPOINT (默认: 30)
+  drain_timeout_secs: <u64>        # SIGTERM 后等待秒数，期间每个 loop_wait 续锁，然后才 CHECKPOINT (默认: 30)
 
 # ─── Watchdog 配置 (可选) ───
 watchdog:
