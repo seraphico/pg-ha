@@ -740,17 +740,38 @@ impl Ha {
 
     /// Handle case when PostgreSQL is not running
     async fn handle_postgres_not_running(&mut self) -> CycleResult {
-        // If we hold the lock but PG is down, release it
+        // If we hold the lock but PG is down, release it. A failed delete
+        // leaves the lock possibly still ours: do not start. The next cycle
+        // retries. Starting as a standby and then seeing our own lock promotes
+        // this node (timeline +1) and undoes a switchover whose delete failed.
         if self.is_lock_owner() {
             if self.is_paused {
                 return CycleResult::Leader("postgres not running (paused)".into());
             }
-            if let Some(leader) = &self.cluster.leader.clone() {
+            if let Some(leader) = self.cluster.leader.clone() {
                 info!("Releasing leader lock because PostgreSQL is not running");
-                let _ = self.dcs.delete_leader(leader).await;
+                match self.dcs.delete_leader(&leader).await {
+                    Ok(true) => {
+                        info!("Leader lock released after PostgreSQL stopped");
+                        self.is_leader = false;
+                        self.reset_sync_cache();
+                    }
+                    Ok(false) => {
+                        // CAS: the key is already gone, or it is no longer ours.
+                        info!("Leader lock was not ours while PostgreSQL was down");
+                        self.is_leader = false;
+                        self.reset_sync_cache();
+                    }
+                    Err(e) => {
+                        error!(
+                            "Not starting PostgreSQL: the leader lock may still be ours ({e}). Releasing it again next cycle"
+                        );
+                        return CycleResult::Error(format!(
+                            "not starting PostgreSQL: leader lock release failed: {e}"
+                        ));
+                    }
+                }
             }
-            self.is_leader = false;
-            self.reset_sync_cache();
         }
 
         if self.is_paused {
@@ -785,10 +806,8 @@ impl Ha {
         }
 
         // D1: pg-ha starts PostgreSQL as a primary only while holding the
-        // leader lock. It never holds it here (released above, or returned in
-        // pause mode), so PostgreSQL always starts as a standby. If the lock
-        // release failed, the lock may still be ours in DCS; this node then
-        // gets it back as a standby and is promoted (timeline +1).
+        // leader lock. A failed release returned above. Reaching here means
+        // the lock is not ours, so PostgreSQL starts as a standby.
         if let Err(e) = self.prepare_standby_start().await {
             error!(
                 "Not starting PostgreSQL: could not write the standby configuration ({e}). pg-ha starts PostgreSQL as a primary only while holding the leader lock; retrying next cycle"
@@ -1113,6 +1132,8 @@ mod tests {
         last_failover_value: Mutex<Option<String>>,
         /// When set, leader-lock writes return Err (a DCS write failure).
         fail_leader_writes: std::sync::atomic::AtomicBool,
+        /// When set, `delete_leader` returns Err and the lock stays.
+        fail_delete_leader: std::sync::atomic::AtomicBool,
         /// The persistent /timeline key (D6).
         timeline: Mutex<Option<u64>>,
         /// Every set_cluster_timeline argument, including rejected ones.
@@ -1139,6 +1160,7 @@ mod tests {
                 leader_held_by: Mutex::new(None),
                 last_failover_value: Mutex::new(None),
                 fail_leader_writes: std::sync::atomic::AtomicBool::new(false),
+                fail_delete_leader: std::sync::atomic::AtomicBool::new(false),
                 timeline: Mutex::new(None),
                 timeline_writes: Mutex::new(Vec::new()),
                 fail_timeline_writes: std::sync::atomic::AtomicBool::new(false),
@@ -1163,6 +1185,7 @@ mod tests {
                 leader_held_by: Mutex::new(Some(name.to_string())),
                 last_failover_value: Mutex::new(None),
                 fail_leader_writes: std::sync::atomic::AtomicBool::new(false),
+                fail_delete_leader: std::sync::atomic::AtomicBool::new(false),
                 timeline: Mutex::new(None),
                 timeline_writes: Mutex::new(Vec::new()),
                 fail_timeline_writes: std::sync::atomic::AtomicBool::new(false),
@@ -1198,6 +1221,11 @@ mod tests {
 
         fn fail_leader_writes(&self) {
             self.fail_leader_writes
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn fail_delete_leader(&self) {
+            self.fail_delete_leader
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -1267,6 +1295,14 @@ mod tests {
         }
 
         async fn delete_leader(&self, _leader: &Leader) -> Result<bool> {
+            if self
+                .fail_delete_leader
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::Dcs(
+                    "injected leader-lock delete failure".into(),
+                ));
+            }
             let mut held = self.leader_held_by.lock().unwrap();
             *held = None;
             let mut cluster = self.cluster.lock().unwrap();
@@ -3884,6 +3920,30 @@ mod tests {
         // The leader in this cycle's view is this node: signal only.
         assert!(!auto_conf(&dir).contains("primary_conninfo"));
         assert_start_attempted(&ha, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_stopped_lock_holder_does_not_start_when_delete_fails() {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        dcs.fail_delete_leader();
+        let (mut ha, dir, _tx) = stopped_pg_test_ha("node1", "lock-delete-fail", dcs.clone(), None);
+        ha.is_leader = true;
+        ha.cluster = leader_cluster("node1", "node2");
+
+        let result = ha.handle_postgres_not_running().await;
+
+        assert!(
+            is_error_starting(
+                &result,
+                "not starting PostgreSQL: leader lock release failed"
+            ),
+            "{result}"
+        );
+        assert_not_started(&ha);
+        assert!(ha.is_leader());
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("node1"));
+        assert!(!dir.join("standby.signal").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
