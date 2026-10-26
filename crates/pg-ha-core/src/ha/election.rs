@@ -336,9 +336,14 @@ impl Ha {
     /// - It is not tagged nofailover and failover_priority > 0
     /// - It has PostgreSQL running
     /// - It is not the leader a no-candidate switchover asked to step down
-    /// - It has the highest WAL position among eligible candidates (that
-    ///   leader is not compared: peers must not defer to it)
-    /// - In case of tie: higher failover_priority wins, then alphabetical name
+    /// - It has the highest published timeline among eligible candidates.
+    ///   A higher timeline wins even when its LSN is smaller: LSN orders
+    ///   WAL only inside one timeline. Peers on a lower timeline are not
+    ///   compared by LSN, and a peer that has not published a timeline
+    ///   cannot win on LSN against one that has.
+    /// - On the same timeline (or when both timelines are missing): highest
+    ///   WAL position, then higher failover_priority, then alphabetical name.
+    ///   The stepped-down switchover leader is not compared.
     pub(super) fn is_healthiest_node(&self) -> bool {
         // Self-check first (cheap)
         if self.config.tags.nofailover || self.config.tags.failover_priority == 0 {
@@ -373,6 +378,7 @@ impl Ha {
         let my_name = &self.config.name;
         let my_member = self.cluster.get_member(my_name);
         let my_wal = my_member.and_then(|m| m.wal_position).unwrap_or(0);
+        let my_timeline = my_member.and_then(|m| m.timeline);
         let my_priority = self.config.tags.failover_priority;
 
         // Compare against all other members
@@ -405,11 +411,20 @@ impl Ha {
                 continue;
             }
 
+            // LSN is an offset inside one timeline. A larger LSN on an older
+            // timeline is not more data.
+            match (my_timeline, member.timeline) {
+                (Some(mine), Some(theirs)) if theirs > mine => return false,
+                (Some(mine), Some(theirs)) if theirs < mine => continue,
+                (None, Some(_)) => return false,
+                (Some(_), None) => continue,
+                _ => {}
+            }
+
             let their_wal = member.wal_position.unwrap_or(0);
             let their_priority = member.failover_priority();
-            let _their_timeline = member.timeline;
 
-            // Compare: higher WAL position wins
+            // Same timeline, or neither published one: higher LSN wins.
             if their_wal > my_wal {
                 return false; // Someone else has more data
             }
