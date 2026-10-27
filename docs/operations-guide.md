@@ -180,7 +180,7 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
 {"status": "rejected", "message": "Candidate 'node2' has a rewind-check marker (not yet verified with pg_rewind)"}
 ```
 
-请求受理之后 candidate 才带上标记、且按 [invariants.md](invariants.md) 1a 的规则不能参选时，其他节点打 WARN `Designated candidate <c> has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated`，按没有指定 candidate 选举：仍排除 `/failover` 里的 `leader`，不把锁还给刚退下来的旧主。
+请求受理之后 candidate 按 [invariants.md](invariants.md) 1a「D6」不能参选时（例如它不在最新 timeline 上），其他节点打 WARN `Designated candidate <c> may not take part in the election (it is not shown to be on the latest timeline); proceeding as if no candidate were designated`，按没有指定 candidate 选举：仍排除 `/failover` 里的 `leader`，不把锁还给刚退下来的旧主。
 
 不指定 candidate、且除本节点外没有处于 running、允许 failover、并且（sync 开启时）属于 `/sync` 的成员时，返回 409，不写 `/failover`、不停库：
 
@@ -222,7 +222,7 @@ sequenceDiagram
     New->>DCS: 读到未持锁 + failover key
     Note over New: 再校验自身 sync 资格后才抢锁
     New->>DCS: attempt_to_acquire_leader()
-    New->>DCS: /timeline = tl+1（promote 前）
+    New->>DCS: /timeline 写 pending（promote 前，CAS）
     New->>New: pg_ctl promote
     HA->>HA: 以备库启动（pg_controldata 为 shut down → 写 rewind 检查标记）
     HA->>New: SELECT pg_is_in_recovery() = f（实时确认新主就绪）
@@ -877,43 +877,45 @@ sleep 10
 curl -s http://node1:8008/cluster | jq .
 
 # 4. 所有节点都以备库启动（不持锁时 pg-ha 只以备库启动 PostgreSQL），
-#    由选举 promote 其中一个（timeline +1）。上次是主库的节点带 rewind 检查标记，
-#    只有它发布的 timeline ≥ DCS /timeline 时才参选
+#    由选举 promote 其中一个（timeline +1）。只有在最新 timeline 上的节点参选
+#    （带不带 rewind 检查标记都一样）；选不出时见场景 4a
 ```
 
-### 场景 4a：所有节点都带 rewind 检查标记，集群一直选不出主库
+### 场景 4a：最新 timeline 的持有者都不在了，集群选不出主库
 
-已知问题（[invariants.md](invariants.md) 第 9 节「`/timeline` 偏移后带标记节点永远不能参选」）。DCS 的 `/timeline` 高于所有真实 timeline 后，带标记的节点不参选；所有可参选节点都带标记时，集群不会自己恢复。数据没有丢，但需要人工让**历史最新**的那个节点参选。
+规则见 [invariants.md](invariants.md) 1a「D6」：只有在最新 timeline 上的节点可以参选。持有最新 timeline 的节点都不在时，pg-ha 不会自动让落后的节点当选：那样会丢掉最新那一任主库的全部写入，还会重复 timeline 编号。
 
-**判断是不是这种情况**（三条同时成立）：
+**先判断是哪种情况**。看各节点每轮的 INFO `Not taking part in the election: <原因>`：
 
-- 所有节点 `/primary` 都返回 503，`/cluster` 里没有 `primary`；
-- 每个节点每轮都打 INFO `Not taking part in the election: rewind-check marker present and this node's timeline <own> is behind the cluster timeline <k>; waiting for a leader to rewind against`；
-- 每个节点 PGDATA 下都有 `pg-ha.rewind_check`。
+| 原因 | 含义 | 处理 |
+|---|---|---|
+| `timeline <n> is not shown to be the latest timeline <L> (begins at ...)` | 这个节点落后于最新 timeline L | 找回持有 L 的节点（`/timeline` 里的 `primary`，以及发布了 L 的成员）。它恢复后会当选，其余节点照常 rewind 跟随，**不丢数据** |
+| `a promote by <R> may have created a newer timeline and is not resolved` | R 在 promote 的那一刻失联 | 找回 R。R 重新运行 pg-ha（PostgreSQL 停着，或重启过）就能判定，无需人工操作 |
+| `the latest timeline is unknown: ...` | 记录缺失或为旧格式，且有节点没上报；或者节点之间有冲突（ERROR） | 恢复缺席的节点；冲突时按 ERROR 里的两条历史判断 |
 
-**找出历史最新的节点**。timeline 编号可能重复（不同历史用了同一个编号），**不能只看编号**，要比对 history 文件内容：
+只有确认上表中要找回的节点**永久丢失**、并且接受丢失它上面的数据，才强制参选。
 
-```bash
-# 在每个节点上执行（以 PostgreSQL OS 用户）
-PGDATA=/var/lib/postgresql/16/data
-ls "$PGDATA"/pg_wal/*.history | sort | tail -1           # 最新的 history 文件
-cat "$(ls "$PGDATA"/pg_wal/*.history | sort | tail -1)"  # 该节点的整条历史
-psql -tAc "select pg_last_wal_replay_lsn()"              # 当前回放位置
-```
+**强制参选**（只在一个节点上做）：
 
-1. 比较各节点最新 history 文件的**全部内容**（每行 `父 timeline  切换点 LSN  原因`）。一个节点的历史是另一个节点历史的前缀，后者更新。
-2. 历史相同（文件内容一样），比较 `pg_last_wal_replay_lsn()`，大者更新。
-3. 历史互不为前缀（同一个编号、切换点不同），说明发生过分叉：两边都有对方没有的数据。**停下来**，确认业务上要保留哪条历史再继续；另一边之后会被 pg_rewind 丢掉分叉之后的写入。
+1. 在剩下的节点里选数据最新的一个。比较各节点 `pg_wal` 下最新的 `.history` 文件内容和 `pg_last_wal_replay_lsn()`：一个节点的历史是另一个的前缀时，后者更新；历史相同时 LSN 大者更新。
+2. 在选中的节点上执行：
 
-**让选中的节点参选**（只在一个节点上做）：
+   ```bash
+   sudo -u postgres touch /var/lib/postgresql/16/data/pg-ha.accept_timeline_loss
+   ```
 
-```bash
-sudo -u postgres rm /var/lib/postgresql/16/data/pg-ha.rewind_check
-```
+   日志出现 WARN `pg-ha.accept_timeline_loss present and no other node may campaign: taking part in the election although ...`，随后 promote，并把集群的历史代加 1（`/timeline` 的 `generation`，以及该节点 PGDATA 下的 `pg-ha.generation`）。记录写入后，pg-ha 删除 `pg-ha.accept_timeline_loss`。如果还有别的节点可以参选，这个文件会被忽略（WARN `... present but <node> is on the latest timeline; ignoring the override`）。
+3. **其他所有旧节点**（包括之后才找回的节点）都属于旧的历史代：pg-ha 让它们保持停库，不参选、不跟随、不 rewind，`POST /restart` 会被拒绝，ERROR 为 `This node's data belongs to history generation <g>; the cluster is in generation <g+1> ...`。逐个执行：
 
-下一轮它参选并 promote（timeline +1）。其他节点看到新 leader 后按正常流程 pg_rewind、删除自己的标记并跟随（日志 `pg_rewind succeeded; removed the rewind-check marker`）。
+   ```bash
+   curl -u admin:secret -X POST http://<node>:8008/reinitialize
+   ```
 
-**确认恢复**：恰好一个节点 `/primary` 200；其他节点 `/replica` 200，`/cluster` 里 `upstream` 指向新主。`/timeline` 仍然高于真实 timeline（只增不减），偏移没有消失；这次恢复之后，只要仍有不带标记的副本，选主就正常，但再遇到所有节点都带标记时需要再处理一次。
+   节点删除数据目录，从新主库重新克隆，克隆带上新的 `pg-ha.generation`，之后成为正常副本。
+
+为什么不能 rewind：强制参选的节点落后，PostgreSQL 会再用一次已经存在的 timeline 编号。两条历史可能连起点 LSN 都相同（实测：两个 TL5 都从 0/402B5F0 开始），这时 pg_rewind 会当成同一条历史，副本数据被静默混写。历史代用来把它们区分开。
+
+**确认恢复**：恰好一个节点 `/primary` 返回 200，其他节点 `/replica` 返回 200；所有成员的 `pg-ha.generation` 相同，等于 `/timeline` 的 `generation`。
 
 ### 场景 5：DCS (Raft) 数据损坏
 

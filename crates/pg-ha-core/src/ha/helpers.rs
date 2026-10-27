@@ -5,11 +5,27 @@ use tracing::{error, info, warn};
 
 use crate::error::Result;
 use crate::standby_config;
+use crate::timeline_files;
 
 use crate::cluster::MemberRole;
 
 use super::lease::{LeaderLease, LeaseAnchor};
-use super::{CycleResult, Ha, LEASE_EXPIRED_REASON, identity};
+use super::{CycleResult, Ha, LEASE_EXPIRED_REASON, identity, lineage};
+
+/// This node's I3 verdict (D6), including the operator override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OwnEligibility {
+    Eligible,
+    Ineligible(lineage::Ineligible),
+    /// `pg-ha.accept_timeline_loss` is present and nobody else may campaign:
+    /// campaign anyway, accepting the loss of the newer history.
+    Override(lineage::Ineligible),
+    /// The override file is present but `eligible` may campaign.
+    OverrideIgnored {
+        why: lineage::Ineligible,
+        eligible: String,
+    },
+}
 
 /// Cycle result while a node is held after a pg_rewind failure (D5).
 const REWIND_HOLD_RESULT: &str =
@@ -513,7 +529,10 @@ impl Ha {
         // The message says "PostgreSQL is stopped": make it true first. If the
         // stop fails, the next cycle stops it again and then logs the message
         // (rewind_hold_logged_at is still None).
-        if let Err(e) = self.stop_held_postgres().await {
+        if let Err(e) = self
+            .stop_held_postgres("stopped while held after a pg_rewind failure")
+            .await
+        {
             return CycleResult::Error(format!("rewind hold: stop failed: {e}"));
         }
         self.log_rewind_hold(what, &cause).await;
@@ -595,7 +614,10 @@ impl Ha {
                 Some(self.rejoin_as_replica(&leader).await)
             }
             (identity::HeldNodeAction::Rebuild | identity::HeldNodeAction::WaitForLeader, _) => {
-                if let Err(e) = self.stop_held_postgres().await {
+                if let Err(e) = self
+                    .stop_held_postgres("stopped while held after a pg_rewind failure")
+                    .await
+                {
                     return Some(CycleResult::Error(format!("rewind hold: stop failed: {e}")));
                 }
                 let _ = self.touch_member().await;
@@ -609,13 +631,12 @@ impl Ha {
     /// Stop a running PostgreSQL on a held node. A writable primary goes
     /// through fence_primary (signal + marker first, stop_pending on
     /// failure); a read-only standby is stopped directly. Ok when not running.
-    async fn stop_held_postgres(&mut self) -> crate::error::Result<()> {
+    async fn stop_held_postgres(&mut self, fence_reason: &'static str) -> crate::error::Result<()> {
         if !self.postgresql.is_running() {
             return Ok(());
         }
         if self.pg_identity() == identity::PgIdentity::Primary {
-            self.fence_primary("fast", "stopped while held after a pg_rewind failure", None)
-                .await
+            self.fence_primary("fast", fence_reason, None).await
         } else {
             self.postgresql.stop("fast").await
         }
@@ -623,7 +644,10 @@ impl Ha {
 
     /// The Hold branch, shared by rejoin step 0a and enforce_rewind_hold.
     pub(super) async fn hold_stop_and_report(&mut self) -> CycleResult {
-        if let Err(e) = self.stop_held_postgres().await {
+        if let Err(e) = self
+            .stop_held_postgres("stopped while held after a pg_rewind failure")
+            .await
+        {
             return CycleResult::Error(format!("rewind hold: stop failed: {e}"));
         }
         self.report_rewind_hold().await
@@ -669,6 +693,7 @@ impl Ha {
         } else {
             (None, None)
         };
+        let lineage = self.local_lineage(timeline);
 
         let mut data = serde_json::json!({
             "name": self.config.name,
@@ -686,9 +711,92 @@ impl Ha {
         if let Some(tl) = timeline {
             data["timeline"] = serde_json::json!(tl);
         }
+        if let Some(lineage) = lineage {
+            data["lineage"] = serde_json::to_value(lineage)
+                .map_err(|e| crate::error::Error::Dcs(format!("Serialize lineage: {e}")))?;
+        }
 
         self.dcs.touch_member(&data).await?;
         Ok(())
+    }
+
+    /// D6 evidence read from the data directory. None (nothing published,
+    /// so no node counts this one as on the latest timeline) when any part
+    /// cannot be read: a guessed value could admit a node to the election.
+    fn local_lineage(&self, timeline: Option<u64>) -> Option<crate::cluster::Lineage> {
+        let data_dir = &self.config.postgresql.data_dir;
+        let read = || -> std::result::Result<crate::cluster::Lineage, String> {
+            let history = timeline_files::newest_history(data_dir)?;
+            let timeline_begin = match timeline {
+                Some(t) => timeline_files::timeline_begin(data_dir, t)?,
+                None => None,
+            };
+            Ok(crate::cluster::Lineage {
+                timeline_begin,
+                history: Some(history),
+                postmaster_start: timeline_files::server_run(data_dir)?,
+                generation: timeline_files::read_generation(data_dir)?,
+            })
+        };
+        match read() {
+            Ok(l) => Some(l),
+            Err(e) => {
+                warn!("Not publishing timeline evidence: {e}");
+                None
+            }
+        }
+    }
+
+    /// D6: the latest timeline from this cycle's DCS view.
+    pub(super) fn latest_timeline(&self) -> lineage::Latest {
+        lineage::resolve_latest(
+            &self.cluster.timeline,
+            &self.cluster.members,
+            self.cluster.dcs_voters,
+        )
+    }
+
+    /// D6 / I3: may `member` campaign? Judged from what it published.
+    pub(super) fn member_eligibility(
+        &self,
+        member: &crate::cluster::Member,
+    ) -> std::result::Result<(), lineage::Ineligible> {
+        lineage::eligibility(member, &self.latest_timeline())
+    }
+
+    /// I3 for this node, from its own published record (the value every
+    /// node uses when judging it, A9), plus the operator override.
+    pub(super) fn own_eligibility(&self) -> OwnEligibility {
+        let verdict = match self.cluster.get_member(&self.config.name) {
+            Some(m) => self.member_eligibility(m),
+            None => Err(lineage::Ineligible::NoEvidence),
+        };
+        match verdict {
+            Ok(()) => OwnEligibility::Eligible,
+            Err(why) => {
+                if !timeline_files::has_accept_timeline_loss(&self.config.postgresql.data_dir) {
+                    return OwnEligibility::Ineligible(why);
+                }
+                // The override only applies when nobody else may campaign.
+                let other = self
+                    .cluster
+                    .members
+                    .iter()
+                    .find(|m| m.name != self.config.name && self.member_eligibility(m).is_ok());
+                match other {
+                    Some(m) => OwnEligibility::OverrideIgnored {
+                        why,
+                        eligible: m.name.clone(),
+                    },
+                    None => OwnEligibility::Override(why),
+                }
+            }
+        }
+    }
+
+    /// Generation of the local data directory.
+    pub(super) fn local_generation(&self) -> std::result::Result<u64, String> {
+        timeline_files::read_generation(&self.config.postgresql.data_dir)
     }
 
     /// Check if standby.signal file exists in the data directory.
@@ -705,47 +813,305 @@ impl Ha {
         standby_config::has_rewind_check_marker(&self.config.postgresql.data_dir)
     }
 
-    /// The timeline this node published in its member record this cycle:
-    /// the value every node uses when judging it (A9).
-    pub(super) fn own_published_timeline(&self) -> Option<u64> {
-        self.cluster
-            .get_member(&self.config.name)
-            .and_then(|m| m.timeline)
+    /// Log a D6 problem at ERROR once per distinct message (it repeats every
+    /// cycle until someone acts).
+    pub(super) fn log_timeline_problem(&mut self, message: String) {
+        if self.timeline_problem_logged.as_deref() != Some(message.as_str()) {
+            error!("{message}");
+            self.timeline_problem_logged = Some(message);
+        }
     }
 
-    /// Highest timeline other members published this cycle.
-    pub(super) fn max_peer_timeline(&self) -> Option<u64> {
-        identity::max_timeline_excluding(&self.cluster.members, &self.config.name)
+    /// The identity of the timeline this primary writes WAL on right now.
+    pub(super) async fn primary_timeline_id(
+        &self,
+    ) -> std::result::Result<crate::cluster::TimelineId, String> {
+        let timeline = self
+            .postgresql
+            .primary_timeline()
+            .await
+            .map_err(|e| format!("could not read this primary's timeline: {e}"))?;
+        let begin = timeline_files::timeline_begin(&self.config.postgresql.data_dir, timeline)?
+            .ok_or_else(|| format!("no history file for this primary's timeline {timeline}"))?;
+        Ok(crate::cluster::TimelineId { timeline, begin })
     }
 
-    /// D6: make /timeline >= the timeline this primary writes WAL on. Failures
-    /// only warn; a key above the primary's timeline is never lowered.
+    /// D6 Hold: keep `/timeline` equal to this lock-holding primary's
+    /// timeline. Never lowers it, never overwrites another history or an
+    /// unresolved promote by another node (those are logged as errors).
     pub(super) async fn record_cluster_timeline(&mut self) {
-        let tl = match self.postgresql.primary_timeline().await {
-            Ok(tl) => tl,
+        match self.primary_timeline_id().await {
+            Ok(own) => self.record_own_timeline(own).await,
+            Err(e) => warn!("Not recording the cluster timeline this cycle: {e}"),
+        }
+    }
+
+    /// D6 Hold for a standby leader (standby cluster): it never promotes, so
+    /// the remote timeline it follows is this cluster's latest. Its newest
+    /// history with WAL on it is that timeline.
+    pub(super) async fn record_standby_leader_timeline(&mut self) {
+        match timeline_files::newest_history(&self.config.postgresql.data_dir) {
+            Ok(h) if h.wal => self.record_own_timeline(h.id()).await,
+            Ok(h) => info!(
+                "Not recording the cluster timeline yet: no WAL received on {} yet",
+                h.id()
+            ),
+            Err(e) => warn!("Not recording the cluster timeline this cycle: {e}"),
+        }
+    }
+
+    async fn record_own_timeline(&mut self, own: crate::cluster::TimelineId) {
+        let own_generation = match self.local_generation() {
+            Ok(g) => g,
             Err(e) => {
-                warn!("Could not read this primary's timeline to record it in DCS: {e}");
+                warn!("Not recording the cluster timeline this cycle: {e}");
                 return;
             }
         };
-        let recorded = self.cluster.timeline;
-        match identity::timeline_record_action(tl, recorded) {
-            identity::TimelineRecord::Write => {
-                if let Err(e) = self.dcs.set_cluster_timeline(tl).await {
-                    warn!("Failed to record cluster timeline {tl} in DCS: {e}");
+        match lineage::hold_action(
+            &self.config.name,
+            &self.cluster.timeline,
+            &self.cluster.members,
+            self.cluster.dcs_voters,
+            own,
+            own_generation,
+        ) {
+            lineage::HoldAction::UpToDate => {
+                self.timeline_problem_logged = None;
+                self.finish_override();
+            }
+            lineage::HoldAction::Write(record) => {
+                match self
+                    .dcs
+                    .write_cluster_timeline(&record, self.cluster.timeline.version())
+                    .await
+                {
+                    Ok(true) => {
+                        self.timeline_problem_logged = None;
+                        self.finish_override();
+                    }
+                    Ok(false) => {
+                        info!("/timeline changed since it was read; checking again next cycle")
+                    }
+                    Err(e) => warn!("Failed to record cluster timeline {own} in DCS: {e}"),
                 }
             }
-            identity::TimelineRecord::UpToDate => {}
-            identity::TimelineRecord::RecordedAhead => {
-                let k = recorded.unwrap_or(tl);
-                if identity::should_warn_timeline_ahead(self.timeline_ahead_warned, k, tl) {
-                    warn!(
-                        "DCS /timeline ({k}) is higher than this primary's timeline ({tl}); a promote attempt recorded it in advance"
-                    );
-                    self.timeline_ahead_warned = Some((k, tl));
-                }
+            lineage::HoldAction::Conflict(msg) => {
+                self.log_timeline_problem(format!("Not recording the cluster timeline: {msg}"))
             }
         }
+    }
+
+    /// D6 (I2): write `pending` into `/timeline` before `pg_ctl promote`.
+    /// Written once per lock term; retries after a failed promote reuse it.
+    pub(super) async fn record_pending_promote(
+        &mut self,
+    ) -> std::result::Result<crate::cluster::PendingPromote, String> {
+        if let Some(p) = &self.promote_pending {
+            return Ok(p.clone());
+        }
+        let local = timeline_files::newest_history(&self.config.postgresql.data_dir)?;
+        // The server run that will execute the promote, read now: a later
+        // run is what makes this entry void for other nodes.
+        let postmaster_start = timeline_files::server_run(&self.config.postgresql.data_dir)?
+            .ok_or("postmaster.pid is missing: cannot identify the server run to promote")?;
+        let own = self.own_eligibility();
+        let accept_loss = matches!(own, OwnEligibility::Override(_));
+        let generation = self.cluster.timeline.generation();
+        let pending = lineage::plan_promote(
+            &self.config.name,
+            &self.latest_timeline(),
+            generation,
+            local,
+            accept_loss,
+            Some(postmaster_start),
+        )?;
+        if let OwnEligibility::Override(why) = &own {
+            warn!(
+                "Promoting on the operator's {} although {why}: the newer history is abandoned \
+                 and the cluster moves to history generation {}; every other node must be \
+                 reinitialized",
+                timeline_files::ACCEPT_TIMELINE_LOSS_FILE,
+                pending.generation
+            );
+        }
+        let record = match self.cluster.timeline.record() {
+            Some(r) => crate::cluster::TimelineRecord {
+                pending: Some(pending.clone()),
+                ..r.clone()
+            },
+            None => crate::cluster::TimelineRecord {
+                timeline: pending.base_timeline,
+                begin: pending.base_begin,
+                primary: String::new(),
+                generation,
+                pending: Some(pending.clone()),
+            },
+        };
+        match self
+            .dcs
+            .write_cluster_timeline(&record, self.cluster.timeline.version())
+            .await
+        {
+            Ok(true) => {
+                self.promote_pending = Some(pending.clone());
+                Ok(pending)
+            }
+            Ok(false) => Err("/timeline changed since it was read; trying again next cycle".into()),
+            Err(e) => Err(format!("could not record the pending promote in DCS: {e}")),
+        }
+    }
+
+    /// D6: after a confirmed promote, replace this node's pending entry with
+    /// the timeline PostgreSQL created. Failures leave the pending entry,
+    /// which keeps other nodes out; the Hold path retries.
+    pub(super) async fn confirm_promote(&mut self, pending: &crate::cluster::PendingPromote) {
+        let new = match self.primary_timeline_id().await {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("Promoted, but {e}; recording the timeline next cycle");
+                return;
+            }
+        };
+        let record = match lineage::confirmed_record(&self.config.name, pending, new) {
+            Ok(r) => r,
+            Err(e) => {
+                self.log_timeline_problem(format!("Promoted, but not recording the timeline: {e}"));
+                return;
+            }
+        };
+        if pending.generation > self.cluster.timeline.generation()
+            && let Err(e) = timeline_files::write_generation(
+                &self.config.postgresql.data_dir,
+                pending.generation,
+            )
+        {
+            self.log_timeline_problem(format!(
+                "Promoted on the operator override, but could not write history generation {} \
+                 to {}: {e}; not recording the timeline",
+                pending.generation,
+                timeline_files::GENERATION_FILE
+            ));
+            return;
+        }
+        // CAS against the entry this node wrote, read again: the cycle's view
+        // predates the pending write.
+        let current = match self.dcs.get_cluster().await {
+            Ok(c) => c.timeline,
+            Err(e) => {
+                warn!("Promoted, but could not read /timeline: {e}; recording it next cycle");
+                return;
+            }
+        };
+        if current.record().and_then(|r| r.pending.as_ref()) != Some(pending) {
+            self.log_timeline_problem(
+                "Promoted, but /timeline no longer carries this node's pending promote; not \
+                 overwriting it"
+                    .into(),
+            );
+            return;
+        }
+        match self
+            .dcs
+            .write_cluster_timeline(&record, current.version())
+            .await
+        {
+            Ok(true) => {
+                info!("Recorded {new} as the latest timeline");
+                self.promote_pending = None;
+                self.timeline_problem_logged = None;
+                self.finish_override();
+            }
+            Ok(false) => warn!("/timeline changed while recording {new}; retrying next cycle"),
+            Err(e) => warn!("Failed to record {new} in DCS: {e}; retrying next cycle"),
+        }
+    }
+
+    /// The override was recorded: the operator's file has done its job.
+    fn finish_override(&mut self) {
+        let data_dir = &self.config.postgresql.data_dir;
+        if !timeline_files::has_accept_timeline_loss(data_dir) {
+            return;
+        }
+        match timeline_files::remove_accept_timeline_loss(data_dir) {
+            Ok(()) => info!(
+                "Removed {}: this primary's timeline is recorded as the latest",
+                timeline_files::ACCEPT_TIMELINE_LOSS_FILE
+            ),
+            Err(e) => warn!(
+                "Could not remove {}: {e}",
+                timeline_files::ACCEPT_TIMELINE_LOSS_FILE
+            ),
+        }
+    }
+
+    /// D6 / 2A: is the local data in an older generation than the cluster's
+    /// (or is its generation unreadable)? None = not stale; otherwise the
+    /// cluster's generation, the local one, and whether an override promote
+    /// is still in progress.
+    fn stale_generation(&self) -> Option<(u64, std::result::Result<u64, String>, bool)> {
+        let recorded = self.cluster.timeline.generation();
+        let (generation, in_progress) = match self.latest_timeline() {
+            lineage::Latest::Known { generation, .. } => (generation, false),
+            // An override promote may be creating the new generation: do not
+            // follow or rewind onto its node until it is resolved.
+            lineage::Latest::PendingUnresolved { pending } if pending.node == self.config.name => {
+                return None;
+            }
+            lineage::Latest::PendingUnresolved { pending } => (
+                recorded.max(pending.generation),
+                pending.generation > recorded,
+            ),
+            lineage::Latest::Unknown(_) => (recorded, false),
+        };
+        match self.local_generation() {
+            Ok(local) if local >= generation => None,
+            local => Some((generation, local, in_progress)),
+        }
+    }
+
+    pub(super) fn data_generation_is_stale(&self) -> bool {
+        self.stale_generation().is_some()
+    }
+
+    /// D6 / 2A: data of an older history generation (an operator override
+    /// accepted losing it) must never be rewound onto, followed from, or
+    /// elected over the new history. Keep PostgreSQL stopped until the node
+    /// is reinitialized. None = not stale.
+    pub(super) async fn enforce_generation(&mut self) -> Option<CycleResult> {
+        let (generation, local, in_progress) = self.stale_generation()?;
+        let reason = match local {
+            Ok(local) if in_progress => format!(
+                "An operator override is moving the cluster to history generation {generation}; \
+                 this node's data is in generation {local}. pg-ha keeps PostgreSQL stopped until \
+                 the override is recorded or abandoned"
+            ),
+            Ok(local) => format!(
+                "This node's data belongs to history generation {local}; the cluster is in \
+                 generation {generation} after an operator override accepted losing the older \
+                 history. pg-ha keeps PostgreSQL stopped and will not rewind or follow it. \
+                 Operator action required: POST /reinitialize on this node to clone it again"
+            ),
+            Err(e) => format!(
+                "Cannot read this node's history generation ({e}); pg-ha keeps PostgreSQL \
+                 stopped. Operator action required: fix or remove the file, or POST \
+                 /reinitialize on this node"
+            ),
+        };
+        self.log_timeline_problem(reason);
+        if let Err(e) = self
+            .stop_held_postgres("stopped: data of an older history generation")
+            .await
+        {
+            return Some(CycleResult::Error(format!(
+                "older history generation: stop failed: {e}"
+            )));
+        }
+        let _ = self.touch_member().await;
+        Some(CycleResult::Error(
+            "data of an older history generation; operator action required (see the ERROR log)"
+                .into(),
+        ))
     }
 
     /// Check if recovery.signal exists (targeted archive / point-in-time

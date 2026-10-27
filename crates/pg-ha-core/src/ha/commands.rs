@@ -230,6 +230,12 @@ impl Ha {
 
     async fn handle_restart_command(&mut self) -> CommandResponse {
         // D5: a held node stays stopped until the operator reinitializes it.
+        // D6 / 2A: data of an older history generation is never started.
+        if self.data_generation_is_stale() {
+            return CommandResponse::rejected(
+                "Restart refused: this node's data belongs to an older history generation; POST /reinitialize it",
+            );
+        }
         if self.refresh_rewind_hold() {
             return CommandResponse::rejected(
                 "PostgreSQL is held after a pg_rewind failure; use POST /reinitialize (see the ERROR log)",

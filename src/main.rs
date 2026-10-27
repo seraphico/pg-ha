@@ -1011,6 +1011,7 @@ mod tests {
             tags: Default::default(),
             version: None,
             rewind_check: false,
+            lineage: None,
         }]);
         drop(tx);
         tokio::time::timeout(std::time::Duration::from_secs(5), task)

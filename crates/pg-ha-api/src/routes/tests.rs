@@ -514,7 +514,11 @@ impl pg_ha_core::dcs::DcsAdapter for ConfigDcs {
     async fn get_config_value(&self) -> pg_ha_core::Result<Option<String>> {
         Ok(self.config.lock().unwrap().clone())
     }
-    async fn set_cluster_timeline(&self, _: u64) -> pg_ha_core::Result<bool> {
+    async fn write_cluster_timeline(
+        &self,
+        _: &pg_ha_core::cluster::TimelineRecord,
+        _: Option<u64>,
+    ) -> pg_ha_core::Result<bool> {
         Ok(true)
     }
     fn ttl(&self) -> u64 {

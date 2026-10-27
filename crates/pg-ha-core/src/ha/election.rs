@@ -5,11 +5,11 @@ use tracing::{error, info, warn};
 
 use crate::cluster::SyncState;
 
-use super::identity::{
-    self, ElectionStance, MarkedElectionGate, MarkedGateAction, PgIdentity, election_stance,
-    marked_election_gate, marked_gate_action,
-};
+use super::helpers::OwnEligibility;
+use super::identity::{self, ElectionStance, PgIdentity, election_stance};
+use super::lineage::Ineligible;
 use super::{CycleResult, Ha};
+use crate::timeline_files::ACCEPT_TIMELINE_LOSS_FILE;
 
 /// Whether `name` may acquire the leader lock under current sync settings.
 ///
@@ -43,6 +43,11 @@ impl Ha {
             return CycleResult::Follower("no action in pause mode (cluster has no leader)".into());
         }
 
+        // D6 / 2A first: data of an older history generation never
+        // campaigns, and is never rebuilt by rewinding it (D5 Rebuild).
+        if let Some(r) = self.enforce_generation().await {
+            return r;
+        }
         // D5: a held node never campaigns (and is stopped if started by hand).
         if let Some(r) = self.enforce_rewind_hold().await {
             return r;
@@ -86,65 +91,57 @@ impl Ha {
             }
         }
 
-        // ─── D6: a node with the rewind-check marker campaigns only if its
-        // published timeline is >= the recorded cluster timeline ───
-        let gate = marked_election_gate(
-            self.has_rewind_check_marker(),
-            self.own_published_timeline(),
-            self.cluster.timeline,
-            self.max_peer_timeline(),
-        );
-        if gate == MarkedElectionGate::AllowedIncompleteEvidence {
-            warn!(
-                "No /timeline key in DCS; comparing this node's timeline with the timelines members published. The evidence is incomplete"
-            );
-        }
-        let stand_aside = match gate {
-            MarkedElectionGate::Behind { own, cluster } => {
-                info!(
-                    "Not taking part in the election: rewind-check marker present and this node's timeline {own} is behind the cluster timeline {cluster}; waiting for a leader to rewind against"
-                );
-                format!(
-                    "rewind-check marker present and timeline {own} is behind the cluster timeline {cluster}; not taking part in the election"
-                )
-            }
-            MarkedElectionGate::OwnTimelineUnknown => {
-                info!(
-                    "Not taking part in the election this cycle: rewind-check marker present and this node's timeline is not published yet"
-                );
-                "rewind-check marker present and own timeline not published yet; not taking part in the election this cycle".to_string()
-            }
-            MarkedElectionGate::Allowed | MarkedElectionGate::AllowedIncompleteEvidence => {
-                String::new()
-            }
-        };
-        match marked_gate_action(gate, identity) {
-            MarkedGateAction::Proceed => {}
-            MarkedGateAction::StandAside => {
-                let _ = self.touch_member().await;
-                return CycleResult::Follower(stand_aside);
-            }
-            MarkedGateAction::StopThenStandAside => {
+        // ─── D6 / I3: only a node on the latest timeline campaigns, marked
+        // or not. A behind node would reuse a timeline number (I1) and drop
+        // the newer history ───
+        let stand_aside = match self.own_eligibility() {
+            OwnEligibility::Eligible => None,
+            OwnEligibility::Override(why) => {
                 warn!(
-                    "Rewind-check marker present and not eligible for the election while PostgreSQL is a primary without the leader lock — stopping PostgreSQL"
+                    "{ACCEPT_TIMELINE_LOSS_FILE} present and no other node may campaign: taking part in the election although {why}"
                 );
+                None
+            }
+            OwnEligibility::OverrideIgnored { why, eligible } => {
+                warn!(
+                    "{ACCEPT_TIMELINE_LOSS_FILE} present but {eligible} is on the latest timeline; ignoring the override"
+                );
+                Some(why)
+            }
+            OwnEligibility::Ineligible(why) => Some(why),
+        };
+        if let Some(why) = stand_aside {
+            let message = format!("Not taking part in the election: {why}");
+            match &why {
+                Ineligible::DifferentHistory { .. }
+                | Ineligible::UnrecordedNewer { .. }
+                | Ineligible::LatestUnknown(_) => self.log_timeline_problem(message),
+                _ => info!("{message}"),
+            }
+            let result = format!("not taking part in the election: {why}");
+            if identity == PgIdentity::Primary {
+                // L5: not eligible while observed writable without the lock.
                 // standby.signal + marker first; a failed stop sets
-                // stop_pending, so the next cycle fences it again. A
-                // successful stop is already published by fence_primary.
+                // stop_pending, so the next cycle fences it again.
+                warn!(
+                    "Not eligible for the election while PostgreSQL is a primary without the leader lock — stopping PostgreSQL"
+                );
                 if let Err(e) = self
                     .fence_primary(
                         "fast",
-                        "stopped: marked node not eligible for the election while running as a primary",
+                        "stopped: not eligible for the election while running as a primary",
                         None,
                     )
                     .await
                 {
                     return CycleResult::Error(format!(
-                        "stop failed for a marked, ineligible primary: {e}"
+                        "stop failed for an ineligible primary: {e}"
                     ));
                 }
-                return CycleResult::Follower(format!("{stand_aside}; stopped PostgreSQL"));
+                return CycleResult::Follower(format!("{result}; stopped PostgreSQL"));
             }
+            let _ = self.touch_member().await;
+            return CycleResult::Follower(result);
         }
 
         // ─── Stale primary detection ───
@@ -192,7 +189,7 @@ impl Ha {
         {
             warn!(
                 candidate = %c,
-                "Designated candidate {c} has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated"
+                "Designated candidate {c} may not take part in the election (it is not shown to be on the latest timeline); proceeding as if no candidate were designated"
             );
         }
 
@@ -277,14 +274,10 @@ impl Ha {
     /// rule says it will not campaign (A25). A missing member is still honoured.
     fn honoured_candidate(&self) -> Option<&str> {
         let candidate = self.cluster.failover.as_ref()?.candidate.as_deref()?;
-        let may = self.cluster.get_member(candidate).map(|m| {
-            identity::peer_may_campaign(
-                m.rewind_check,
-                m.timeline,
-                self.cluster.timeline,
-                identity::max_timeline_excluding(&self.cluster.members, &m.name),
-            )
-        });
+        let may = self
+            .cluster
+            .get_member(candidate)
+            .map(|m| self.member_eligibility(m).is_ok());
         identity::honour_designated_candidate(candidate == self.config.name, may)
             .then_some(candidate)
     }
@@ -321,12 +314,7 @@ impl Ha {
                 && member.failover_priority() != 0
                 && member.state == crate::cluster::MemberState::Running
                 && sync_failover_allowed(&member.name, sync_mode, self.cluster.sync_state.as_ref())
-                && identity::peer_may_campaign(
-                    member.rewind_check,
-                    member.timeline,
-                    self.cluster.timeline,
-                    identity::max_timeline_excluding(&self.cluster.members, &member.name),
-                )
+                && self.member_eligibility(member).is_ok()
         })
     }
 
@@ -336,17 +324,20 @@ impl Ha {
     /// - It is not tagged nofailover and failover_priority > 0
     /// - It has PostgreSQL running
     /// - It is not the leader a no-candidate switchover asked to step down
-    /// - It has the highest published timeline among eligible candidates.
-    ///   A higher timeline wins even when its LSN is smaller: LSN orders
-    ///   WAL only inside one timeline. Peers on a lower timeline are not
-    ///   compared by LSN, and a peer that has not published a timeline
-    ///   cannot win on LSN against one that has.
-    /// - On the same timeline (or when both timelines are missing): highest
-    ///   WAL position, then higher failover_priority, then alphabetical name.
+    /// - It may campaign under D6 / I3 (on the latest timeline, or the
+    ///   operator override); peers that may not are not compared
+    /// - Among eligible nodes, all on the latest timeline: highest WAL
+    ///   position, then higher failover_priority, then alphabetical name.
     ///   The stepped-down switchover leader is not compared.
     pub(super) fn is_healthiest_node(&self) -> bool {
         // Self-check first (cheap)
         if self.config.tags.nofailover || self.config.tags.failover_priority == 0 {
+            return false;
+        }
+        if !matches!(
+            self.own_eligibility(),
+            OwnEligibility::Eligible | OwnEligibility::Override(_)
+        ) {
             return false;
         }
         if !self.postgresql.is_running() {
@@ -378,7 +369,6 @@ impl Ha {
         let my_name = &self.config.name;
         let my_member = self.cluster.get_member(my_name);
         let my_wal = my_member.and_then(|m| m.wal_position).unwrap_or(0);
-        let my_timeline = my_member.and_then(|m| m.timeline);
         let my_priority = self.config.tags.failover_priority;
 
         // Compare against all other members
@@ -400,31 +390,17 @@ impl Ha {
             if !sync_failover_allowed(&member.name, sync_mode, self.cluster.sync_state.as_ref()) {
                 continue;
             }
-            // A18: do not defer to a peer that will not campaign under the
-            // marked-node rule (the same rule it applies to itself).
-            if !identity::peer_may_campaign(
-                member.rewind_check,
-                member.timeline,
-                self.cluster.timeline,
-                identity::max_timeline_excluding(&self.cluster.members, &member.name),
-            ) {
+            // A18 / I3: do not defer to a peer that may not campaign (the
+            // same rule it applies to itself).
+            if self.member_eligibility(member).is_err() {
                 continue;
-            }
-
-            // LSN is an offset inside one timeline. A larger LSN on an older
-            // timeline is not more data.
-            match (my_timeline, member.timeline) {
-                (Some(mine), Some(theirs)) if theirs > mine => return false,
-                (Some(mine), Some(theirs)) if theirs < mine => continue,
-                (None, Some(_)) => return false,
-                (Some(_), None) => continue,
-                _ => {}
             }
 
             let their_wal = member.wal_position.unwrap_or(0);
             let their_priority = member.failover_priority();
 
-            // Same timeline, or neither published one: higher LSN wins.
+            // Every eligible peer is on the latest timeline, like this node:
+            // LSNs are comparable. Higher LSN wins.
             if their_wal > my_wal {
                 return false; // Someone else has more data
             }

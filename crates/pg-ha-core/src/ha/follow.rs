@@ -26,6 +26,11 @@ impl Ha {
     /// If this node has the `replicatefrom` tag set, it will attempt to stream from
     /// the tagged member. If that member is unavailable, it falls back to the primary.
     pub(super) async fn follow_upstream(&mut self, lock_owner: &str) -> CycleResult {
+        // D6 / 2A first: data of an older history generation is never
+        // followed or rewound onto the new history (also not by D5 Rebuild).
+        if let Some(r) = self.enforce_generation().await {
+            return r;
+        }
         // D5: a held node is kept stopped (also when started by hand).
         if let Some(r) = self.enforce_rewind_hold().await {
             return r;
