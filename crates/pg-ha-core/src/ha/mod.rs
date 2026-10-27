@@ -4837,6 +4837,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// R2 regression (35ff9df): after a failover to timeline 6, node1 was
+    /// rewound (control file copied from the source: checkpoint timeline 6)
+    /// and has the least WAL; node3 streamed all along but has not made a
+    /// restartpoint yet (checkpoint timeline still 5). The leader dies before
+    /// the next restartpoint. Publishing the checkpoint timeline made node1
+    /// win and dropped node3's extra WAL; the receiver timeline makes both 6
+    /// and the larger LSN wins.
+    #[tokio::test]
+    async fn test_replica_without_a_restartpoint_still_wins_on_lsn() {
+        use crate::postgresql::{ReplicaWalSample, resolve_replica_wal};
+
+        let run = "2026-10-27 08:00:00+00".to_string();
+        let observe = |receive: u64, checkpoint_tl: u64| {
+            let streaming = ReplicaWalSample {
+                receive_lsn: Some(receive),
+                replay_lsn: Some(receive),
+                checkpoint_timeline: Some(checkpoint_tl),
+                receiver: Some((receive, 6)),
+                postmaster_start: Some(run.clone()),
+            };
+            let last = resolve_replica_wal(&streaming, None).remember;
+            // The leader died: its last WAL (shutdown checkpoint) arrived
+            // after that sample, then the receiver stopped.
+            let after = ReplicaWalSample {
+                receive_lsn: Some(receive + 48),
+                replay_lsn: Some(receive + 48),
+                receiver: None,
+                ..streaming
+            };
+            let r = resolve_replica_wal(&after, last.as_ref());
+            member_with_tl("unused", r.wal_position, r.timeline.unwrap_or(0))
+        };
+        let rewound = Member {
+            name: "node1".into(),
+            ..observe(100, 6)
+        };
+        let streamed = Member {
+            name: "node3".into(),
+            ..observe(900, 5)
+        };
+        assert_eq!(rewound.timeline, Some(6));
+        assert_eq!(
+            streamed.timeline,
+            Some(6),
+            "receiver timeline, not checkpoint 5"
+        );
+
+        let dcs = Arc::new(MockDcs::new().with_timeline(6));
+        let (mut ha, dir) = identity_test_ha("node3", "tl-no-restartpoint", dcs, Some(true), true);
+        ha.cluster = unlocked(vec![rewound.clone(), streamed.clone()], Some(6));
+        assert!(
+            ha.is_healthiest_node(),
+            "node3 has more WAL on the same timeline"
+        );
+
+        let dcs = Arc::new(MockDcs::new().with_timeline(6));
+        let (mut other, other_dir) =
+            identity_test_ha("node1", "tl-no-restartpoint-1", dcs, Some(true), true);
+        other.cluster = unlocked(vec![rewound, streamed], Some(6));
+        assert!(!other.is_healthiest_node());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
     #[tokio::test]
     async fn test_marked_peer_at_cluster_timeline_still_counts() {
         let dcs = Arc::new(MockDcs::new().with_timeline(2));
