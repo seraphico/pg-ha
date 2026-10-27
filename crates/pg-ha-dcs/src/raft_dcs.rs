@@ -13,13 +13,14 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 use pg_ha_core::cluster::{
-    Cluster, ClusterConfig, Failover, Leader, Member, MemberRole, MemberState, SyncState,
+    Cluster, ClusterConfig, ClusterTimeline, Failover, Leader, Member, MemberRole, MemberState,
+    SyncState, TimelineRecord,
 };
 use pg_ha_core::dcs::DcsAdapter;
 use pg_ha_core::error::{Error, Result};
 
 use crate::network::NetworkFactory;
-use crate::state_machine::{KvEntry, Request, Response, current_millis, stamp_leader_time};
+use crate::state_machine::{Request, Response, current_millis, stamp_leader_time};
 use crate::store::{MemStore, NodeId, TypeConfig};
 
 /// DCS adapter built on top of embedded Raft
@@ -428,6 +429,7 @@ impl DcsAdapter for RaftDcs {
                     tags: Default::default(),
                     version: None,
                     rewind_check: false,
+                    lineage: None,
                 });
             }
         }
@@ -463,12 +465,26 @@ impl DcsAdapter for RaftDcs {
                 data: serde_json::from_str(&e.value).unwrap_or_default(),
             });
 
-        // Read the persistent cluster timeline key
+        // Read the persistent cluster timeline key (D6)
         let timeline = self
             .store
             .get(&self.timeline_path())
             .await
-            .and_then(|e| e.value.trim().parse::<u64>().ok());
+            .map_or(ClusterTimeline::Absent, |e| {
+                ClusterTimeline::parse(&e.value, e.version)
+            });
+
+        // Raft voters = pg-ha nodes (all members are voters, see
+        // bootstrap_cluster).
+        let dcs_voters = Some(
+            self.raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .count(),
+        );
 
         Ok(Cluster {
             leader,
@@ -480,6 +496,7 @@ impl DcsAdapter for RaftDcs {
             failsafe: None, // TODO: read /failsafe key
             history: Vec::new(),
             timeline,
+            dcs_voters,
         })
     }
 
@@ -640,33 +657,29 @@ impl DcsAdapter for RaftDcs {
             .map(|e| e.value.clone()))
     }
 
-    async fn set_cluster_timeline(&self, timeline: u64) -> Result<bool> {
-        const ATTEMPTS: u32 = 3;
-        let key = self.timeline_path();
-        for attempt in 1..=ATTEMPTS {
-            let current = self.store.get(&key).await;
-            let Some(request) =
-                timeline_raise_request(key.clone(), current.as_ref(), timeline, current_millis())
-            else {
-                return Ok(false);
-            };
-            match self.propose(request).await? {
-                Response::Ok { .. } => {
-                    info!(timeline, "Recorded cluster timeline in DCS");
-                    return Ok(true);
-                }
-                Response::NotChanged => {
-                    // Written concurrently, or the local view lags: re-read.
-                    debug!(timeline, attempt, "/timeline CAS not applied, retrying");
-                    if attempt < ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
+    async fn write_cluster_timeline(
+        &self,
+        record: &TimelineRecord,
+        expected: Option<u64>,
+    ) -> Result<bool> {
+        let request =
+            timeline_write_request(self.timeline_path(), record, expected, current_millis())?;
+        match self.propose(request).await? {
+            Response::Ok { .. } => {
+                info!(
+                    timeline = record.timeline,
+                    begin = record.begin,
+                    generation = record.generation,
+                    pending = ?record.pending.as_ref().map(|p| &p.node),
+                    "Recorded cluster timeline in DCS"
+                );
+                Ok(true)
+            }
+            Response::NotChanged => {
+                debug!(?expected, "/timeline CAS not applied: changed since read");
+                Ok(false)
             }
         }
-        Err(Error::Dcs(
-            "could not raise /timeline: concurrent updates".into(),
-        ))
     }
 
     fn ttl(&self) -> u64 {
@@ -699,39 +712,26 @@ where
     }
 }
 
-/// CAS request that raises the `/timeline` key to `timeline` (no TTL), or
-/// None when the stored value is already >= `timeline`. The write is
-/// conditioned on the version that was read (or on the key being absent), so
-/// a concurrent write makes it fail instead of lowering the key. An
-/// unparsable stored value is replaced.
-fn timeline_raise_request(
+/// CAS request that writes the `/timeline` record (no TTL) only if the key
+/// still has version `expected`, or does not exist when `expected` is None.
+/// A concurrent write makes it fail (NotChanged) instead of being overwritten.
+fn timeline_write_request(
     key: String,
-    current: Option<&KvEntry>,
-    timeline: u64,
+    record: &TimelineRecord,
+    expected: Option<u64>,
     now: u64,
-) -> Option<Request> {
-    let value = timeline.to_string();
-    match current {
-        None => Some(Request::Set {
-            key,
-            value,
-            ttl: None,
-            prev_exist: Some(false),
-            prev_value: None,
-            prev_version: None,
-            now,
-        }),
-        Some(e) if e.value.trim().parse::<u64>().is_ok_and(|v| v >= timeline) => None,
-        Some(e) => Some(Request::Set {
-            key,
-            value,
-            ttl: None,
-            prev_exist: None,
-            prev_value: None,
-            prev_version: Some(e.version),
-            now,
-        }),
-    }
+) -> Result<Request> {
+    let value = serde_json::to_string(record)
+        .map_err(|e| Error::Dcs(format!("Serialize /timeline record: {e}")))?;
+    Ok(Request::Set {
+        key,
+        value,
+        ttl: None,
+        prev_exist: expected.is_none().then_some(false),
+        prev_value: None,
+        prev_version: expected,
+        now,
+    })
 }
 
 #[cfg(test)]
@@ -741,27 +741,35 @@ mod tests {
 
     const KEY: &str = "/service/test/timeline";
 
-    fn entry(value: &str, version: u64) -> KvEntry {
-        KvEntry {
-            value: value.to_string(),
-            created_at: 1,
-            updated_at: 1,
-            expire_at: None,
-            version,
+    fn record(timeline: u64) -> TimelineRecord {
+        TimelineRecord {
+            timeline,
+            begin: 0x100 * timeline,
+            primary: "node1".into(),
+            generation: 0,
+            pending: None,
         }
     }
 
-    fn raise(sm: &KvStateMachine, timeline: u64) -> Option<Request> {
-        timeline_raise_request(KEY.to_string(), sm.get(KEY), timeline, 1_000)
+    fn write(
+        sm: &mut KvStateMachine,
+        rec: &TimelineRecord,
+        expected: Option<u64>,
+        index: u64,
+    ) -> Response {
+        let req = timeline_write_request(KEY.to_string(), rec, expected, 1_000).unwrap();
+        sm.apply(&req, index)
     }
 
-    fn stored(sm: &KvStateMachine) -> Option<&str> {
-        sm.get(KEY).map(|e| e.value.as_str())
+    fn stored(sm: &KvStateMachine) -> ClusterTimeline {
+        sm.get(KEY).map_or(ClusterTimeline::Absent, |e| {
+            ClusterTimeline::parse(&e.value, e.version)
+        })
     }
 
     #[test]
-    fn raise_request_creates_when_absent() {
-        let req = timeline_raise_request(KEY.to_string(), None, 3, 7).unwrap();
+    fn write_request_is_a_cas_without_ttl() {
+        let req = timeline_write_request(KEY.to_string(), &record(3), None, 7).unwrap();
         match req {
             Request::Set {
                 key,
@@ -773,99 +781,70 @@ mod tests {
                 now,
             } => {
                 assert_eq!(key, KEY);
-                assert_eq!(value, "3");
+                assert_eq!(
+                    serde_json::from_str::<TimelineRecord>(&value).unwrap(),
+                    record(3)
+                );
                 assert_eq!(ttl, None, "the key has no TTL");
-                assert_eq!(prev_exist, Some(false));
+                assert_eq!(prev_exist, Some(false), "absent expected: create only");
                 assert_eq!(prev_value, None);
                 assert_eq!(prev_version, None);
                 assert_eq!(now, 7);
             }
             other => panic!("unexpected request {other:?}"),
         }
-    }
-
-    #[test]
-    fn raise_request_skips_when_equal_or_higher() {
-        assert!(timeline_raise_request(KEY.to_string(), Some(&entry("3", 5)), 3, 1).is_none());
-        assert!(timeline_raise_request(KEY.to_string(), Some(&entry("4", 5)), 3, 1).is_none());
-        assert!(timeline_raise_request(KEY.to_string(), Some(&entry(" 4\n", 5)), 3, 1).is_none());
-    }
-
-    #[test]
-    fn raise_request_overwrites_lower_with_version_cas() {
-        let req = timeline_raise_request(KEY.to_string(), Some(&entry("2", 5)), 3, 1).unwrap();
-        match req {
-            Request::Set {
-                value,
-                ttl,
-                prev_exist,
-                prev_value,
-                prev_version,
-                ..
-            } => {
-                assert_eq!(value, "3");
-                assert_eq!(ttl, None);
-                assert_eq!(prev_exist, None);
-                assert_eq!(prev_value, None);
-                assert_eq!(prev_version, Some(5));
-            }
-            other => panic!("unexpected request {other:?}"),
-        }
-    }
-
-    #[test]
-    fn raise_request_replaces_unparsable_value() {
-        let req = timeline_raise_request(KEY.to_string(), Some(&entry("junk", 9)), 1, 1).unwrap();
+        let req = timeline_write_request(KEY.to_string(), &record(3), Some(5), 7).unwrap();
         assert!(matches!(
             req,
-            Request::Set { ref value, prev_version: Some(9), .. } if value == "1"
+            Request::Set {
+                prev_exist: None,
+                prev_version: Some(5),
+                ..
+            }
         ));
     }
 
     #[test]
-    fn stale_version_cas_does_not_lower_the_key() {
+    fn stale_version_write_is_not_applied() {
         let mut sm = KvStateMachine::new();
-        sm.apply(&raise(&sm, 2).unwrap(), 10);
-        let v1 = sm.get(KEY).cloned().unwrap();
-        // Two writers read version v1 (value 2): one raises to 5, the other to 4.
-        let to5 = timeline_raise_request(KEY.to_string(), Some(&v1), 5, 1).unwrap();
-        let to4 = timeline_raise_request(KEY.to_string(), Some(&v1), 4, 1).unwrap();
-        assert!(matches!(sm.apply(&to5, 11), Response::Ok { .. }));
-        assert_eq!(sm.apply(&to4, 12), Response::NotChanged);
-        assert_eq!(stored(&sm), Some("5"));
-        // A fresh read sees 5 and does not write 4 at all.
-        assert!(raise(&sm, 4).is_none());
-        assert_eq!(stored(&sm), Some("5"));
+        assert!(matches!(
+            write(&mut sm, &record(2), None, 10),
+            Response::Ok { .. }
+        ));
+        let v = stored(&sm).version();
+        // Two writers read the same version: the second loses.
+        assert!(matches!(
+            write(&mut sm, &record(3), v, 11),
+            Response::Ok { .. }
+        ));
+        assert_eq!(write(&mut sm, &record(4), v, 12), Response::NotChanged);
+        assert_eq!(stored(&sm).record(), Some(&record(3)));
+        // Create-only fails once the key exists.
+        assert_eq!(write(&mut sm, &record(9), None, 13), Response::NotChanged);
     }
 
     #[test]
-    fn absent_cas_fails_when_created_concurrently() {
+    fn legacy_number_is_replaced_by_version() {
         let mut sm = KvStateMachine::new();
-        // Both writers saw no key.
-        let first = timeline_raise_request(KEY.to_string(), None, 3, 1).unwrap();
-        let second = timeline_raise_request(KEY.to_string(), None, 2, 1).unwrap();
-        assert!(matches!(sm.apply(&first, 10), Response::Ok { .. }));
-        assert_eq!(sm.apply(&second, 11), Response::NotChanged);
-        assert_eq!(stored(&sm), Some("3"));
-    }
-
-    #[test]
-    fn timeline_key_never_decreases_over_a_sequence() {
-        let mut sm = KvStateMachine::new();
-        let mut index = 1;
-        let mut highest = 0;
-        for tl in [1, 3, 2, 3, 1, 5, 4] {
-            if let Some(req) = raise(&sm, tl) {
-                index += 1;
-                assert!(matches!(sm.apply(&req, index), Response::Ok { .. }));
-            }
-            highest = highest.max(tl);
-            assert_eq!(
-                stored(&sm),
-                Some(highest.to_string().as_str()),
-                "after {tl}"
-            );
-        }
+        sm.apply(
+            &Request::Set {
+                key: KEY.into(),
+                value: "17".into(),
+                ttl: None,
+                prev_exist: None,
+                prev_value: None,
+                prev_version: None,
+                now: 1,
+            },
+            10,
+        );
+        let legacy = stored(&sm);
+        assert!(matches!(legacy, ClusterTimeline::Legacy { value: 17, .. }));
+        assert!(matches!(
+            write(&mut sm, &record(14), legacy.version(), 11),
+            Response::Ok { .. }
+        ));
+        assert_eq!(stored(&sm).record(), Some(&record(14)));
     }
 
     /// R19: a DCS write that never completes is abandoned after the bound
@@ -1025,11 +1004,11 @@ mod tests {
     #[test]
     fn timeline_key_survives_expiry_and_reload() {
         let mut sm = KvStateMachine::new();
-        sm.apply(&raise(&sm, 3).unwrap(), 10);
+        write(&mut sm, &record(3), None, 10);
         assert_eq!(sm.get(KEY).unwrap().expire_at, None, "no TTL");
         // The Raft leader's periodic expiry, far in the future, keeps it.
         sm.apply(&Request::ExpireKeys { now: u64::MAX / 2 }, 11);
-        assert_eq!(stored(&sm), Some("3"));
+        assert_eq!(stored(&sm).record(), Some(&record(3)));
         // Persisted with the state machine (P1) and read back unchanged.
         let path = std::env::temp_dir().join(format!(
             "pg-ha-dcs-timeline-{}/state_machine.json",
@@ -1037,7 +1016,7 @@ mod tests {
         ));
         sm.save_to_disk(&path);
         let loaded = KvStateMachine::load_from_disk(&path);
-        assert_eq!(stored(&loaded), Some("3"));
+        assert_eq!(stored(&loaded).record(), Some(&record(3)));
         assert_eq!(loaded.get(KEY).unwrap().expire_at, None);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

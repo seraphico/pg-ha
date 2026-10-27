@@ -61,21 +61,23 @@ flowchart TD
     IDENT -->|UnmanagedRecovery| ASIDE[不参选 交运维]
     IDENT -->|Unknown| SKIP[本轮不参选]
     IDENT -->|降级停库失败未确认| FENCE[先停库 不参选]
-    IDENT -->|Primary / ManagedStandby| MARK{带 rewind 检查标记且 timeline < /timeline?}
-    MARK -->|是| ASIDE2[不参选 以主库运行则先停库<br/>等 leader 后 rewind]
-    MARK -->|否| STALE{观测为主且非最健康?}
+    IDENT -->|Primary / ManagedStandby| GEN{数据属于旧的历史代?}
+    GEN -->|是| HOLDGEN[停库 不参选 不跟随<br/>等运维 reinitialize]
+    GEN -->|否| MARK{在最新 timeline 上?<br/>D6，带不带标记都一样}
+    MARK -->|否| ASIDE2[不参选 以主库运行则先停库<br/>等 leader 后跟随]
+    MARK -->|是| STALE{观测为主且非最健康?}
     STALE -->|是| STOPSTALE[停库 下次以备库启动]
     STALE -->|否| FAILOVER{有 failover key 指定 candidate?}
     FAILOVER -->|是 我是candidate| ACQUIRE[尝试获取 leader lock]
-    FAILOVER -->|是 我不是| DEFER[让步给 candidate<br/>candidate 带标记且不能参选时按无 candidate 处理]
-    FAILOVER -->|否| HEALTH{is_healthiest_node?<br/>先比 timeline 再比 LSN<br/>不计入不能参选的带标记 peer<br/>也不计入 switchover 点名退位的旧主}
+    FAILOVER -->|是 我不是| DEFER[让步给 candidate<br/>candidate 不能参选时按无 candidate 处理]
+    FAILOVER -->|否| HEALTH{is_healthiest_node?<br/>只比 LSN（候选都在最新 timeline 上）<br/>不计入不能参选的 peer<br/>也不计入 switchover 点名退位的旧主}
     HEALTH -->|是| ACQUIRE
     HEALTH -->|否| WAIT[等待选举结果]
-    ACQUIRE -->|成功| PROMOTE[ManagedStandby: promote 前写 /timeline<br/>pg_ctl promote<br/>重新观测确认后记为主]
+    ACQUIRE -->|成功| PROMOTE[ManagedStandby: 自检本地最新 history 是最新 timeline<br/>promote 前 CAS 写 /timeline pending<br/>pg_ctl promote<br/>重新观测确认后写实际身份]
     ACQUIRE -->|失败| WAIT
 ```
 
-带 rewind 检查标记的节点能否参选、`/timeline` 的写入时机见 [invariants.md](invariants.md) 1a「集群 timeline 记录」。
+参选资格、`/timeline` 的格式与写入时机、历史代与运维强制参选见 [invariants.md](invariants.md) 1a「D6」。
 
 ## Failover + Rejoin 完整流程
 
@@ -94,10 +96,10 @@ sequenceDiagram
     R1->>R1: is_healthiest_node() = true
     R1->>DCS: attempt_to_acquire_leader()
     DCS-->>R1: OK (获取成功)
-    R1->>DCS: /timeline = tl+1 (promote 前, 写不成不 promote)
+    R1->>DCS: /timeline 写 pending (promote 前 CAS, 写不成不 promote)
     R1->>R1: pg_ctl promote
     R1->>R1: 重新观测 pg_is_in_recovery() = f
-    R1->>DCS: /timeline = 实际 timeline
+    R1->>DCS: /timeline = 实际身份 {timeline, begin} (CAS, 清除 pending)
     Note over R1: 成为新 Primary
 
     R2->>DCS: get_cluster() → leader=node2
@@ -227,10 +229,10 @@ flowchart LR
 /service/{scope}/
 ├── leader          → "node1"              (TTL=15s, CAS 原子操作)
 ├── members/
-│   ├── node1       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check}  (TTL)
-│   ├── node2       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check}  (TTL)
-│   └── node3       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check}  (TTL)
-├── timeline        → "3"                  (无 TTL, 单调不减, 持锁主写)
+│   ├── node1       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
+│   ├── node2       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
+│   └── node3       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
+├── timeline        → {timeline, begin, primary, generation, pending?}  (无 TTL, CAS, 持锁节点写; 见 invariants D6)
 ├── initialize      → "system_id"          (原子创建, 初始化竞争)
 ├── config          → {loop_wait, ttl, synchronous_mode, postgresql: {...}}
 ├── failover        → {leader, candidate}  (switchover 请求)

@@ -466,6 +466,7 @@ mod tests {
             tags,
             version: None,
             rewind_check: false,
+            lineage: None,
         }
     }
 

@@ -3,7 +3,7 @@
 //! Implemented by pg-ha-dcs (Raft) but could also be implemented for etcd/consul/zk.
 
 use crate::Result;
-use crate::cluster::{Cluster, Leader};
+use crate::cluster::{Cluster, Leader, TimelineRecord};
 
 /// Abstract DCS interface.
 ///
@@ -41,10 +41,16 @@ pub trait DcsAdapter: Send + Sync {
     /// Read the dynamic configuration value from the DCS /config key.
     /// Returns None if the key does not exist.
     async fn get_config_value(&self) -> Result<Option<String>>;
-    /// Raise the persistent `/timeline` key to `timeline` (no TTL). Never lowers
-    /// it: Ok(false) when the stored value is already >= `timeline`, Ok(true)
-    /// when written. Read it through `get_cluster().timeline`.
-    async fn set_cluster_timeline(&self, timeline: u64) -> Result<bool>;
+    /// D6: write the persistent `/timeline` key (no TTL) only if it still has
+    /// version `expected` (`None`: the key must not exist). Ok(true) when
+    /// written, Ok(false) when the key changed since it was read; the caller
+    /// re-reads it through `get_cluster().timeline` next cycle. Callers
+    /// decide what to write (`ha::lineage`); this never merges values.
+    async fn write_cluster_timeline(
+        &self,
+        record: &TimelineRecord,
+        expected: Option<u64>,
+    ) -> Result<bool>;
 
     /// Get the configured TTL
     fn ttl(&self) -> u64;

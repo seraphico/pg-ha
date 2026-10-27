@@ -29,6 +29,7 @@ mod follow;
 mod helpers;
 pub(crate) mod identity;
 mod lease;
+mod lineage;
 mod shutdown;
 
 use identity::{LeaderAction, PgIdentity};
@@ -115,14 +116,13 @@ pub struct Ha {
     /// instead of campaigning.
     stop_pending: bool,
 
-    /// D6: the `/timeline` value recorded before promoting in this lock term.
-    /// Retries after a failed promote reuse it; cleared when the lock is not
-    /// ours and after a confirmed promote.
-    promote_timeline_target: Option<u64>,
+    /// D6: the pending promote this node recorded in `/timeline` in this
+    /// lock term. Retries after a failed promote reuse it; cleared when the
+    /// lock is not ours and after the confirmed record is written.
+    promote_pending: Option<crate::cluster::PendingPromote>,
 
-    /// Last (`/timeline`, own timeline) pair warned about as "recorded ahead",
-    /// so the warning is not repeated every cycle.
-    timeline_ahead_warned: Option<(u64, u64)>,
+    /// Last D6 problem logged at ERROR, so it is not repeated every cycle.
+    timeline_problem_logged: Option<String>,
 
     /// D5: held after a pg_rewind failure (A11). The hold file
     /// (PGDATA/pg-ha.rewind_failed) is the source of truth; this flag covers
@@ -179,8 +179,8 @@ impl Ha {
             start_fail_count: 0,
             applied_sync_standby_names: None,
             stop_pending: false,
-            promote_timeline_target: None,
-            timeline_ahead_warned: None,
+            promote_pending: None,
+            timeline_problem_logged: None,
             rewind_hold: false,
             rewind_hold_persisted: false,
             rewind_hold_logged_at: None,
@@ -272,9 +272,9 @@ impl Ha {
                     .collect();
                 self.failsafe.update_members(failsafe_members);
 
-                // D6: the promote target belongs to one lock term.
+                // D6: the pending promote belongs to one lock term.
                 if !self.is_lock_owner() {
-                    self.promote_timeline_target = None;
+                    self.promote_pending = None;
                     // Another node (or nobody) holds the lock: no lease left
                     // to race; the follower / election paths fence a primary.
                     self.set_leader_lease(None);
@@ -476,35 +476,16 @@ impl Ha {
     /// `pg_ctl promote` succeeding is not enough to claim primary: the role
     /// becomes `Primary` only after `pg_is_in_recovery()` returns false.
     async fn promote_and_confirm(&mut self) -> CycleResult {
-        // D6: record the next timeline before promoting. One target per lock
-        // term: retries after a failed promote reuse it. If promote fails the
-        // key is only too high, which only makes marked nodes stricter; if
-        // the write fails, do not promote (the key must never be below the
-        // timeline of a promoted primary).
-        let target = match self.promote_timeline_target {
-            Some(t) => t,
-            None => {
-                let Some(t) = identity::planned_promote_timeline(
-                    self.own_published_timeline(),
-                    self.cluster.timeline,
-                ) else {
-                    error!(
-                        "Not promoting: cannot determine the timeline to record in DCS before promote"
-                    );
-                    return CycleResult::Error("not promoting: cluster timeline unknown".into());
-                };
-                self.promote_timeline_target = Some(t);
-                t
+        // D6 (I2): record a pending promote before promoting, so no other
+        // node campaigns on the base timeline while this one may be creating
+        // the next. If the write fails, do not promote.
+        let pending = match self.record_pending_promote().await {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Not promoting: {e}");
+                return CycleResult::Error(format!("not promoting: {e}"));
             }
         };
-        if let Err(e) = self.dcs.set_cluster_timeline(target).await {
-            error!(
-                "Not promoting: could not record cluster timeline {target} in DCS before promote: {e}"
-            );
-            return CycleResult::Error(format!(
-                "not promoting: could not record cluster timeline: {e}"
-            ));
-        }
 
         if self.lease_lost() {
             return self.fence_at_lease_check("pg_ctl promote").await;
@@ -530,10 +511,11 @@ impl Ha {
         }
 
         self.postgresql.set_role(MemberRole::Primary);
-        self.promote_timeline_target = None;
+        // D6: record the timeline PostgreSQL actually created. A failure is
+        // retried by the Hold path; the pending entry keeps others out
+        // meanwhile.
+        self.confirm_promote(&pending).await;
         let _ = self.touch_member().await;
-        // D6: after a confirmed promote, record the actual timeline.
-        self.record_cluster_timeline().await;
         self.enforce_synchronous_replication().await;
         info!("PostgreSQL promoted to primary and confirmed out of recovery");
         CycleResult::Leader(format!(
@@ -693,6 +675,8 @@ impl Ha {
                 // Only a server observed in recovery is a standby leader.
                 self.postgresql.set_role(MemberRole::StandbyLeader);
                 let _ = self.touch_member().await;
+                // D6: the remote's timeline this cluster follows is its latest.
+                self.record_standby_leader_timeline().await;
                 CycleResult::Leader(format!(
                     "no action. I am ({}), the standby leader replicating from {}:{}",
                     self.config.name, standby_config.host, standby_config.port
@@ -778,6 +762,11 @@ impl Ha {
             return CycleResult::Follower("postgres is not running (paused)".into());
         }
 
+        // D6 / 2A first: data of an older history generation is never
+        // started, followed or rewound (also not by D5 Rebuild).
+        if let Some(r) = self.enforce_generation().await {
+            return r;
+        }
         // D5: a node held after a pg_rewind failure is never started.
         if let Some(r) = self.enforce_rewind_hold().await {
             return r;
@@ -1117,7 +1106,9 @@ impl Ha {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::{Failover, Leader, Member, MemberRole, MemberState};
+    use crate::cluster::{
+        ClusterTimeline, Failover, Leader, Member, MemberRole, MemberState, TimelineRecord,
+    };
     use crate::commands::{CommandStatus, ManagementCommand};
     use crate::config::*;
     use crate::error::Result;
@@ -1135,10 +1126,10 @@ mod tests {
         /// When set, `delete_leader` returns Err and the lock stays.
         fail_delete_leader: std::sync::atomic::AtomicBool,
         /// The persistent /timeline key (D6).
-        timeline: Mutex<Option<u64>>,
-        /// Every set_cluster_timeline argument, including rejected ones.
-        timeline_writes: Mutex<Vec<u64>>,
-        /// When set, set_cluster_timeline returns Err.
+        timeline: Mutex<ClusterTimeline>,
+        /// Every write_cluster_timeline record, including rejected ones.
+        timeline_writes: Mutex<Vec<TimelineRecord>>,
+        /// When set, write_cluster_timeline returns Err.
         fail_timeline_writes: std::sync::atomic::AtomicBool,
         /// The last data passed to touch_member.
         last_member_data: Mutex<Option<serde_json::Value>>,
@@ -1161,7 +1152,7 @@ mod tests {
                 last_failover_value: Mutex::new(None),
                 fail_leader_writes: std::sync::atomic::AtomicBool::new(false),
                 fail_delete_leader: std::sync::atomic::AtomicBool::new(false),
-                timeline: Mutex::new(None),
+                timeline: Mutex::new(ClusterTimeline::Absent),
                 timeline_writes: Mutex::new(Vec::new()),
                 fail_timeline_writes: std::sync::atomic::AtomicBool::new(false),
                 last_member_data: Mutex::new(None),
@@ -1174,6 +1165,7 @@ mod tests {
 
         fn with_leader(name: &str) -> Self {
             let cluster = Cluster {
+                timeline: rec(1),
                 leader: Some(Leader {
                     name: name.to_string(),
                     version: 1,
@@ -1186,7 +1178,7 @@ mod tests {
                 last_failover_value: Mutex::new(None),
                 fail_leader_writes: std::sync::atomic::AtomicBool::new(false),
                 fail_delete_leader: std::sync::atomic::AtomicBool::new(false),
-                timeline: Mutex::new(None),
+                timeline: Mutex::new(ClusterTimeline::Absent),
                 timeline_writes: Mutex::new(Vec::new()),
                 fail_timeline_writes: std::sync::atomic::AtomicBool::new(false),
                 last_member_data: Mutex::new(None),
@@ -1202,15 +1194,18 @@ mod tests {
         }
 
         fn with_timeline(self, timeline: u64) -> Self {
-            *self.timeline.lock().unwrap() = Some(timeline);
+            *self.timeline.lock().unwrap() = ClusterTimeline::Record {
+                record: test_record(timeline),
+                version: 1,
+            };
             self
         }
 
-        fn timeline_value(&self) -> Option<u64> {
-            *self.timeline.lock().unwrap()
+        fn timeline_value(&self) -> ClusterTimeline {
+            self.timeline.lock().unwrap().clone()
         }
 
-        fn timeline_writes(&self) -> Vec<u64> {
+        fn timeline_writes(&self) -> Vec<TimelineRecord> {
             self.timeline_writes.lock().unwrap().clone()
         }
 
@@ -1338,8 +1333,12 @@ mod tests {
             Ok(None)
         }
 
-        async fn set_cluster_timeline(&self, timeline: u64) -> Result<bool> {
-            self.timeline_writes.lock().unwrap().push(timeline);
+        async fn write_cluster_timeline(
+            &self,
+            record: &TimelineRecord,
+            expected: Option<u64>,
+        ) -> Result<bool> {
+            self.timeline_writes.lock().unwrap().push(record.clone());
             if self
                 .fail_timeline_writes
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -1349,10 +1348,14 @@ mod tests {
                 ));
             }
             let mut stored = self.timeline.lock().unwrap();
-            if stored.is_some_and(|k| k >= timeline) {
+            if stored.version() != expected {
                 return Ok(false);
             }
-            *stored = Some(timeline);
+            let version = stored.version().unwrap_or(0) + 1;
+            *stored = ClusterTimeline::Record {
+                record: record.clone(),
+                version,
+            };
             Ok(true)
         }
 
@@ -1462,6 +1465,7 @@ mod tests {
         let dcs = Arc::new(MockDcs::new());
         // Set cluster with node1 having higher WAL
         dcs.set_cluster(Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![
                 Member {
@@ -1475,6 +1479,7 @@ mod tests {
                     tags: Default::default(),
                     version: None,
                     rewind_check: false,
+                    lineage: Some(test_lineage(1)),
                 },
                 Member {
                     name: "node2".to_string(),
@@ -1487,6 +1492,7 @@ mod tests {
                     tags: Default::default(),
                     version: None,
                     rewind_check: false,
+                    lineage: Some(test_lineage(1)),
                 },
             ],
             ..Default::default()
@@ -1505,6 +1511,7 @@ mod tests {
         config.tags.failover_priority = 1;
         let dcs = Arc::new(MockDcs::new());
         dcs.set_cluster(Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![
                 Member {
@@ -1518,6 +1525,7 @@ mod tests {
                     tags: HashMap::from([("failover_priority".to_string(), serde_json::json!(10))]),
                     version: None,
                     rewind_check: false,
+                    lineage: Some(test_lineage(1)),
                 },
                 Member {
                     name: "node2".to_string(),
@@ -1530,6 +1538,7 @@ mod tests {
                     tags: Default::default(),
                     version: None,
                     rewind_check: false,
+                    lineage: Some(test_lineage(1)),
                 },
             ],
             ..Default::default()
@@ -1547,6 +1556,7 @@ mod tests {
         let config = test_config("node2");
         let dcs = Arc::new(MockDcs::new());
         dcs.set_cluster(Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![
                 Member {
@@ -1560,6 +1570,7 @@ mod tests {
                     tags: HashMap::from([("nofailover".to_string(), serde_json::json!(true))]),
                     version: None,
                     rewind_check: false,
+                    lineage: Some(test_lineage(1)),
                 },
                 Member {
                     name: "node2".to_string(),
@@ -1572,6 +1583,7 @@ mod tests {
                     tags: Default::default(),
                     version: None,
                     rewind_check: false,
+                    lineage: Some(test_lineage(1)),
                 },
             ],
             ..Default::default()
@@ -1611,18 +1623,87 @@ mod tests {
             tags: Default::default(),
             version: None,
             rewind_check: false,
+            lineage: Some(test_lineage(1)),
+        }
+    }
+
+    /// Begin LSN the tests give timeline `t`.
+    fn tl_begin(t: u64) -> u64 {
+        if t <= 1 { 0 } else { t * 0x1000 }
+    }
+
+    fn test_record(t: u64) -> TimelineRecord {
+        TimelineRecord {
+            timeline: t,
+            begin: tl_begin(t),
+            primary: String::new(),
+            generation: 0,
+            pending: None,
+        }
+    }
+
+    fn rec(t: u64) -> ClusterTimeline {
+        ClusterTimeline::Record {
+            record: test_record(t),
+            version: 1,
+        }
+    }
+
+    /// Make timeline `t` the newest history in `dir`, with WAL on it.
+    fn put_history(dir: &std::path::Path, t: u64) {
+        let wal = dir.join("pg_wal");
+        std::fs::create_dir_all(&wal).unwrap();
+        if t > 1 {
+            let b = tl_begin(t);
+            std::fs::write(
+                wal.join(format!("{t:08X}.history")),
+                format!(
+                    "{}\t{:X}/{:X}\tno recovery target specified\n",
+                    t - 1,
+                    b >> 32,
+                    b & 0xFFFF_FFFF
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(wal.join(format!("{t:08X}0000000000000001")), "").unwrap();
+    }
+
+    /// The server run `with_fake_running_pg` writes into postmaster.pid.
+    fn fake_run() -> String {
+        format!("pid={} start=1793000000", std::process::id())
+    }
+
+    /// Evidence of a member on timeline `t` with WAL on it.
+    fn test_lineage(t: u64) -> crate::cluster::Lineage {
+        crate::cluster::Lineage {
+            timeline_begin: Some(tl_begin(t)),
+            history: Some(crate::cluster::HistoryEvidence {
+                timeline: t,
+                begin: tl_begin(t),
+                wal: true,
+            }),
+            postmaster_start: Some("run".into()),
+            generation: 0,
         }
     }
 
     fn with_fake_running_pg(config: &Config, label: &str) -> (Postgresql, PathBuf) {
         let data_dir =
             std::env::temp_dir().join(format!("pg-ha-test-{label}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&data_dir);
+        let _ = std::fs::create_dir_all(data_dir.join("pg_wal"));
+        // postmaster.pid lines 1 and 3: PID (this process, so it is alive)
+        // and start time; pg_wal holds one timeline-1 segment (D6 evidence).
         std::fs::write(
             data_dir.join("postmaster.pid"),
-            format!("{}\n", std::process::id()),
+            format!(
+                "{}\n{}\n1793000000\n5432\n",
+                std::process::id(),
+                data_dir.display()
+            ),
         )
         .unwrap();
+        std::fs::write(data_dir.join("pg_wal").join("000000010000000000000001"), "").unwrap();
         let mut pg_config = config.postgresql.clone();
         pg_config.data_dir = data_dir.clone();
         (Postgresql::new(pg_config), data_dir)
@@ -1640,6 +1721,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![running_member("node2", 1000)],
             sync_state: None,
@@ -1662,6 +1744,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![running_member("node2", 1000)],
             sync_state: Some(SyncState {
@@ -1688,6 +1771,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![
                 running_member("node2", 1000),
@@ -1717,6 +1801,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![
                 running_member("node2", 1000), // listed, lower WAL
@@ -1747,6 +1832,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![
                 running_member("node2", 1000), // self, lower WAL
@@ -1777,6 +1863,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![running_member("node2", 1000), running_member("node3", 9999)],
             sync_state: Some(SyncState {
@@ -1904,6 +1991,7 @@ mod tests {
 
     fn leader_cluster(leader: &str, other: &str) -> Cluster {
         Cluster {
+            timeline: rec(1),
             leader: Some(Leader {
                 name: leader.to_string(),
                 version: 1,
@@ -2078,6 +2166,7 @@ mod tests {
         );
         // Only member, so it would be the healthiest node.
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![running_member("test_node", 100)],
             ..Default::default()
@@ -2099,6 +2188,7 @@ mod tests {
         let dcs = Arc::new(MockDcs::new());
         let (mut ha, dir) = identity_test_ha("test_node", "id-elect-wait", dcs.clone(), None, true);
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![running_member("test_node", 100)],
             ..Default::default()
@@ -2297,6 +2387,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: Some(Leader {
                 name: "node1".into(),
                 version: 1,
@@ -2345,6 +2436,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
+            timeline: rec(1),
             members: vec![running_member("node2", 1000), running_member("node3", 1000)],
             sync_state: Some(SyncState {
                 leader: "node1".into(),
@@ -2386,6 +2478,7 @@ mod tests {
             ..Default::default()
         });
         ha.cluster = Cluster {
+            timeline: rec(1),
             members: vec![running_member("node2", 1000), running_member("node3", 1000)],
             sync_state: Some(SyncState {
                 leader: "node1".into(),
@@ -2652,6 +2745,7 @@ mod tests {
         ha.is_leader = true;
         ha.applied_sync_standby_names = applied_sync();
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: Some(Leader {
                 name: "node1".into(),
                 version: 1,
@@ -2755,6 +2849,7 @@ mod tests {
     fn cluster_led_by(leader: &str, conn_url: Option<&str>, other: &str) -> Cluster {
         let url = conn_url.map_or_else(|| format!("host={leader} port=5432"), str::to_string);
         Cluster {
+            timeline: rec(1),
             leader: Some(Leader {
                 name: leader.to_string(),
                 version: 1,
@@ -3056,6 +3151,7 @@ mod tests {
         let (mut ha, dir) =
             identity_test_ha("test_node", "r19-promote", dcs.clone(), Some(true), true);
         preset_auto_conf(&dir, "old");
+        put_history(&dir, 2);
         ha.cluster = self_led(Some(2), Some(2));
 
         let result = ha.process_healthy_cluster().await;
@@ -3319,6 +3415,7 @@ mod tests {
         // No leader at all: fenced at the election entry, no campaign.
         *dcs.leader_held_by.lock().unwrap() = None;
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![running_member("test_node", 1)],
             ..Default::default()
@@ -3346,6 +3443,7 @@ mod tests {
         ha.stop_pending = true;
         // Only member: it would be the healthiest node.
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: None,
             members: vec![running_member("test_node", 1)],
             ..Default::default()
@@ -4273,6 +4371,7 @@ mod tests {
     fn member_with_tl(name: &str, wal: u64, tl: u64) -> Member {
         Member {
             timeline: Some(tl),
+            lineage: Some(test_lineage(tl)),
             ..running_member(name, wal)
         }
     }
@@ -4292,7 +4391,7 @@ mod tests {
         Cluster {
             leader: None,
             members,
-            timeline,
+            timeline: timeline.map_or(ClusterTimeline::Absent, rec),
             ..Default::default()
         }
     }
@@ -4306,9 +4405,10 @@ mod tests {
             }),
             members: vec![Member {
                 timeline: tl,
+                lineage: tl.map(test_lineage),
                 ..running_member("test_node", 100)
             }],
-            timeline: recorded,
+            timeline: recorded.map_or(ClusterTimeline::Absent, rec),
             ..Default::default()
         }
     }
@@ -4336,7 +4436,7 @@ mod tests {
         let result = ha.process_unhealthy_cluster().await;
 
         assert!(
-            follower_msg(&result).contains("behind the cluster timeline 3"),
+            follower_msg(&result).contains("is not shown to be the latest timeline 3"),
             "got: {result}"
         );
         assert_eq!(lock_held_by(&dcs), None);
@@ -4360,7 +4460,7 @@ mod tests {
         let result = ha.process_unhealthy_cluster().await;
 
         assert!(
-            follower_msg(&result).contains("behind the cluster timeline 3"),
+            follower_msg(&result).contains("is not shown to be the latest timeline 3"),
             "got: {result}"
         );
         assert_eq!(
@@ -4379,22 +4479,28 @@ mod tests {
         let (mut ha, dir) =
             identity_test_ha("test_node", "c4-marked-at", dcs.clone(), Some(true), true);
         write_marker(&dir);
+        put_history(&dir, 3);
         ha.cluster = unlocked(vec![member_with_tl("test_node", 100, 3)], Some(3));
+        ha.cluster.timeline = dcs.timeline_value();
 
         let result = ha.process_unhealthy_cluster().await;
 
-        // Won the lock, recorded max(3, 3) + 1 before promote; no pg_ctl.
+        // Won the lock (a marker does not matter on the latest timeline) and
+        // recorded a pending promote on base 3 before promote; no pg_ctl.
         assert!(
             matches!(result, CycleResult::Error(ref m) if m.starts_with("Promote failed")),
             "got: {result}"
         );
         assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
-        assert_eq!(dcs.timeline_writes(), [4]);
+        let writes = dcs.timeline_writes();
+        assert_eq!(writes.len(), 1);
+        let p = writes[0].pending.as_ref().expect("pending promote");
+        assert_eq!((p.node.as_str(), p.base_timeline), ("test_node", 3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn test_unmarked_standby_behind_timeline_still_takes_part() {
+    async fn test_unmarked_standby_behind_timeline_stands_aside() {
         let dcs = Arc::new(MockDcs::new().with_timeline(3));
         let (mut ha, dir) = identity_test_ha(
             "test_node",
@@ -4405,16 +4511,25 @@ mod tests {
         );
         ha.cluster = unlocked(vec![member_with_tl("test_node", 100, 1)], Some(3));
 
-        let _ = ha.process_unhealthy_cluster().await;
+        let result = ha.process_unhealthy_cluster().await;
 
-        assert!(ha.is_leader());
-        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        // I3: no marker, but behind: promoting would reuse timeline 2 and drop
+        // the newer history.
+        assert!(
+            follower_msg(&result).contains("timeline 1 is not shown to be the latest timeline 3"),
+            "got: {result}"
+        );
+        assert!(!ha.is_leader());
+        assert_eq!(lock_held_by(&dcs), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn test_marked_standby_without_key_compares_member_timelines() {
-        for (own, takes_part) in [(1, false), (2, true)] {
+        // Without a record the latest is inferred only when every node
+        // reported; then the highest history decides.
+        for (own, voters, takes_part) in [(1, Some(2), false), (2, Some(2), true), (2, None, false)]
+        {
             let dcs = Arc::new(MockDcs::new());
             let label = format!("c4-marked-nokey-{own}");
             let (mut ha, dir) =
@@ -4428,15 +4543,18 @@ mod tests {
                 ],
                 None,
             );
+            ha.cluster.dcs_voters = voters;
 
             let result = ha.process_unhealthy_cluster().await;
 
             assert_eq!(ha.is_leader(), takes_part, "own {own}: {result}");
             if !takes_part {
-                assert!(
-                    follower_msg(&result).contains("timeline 1 is behind the cluster timeline 2"),
-                    "got: {result}"
-                );
+                let expected = if voters.is_some() {
+                    "timeline 1 is not shown to be the latest timeline 2"
+                } else {
+                    "the latest timeline is unknown"
+                };
+                assert!(follower_msg(&result).contains(expected), "got: {result}");
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -4456,6 +4574,7 @@ mod tests {
         ha.cluster = unlocked(
             vec![Member {
                 timeline: None,
+                lineage: None,
                 ..running_member("test_node", 100)
             }],
             Some(1),
@@ -4464,7 +4583,7 @@ mod tests {
         let result = ha.process_unhealthy_cluster().await;
 
         assert!(
-            follower_msg(&result).contains("own timeline not published yet"),
+            follower_msg(&result).contains("no timeline evidence published"),
             "got: {result}"
         );
         assert_eq!(lock_held_by(&dcs), None);
@@ -4488,13 +4607,13 @@ mod tests {
 
         assert!(
             matches!(result, CycleResult::Error(ref m)
-                if m.starts_with("stop failed for a marked, ineligible primary")),
+                if m.starts_with("stop failed for an ineligible primary")),
             "got: {result}"
         );
         assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
         assert!(dir.join("standby.signal").is_file(), "signal before stop");
         let m = marker(&dir).unwrap();
-        assert!(m.contains("marked node not eligible"), "{m}");
+        assert!(m.contains("not eligible for the election"), "{m}");
         assert!(ha.stop_pending);
         assert_eq!(lock_held_by(&dcs), None);
 
@@ -4526,7 +4645,10 @@ mod tests {
         let result = ha.process_unhealthy_cluster().await;
 
         let msg = follower_msg(&result);
-        assert!(msg.contains("behind the cluster timeline 3"), "{msg}");
+        assert!(
+            msg.contains("is not shown to be the latest timeline 3"),
+            "{msg}"
+        );
         assert!(msg.ends_with("; stopped PostgreSQL"), "{msg}");
         assert!(!ha.postgresql().is_running());
         assert!(!ha.stop_pending);
@@ -4536,27 +4658,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_promote_records_timeline_before_promote() {
+    async fn test_promote_records_pending_before_promote() {
         let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
         let (mut ha, dir) =
             identity_test_ha("test_node", "c4-promote-tl", dcs.clone(), Some(true), true);
+        put_history(&dir, 2);
         ha.cluster = self_led(Some(2), Some(2));
+        ha.cluster.timeline = dcs.timeline_value();
 
         let result = ha.process_healthy_cluster().await;
 
-        // Written before promote, and a failed promote does not lower it.
+        // Pending written before promote; a failed promote leaves it (it
+        // keeps other nodes out) and the confirmed timeline stays 2.
         assert!(
             matches!(result, CycleResult::Error(ref m) if m.starts_with("Promote failed")),
             "got: {result}"
         );
-        assert_eq!(dcs.timeline_writes(), [3]);
-        assert_eq!(dcs.timeline_value(), Some(3));
-        assert_eq!(ha.promote_timeline_target, Some(3));
+        let stored = dcs.timeline_value();
+        let r = stored.record().expect("record");
+        assert_eq!(r.id(), test_record(2).id());
+        let p = r.pending.as_ref().expect("pending");
+        assert_eq!(
+            (p.node.as_str(), p.base_timeline, p.base_begin),
+            ("test_node", 2, tl_begin(2))
+        );
+        assert_eq!(p.postmaster_start, Some(fake_run()));
+        assert_eq!(ha.promote_pending.as_ref(), Some(p));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn test_promote_retry_does_not_raise_timeline_again() {
+    async fn test_promote_retry_reuses_the_pending_entry() {
         let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
         let (mut ha, dir) = identity_test_ha(
             "test_node",
@@ -4565,11 +4697,12 @@ mod tests {
             Some(true),
             true,
         );
+        put_history(&dir, 2);
         ha.cluster = self_led(Some(2), Some(2));
+        ha.cluster.timeline = dcs.timeline_value();
 
         let _ = ha.process_healthy_cluster().await;
-        // Next cycle reads the value written by the first attempt.
-        ha.cluster.timeline = Some(3);
+        ha.cluster.timeline = dcs.timeline_value();
         ha.postgresql.set_observed_in_recovery(Some(true));
         let result = ha.process_healthy_cluster().await;
 
@@ -4577,8 +4710,7 @@ mod tests {
             matches!(result, CycleResult::Error(ref m) if m.starts_with("Promote failed")),
             "got: {result}"
         );
-        assert_eq!(dcs.timeline_writes(), [3, 3]);
-        assert_eq!(dcs.timeline_value(), Some(3));
+        assert_eq!(dcs.timeline_writes().len(), 1, "written once per lock term");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4593,13 +4725,15 @@ mod tests {
             Some(true),
             true,
         );
+        put_history(&dir, 2);
         ha.cluster = self_led(Some(2), Some(2));
+        ha.cluster.timeline = dcs.timeline_value();
 
         let result = ha.process_healthy_cluster().await;
 
         assert!(
             matches!(result, CycleResult::Error(ref m)
-                if m.starts_with("not promoting: could not record cluster timeline")),
+                if m.starts_with("not promoting: could not record the pending promote")),
             "got: {result}"
         );
         assert_eq!(
@@ -4607,7 +4741,31 @@ mod tests {
             Some(true),
             "promote not called"
         );
-        assert_eq!(dcs.timeline_value(), Some(2));
+        assert_eq!(dcs.timeline_value(), rec(2));
+        assert_eq!(ha.promote_pending, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_promote_not_attempted_when_the_record_changed() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "c4-promote-cas", dcs.clone(), Some(true), true);
+        put_history(&dir, 2);
+        ha.cluster = self_led(Some(2), Some(2));
+        // The cycle's view has an older version than the store.
+        ha.cluster.timeline = ClusterTimeline::Record {
+            record: test_record(2),
+            version: 0,
+        };
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("/timeline changed")),
+            "got: {result}"
+        );
+        assert_eq!(ha.postgresql().observed_in_recovery(), Some(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4627,7 +4785,35 @@ mod tests {
 
         assert!(
             matches!(result, CycleResult::Error(ref m)
-                if m == "not promoting: cluster timeline unknown"),
+                if m.starts_with("not promoting: the latest timeline is unknown")),
+            "got: {result}"
+        );
+        assert!(dcs.timeline_writes().is_empty());
+        assert_eq!(ha.postgresql().observed_in_recovery(), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_promote_refused_when_local_history_is_not_the_latest() {
+        // I1: this node's newest history is 2 but the record says 3; PG would
+        // name the new timeline 3 again.
+        let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(3));
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "c4-promote-behind",
+            dcs.clone(),
+            Some(true),
+            true,
+        );
+        put_history(&dir, 2);
+        ha.cluster = self_led(Some(3), Some(3));
+        ha.cluster.timeline = dcs.timeline_value();
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m)
+                if m.contains("promoting would reuse a timeline number")),
             "got: {result}"
         );
         assert!(dcs.timeline_writes().is_empty());
@@ -4656,34 +4842,291 @@ mod tests {
 
         let _ = ha.run_cycle().await;
 
-        assert_eq!(ha.cluster().timeline, Some(5));
+        assert_eq!(ha.cluster().timeline, rec(5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn some_pending() -> crate::cluster::PendingPromote {
+        crate::cluster::PendingPromote {
+            node: "test_node".into(),
+            base_timeline: 9,
+            base_begin: tl_begin(9),
+            generation: 0,
+            postmaster_start: None,
+        }
+    }
+
     #[tokio::test]
-    async fn test_promote_target_cleared_when_lock_lost() {
+    async fn test_promote_pending_cleared_when_lock_lost() {
         let dcs = Arc::new(MockDcs::with_leader("node1"));
         let (mut ha, dir) =
             identity_test_ha("test_node", "c4-target-cleared", dcs, Some(true), true);
-        ha.promote_timeline_target = Some(9);
+        ha.promote_pending = Some(some_pending());
 
         let _ = ha.run_cycle().await;
 
-        assert_eq!(ha.promote_timeline_target, None);
+        assert_eq!(ha.promote_pending, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn test_promote_target_kept_while_holding_the_lock() {
+    async fn test_promote_pending_kept_while_holding_the_lock() {
         let dcs = Arc::new(MockDcs::with_leader("test_node"));
         let (mut ha, dir) =
             identity_test_ha("test_node", "c4-target-kept", dcs.clone(), Some(true), true);
-        ha.promote_timeline_target = Some(9);
+        ha.promote_pending = Some(some_pending());
 
         let _ = ha.run_cycle().await;
 
-        // run_cycle observes again (port 1: unobserved → Wait), target kept.
-        assert_eq!(ha.promote_timeline_target, Some(9));
+        // run_cycle observes again (port 1: unobserved → Wait), pending kept.
+        assert_eq!(ha.promote_pending, Some(some_pending()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn generation_record(t: u64, generation: u64) -> ClusterTimeline {
+        ClusterTimeline::Record {
+            record: TimelineRecord {
+                generation,
+                ..test_record(t)
+            },
+            version: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_older_generation_node_is_stopped_and_never_campaigns() {
+        // 2A: an override moved the cluster to generation 1; this node's
+        // data (no pg-ha.generation file = 0) must be cloned again.
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "test_node",
+            "d6-old-generation",
+            dcs.clone(),
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::PgCtlStopOk)),
+        );
+        ha.cluster = unlocked(vec![member_with_tl("test_node", 100, 3)], None);
+        ha.cluster.timeline = generation_record(3, 1);
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            is_error_starting(&result, "data of an older history generation"),
+            "{result}"
+        );
+        assert!(!ha.postgresql().is_running(), "stopped");
+        assert_eq!(lock_held_by(&dcs), None);
+        let logged = ha.timeline_problem_logged.clone().unwrap_or_default();
+        assert!(logged.contains("POST /reinitialize"), "{logged}");
+
+        // The same check guards following and starting.
+        crate::timeline_files::write_generation(&dir, 1).unwrap();
+        assert!(
+            ha.enforce_generation().await.is_none(),
+            "current generation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_restart_refused_for_older_generation_data() {
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "test_node",
+            "d6-old-generation-restart",
+            dcs.clone(),
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::PgCtlStopOk)),
+        );
+        ha.cluster = leader_cluster("node1", "test_node");
+        ha.cluster.timeline = generation_record(1, 1);
+
+        let resp = send_cmd(&mut ha, &tx, ManagementCommand::Restart).await;
+
+        assert_eq!(resp.status, CommandStatus::Rejected);
+        assert!(
+            resp.message.contains("older history generation"),
+            "{}",
+            resp.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_override_pending_keeps_old_generation_nodes_stopped() {
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "test_node",
+            "d6-override-in-progress",
+            dcs.clone(),
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::PgCtlStopOk)),
+        );
+        let pending = crate::cluster::PendingPromote {
+            node: "node9".into(),
+            base_timeline: 1,
+            base_begin: 0,
+            generation: 1,
+            postmaster_start: Some("run".into()),
+        };
+        ha.cluster = unlocked(vec![member_with_tl("test_node", 100, 3)], None);
+        ha.cluster.timeline = ClusterTimeline::Record {
+            record: TimelineRecord {
+                pending: Some(pending),
+                ..test_record(3)
+            },
+            version: 1,
+        };
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            is_error_starting(&result, "data of an older history generation"),
+            "{result}"
+        );
+        assert!(!ha.postgresql().is_running());
+        let logged = ha.timeline_problem_logged.clone().unwrap_or_default();
+        assert!(logged.contains("operator override is moving"), "{logged}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_override_is_ignored_while_another_node_may_campaign() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "d6-override-ignored",
+            dcs.clone(),
+            Some(true),
+            true,
+        );
+        std::fs::write(
+            dir.join(crate::timeline_files::ACCEPT_TIMELINE_LOSS_FILE),
+            "",
+        )
+        .unwrap();
+        ha.cluster = unlocked(
+            vec![
+                member_with_tl("test_node", 900, 1),
+                member_with_tl("node2", 100, 3),
+            ],
+            Some(3),
+        );
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            follower_msg(&result).contains("timeline 1 is not shown to be the latest timeline 3"),
+            "{result}"
+        );
+        assert_eq!(lock_held_by(&dcs), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_override_campaigns_and_records_a_new_generation_pending() {
+        // Nobody is on the latest timeline 3 (its holders are gone): the
+        // operator's file lets this behind node take over in generation 1.
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "d6-override", dcs.clone(), Some(true), true);
+        std::fs::write(
+            dir.join(crate::timeline_files::ACCEPT_TIMELINE_LOSS_FILE),
+            "",
+        )
+        .unwrap();
+        ha.cluster = unlocked(vec![member_with_tl("test_node", 900, 1)], Some(3));
+        ha.cluster.timeline = dcs.timeline_value();
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        // Lock taken, pending written, then no pg_ctl in the test.
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.starts_with("Promote failed")),
+            "{result}"
+        );
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        let stored = dcs.timeline_value();
+        let r = stored.record().unwrap();
+        assert_eq!(
+            (r.timeline, r.generation),
+            (3, 0),
+            "confirmed part unchanged"
+        );
+        let p = r.pending.as_ref().unwrap();
+        assert_eq!((p.base_timeline, p.generation), (1, 1));
+        assert!(
+            dir.join(crate::timeline_files::ACCEPT_TIMELINE_LOSS_FILE)
+                .exists(),
+            "kept until the override is recorded"
+        );
+        assert_eq!(crate::timeline_files::read_generation(&dir), Ok(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_key_elects_on_the_highest_history_once_every_node_reported() {
+        // The 2026-10-26 docker cluster: legacy key 17, real histories 14/13.
+        let dcs = Arc::new(MockDcs::new());
+        *dcs.timeline.lock().unwrap() = ClusterTimeline::Legacy {
+            value: 17,
+            version: 7,
+        };
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "d6-legacy", dcs.clone(), Some(true), true);
+        write_marker(&dir);
+        put_history(&dir, 14);
+        ha.cluster = unlocked(
+            vec![
+                member_with_tl("test_node", 100, 14),
+                member_with_tl("node2", 900, 13),
+            ],
+            None,
+        );
+        ha.cluster.timeline = dcs.timeline_value();
+        ha.cluster.dcs_voters = Some(2);
+
+        let _ = ha.process_unhealthy_cluster().await;
+
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        let stored = dcs.timeline_value();
+        let r = stored.record().expect("legacy value replaced by a record");
+        assert_eq!(r.id(), test_record(14).id());
+        assert_eq!(r.pending.as_ref().map(|p| p.base_timeline), Some(14));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_touch_member_publishes_lineage() {
+        let dcs = Arc::new(MockDcs::new());
+        let (ha, dir) = identity_test_ha(
+            "test_node",
+            "d6-touch-lineage",
+            dcs.clone(),
+            Some(true),
+            true,
+        );
+        put_history(&dir, 3);
+        crate::timeline_files::write_generation(&dir, 2).unwrap();
+
+        ha.touch_member().await.unwrap();
+
+        let data = dcs.last_member_data.lock().unwrap().clone().unwrap();
+        let lineage: crate::cluster::Lineage =
+            serde_json::from_value(data["lineage"].clone()).unwrap();
+        assert_eq!(
+            lineage.history,
+            Some(crate::cluster::HistoryEvidence {
+                timeline: 3,
+                begin: tl_begin(3),
+                wal: true
+            })
+        );
+        assert_eq!(lineage.generation, 2);
+        assert_eq!(lineage.postmaster_start, Some(fake_run()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4949,7 +5392,7 @@ mod tests {
     fn candidate_cluster(candidate: Member) -> Cluster {
         Cluster {
             leader: None,
-            timeline: Some(2),
+            timeline: rec(2),
             failover: Some(Failover {
                 leader: Some("node1".into()),
                 candidate: Some("node3".into()),
@@ -4993,19 +5436,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unmarked_candidate_is_still_honoured() {
+    async fn test_behind_candidate_is_ignored_even_without_a_marker() {
+        // I3: node3 is on timeline 1, the latest is 2. Deferring to it would
+        // leave the cluster without a primary; the election goes on without
+        // a designated candidate.
         let dcs = Arc::new(MockDcs::new().with_timeline(2));
         let (mut ha, dir) =
             identity_test_ha("node2", "c4-cand-unmarked", dcs.clone(), Some(true), true);
+        put_history(&dir, 2);
         ha.cluster = candidate_cluster(member_with_tl("node3", 900, 1));
 
-        let result = ha.process_unhealthy_cluster().await;
+        let _ = ha.process_unhealthy_cluster().await;
 
-        assert_eq!(
-            follower_msg(&result),
-            "deferring to designated candidate (node3)"
-        );
-        assert!(!ha.is_leader());
+        assert!(ha.is_leader());
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5015,7 +5459,7 @@ mod tests {
     fn nocandidate_switchover(former: Member, other: Member) -> Cluster {
         Cluster {
             leader: None,
-            timeline: Some(3),
+            timeline: rec(3),
             failover: Some(Failover {
                 leader: Some("node1".into()),
                 candidate: None,
@@ -5077,7 +5521,7 @@ mod tests {
         let (mut ha, dir) = identity_test_ha("node2", "so-a25-old", dcs.clone(), Some(true), true);
         ha.cluster = Cluster {
             leader: None,
-            timeline: Some(3),
+            timeline: rec(3),
             failover: Some(Failover {
                 leader: Some("node1".into()),
                 candidate: Some("node3".into()),
@@ -5108,7 +5552,7 @@ mod tests {
             identity_test_ha("node1", "fo-no-leader-field", dcs.clone(), Some(true), true);
         ha.cluster = Cluster {
             leader: None,
-            timeline: Some(3),
+            timeline: rec(3),
             failover: Some(Failover {
                 leader: None,
                 candidate: None,
@@ -5137,7 +5581,7 @@ mod tests {
             identity_test_ha("node3", "so-cand-wins", dcs.clone(), Some(true), true);
         ha.cluster = Cluster {
             leader: None,
-            timeline: Some(3),
+            timeline: rec(3),
             failover: Some(Failover {
                 leader: Some("node1".into()),
                 candidate: Some("node3".into()),
@@ -5201,6 +5645,7 @@ mod tests {
         let mut stopped = running_member("node2", 100);
         stopped.state = MemberState::Stopped;
         ha.cluster = Cluster {
+            timeline: rec(1),
             leader: Some(Leader {
                 name: "node1".into(),
                 version: 1,
@@ -5247,6 +5692,7 @@ mod tests {
         );
         ha.is_leader = true;
         ha.cluster = Cluster {
+            timeline: rec(1),
             members: vec![running_member("node1", 100), marked_member("node2", 100, 1)],
             ..leader_cluster("node1", "node2")
         };
@@ -5624,7 +6070,7 @@ mod tests {
         );
         ha.cluster = unlocked(
             vec![running_member("node2", 1), running_member("node1", 100)],
-            None,
+            Some(1),
         );
 
         let result = ha.process_unhealthy_cluster().await;
@@ -6290,7 +6736,7 @@ mod tests {
             "got: {result}"
         );
         assert_eq!(stop_modes(&dir), ["fast", "immediate", "fast"]);
-        assert_eq!(ha.promote_timeline_target, None, "no promote");
+        assert_eq!(ha.promote_pending, None, "no promote");
         assert!(ha.is_leader());
         assert!(ha.leader_lease.is_some(), "renewed");
         assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
@@ -6335,7 +6781,7 @@ mod tests {
         );
         assert_eq!(stop_modes(&dir), ["fast", "immediate", "immediate"]);
         assert!(!ha.is_leader());
-        assert_eq!(ha.promote_timeline_target, None, "no promote");
+        assert_eq!(ha.promote_pending, None, "no promote");
         assert!(!dir.join("standby.signal").exists(), "recovery untouched");
         assert_eq!(ha.continue_shutdown().await, ShutdownOutcome::KeepRunning);
 
@@ -6649,16 +7095,19 @@ mod tests {
         assert!(election_fence.contains("fence_primary("));
         assert!(!election_fence.contains(DIRECT_STOP), "election Fence");
 
-        // D6 / A20: a marked, ineligible primary is fenced, not stopped directly.
-        let marked_stop = section(
+        // D6 / A20: an ineligible primary is fenced, not stopped directly.
+        let ineligible_stop = section(
             election_rs,
-            "MarkedGateAction::StopThenStandAside =>",
+            "if identity == PgIdentity::Primary {",
             &["// ─── Stale primary detection"],
         );
-        assert!(marked_stop.contains("fence_primary("), "marked primary");
         assert!(
-            !marked_stop.contains(DIRECT_STOP),
-            "marked primary: direct stop"
+            ineligible_stop.contains("fence_primary("),
+            "ineligible primary"
+        );
+        assert!(
+            !ineligible_stop.contains(DIRECT_STOP),
+            "ineligible primary: direct stop"
         );
 
         let shutdown = body(helpers_rs, "async fn stop_observed_postgres_for_shutdown");
@@ -6753,6 +7202,7 @@ mod tests {
             ("election.rs", include_str!("election.rs"), 0),
             ("commands.rs", include_str!("commands.rs"), 2),
             ("helpers.rs", include_str!("helpers.rs"), 4),
+            ("lineage.rs", include_str!("lineage.rs"), 0),
             ("identity.rs", include_str!("identity.rs"), 0),
             ("shutdown.rs", include_str!("shutdown.rs"), 0),
         ];

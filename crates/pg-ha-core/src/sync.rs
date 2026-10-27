@@ -119,6 +119,7 @@ mod tests {
             tags,
             version: None,
             rewind_check: false,
+            lineage: None,
         }
     }
 
@@ -134,6 +135,7 @@ mod tests {
             tags: HashMap::from([("nosync".to_string(), serde_json::json!(true))]),
             version: None,
             rewind_check: false,
+            lineage: None,
         }
     }
 

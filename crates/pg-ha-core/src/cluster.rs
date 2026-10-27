@@ -33,10 +33,172 @@ pub struct Cluster {
     /// Cluster history (timeline changes)
     pub history: Vec<HistoryEntry>,
 
-    /// Highest timeline a lock-holding primary recorded in the DCS `/timeline`
-    /// key (no TTL, never decreases). None when the key does not exist.
+    /// The DCS `/timeline` key (D6): identity of the latest confirmed
+    /// timeline and any promote that may still be creating a newer one.
     #[serde(default)]
-    pub timeline: Option<u64>,
+    pub timeline: ClusterTimeline,
+
+    /// Number of Raft voters (pg-ha nodes), when the DCS knows it. Used only
+    /// to tell whether every node has published its timeline evidence.
+    #[serde(default)]
+    pub dcs_voters: Option<usize>,
+}
+
+/// D6: the DCS `/timeline` key as read, with the version for CAS writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClusterTimeline {
+    /// No key.
+    #[default]
+    Absent,
+    /// Pre-D6 format: a bare number, an upper bound that may exceed every
+    /// real timeline. Never trusted as an identity.
+    Legacy { value: u64, version: u64 },
+    /// Current format.
+    Record {
+        record: TimelineRecord,
+        version: u64,
+    },
+    /// Neither format parses. Treated like a missing key, but CAS writes
+    /// replace it by version.
+    Unreadable { version: u64 },
+}
+
+impl ClusterTimeline {
+    /// Parse the stored value. A bare number is the legacy format.
+    pub fn parse(value: &str, version: u64) -> Self {
+        let trimmed = value.trim();
+        if let Ok(value) = trimmed.parse::<u64>() {
+            return Self::Legacy { value, version };
+        }
+        match serde_json::from_str::<TimelineRecord>(trimmed) {
+            Ok(record) => Self::Record { record, version },
+            Err(_) => Self::Unreadable { version },
+        }
+    }
+
+    /// The current-format record, if any.
+    pub fn record(&self) -> Option<&TimelineRecord> {
+        match self {
+            Self::Record { record, .. } => Some(record),
+            _ => None,
+        }
+    }
+
+    /// Version of the stored key (None when absent), for CAS writes.
+    pub fn version(&self) -> Option<u64> {
+        match self {
+            Self::Absent => None,
+            Self::Legacy { version, .. }
+            | Self::Record { version, .. }
+            | Self::Unreadable { version } => Some(*version),
+        }
+    }
+
+    /// History generation the cluster is in (0 before any override).
+    pub fn generation(&self) -> u64 {
+        self.record().map_or(0, |r| r.generation)
+    }
+}
+
+/// A timeline identified by its number and the LSN where it began (the
+/// switchpoint in its history file; 0 for timeline 1). With pg-ha's
+/// invariants the number alone is unique; the begin LSN detects histories
+/// created outside them (older versions, manual promotes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TimelineId {
+    pub timeline: u64,
+    pub begin: u64,
+}
+
+/// D6 `/timeline` value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineRecord {
+    /// Latest confirmed timeline: the one the last confirmed primary wrote on.
+    pub timeline: u64,
+    pub begin: u64,
+    /// Node that confirmed it (informational).
+    #[serde(default)]
+    pub primary: String,
+    /// History generation. Raised only by an operator override that accepted
+    /// losing the newer history; data of an older generation must be cloned
+    /// again, never rewound.
+    #[serde(default)]
+    pub generation: u64,
+    /// A promote recorded before `pg_ctl promote` and not yet confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingPromote>,
+}
+
+impl TimelineRecord {
+    pub fn id(&self) -> TimelineId {
+        TimelineId {
+            timeline: self.timeline,
+            begin: self.begin,
+        }
+    }
+}
+
+/// A promote that may have created a timeline above `base`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPromote {
+    pub node: String,
+    pub base_timeline: u64,
+    pub base_begin: u64,
+    /// Generation the promote creates (record generation + 1 for an override).
+    pub generation: u64,
+    /// The promoter's server run (PID and start time from `postmaster.pid`)
+    /// when it wrote this. A later server run cannot still be finishing this
+    /// promote: the postmaster removes promote signal files at startup.
+    #[serde(default)]
+    pub postmaster_start: Option<String>,
+}
+
+impl PendingPromote {
+    pub fn base(&self) -> TimelineId {
+        TimelineId {
+            timeline: self.base_timeline,
+            begin: self.base_begin,
+        }
+    }
+}
+
+/// D6 evidence a member publishes about its timelines.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lineage {
+    /// Begin LSN of the member's published `timeline`, from its local
+    /// history file (0 for timeline 1). None when the file is missing.
+    #[serde(default)]
+    pub timeline_begin: Option<u64>,
+    /// Newest timeline history known on disk (`pg_wal/*.history`).
+    #[serde(default)]
+    pub history: Option<HistoryEvidence>,
+    /// Server run (PID and start time from `postmaster.pid`); None while
+    /// PostgreSQL is stopped.
+    #[serde(default)]
+    pub postmaster_start: Option<String>,
+    /// History generation of the data directory (`pg-ha.generation`;
+    /// missing file = 0).
+    #[serde(default)]
+    pub generation: u64,
+}
+
+/// Newest timeline history file in a data directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEvidence {
+    pub timeline: u64,
+    pub begin: u64,
+    /// A WAL segment named with this timeline exists: the node has WAL on
+    /// it, not only its history file.
+    pub wal: bool,
+}
+
+impl HistoryEvidence {
+    pub fn id(&self) -> TimelineId {
+        TimelineId {
+            timeline: self.timeline,
+            begin: self.begin,
+        }
+    }
 }
 
 impl Cluster {
@@ -130,6 +292,11 @@ pub struct Member {
     /// not publish it (older versions) count as unmarked.
     #[serde(default)]
     pub rewind_check: bool,
+
+    /// D6 timeline evidence. None from older versions: such a member cannot
+    /// prove it is on the latest timeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
 }
 
 impl Member {
@@ -377,6 +544,7 @@ mod tests {
             ]),
             version: None,
             rewind_check: false,
+            lineage: None,
         };
         assert!(member.is_nofailover());
         assert_eq!(member.failover_priority(), 0);
@@ -402,6 +570,7 @@ mod tests {
                     tags: HashMap::new(),
                     version: None,
                     rewind_check: false,
+                    lineage: None,
                 },
                 Member {
                     name: "node2".to_string(),
@@ -414,6 +583,7 @@ mod tests {
                     tags: HashMap::from([("clonefrom".to_string(), serde_json::json!(true))]),
                     version: None,
                     rewind_check: false,
+                    lineage: None,
                 },
             ],
             ..Default::default()

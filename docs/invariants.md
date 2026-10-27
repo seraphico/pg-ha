@@ -59,8 +59,8 @@
 
 | 身份 | 持锁 | 他人持锁 | 无主（选举） |
 |------|------|----------|--------------|
-| Primary | 保持主 | rejoin（S4）；leader 还没有以主库运行时先停库 | 参选（有 rewind 检查标记时同样受 `/timeline` 约束，不能参选时先停库）；非最健康则按陈旧主停库，下次以备库启动 |
-| ManagedStandby | promote，重新观测确认后才记为主 | 跟随；有 rewind 检查标记时先对 leader 跑 pg_rewind | 参选；有 rewind 检查标记时须 timeline ≥ `/timeline` |
+| Primary | 保持主 | rejoin（S4）；leader 还没有以主库运行时先停库 | 参选（须在最新 timeline 上，D6；不能参选时先停库）；非最健康则按陈旧主停库，下次以备库启动 |
+| ManagedStandby | promote，重新观测确认后才记为主 | 跟随；有 rewind 检查标记时先对 leader 跑 pg_rewind | 参选；须在最新 timeline 上（D6，带不带标记都一样） |
 | UnmanagedRecovery | 释放锁，交运维（pause 下保留锁，但不宣称主） | 交运维 | 不参选 |
 | Unknown | 本轮不动作，不宣称主 | 有 `standby.signal`：等待；无：停库围栏（L5）。降级停库失败后，直到确认已停，一律按围栏处理（即使有 `standby.signal`） | 本轮不参选；降级停库失败后先停库 |
 
@@ -104,7 +104,7 @@
 - 判定：单调时钟或墙钟任一到达截止时间，租约即到期。墙钟判定覆盖本节点墙钟被往回调、以及单调时钟在系统挂起时不计时的情况（DCS 的过期判断用的是墙钟）。
 - 检查点：`pg_ctl promote` 之前、报告 Hold（保持主）之前都检查租约，到期按失去锁处理：执行租约到期围栏，日志 ERROR `Leader lease expired before pg_ctl promote; fencing PostgreSQL (immediate stop)` 或 `Leader lease expired before reporting the leader role; fencing PostgreSQL (immediate stop)`。
 - 有界周期：每轮 HA 周期与租约截止时间赛跑（`Ha::run_cycle_bounded`，`src/main.rs` 只调用它）。截止时间先到时，丢弃本轮（被丢弃的 DCS 写可能迟到提交，见上文），执行上一小节的租约到期围栏。日志 ERROR `Leader lease expired before the lock renewal completed; fencing PostgreSQL (immediate stop) without waiting for the DCS`。两轮之间 HA 循环只等定时器（受下文参数约束限制）和 REST API 状态的写锁（API 处理函数只在本地读时持有它），不做其他无上限的 await：代理后端刷新要做没有超时的 DNS 解析，所以放在单独的任务里，HA 循环每轮只把成员列表交给它（`src/main.rs` 的 `refresh_proxy_backends`，测试 `test_ha_loop_awaits_nothing_unbounded_outside_the_bounded_cycle` 检查这一点）。优雅关停停不掉 PG 时进入的保持运行循环（`keep_running_until_stopped`）同样只等定时器、有界周期和 API 状态写锁，另外每轮调用 `Ha::continue_shutdown`，它只在确认 PG 已停之后才等一次 DCS 写（删锁）。
-- 时间界：旧主最后可写时刻 ≤ 锚点 + TTL − `safety_margin` + ε（ε 为定时器唤醒、写 signal 和标记并 fsync、发 SIGQUIT 的耗时，约 0.1 秒）；多数派最早在锚点 + TTL − δ 抢到锁（δ 为多数派墙钟比旧主快的量），之后还要 Raft 提交、写 `/timeline`、promote。所以只要 δ < `safety_margin` − ε 就不会重叠，与 DCS 调用是否返回无关。
+- 时间界：旧主最后可写时刻 ≤ 锚点 + TTL − `safety_margin` + ε（ε 为定时器唤醒、写 signal 和标记并 fsync、发 SIGQUIT 的耗时，约 0.1 秒）；多数派最早在锚点 + TTL − δ 抢到锁（δ 为多数派墙钟比旧主快的量），之后还要 Raft 提交、写 `/timeline` 的 pending、promote。所以只要 δ < `safety_margin` − ε 就不会重叠，与 DCS 调用是否返回无关。
 - 参数约束：`ttl ≥ loop_wait + retry_timeout + watchdog.safety_margin`，并且 `retry_timeout ≥ 1`。健康的主库要在租约内完成一轮 HA 周期加一次有界的续锁写。静态配置（包括环境变量覆盖后的值和 `bootstrap.dcs`）不满足时拒绝启动；`PATCH` / `PUT /config` 改动 `ttl`、`loop_wait` 或 `retry_timeout` 后不满足时返回 400，配置不写入。动态配置缺省的项按接收请求的节点的静态值计算。
 - 代价：PG 或 DCS 慢到一轮续锁来不及在租约内完成时（例如 docker 配置下 `pg_is_in_recovery()` 接近 5 秒的超时），健康的主库也会被围栏，集群多一次 failover。这是用可用性换 L5。
 - pause 下豁免：与 pause 下续锁失败保持主库一致（W1，pause 时其他节点不会自动抢锁），租约到期不围栏。
@@ -131,23 +131,53 @@
 - 节点在成员数据里发布 `rewind_check`（标记文件是否存在），供其他节点在选举和 switchover 中使用（见下一小节）。老版本节点不发布这个字段，按未带标记处理；滚动升级期间老节点仍可能让位给不会参选的新版本带标记节点。
 - **已知窗口（不在任务 3 修改，登记在第 9 节）**：带标记的备库在等待 rewind 检查期间（leader 未就绪、分区期间、恢复网络后 pg_rewind 之前）仍以只读备库运行，`/patroni` state 为 `running`，满足 `/replica` 200 的判定（H2）。经 RO 端口的只读客户端因此可能读到只存在于分叉历史上的数据，例如旧主失锁前接受、新主上没有的写入。
 
-#### 集群 timeline 记录（`/timeline`）与带标记节点的选举
+#### D6：timeline 身份、参选资格与历史代（`/timeline`）
 
-- key：`/<namespace>/<scope>/timeline`，值为十进制字符串（如 `"3"`），**无 TTL**。
-- 单调不减：写入用 CAS，只在新值大于当前值时写。
-- 写入者：只有持锁节点写。
-- 写入时机：
-  1. promote 之前写 `max(自身成员 timeline, 当前值) + 1`。同一个持锁任期内 promote 重试复用这个值，不再加 1。写不成就不 promote（返回错误，下一轮重试；DCS 写抖动会让 failover 推迟一轮）。
-  2. 确认 promote（观测不在 recovery）后写实际 timeline，取主库上的精确值（`pg_walfile_name(pg_current_wal_lsn())` 的前 8 位十六进制）。
-  3. Hold（持锁且为主）时，key 缺失或小于实际 timeline 则补写。
-  
-  key 可能因 promote 失败而高于实际 timeline（Hold 时 WARN `DCS /timeline (<k>) is higher than this primary's timeline (<tl>); a promote attempt recorded it in advance`，同一对值只打一次）。当选节点没跟上上一任主库的最新 timeline 时，key 同样会高于实际 timeline。偏高只会让带标记节点更严格，不会丢数据，但偏高之后不会回落，可能让集群永久无主（第 9 节「`/timeline` 偏移后带标记节点永远不能参选」）。
-- 选举规则：带 rewind 检查标记的节点，只有在**自身成员记录的 timeline ≥ `/timeline`** 时才参选；否则不参选，等看到 leader 后 rewind（INFO `Not taking part in the election: rewind-check marker present and this node's timeline <own> is behind the cluster timeline <cluster>; waiting for a leader to rewind against`）。key 不存在（升级来的集群）时改为与其他成员发布的 timeline 比较，并 WARN `No /timeline key in DCS; comparing this node's timeline with the timelines members published. The evidence is incomplete`。自身 timeline 还没发布时本轮不参选。
-- 成员记录的 timeline 是该成员发布的 `wal_position` 所在的 timeline（R2，同一个 WAL 点）。主库取 `pg_walfile_name(pg_current_wal_lsn())`，是精确值。副本在 WAL receiver 正在流复制、且其 `flushed_lsn` 不低于 replay 位置时取 `pg_stat_wal_receiver.received_tli`（与 `flushed_lsn` 从同一行读出），是精确值；否则取下界，即以下几项中已知不高于发布位置的最大值：`pg_control_checkpoint()` 的 timeline、当前 receiver 的那一对值、本次 PostgreSQL 运行中 receiver 最后报告的那一对值（`pg_postmaster_start_time()` 变了就作废，因为 pg_rewind / pg_basebackup 都要停库）。依据：同一次运行中副本的 WAL 是一条历史，timeline 沿历史只增不减。下界只可能偏低、不会偏高，所以这个比较只会更严格。用成员发布值而不是本地值，是因为其他节点判断这个节点能否参选时只能看到发布值，两边必须得出同一结论。
-- 带标记、不能参选的节点如果正以主库运行，先停库（L5，先写 `standby.signal` 和标记）。
-- 其他节点用同一规则判断带标记的 peer：不能参选的 peer 不计入「谁最健康」的比较，避免所有节点都让位给一个不会参选的节点。`POST /switchover`、`POST /failover` 拒绝带标记的 candidate（409，`Candidate '<c>' has a rewind-check marker (not yet verified with pg_rewind)`）。`/failover` 里已经指定的 candidate 之后才带上标记、且按此规则不能参选时，其他节点 WARN `Designated candidate <c> has a rewind-check marker and may not take part in the election; proceeding as if no candidate were designated`，按没有指定 candidate 继续选举（仍排除 `/failover.leader`，见 S1）。
-- 不带标记的节点不用 `/timeline` 做绝对门槛（副本发布的可能是下界，见上一条和第 9 节）。谁最健康对所有仍可参选的节点先比**发布的 timeline**，再在相同 timeline 上比 LSN：timeline 更高者赢，哪怕 LSN 更小；timeline 更低者的 LSN 不参加比较；没发布 timeline 的成员不能靠更大的 LSN 赢过已经发布了 timeline 的成员。两边都没发布时才只比 LSN。
-- 后果：如果只剩带标记且 timeline 落后的节点，集群不会自动选出主库。运维确认接受数据丢失后，可删除该节点的 `pg-ha.rewind_check` 让它参选。
+不变式：
+
+- **I1 编号唯一**：pg-ha 管理的每个 timeline 编号只对应一条历史。
+- **I2 记录真实值**：`/timeline` 记录最新已确认 timeline 的身份（编号 + 起点 LSN，即该编号 history 文件最后一行的切换点；timeline 1 的起点为 0），以及可能正在进行的 promote（`pending`）。任何时刻，集群里存在的 timeline 要么不高于记录值，要么是 pending 那次 promote 生成的那一条。
+- **I3 参选资格**：只有在最新 timeline 上的节点可以参选，带不带 rewind 检查标记都一样。
+
+由 I2、I3 推出 I1：PostgreSQL 给新 timeline 取的编号是 `findNewestTimeLine(recoveryTargetTLI) + 1`，从恢复目标开始逐个探测 `pg_wal/<TLI>.history`（配置了 `restore_command` 时也探测归档）。在最新 timeline L 上的节点，本地最新 history 就是 L，所以新编号是 L + 1；没有 pending 时，没有任何节点有 L + 1。编号重复的后果：pg_rewind 按「编号 + 起点」比较两条历史，两条不同的历史编号和起点都相同时，pg_rewind 会当成同一条历史（2026-10-27 docker 实测：两个 TL5 都从 0/402B5F0 开始）；开了归档时同名文件冲突。
+
+- key：`/<namespace>/<scope>/timeline`，**无 TTL**，JSON，例如 `{"timeline":5,"begin":67286512,"primary":"node1","generation":0,"pending":{...}}`。所有写入都按读到的版本做 CAS（key 不存在时只允许创建），不合并、不降低。
+- 旧格式（一个十进制数字，例如 `"17"`）只当作上界，从不当作身份；key 不存在或无法解析时同样处理（见下文判定第 3 条）。
+- 成员记录的 `timeline` 是该成员发布的 `wal_position` 所在的 timeline（R2，同一个 WAL 点）。主库取 `pg_walfile_name(pg_current_wal_lsn())`，是精确值。副本在 WAL receiver 正在流复制、且其 `flushed_lsn` 不低于 replay 位置时取 `pg_stat_wal_receiver.received_tli`（与 `flushed_lsn` 从同一行读出），是精确值；否则取下界，即以下几项中已知不高于发布位置的最大值：`pg_control_checkpoint()` 的 timeline、当前 receiver 的那一对值、本次 PostgreSQL 运行中 receiver 最后报告的那一对值（`pg_postmaster_start_time()` 变了就作废，因为 pg_rewind / pg_basebackup 都要停库）。下界只可能偏低、不会偏高。
+- 成员发布（`lineage`，旧版本节点没有）：`timeline_begin`（发布的 `timeline` 的起点，取自本地 history 文件）；`history`（`pg_wal` 里编号最大的 history：编号、起点，以及本地是否有以该编号命名的 WAL 段 `wal`）；`postmaster_start`（`postmaster.pid` 第 1、3 行：PID 和启动时间；PostgreSQL 停着时为空）；`generation`（`PGDATA/pg-ha.generation`，文件不存在为 0）。任何一项读不出来时整个 `lineage` 不发布（WARN `Not publishing timeline evidence: ...`），不猜。
+
+**最新 timeline L 的判定**（`ha::lineage::resolve_latest`，纯函数，所有节点用同样的输入得出同样的结论）：
+
+1. 记录里没有 pending：L 就是记录。
+2. 有 pending（发起者 R、基准 T、代 g）：
+   - 有代为 g 的成员发布的 `history` 编号高于 T：R 已经生成了新 timeline（PostgreSQL 先写 history 文件再切换，history 文件存在就算），L 取这个身份。多个成员给出不同身份时判为冲突，所有节点不参选（ERROR）。
+   - R 发布的 `history` 不高于 T，并且 R 的 PostgreSQL 停着（`stopped`/`crashed`），或 `postmaster_start` 与 pending 里记录的不同：那次 promote 不可能再完成（postmaster 启动时删除残留的 promote 信号文件；后端崩溃重启不改 `postmaster.pid`），pending 作废，L 为记录值。
+   - 否则未决：**只有 R 可以参选**（它可能持有最新数据；再次当选后重新 promote）。
+3. 没有当前格式的记录（旧格式、不存在、无法解析）：只有在每个 Raft voter 都发布了 `history`（成员数不少于 voter 数，且每个成员都发布了）、各成员代相同时，L 取所有成员 history 中编号最大者，起点由持有它的成员给出，必须一致。否则未决（不完整、代不一致或冲突），所有节点不参选。
+4. 有持锁主库时，它在 Hold 中把记录写成自己的身份（它就是当前写入方）；旧格式由此迁移。
+
+**参选资格**（`ha::lineage::eligibility`，节点判自己时用自己发布的记录，A9）：L 已知时，成员必须与 L 同代，且满足以下任一条，起点与 L 一致：
+
+- 发布的 `timeline` 等于 L。下界等于 L 也算：真实值不低于 L，而 I2 保证不存在高于 L 的 timeline。
+- `history` 等于 L 且 `wal` 为真。这条覆盖「promote 后、第一次 checkpoint 前就被围栏的主库」。
+
+编号相同、起点不同，或本地 history 高于 L：ERROR，不参选。没发布 `lineage`：不参选。L 未决时只有 pending 发起者可以参选。不能参选时打 INFO `Not taking part in the election: <原因>`（冲突类为 ERROR，同一条只打一次）；以主库运行的不能参选节点先停库（L5，先写 `standby.signal` 和标记）。
+
+- 有资格的节点都在 L 上，「谁最健康」只比 LSN，然后比 `failover_priority`、名字（2026-10-26 加入的「先比 timeline」不再需要）。rewind 检查标记不再影响参选：在 L 上的节点不可能分叉，L 只被它自己的主库写过。标记仍用于「先 rewind 再跟随」和 switchover/failover 的 candidate 检查。
+- 指定的 candidate 不能参选时，其他节点按没有 candidate 继续（A25），仍排除 `/failover.leader`（S1）。
+
+**promote**（持锁节点 R）：
+
+1. 自检：本地最新 history 必须就是 L（或 L 来自 R 自己未决的 pending）；否则拒绝 promote（ERROR `Not promoting: this node's newest history is ..., not the latest ...; promoting would reuse a timeline number`）。
+2. CAS 写入 pending（R、基准、代，`postmaster_start` 取自当前 `postmaster.pid`）。写失败或版本已变就不 promote。同一任期内重试复用这条 pending，不重写。
+3. `pg_ctl promote`。观测到不在 recovery 后，从 `pg_walfile_name(pg_current_wal_lsn())` 和新的 history 文件读出身份，重新读取 key、确认 pending 仍是自己的，再 CAS 写入确认记录（清除 pending）。失败时 pending 保留（继续挡住其他节点），由 Hold 重试。
+4. Hold（持锁且为主）每轮：记录与自身身份一致则不动；记录缺失、旧格式、低于自身，或是自己的 pending，则写入；记录高于自身、同编号不同起点、另一节点的 pending 未决，或代不一致时不写，打 ERROR。standby cluster 的 standby leader 不 promote，Hold 时以本地带 WAL 的最新 history 为身份写入。
+
+**历史代（generation）与运维强制参选**：
+
+- 以下情况集群不会自动选主：L 上的节点全部永久丢失；pending 发起者永久丢失；判定为冲突。这是 I3 的代价，因为自动选主会丢掉更新的历史并重复编号。
+- 运维确认接受丢失后，在选定节点的 PGDATA 放 `pg-ha.accept_timeline_loss`。只在没有其他节点可以参选时生效，否则 WARN 并忽略。该节点参选并 promote，pending 的代为记录代 + 1；promote 确认后先持久化本地 `pg-ha.generation`，再写入新代的记录，然后删除该文件。
+- 强制参选**必然重复编号**：落后节点本地的 history 低于已经存在的编号；往 `pg_wal` 放更新的 history 文件会改变恢复目标、生成非法的 history，不可行。所以只能靠代来区分。代低于集群代的数据不参选、不启动、不跟随、不 rewind，`POST /restart` 被拒绝，PostgreSQL 被停掉（ERROR 给出 `POST /reinitialize`）。重新克隆后，新的数据目录随 pg_basebackup 带上源的 `pg-ha.generation`（A16 不删除它）。强制参选的 pending 未决期间，旧代节点同样保持停库，直到它被确认或作废。
 
 #### pg_rewind 失败
 
@@ -234,7 +264,7 @@
 | R2 | 成员发布的 timeline / wal_position 与选举、lag 判断所依据的规则一致（同一套度量，禁止各读各的）。 | 持有 |
 | R3 | 跨节点 clone / rewind / basebackup 所需的地址信息来自 DCS 成员（至少 host/port）；**密码是否写入 DCS** 必须在文档中唯一裁定，并与实现一致。 | **待裁定** |
 
-**例外（R2，任务 3）**：带 rewind 检查标记的节点参选时，比较的是成员发布的 timeline（`wal_position` 所在的 timeline；副本拿不到精确值时是下界，见 1a）与 `/timeline`（持锁主库写入的精确值，`pg_walfile_name(pg_current_wal_lsn())`）。偏差只会让带标记节点更严格，不会放宽；所有节点判定同一个带标记节点时用的都是它发布的同一个值（见 1a）。谁最健康同样只用这个发布的 timeline 决定两条历史的先后，相同 timeline 上才比 `wal_position`（LSN）。
+**例外（R2，D6）**：参选资格比较的是成员发布的 timeline（`wal_position` 所在的 timeline；副本拿不到精确值时是下界，见 1a）和本地 history 证据，与 `/timeline` 记录的身份比对。下界只会让判定更严格；所有节点判定同一个成员时用的都是它发布的同一组值（A9）。有资格的成员都在同一 timeline 上，「谁最健康」只比 `wal_position`（LSN）。
 
 **说明（R3）**：当前实现由 `touch_member` 将 superuser 密码写入 `conn_url` 并进入 Raft 日志；多数运行路径（Proxy、重配 upstream）仅需 host/port，密码来自本地配置。产品语义应二选一写死，避免「磁盘有密、代码有时又不用」的双故事。
 
@@ -307,8 +337,10 @@
 |----|---------|------|
 | Failsafe 持久化 | P3 | 架构列出 `/failsafe`；实现仍有「未读 key」类缺口 |
 | Member `conn_url` 含密码 | R3 | 落盘与最小密钥面目标冲突，需先裁定再改 |
-| `/timeline` 偏移后带标记节点永远不能参选 | D6 / S4 / L4 | promote 前预写 `max(自身发布的 timeline, /timeline) + 1`。当选节点没跟上上一任主库的最新 timeline 时（例如它在那段任期里停着），PostgreSQL 实际生成的 timeline 小于预写值，key 从此高于所有真实 timeline。key 只增不减，之后每次 promote 再预写 key + 1，差距不会回落。偏移之后，即使节点手里就是最新历史，带标记的节点也不满足「自身 timeline ≥ `/timeline`」，只能等某个 leader 存在时 pg_rewind 清掉标记。主库连续被围栏、所有可参选节点都带上标记时，集群永久无主（2026-10-26 docker 集群：真实最高 TL14，`/timeline` = 17，三个节点都带标记，20:31 之后不再选主）。不丢数据，只影响可用性。征兆：持锁主库 WARN `DCS /timeline (<k>) is higher than this primary's timeline (<tl>); a promote attempt recorded it in advance`，以及所有节点每轮 INFO `... timeline <own> is behind the cluster timeline <k> ...`。人工恢复见 [operations-guide.md](operations-guide.md)「场景 4a」。另有 timeline 编号重复的问题：落后节点 promote 会生成一个已在另一条历史上用过的编号，只比编号的门槛分不清这两条历史，所以人工恢复不能只看编号。候选修法：预写值改为 `max(本地 pg_wal 最新 history 编号 + 1, /timeline)`（配置了 `restore_command` 时 PostgreSQL 还会查归档，需退回原公式），并给已偏移的集群一次性校正；彻底修法是用「编号 + 起始 LSN」标识历史 |
-| 副本发布的 timeline 可能只是下界 | S2 / S4 | 拿不到 receiver 的精确值时（本次 PostgreSQL 运行中从未流复制过，例如刚重启、上游已经不在），副本发布检查点 timeline 等下界，最多落后一个 `checkpoint_timeout`。这时它在「谁最健康」里可能输给 timeline 更高、LSN 更小的节点。一直在流复制的副本、以及上游挂掉前流复制过的副本不受影响。不带标记的节点仍不用 `/timeline` 做绝对门槛 |
+| 最新 timeline 的持有者全部永久丢失时需要运维强制参选 | D6 / S4 | I3 的代价：不再自动选落后节点（以前会丢掉整任主库的写入并重复编号）。新主库刚 promote、其他副本还没切过来它就永久丢失，或 pending 发起者在 promote 那一刻永久丢失，都属于这种情况。处理见 [operations-guide.md](operations-guide.md)「场景 4a」；强制参选后其他旧节点必须 reinitialize，pg-ha 用历史代强制 |
+| 升级前遗留的同编号、同起点历史无法区分 | D6 | 升级前已经发生的编号重复，如果两条历史连起点 LSN 也相同，身份比对分不出来。升级后由 I3 保证不再产生；强制参选产生的重复由历史代区分 |
+| 混合版本滚动升级 | D6 | 旧版本 leader 会把 `/timeline` 写回数字格式；旧版本节点不发布 `lineage`，新版本节点判定它们不能参选。新版本节点持锁后改回新格式。建议一次升级完所有节点 |
+| 副本发布的 timeline 可能只是下界 | S2 / S4 | 拿不到 receiver 的精确值时（本次 PostgreSQL 运行中从未流复制过，例如刚重启、上游已经不在），副本发布检查点 timeline 等下界，最多落后一个 `checkpoint_timeout`。下界低于最新 timeline、本地又没有以最新 timeline 命名的 WAL 段时，这个副本判为不能参选（偏严，不会偏松）。一直在流复制的副本、上游挂掉前流复制过的副本，以及收到过最新 timeline WAL 的副本不受影响 |
 | 带标记、等待 rewind 检查的备库对外是健康副本 | H2 / S4 | 带 `pg-ha.rewind_check` 的 ManagedStandby 在 leader 未就绪、分区期间、恢复后 pg_rewind 之前以只读备库运行，`/replica` 200，RO 客户端可能读到只存在于分叉历史上的数据（见 1a「rewind 检查标记」）。候选修法：带标记的节点 `/replica` 返回 503 |
 | 分区节点重新加入 Raft 会引发 Raft 重选 | L4 / L5 | openraft 0.9 没有 pre-vote：分区节点的 term 在分区期间上涨，重新连上后迫使集群重选 Raft leader；重选期间当前锁持有者续锁失败而被降级（多一次 failover，timeline +1）。任务 3 在 docker 集群上复现分区场景时每次都出现，不在任务 3 处理 |
 | watchdog 未接入租约 | W2 / L5 | `watchdog.rs` 没有调用点，超时硬编码 30 秒。HA 循环被同步阻塞、tokio worker 被占满、进程被 SIGSTOP 或 VM 冻结时，leader 租约的围栏无法执行。待做：只在租约有效且本节点是 Primary 时喂狗，超时 = TTL − `safety_margin` |
@@ -323,6 +355,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-10-27 | D6 重写：`/timeline` 记录最新已确认 timeline 的身份（编号 + 起点 LSN）和 promote 前的 pending，不再预写猜测值，闭合「`/timeline` 偏移后带标记节点永远不能参选」。只有在最新 timeline 上的节点参选，带不带标记都一样，防止编号重复和丢掉整任主库的写入；「谁最健康」只比 LSN。旧格式和缺失的 key 在全部节点上报后推断。新增历史代 `pg-ha.generation` 与运维强制参选 `pg-ha.accept_timeline_loss`：旧代数据不参选、不启动、不跟随、不 rewind，只能 reinitialize。第 9 节相应调整 |
 | 2026-10-27 | 第 9 节登记「`/timeline` 偏移后带标记节点永远不能参选」（只登记，代码未改），operations-guide 增加「场景 4a」人工恢复步骤 |
 | 2026-10-27 | 成员发布的 timeline 改为 `wal_position` 所在的 timeline（R2）。此前副本发布 `pg_control_checkpoint()` 的 timeline，failover 后最多落后一个 `checkpoint_timeout`；选举先比 timeline，于是一直流复制、WAL 最多的副本会输给刚 rewind、WAL 更少但控制文件已是新 timeline 的节点，多出的 WAL 被丢弃（2026-10-26 选举改为先比 timeline 后引入）。现在主库取 `pg_walfile_name(pg_current_wal_lsn())`，副本取 receiver 的 `received_tli`；receiver 停掉后沿用本次运行中最后报告的值，拿不到精确值时发布只会偏低的下界。第 9 节改为登记下界情形 |
 | 2026-10-26 | 选举先比成员发布的 timeline，再比 LSN：timeline 更高者赢，更低者的 LSN 不参加比较；没发布 timeline 的成员不能靠 LSN 赢过已发布者。`/timeline` 绝对门槛仍只用于带 rewind 检查标记的节点。第 9 节改为登记检查点 timeline 落后于正在回放的 timeline |
