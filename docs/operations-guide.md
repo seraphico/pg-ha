@@ -881,6 +881,40 @@ curl -s http://node1:8008/cluster | jq .
 #    只有它发布的 timeline ≥ DCS /timeline 时才参选
 ```
 
+### 场景 4a：所有节点都带 rewind 检查标记，集群一直选不出主库
+
+已知问题（[invariants.md](invariants.md) 第 9 节「`/timeline` 偏移后带标记节点永远不能参选」）。DCS 的 `/timeline` 高于所有真实 timeline 后，带标记的节点不参选；所有可参选节点都带标记时，集群不会自己恢复。数据没有丢，但需要人工让**历史最新**的那个节点参选。
+
+**判断是不是这种情况**（三条同时成立）：
+
+- 所有节点 `/primary` 都返回 503，`/cluster` 里没有 `primary`；
+- 每个节点每轮都打 INFO `Not taking part in the election: rewind-check marker present and this node's timeline <own> is behind the cluster timeline <k>; waiting for a leader to rewind against`；
+- 每个节点 PGDATA 下都有 `pg-ha.rewind_check`。
+
+**找出历史最新的节点**。timeline 编号可能重复（不同历史用了同一个编号），**不能只看编号**，要比对 history 文件内容：
+
+```bash
+# 在每个节点上执行（以 PostgreSQL OS 用户）
+PGDATA=/var/lib/postgresql/16/data
+ls "$PGDATA"/pg_wal/*.history | sort | tail -1           # 最新的 history 文件
+cat "$(ls "$PGDATA"/pg_wal/*.history | sort | tail -1)"  # 该节点的整条历史
+psql -tAc "select pg_last_wal_replay_lsn()"              # 当前回放位置
+```
+
+1. 比较各节点最新 history 文件的**全部内容**（每行 `父 timeline  切换点 LSN  原因`）。一个节点的历史是另一个节点历史的前缀，后者更新。
+2. 历史相同（文件内容一样），比较 `pg_last_wal_replay_lsn()`，大者更新。
+3. 历史互不为前缀（同一个编号、切换点不同），说明发生过分叉：两边都有对方没有的数据。**停下来**，确认业务上要保留哪条历史再继续；另一边之后会被 pg_rewind 丢掉分叉之后的写入。
+
+**让选中的节点参选**（只在一个节点上做）：
+
+```bash
+sudo -u postgres rm /var/lib/postgresql/16/data/pg-ha.rewind_check
+```
+
+下一轮它参选并 promote（timeline +1）。其他节点看到新 leader 后按正常流程 pg_rewind、删除自己的标记并跟随（日志 `pg_rewind succeeded; removed the rewind-check marker`）。
+
+**确认恢复**：恰好一个节点 `/primary` 200；其他节点 `/replica` 200，`/cluster` 里 `upstream` 指向新主。`/timeline` 仍然高于真实 timeline（只增不减），偏移没有消失；这次恢复之后，只要仍有不带标记的副本，选主就正常，但再遇到所有节点都带标记时需要再处理一次。
+
 ### 场景 5：DCS (Raft) 数据损坏
 
 ```bash

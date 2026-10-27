@@ -72,6 +72,9 @@ pub struct Postgresql {
     /// Set once graceful shutdown begins: `start()` refuses to run, so
     /// pg-ha never starts PostgreSQL again before it exits.
     starts_blocked: bool,
+    /// Receiver pair from the last cycle it was streaming (see
+    /// [`ReceivedWal`]). A Mutex because `wal_status` takes `&self`.
+    last_received_wal: std::sync::Mutex<Option<ReceivedWal>>,
 }
 
 /// Internal PostgreSQL process state
@@ -99,12 +102,140 @@ impl std::fmt::Display for PgState {
 /// Result of querying PostgreSQL for WAL position and timeline
 #[derive(Debug, Clone)]
 pub struct WalStatus {
-    /// Current timeline
+    /// Timeline of the WAL at `wal_position` (R2: the pair describes one
+    /// point). On a replica this is a lower bound when the receiver's
+    /// timeline is unknown (see [`resolve_replica_wal`]).
     pub timeline: Option<u64>,
     /// WAL position in bytes (receive or replay LSN, whichever is higher)
     pub wal_position: u64,
     /// Whether the instance is in recovery (replica)
     pub in_recovery: bool,
+}
+
+/// Timeline and flushed LSN the WAL receiver last reported.
+///
+/// Kept after the receiver stops: when the upstream dies, the receiver exits
+/// and `pg_stat_wal_receiver` is empty, which is exactly when an election
+/// needs the timeline. `pg_last_wal_receive_lsn()` keeps returning the same
+/// flushed position, so the pair still describes the replica's WAL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceivedWal {
+    /// `pg_postmaster_start_time()`: the pair is valid only for this server run.
+    pub(crate) postmaster_start: String,
+    pub(crate) flushed_lsn: u64,
+    pub(crate) timeline: u64,
+}
+
+/// One replica observation, all values from one SQL statement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReplicaWalSample {
+    /// `pg_last_wal_receive_lsn()`
+    pub(crate) receive_lsn: Option<u64>,
+    /// `pg_last_wal_replay_lsn()`
+    pub(crate) replay_lsn: Option<u64>,
+    /// `pg_control_checkpoint().timeline_id`: timeline of the last
+    /// restartpoint, never above the timeline of the replica's newest WAL.
+    pub(crate) checkpoint_timeline: Option<u64>,
+    /// `pg_stat_wal_receiver` (`flushed_lsn`, `received_tli`), read together
+    /// from one view row. `None` while no receiver is streaming.
+    pub(crate) receiver: Option<(u64, u64)>,
+    /// `pg_postmaster_start_time()`
+    pub(crate) postmaster_start: Option<String>,
+}
+
+/// How a replica's published timeline relates to its published position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplicaTimelineSource {
+    /// Exact: the streaming receiver's `flushed_lsn` is the published
+    /// position and `received_tli` is its timeline.
+    Receiver,
+    /// Lower bound: the highest timeline known to hold at or below the
+    /// published position (the checkpoint, the current receiver pair, or the
+    /// pair remembered from this server run).
+    LowerBound,
+}
+
+/// A replica's published (wal_position, timeline) and the receiver pair to
+/// remember for later cycles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplicaWalResolution {
+    pub(crate) wal_position: u64,
+    pub(crate) timeline: Option<u64>,
+    pub(crate) source: ReplicaTimelineSource,
+    /// `Some` replaces the remembered pair; `None` keeps it.
+    pub(crate) remember: Option<ReceivedWal>,
+}
+
+/// R2: publish the timeline of the WAL at `wal_position`, not the timeline of
+/// the last restartpoint. The election orders by timeline first; a replica
+/// that has streamed the new timeline but not yet made a restartpoint would
+/// otherwise publish the old one and lose to a peer with less WAL.
+///
+/// The receiver's `received_tli` is the timeline of its `flushed_lsn`; it is
+/// exact when that LSN is the published position (flushed >= replay).
+///
+/// Otherwise the result is the highest lower bound. Within one server run a
+/// replica's WAL is one history and timelines only grow along it, so a
+/// timeline seen at LSN `x` holds at every position >= `x`:
+/// - the checkpoint timeline (the restartpoint is below the position);
+/// - the current receiver pair when replay passed it (receiver restarted
+///   from a segment start);
+/// - the pair remembered from this server run when the position is at or
+///   above it. This is the failover case: the dying upstream's last WAL
+///   arrives after the last sample, then the receiver exits.
+///
+/// pg_rewind and pg_basebackup need a stopped server, so a new
+/// `pg_postmaster_start_time()` drops the remembered pair. A replica may
+/// under-report, never over-report.
+pub(crate) fn resolve_replica_wal(
+    sample: &ReplicaWalSample,
+    last: Option<&ReceivedWal>,
+) -> ReplicaWalResolution {
+    let replay = sample.replay_lsn.unwrap_or(0);
+    let remember = match (sample.receiver, &sample.postmaster_start) {
+        (Some((flushed_lsn, timeline)), Some(start)) => Some(ReceivedWal {
+            postmaster_start: start.clone(),
+            flushed_lsn,
+            timeline,
+        }),
+        _ => None,
+    };
+
+    if let Some((flushed, timeline)) = sample.receiver
+        && flushed >= replay
+    {
+        return ReplicaWalResolution {
+            wal_position: flushed,
+            timeline: Some(timeline),
+            source: ReplicaTimelineSource::Receiver,
+            remember,
+        };
+    }
+
+    // The view's flushed_lsn and pg_last_wal_receive_lsn() read the same
+    // field; prefer the view's so the pair stays consistent.
+    let receive = match sample.receiver {
+        Some((flushed, _)) => flushed,
+        None => sample.receive_lsn.unwrap_or(0),
+    };
+    let wal_position = receive.max(replay);
+
+    let mut timeline = sample.checkpoint_timeline;
+    if let Some((_, receiver_tl)) = sample.receiver {
+        timeline = timeline.max(Some(receiver_tl));
+    }
+    if let Some(last) = last
+        && sample.postmaster_start.as_deref() == Some(last.postmaster_start.as_str())
+        && wal_position >= last.flushed_lsn
+    {
+        timeline = timeline.max(Some(last.timeline));
+    }
+    ReplicaWalResolution {
+        wal_position,
+        timeline,
+        source: ReplicaTimelineSource::LowerBound,
+        remember,
+    }
 }
 
 /// Parse a PostgreSQL LSN string (e.g., "0/3000060") into a byte offset (u64).
@@ -139,6 +270,7 @@ impl Postgresql {
             state: PgState::Unknown,
             in_recovery: None,
             starts_blocked: false,
+            last_received_wal: std::sync::Mutex::new(None),
         }
     }
 
@@ -745,45 +877,64 @@ impl Postgresql {
         };
 
         if in_recovery {
-            // Replica: get receive and replay LSN
+            // Replica: receive/replay LSN, the receiver's (flushed_lsn,
+            // received_tli) pair, and the checkpoint timeline as a lower
+            // bound, all in one statement.
             let query = "SELECT \
                 pg_last_wal_receive_lsn() - '0/0', \
                 pg_last_wal_replay_lsn() - '0/0', \
-                (SELECT timeline_id FROM pg_control_checkpoint())";
+                (SELECT timeline_id FROM pg_control_checkpoint()), \
+                r.flushed_lsn - '0/0', \
+                r.received_tli, \
+                pg_postmaster_start_time() \
+                FROM (SELECT 1) AS one \
+                LEFT JOIN pg_stat_wal_receiver AS r ON true";
 
             let rows = client
                 .simple_query(query)
                 .await
                 .map_err(|e| Error::Postgres(format!("WAL status query failed: {e}")))?;
 
-            let mut receive_lsn: u64 = 0;
-            let mut replay_lsn: u64 = 0;
-            let mut timeline: Option<u64> = None;
-
+            let mut sample = ReplicaWalSample::default();
             for msg in rows {
                 if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
-                    if let Some(val) = row.get(0) {
-                        receive_lsn = val.parse().unwrap_or(0);
-                    }
-                    if let Some(val) = row.get(1) {
-                        replay_lsn = val.parse().unwrap_or(0);
-                    }
-                    if let Some(val) = row.get(2) {
-                        timeline = val.parse().ok();
-                    }
+                    let num = |i: usize| row.get(i).and_then(|v| v.parse::<u64>().ok());
+                    sample.receive_lsn = num(0);
+                    sample.replay_lsn = num(1);
+                    sample.checkpoint_timeline = num(2);
+                    sample.receiver = num(3).zip(num(4));
+                    sample.postmaster_start = row.get(5).map(str::to_owned);
                 }
             }
 
+            let mut last = self
+                .last_received_wal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let resolved = resolve_replica_wal(&sample, last.as_ref());
+            if let Some(pair) = resolved.remember.clone() {
+                *last = Some(pair);
+            }
+            drop(last);
+            debug!(
+                wal_position = resolved.wal_position,
+                timeline = ?resolved.timeline,
+                source = ?resolved.source,
+                "Replica WAL status"
+            );
+
             Ok(WalStatus {
-                timeline,
-                wal_position: receive_lsn.max(replay_lsn),
+                timeline: resolved.timeline,
+                wal_position: resolved.wal_position,
                 in_recovery: true,
             })
         } else {
-            // Primary: get current WAL position
+            // Primary: current WAL position and the timeline WAL is inserted
+            // on (exact; the checkpoint timeline lags a promote until the
+            // first checkpoint on the new timeline completes).
             let query = "SELECT \
                 pg_current_wal_lsn() - '0/0', \
-                (SELECT timeline_id FROM pg_control_checkpoint())";
+                pg_walfile_name(pg_current_wal_lsn())";
 
             let rows = client
                 .simple_query(query)
@@ -799,7 +950,7 @@ impl Postgresql {
                         wal_lsn = val.parse().unwrap_or(0);
                     }
                     if let Some(val) = row.get(1) {
-                        timeline = val.parse().ok();
+                        timeline = parse_walfile_timeline(val);
                     }
                 }
             }
@@ -1782,5 +1933,176 @@ mod tests {
              patterns. Each method must follow the preservation pattern: \
              connect → spawn with timeout → query via client."
         );
+    }
+
+    // ── resolve_replica_wal (R2: timeline of the published WAL position) ──
+
+    const RUN: &str = "2026-10-27 08:00:00+00";
+
+    fn sample(
+        receive: Option<u64>,
+        replay: Option<u64>,
+        checkpoint_tl: Option<u64>,
+        receiver: Option<(u64, u64)>,
+    ) -> ReplicaWalSample {
+        ReplicaWalSample {
+            receive_lsn: receive,
+            replay_lsn: replay,
+            checkpoint_timeline: checkpoint_tl,
+            receiver,
+            postmaster_start: Some(RUN.to_string()),
+        }
+    }
+
+    fn received(flushed: u64, timeline: u64) -> ReceivedWal {
+        ReceivedWal {
+            postmaster_start: RUN.to_string(),
+            flushed_lsn: flushed,
+            timeline,
+        }
+    }
+
+    #[test]
+    fn streaming_replica_publishes_the_receiver_timeline_not_the_checkpoint() {
+        // Streamed timeline 6, last restartpoint still on 5.
+        let r = resolve_replica_wal(&sample(Some(900), Some(880), Some(5), Some((900, 6))), None);
+
+        assert_eq!(r.wal_position, 900);
+        assert_eq!(r.timeline, Some(6));
+        assert_eq!(r.source, ReplicaTimelineSource::Receiver);
+        assert_eq!(r.remember, Some(received(900, 6)));
+    }
+
+    #[test]
+    fn receiver_pair_is_used_together_even_if_receive_lsn_moved() {
+        // pg_last_wal_receive_lsn() was read a moment after the view row.
+        let r = resolve_replica_wal(&sample(Some(950), Some(880), Some(5), Some((900, 6))), None);
+
+        assert_eq!(r.wal_position, 900);
+        assert_eq!(r.timeline, Some(6));
+    }
+
+    #[test]
+    fn stopped_receiver_keeps_the_remembered_timeline_at_the_same_position() {
+        let last = received(900, 6);
+        let r = resolve_replica_wal(&sample(Some(900), Some(900), Some(5), None), Some(&last));
+
+        assert_eq!(r.wal_position, 900);
+        assert_eq!(r.timeline, Some(6));
+        assert_eq!(r.source, ReplicaTimelineSource::LowerBound);
+        assert_eq!(r.remember, None, "keeps the remembered pair");
+    }
+
+    /// Docker run 2026-10-27: the dying primary's last WAL (shutdown
+    /// checkpoint) reached node2 after the last sample, so the position
+    /// moved past the remembered pair before the receiver exited.
+    #[test]
+    fn remembered_timeline_holds_after_the_last_wal_from_a_dying_upstream() {
+        let last = received(67_571_080, 2);
+        let r = resolve_replica_wal(
+            &sample(Some(67_575_848), Some(67_575_848), Some(1), None),
+            Some(&last),
+        );
+
+        assert_eq!(r.wal_position, 67_575_848);
+        assert_eq!(r.timeline, Some(2), "not checkpoint timeline 1");
+    }
+
+    #[test]
+    fn remembered_timeline_holds_when_replay_passed_it() {
+        // Replay beyond the received position is the same history.
+        let last = received(900, 6);
+        let r = resolve_replica_wal(&sample(Some(900), Some(1000), Some(5), None), Some(&last));
+
+        assert_eq!(r.wal_position, 1000);
+        assert_eq!(r.timeline, Some(6));
+    }
+
+    #[test]
+    fn remembered_pair_from_another_server_run_is_not_used() {
+        // A new run may follow a rewound or re-cloned history.
+        let last = ReceivedWal {
+            postmaster_start: "2026-10-27 07:00:00+00".to_string(),
+            ..received(900, 6)
+        };
+        let r = resolve_replica_wal(&sample(Some(900), Some(900), Some(5), None), Some(&last));
+
+        assert_eq!(r.timeline, Some(5));
+    }
+
+    #[test]
+    fn remembered_pair_above_the_position_is_not_used() {
+        let last = received(1000, 6);
+        let r = resolve_replica_wal(&sample(Some(900), Some(900), Some(5), None), Some(&last));
+
+        assert_eq!(r.timeline, Some(5));
+    }
+
+    #[test]
+    fn replay_ahead_of_a_restarted_receiver_uses_the_receiver_as_a_lower_bound() {
+        // A receiver restarts from the start of the replay segment.
+        let r = resolve_replica_wal(&sample(Some(512), Some(700), Some(5), Some((512, 6))), None);
+
+        assert_eq!(r.wal_position, 700);
+        assert_eq!(r.timeline, Some(6));
+        assert_eq!(r.source, ReplicaTimelineSource::LowerBound);
+        assert_eq!(r.remember, Some(received(512, 6)));
+    }
+
+    #[test]
+    fn no_receiver_and_nothing_remembered_publishes_the_checkpoint_lower_bound() {
+        let r = resolve_replica_wal(&sample(None, Some(700), Some(5), None), None);
+
+        assert_eq!(r.wal_position, 700);
+        assert_eq!(r.timeline, Some(5));
+        assert_eq!(r.source, ReplicaTimelineSource::LowerBound);
+    }
+
+    #[test]
+    fn unknown_postmaster_start_is_not_remembered_and_matches_nothing() {
+        let mut s = sample(Some(900), Some(900), Some(5), Some((900, 6)));
+        s.postmaster_start = None;
+        let r = resolve_replica_wal(&s, None);
+        assert_eq!(r.timeline, Some(6));
+        assert_eq!(r.remember, None);
+
+        let mut s = sample(Some(900), Some(900), Some(5), None);
+        s.postmaster_start = None;
+        let r = resolve_replica_wal(&s, Some(&received(900, 6)));
+        assert_eq!(r.timeline, Some(5));
+    }
+
+    proptest! {
+        /// Exact only from the streaming pair; otherwise never above the
+        /// highest value known to hold at or below the published position.
+        #[test]
+        fn resolution_never_invents_a_timeline(
+            receive in proptest::option::of(0u64..2000),
+            replay in proptest::option::of(0u64..2000),
+            ckpt in proptest::option::of(1u64..10),
+            receiver in proptest::option::of((0u64..2000, 1u64..10)),
+            last in proptest::option::of((0u64..2000, 1u64..10)),
+        ) {
+            let s = sample(receive, replay, ckpt, receiver);
+            let last = last.map(|(lsn, tl)| received(lsn, tl));
+            let r = resolve_replica_wal(&s, last.as_ref());
+
+            prop_assert!(r.wal_position >= replay.unwrap_or(0));
+            match r.source {
+                ReplicaTimelineSource::Receiver => {
+                    prop_assert_eq!(Some((r.wal_position, r.timeline.unwrap_or(0))), receiver);
+                }
+                ReplicaTimelineSource::LowerBound => {
+                    let mut bound = ckpt;
+                    if let Some((lsn, tl)) = receiver && lsn <= r.wal_position {
+                        bound = bound.max(Some(tl));
+                    }
+                    if let Some(l) = &last && l.flushed_lsn <= r.wal_position {
+                        bound = bound.max(Some(l.timeline));
+                    }
+                    prop_assert_eq!(r.timeline, bound);
+                }
+            }
+        }
     }
 }
