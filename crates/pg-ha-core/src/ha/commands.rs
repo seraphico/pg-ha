@@ -65,6 +65,26 @@ impl Ha {
         )))
     }
 
+    /// Shared candidate checks for switchover and failover: member exists,
+    /// Running, not nofailover, not rewind-check marked, sync-eligible.
+    fn reject_if_ineligible_candidate(&self, candidate: &str) -> Option<CommandResponse> {
+        match self.cluster.get_member(candidate) {
+            None => Some(CommandResponse::rejected(format!(
+                "Candidate '{candidate}' not found"
+            ))),
+            Some(m) if m.is_nofailover() => Some(CommandResponse::rejected(format!(
+                "Candidate '{candidate}' has nofailover tag"
+            ))),
+            Some(m) if m.state != crate::cluster::MemberState::Running => Some(
+                CommandResponse::rejected(format!("Candidate '{candidate}' is not running")),
+            ),
+            Some(m) if m.rewind_check => Some(CommandResponse::rejected(marked_candidate_message(
+                candidate,
+            ))),
+            _ => self.reject_if_sync_ineligible_candidate(candidate),
+        }
+    }
+
     async fn handle_switchover_command(
         &mut self,
         leader: Option<String>,
@@ -86,42 +106,18 @@ impl Ha {
             ));
         }
 
-        // Validate candidate exists and is eligible
-        if let Some(ref cand) = candidate {
-            match self.cluster.get_member(cand) {
-                None => {
-                    return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
-                }
-                Some(m) if m.is_nofailover() => {
-                    return CommandResponse::rejected(format!(
-                        "Candidate '{}' has nofailover tag",
-                        cand
-                    ));
-                }
-                Some(m) if m.state != crate::cluster::MemberState::Running => {
-                    return CommandResponse::rejected(format!(
-                        "Candidate '{}' is not running",
-                        cand
-                    ));
-                }
-                Some(m) if m.rewind_check => {
-                    return CommandResponse::rejected(marked_candidate_message(cand));
-                }
-                _ => {}
-            }
-            if let Some(resp) = self.reject_if_sync_ineligible_candidate(cand) {
-                return resp;
-            }
+        if let Some(ref cand) = candidate
+            && let Some(resp) = self.reject_if_ineligible_candidate(cand)
+        {
+            return resp;
         }
 
-        // If scheduled, store for later
+        // Scheduled switchover is not implemented (was only stored in memory
+        // and never executed). Reject rather than report a false success.
         if scheduled_at.is_some() {
-            self.pending_switchover = Some(ManagementCommand::Switchover {
-                leader,
-                candidate,
-                scheduled_at,
-            });
-            return CommandResponse::accepted("Switchover scheduled");
+            return CommandResponse::rejected(
+                "scheduled switchover is not implemented; omit scheduled_at for an immediate switchover",
+            );
         }
 
         // No candidate: the election excludes this leader. Demoting when no
@@ -141,10 +137,15 @@ impl Ha {
             "leader": self.config.name,
             "candidate": candidate,
         });
-        let _ = self
+        if let Err(e) = self
             .dcs
             .set_failover_value(&failover_value.to_string())
-            .await;
+            .await
+        {
+            return CommandResponse::error(format!(
+                "Switchover aborted: failed to write /failover: {e}"
+            ));
+        }
 
         // The HA loop is blocked inside this command, so renew once before the
         // stop. The lease then covers ttl - safety_margin from here.
@@ -201,29 +202,25 @@ impl Ha {
 
     async fn handle_failover_command(&mut self, candidate: Option<String>) -> CommandResponse {
         // Failover can be initiated from any node — it writes /failover key
-        if let Some(ref cand) = candidate {
-            match self.cluster.get_member(cand) {
-                None => {
-                    return CommandResponse::rejected(format!("Candidate '{}' not found", cand));
-                }
-                Some(m) if m.rewind_check => {
-                    return CommandResponse::rejected(marked_candidate_message(cand));
-                }
-                _ => {}
-            }
-            if let Some(resp) = self.reject_if_sync_ineligible_candidate(cand) {
-                return resp;
-            }
+        if let Some(ref cand) = candidate
+            && let Some(resp) = self.reject_if_ineligible_candidate(cand)
+        {
+            return resp;
         }
 
         info!(candidate = ?candidate, "Initiating manual failover");
         let failover_value = serde_json::json!({
             "candidate": candidate,
         });
-        let _ = self
+        if let Err(e) = self
             .dcs
             .set_failover_value(&failover_value.to_string())
-            .await;
+            .await
+        {
+            return CommandResponse::error(format!(
+                "Failover aborted: failed to write /failover: {e}"
+            ));
+        }
 
         CommandResponse::accepted("Failover request submitted")
     }
@@ -247,7 +244,19 @@ impl Ha {
         // get_cluster), so the lock must also be ours in the current view.
         let holding = self.is_leader && self.is_lock_owner();
         let stopped = if holding {
-            self.postgresql.stop("fast").await
+            // Keep standby.signal absent (legitimate primary restart under the
+            // lock), but stop advertising /primary before PostgreSQL may stop
+            // being writable. A failed stop sets stop_pending so later cycles
+            // keep fencing while the lock is held.
+            self.publish_not_primary().await;
+            let result = self.postgresql.stop("fast").await;
+            self.publish_not_primary().await;
+            if result.is_err() {
+                self.stop_pending = true;
+            } else {
+                self.stop_pending = false;
+            }
+            result
         } else {
             // Prepare the standby start before touching PostgreSQL; if that
             // fails, leave it as it is.
@@ -264,6 +273,11 @@ impl Ha {
             self.stop_after_demotion_write("fast").await
         };
         if let Err(e) = stopped {
+            if holding {
+                return CommandResponse::error(format!(
+                    "Stop failed: {e}; pg-ha keeps fencing it and holds the leader lock"
+                ));
+            }
             return CommandResponse::error(format!("Stop failed: {e}"));
         }
         if let Err(e) = self.postgresql.start().await {

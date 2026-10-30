@@ -55,13 +55,13 @@
 
 `standby.signal` 只说明 PG 下次怎样启动，不说明它现在是什么，所以观测为「不在 recovery」时一律是 Primary。pg-ha 在以下场合写 `standby.signal`：clone、rejoin、switchover 降级、所有降级路径（停库之前），以及每一次不持锁时的启动（见下文「启动规则」）；正常选举路径上 PG promote 后自行删除它。因此「持锁且在 recovery 却没有 `standby.signal`」不会由 pg-ha 自身产生，只来自 `recovery.signal`（归档 / PITR）或运行中被删掉的 `standby.signal`。
 
-**规则**：pg-ha 只 promote 它自己配置为备库的节点。非 pg-ha 造成的恢复交给运维：不 promote、不 rewind、不参选；若持锁则释放锁。
+**规则**：pg-ha 只 promote 它自己配置为备库的节点。非 pg-ha 造成的恢复交给运维：不 promote、不 rewind、不参选；若持锁则**先停库再释放锁**（L5：避免 `recovery.signal` 结束后本机可写而他节点已抢锁）。
 
 | 身份 | 持锁 | 他人持锁 | 无主（选举） |
 |------|------|----------|--------------|
 | Primary | 保持主 | rejoin（S4）；leader 还没有以主库运行时先停库 | 参选（须在最新 timeline 上，D6；不能参选时先停库）；非最健康则按陈旧主停库，下次以备库启动 |
 | ManagedStandby | promote，重新观测确认后才记为主 | 跟随；有 rewind 检查标记时先对 leader 跑 pg_rewind | 参选；须在最新 timeline 上（D6，带不带标记都一样） |
-| UnmanagedRecovery | 释放锁，交运维（pause 下保留锁，但不宣称主） | 交运维 | 不参选 |
+| UnmanagedRecovery | 先停库再释放锁，交运维（有 `recovery.signal` 时不写 `standby.signal`；停不掉则保留锁并 `stop_pending` 每轮围栏；pause 下保留锁，但不宣称主） | 交运维 | 不参选 |
 | Unknown | 本轮不动作，不宣称主 | 有 `standby.signal`：等待；无：停库围栏（L5）。降级停库失败后，直到确认已停，一律按围栏处理（即使有 `standby.signal`） | 本轮不参选；降级停库失败后先停库 |
 
 降级停库失败后，直到确认 PG 已停，以主库运行的节点在选举入口也先停库，不参选（见下文「降级」）。
@@ -129,7 +129,7 @@
 - 所有 pg_rewind 都只以就绪的锁持有者为源。源未就绪时不跑 pg_rewind、不算失败、不进入「rewind 失败」保持：日志 INFO `Not running pg_rewind: <leader> <原因>`；本地 PG 若是主库身份先停库（先写 `standby.signal` 和标记）；第二次确认失败时 PG 已停，保持停止，下一轮以备库启动后再等。
 - 没有锁持有者时发现的陈旧主（以主库运行、不是最健康节点）只停库，不 rewind；下次以备库启动（带标记），等 leader 出现后再 rewind。如果它是唯一可当选的节点，就按带标记节点的规则参选。
 - 节点在成员数据里发布 `rewind_check`（标记文件是否存在），供其他节点在选举和 switchover 中使用（见下一小节）。老版本节点不发布这个字段，按未带标记处理；滚动升级期间老节点仍可能让位给不会参选的新版本带标记节点。
-- **已知窗口（不在任务 3 修改，登记在第 9 节）**：带标记的备库在等待 rewind 检查期间（leader 未就绪、分区期间、恢复网络后 pg_rewind 之前）仍以只读备库运行，`/patroni` state 为 `running`，满足 `/replica` 200 的判定（H2）。经 RO 端口的只读客户端因此可能读到只存在于分叉历史上的数据，例如旧主失锁前接受、新主上没有的写入。
+- 带标记的备库在等待 rewind 检查期间（leader 未就绪、分区期间、恢复网络后 pg_rewind 之前）仍以只读备库运行，`/patroni` state 为 `running`，但 **`/replica` 返回 503**（H2），Proxy RO 不把它当健康副本，避免读到分叉历史。
 
 #### D6：timeline 身份、参选资格与历史代（`/timeline`）
 
@@ -205,7 +205,7 @@
 | ID | 陈述 | 状态 |
 |----|------|------|
 | H1 | `GET /primary` 返回 200 ⟺ 本节点持有 leader lock，且 PG 为健康 Primary，且不在优雅关停中。 | 持有 |
-| H2 | `GET /replica` 返回 200 ⟺ 本节点为健康 Replica（可选 `lag` 阈值满足时）。 | 持有 |
+| H2 | `GET /replica` 返回 200 ⟺ 本节点为健康 Replica（可选 `lag` 阈值满足时），且**无** `pg-ha.rewind_check` 标记。 | 持有 |
 | H3 | 同一时刻，集群中至多一个节点对 `/primary` 返回 200。 | 持有 |
 | H4 | TCP Proxy：RW 端口健康探测依赖 `/primary`；RO 依赖 `/replica`（及文档规定的 fallback）。 | 持有 |
 | H5 | 当 `synchronous_mode` 为 false，或 DCS `/sync` 为空（等价未启用同步名单）时：所有健康 Replica 对 `/async` 为 200、对 `/sync` 为 503；Primary 对二者均为 503。 | 持有 |
@@ -216,7 +216,7 @@
 
 - `/primary` 200 ⟺ 持有 leader lock ∧ `state = running` ∧ `role = primary` ∧ 观测不在 recovery ∧ 不在优雅关停中。观测缺失时为 503。
 - 优雅关停：收到 SIGTERM / SIGINT 起 `/primary` 一律 503（`shutting_down`），其他节点的 Proxy 不再把新写路由到本节点（与旧版关停时 REST 已停的路由效果相同）；REST API 在整个关停期间继续服务，`/patroni`、`/cluster` 照实报告角色和锁。`/liveness` 在 drain 期间（没有 HA 周期）会变 503。
-- `/replica` 200 ⟺ `state = running` ∧ `role = replica` ∧ 观测在 recovery（再叠加 `lag` 阈值）。观测为不在 recovery 的节点，不论记录的 role 是什么，都不作为副本对外服务。
+- `/replica` 200 ⟺ `state = running` ∧ `role = replica` ∧ 观测在 recovery ∧ 无 rewind 检查标记（再叠加 `lag` 阈值）。观测为不在 recovery 的节点，不论记录的 role 是什么，都不作为副本对外服务。带 `pg-ha.rewind_check` 的节点返回 503，避免 RO 客户端读到分叉历史上的数据。
 - `/health` 只反映 PG 进程是否运行，与 HA 身份无关。
 - 降级 / 围栏不等本轮 cycle 结束：`stop_after_demotion_write` 在停库前、停库后（停库后的 `touch_member` 之前）各发布一次 API 状态（不持锁、role 非 primary、观测缺失），所以 `/primary` 不晚于 PG 不可写变成 503。停库后的 DCS 写在少数派上可能等满 `retry_timeout`，不影响这一点（`Ha::set_state_publisher`，测试 `test_demotion_publishes_non_primary_before_stop_and_touch_member`）。
 
@@ -297,9 +297,9 @@
 | ID | 陈述 | 状态 |
 |----|------|------|
 | W1 | `pause`（或等价维护模式）下：不自动抢锁 / 不自动 failover（与运维「暂停」语义一致）。 | 持有 |
-| W2 | Watchdog 仅在「本节点自认可写 Primary」路径喂狗；失去 lock 或不再是 Primary 时必须停止喂狗，防止僵尸主。 | 目标 |
+| W2 | Watchdog 仅在「本节点自认可写 Primary」路径喂狗；失去 lock 或不再是 Primary 时必须停止喂狗，防止僵尸主。 | 持有 |
 
-**W2 现状**：`crates/pg-ha-core/src/watchdog.rs` 没有调用点（`Ha` 不持有它，全仓库没有 `activate` / `keepalive` 调用），Linux 下的超时硬编码为 30 秒，默认 `mode: off`。所以目前不喂狗，本条只是没有反例。`watchdog.safety_margin` 已被 leader 租约使用（L5）。HA 循环被同步阻塞、进程被 SIGSTOP 或 VM 冻结时，只有接入 watchdog 才能兜底（第 9 节）。
+**W2 实现**：`Ha` 持有 `Watchdog`；仅在持锁、租约有效、观测为 Primary、非 pause、非关停、非 `stop_pending` 时 `activate(ttl − safety_margin)` 并每轮 `keepalive`；降级、租约围栏、关停、`stop_pending` 时 `disarm`。默认 `mode: off`；`required` 且激活失败则清租约并围栏。`watchdog.safety_margin` 同时用于 leader 租约（L5）。
 
 **相关**：运维暂停与维护；架构 / 代码 `watchdog.rs`。
 
@@ -341,10 +341,10 @@
 | 升级前遗留的同编号、同起点历史无法区分 | D6 | 升级前已经发生的编号重复，如果两条历史连起点 LSN 也相同，身份比对分不出来。升级后由 I3 保证不再产生；强制参选产生的重复由历史代区分 |
 | 混合版本滚动升级 | D6 | 旧版本 leader 会把 `/timeline` 写回数字格式；旧版本节点不发布 `lineage`，新版本节点判定它们不能参选。新版本节点持锁后改回新格式。建议一次升级完所有节点 |
 | 副本发布的 timeline 可能只是下界 | S2 / S4 | 拿不到 receiver 的精确值时（本次 PostgreSQL 运行中从未流复制过，例如刚重启、上游已经不在），副本发布检查点 timeline 等下界，最多落后一个 `checkpoint_timeout`。下界低于最新 timeline、本地又没有以最新 timeline 命名的 WAL 段时，这个副本判为不能参选（偏严，不会偏松）。一直在流复制的副本、上游挂掉前流复制过的副本，以及收到过最新 timeline WAL 的副本不受影响 |
-| 带标记、等待 rewind 检查的备库对外是健康副本 | H2 / S4 | 带 `pg-ha.rewind_check` 的 ManagedStandby 在 leader 未就绪、分区期间、恢复后 pg_rewind 之前以只读备库运行，`/replica` 200，RO 客户端可能读到只存在于分叉历史上的数据（见 1a「rewind 检查标记」）。候选修法：带标记的节点 `/replica` 返回 503 |
+| ~~带标记、等待 rewind 检查的备库对外是健康副本~~ | H2 / S4 | **已闭合（2026-10-30）**：带 `pg-ha.rewind_check` 时 `/replica` 503（H2）；节点仍可只读运行并等待 rewind，但不经 Proxy RO 对外服务 |
 | 分区节点重新加入 Raft 会引发 Raft 重选 | L4 / L5 | openraft 0.9 没有 pre-vote：分区节点的 term 在分区期间上涨，重新连上后迫使集群重选 Raft leader；重选期间当前锁持有者续锁失败而被降级（多一次 failover，timeline +1）。任务 3 在 docker 集群上复现分区场景时每次都出现，不在任务 3 处理 |
-| watchdog 未接入租约 | W2 / L5 | `watchdog.rs` 没有调用点，超时硬编码 30 秒。HA 循环被同步阻塞、tokio worker 被占满、进程被 SIGSTOP 或 VM 冻结时，leader 租约的围栏无法执行。待做：只在租约有效且本节点是 Primary 时喂狗，超时 = TTL − `safety_margin` |
-| 动态修改 `ttl` 不改变写入锁的 TTL | L5 / C1 | `RaftDcs` 的 TTL 和 DCS 写超时在启动时由静态 `ttl`、`retry_timeout` 固定（`raft_dcs.rs` `RaftDcs::new`，锁写入用 `ttl: Some(self.ttl)`）；动态配置只改 HA 内存里的值。leader 租约按实际写进锁的 TTL 计算。`PATCH /config` 的参数约束按动态值检查，所以同时调大 `ttl` 和 `loop_wait` 的请求会被接受，而锁的 TTL 和租约仍按静态 `ttl`：`loop_wait` 超过它时，健康的主库也会在两轮之间失锁或被围栏 |
+| ~~watchdog 未接入租约~~ | W2 / L5 | **已闭合（2026-10-30）**：见 W2；默认仍 `mode: off`，生产建议 `automatic` 或 `required` |
+| ~~动态修改 `ttl` 不改变写入锁的 TTL~~ | L5 / C1 | **已闭合（2026-10-30）**：`process_dynamic_config` 在应用 HA 参数后调用 `DcsAdapter::set_lock_timing`；`RaftDcs` 用原子值更新锁 TTL 与写超时，租约继续读 `dcs.ttl()` |
 | TTL 过期仍受 Raft leader 墙钟影响 | L5 | 写入日志前由 Raft leader 用自己的时钟覆盖 `now`（`stamp_leader_time`），发起节点的时钟不再决定锁是否过期。本地读取仍用读取节点的墙钟，所以时钟快的节点可能在本地视图里认为锁已过期，但抢锁要经过 leader 的 `now`，在 leader 认为锁还在时会失败。Raft leader 的时钟比锁持有者快超过 `safety_margin`（减去约 0.1 秒）时，新主仍可能在旧主围栏前出现 |
 | 停库一直失败时锁一直被占（switchover 与优雅关停） | L5 / S1 | 用可用性换安全：持锁节点每轮续锁、重试停库，集群不换主，没有可写主对外（`/primary` 503）。运维处理见运维指南「关停卡住」「switchover 卡住」 |
 | 主库正常关停期间写不可用 | H4 / S1 | drain（默认 30 秒，只等待，不看连接是否清零）+ CHECKPOINT + 停库期间 `/primary` 503 且锁被续着，别的节点不接管。先 switchover 再停主库，或把主库的 `drain_timeout_secs` 调短 |
@@ -355,6 +355,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-10-30 | 闭合「UnmanagedRecovery 持锁时在 PG 仍运行时释放锁」：先停库再 `delete_leader`；有 `recovery.signal` 时不写 `standby.signal`；停不掉则保留锁并 `stop_pending` 每轮围栏（与 switchover / 关停一致）。闭合「动态 `ttl` 不改变写入锁的 TTL」：`set_lock_timing` 同步 RaftDcs。闭合「带 rewind_check 的 `/replica` 仍 200」：H2 要求无标记。闭合 W2：watchdog 在可写主 + 有效租约时喂狗（超时 = ttl − safety_margin），降级/关停停喂。运维：failover 与 switchover 候选校验对齐；`/failover` 写失败不 accepted；拒绝未实现的 `scheduled_at`；持锁 `/restart` 停前 `/primary` 503 且停失败 `stop_pending` |
 | 2026-10-27 | D6 重写：`/timeline` 记录最新已确认 timeline 的身份（编号 + 起点 LSN）和 promote 前的 pending，不再预写猜测值，闭合「`/timeline` 偏移后带标记节点永远不能参选」。只有在最新 timeline 上的节点参选，带不带标记都一样，防止编号重复和丢掉整任主库的写入；「谁最健康」只比 LSN。旧格式和缺失的 key 在全部节点上报后推断。新增历史代 `pg-ha.generation` 与运维强制参选 `pg-ha.accept_timeline_loss`：旧代数据不参选、不启动、不跟随、不 rewind，只能 reinitialize。第 9 节相应调整 |
 | 2026-10-27 | 第 9 节登记「`/timeline` 偏移后带标记节点永远不能参选」（只登记，代码未改），operations-guide 增加「场景 4a」人工恢复步骤 |
 | 2026-10-27 | 成员发布的 timeline 改为 `wal_position` 所在的 timeline（R2）。此前副本发布 `pg_control_checkpoint()` 的 timeline，failover 后最多落后一个 `checkpoint_timeout`；选举先比 timeline，于是一直流复制、WAL 最多的副本会输给刚 rewind、WAL 更少但控制文件已是新 timeline 的节点，多出的 WAL 被丢弃（2026-10-26 选举改为先比 timeline 后引入）。现在主库取 `pg_walfile_name(pg_current_wal_lsn())`，副本取 receiver 的 `received_tli`；receiver 停掉后沿用本次运行中最后报告的值，拿不到精确值时发布只会偏低的下界。第 9 节改为登记下界情形 |

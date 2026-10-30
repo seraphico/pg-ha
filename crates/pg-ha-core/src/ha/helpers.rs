@@ -199,6 +199,43 @@ impl Ha {
         &mut self,
         mode: &str,
     ) -> crate::error::Result<()> {
+        self.stop_publishing_not_primary(
+            mode,
+            "Failed to stop PostgreSQL after writing standby.signal",
+        )
+        .await
+    }
+
+    /// Stop PostgreSQL without writing `standby.signal` (operator-owned
+    /// `recovery.signal` / PITR). Publishes not-primary before and after the
+    /// stop; a failed stop sets `stop_pending` so later cycles retry without
+    /// altering the recovery intent.
+    pub(super) async fn stop_preserving_recovery_intent(
+        &mut self,
+        mode: &str,
+    ) -> crate::error::Result<()> {
+        self.stop_publishing_not_primary(
+            mode,
+            "Failed to stop PostgreSQL in unmanaged recovery (recovery.signal kept)",
+        )
+        .await
+    }
+
+    /// Retry a pending stop: with `recovery.signal`, do not write
+    /// `standby.signal`; otherwise assume demotion config is already written.
+    pub(super) async fn retry_pending_stop(&mut self, mode: &str) -> crate::error::Result<()> {
+        if self.has_recovery_signal() {
+            self.stop_preserving_recovery_intent(mode).await
+        } else {
+            self.stop_after_demotion_write(mode).await
+        }
+    }
+
+    async fn stop_publishing_not_primary(
+        &mut self,
+        mode: &str,
+        fail_prefix: &str,
+    ) -> crate::error::Result<()> {
         // H1: the REST API stops advertising primary before PostgreSQL stops
         // being writable, and again after the stop, before the post-stop DCS
         // write (which may wait up to retry_timeout on a minority).
@@ -207,9 +244,7 @@ impl Ha {
         self.publish_not_primary().await;
         if let Err(e) = stopped {
             self.stop_pending = true;
-            error!(
-                "Failed to stop PostgreSQL after writing standby.signal: {e}; pg-ha keeps fencing it until it is confirmed stopped"
-            );
+            error!("{fail_prefix}: {e}; pg-ha keeps fencing it until it is confirmed stopped");
             return Err(e);
         }
         self.stop_pending = false;
@@ -238,6 +273,48 @@ impl Ha {
             );
         }
         self.stop_after_demotion_write(mode).await
+    }
+
+    // ─── Watchdog (W2) ───
+
+    /// Arm and pet the hardware watchdog only while this node is a writable
+    /// primary under a valid leader lease. Timeout = `dcs.ttl() −
+    /// safety_margin`. Otherwise disarm so a zombie primary cannot keep the
+    /// machine alive past the lease.
+    pub(super) fn sync_watchdog_for_writable_primary(&mut self) {
+        let lease_ok = !self.lease_lost();
+        let writable_primary = self.is_leader
+            && lease_ok
+            && !self.is_paused
+            && !self.shutting_down
+            && !self.stop_pending
+            && self.pg_identity() == identity::PgIdentity::Primary;
+        if writable_primary {
+            let timeout = self
+                .dcs
+                .ttl()
+                .saturating_sub(self.config.watchdog.safety_margin)
+                .max(1);
+            if !self.watchdog.is_active() {
+                if !self.watchdog.activate(timeout) && self.watchdog.is_required() {
+                    error!(
+                        "Watchdog required but could not be activated; refusing to stay primary"
+                    );
+                    // Caller must demote; mark lease lost so the next check fences.
+                    self.set_leader_lease(None);
+                    return;
+                }
+            }
+            self.watchdog.keepalive();
+        } else {
+            self.disarm_watchdog();
+        }
+    }
+
+    pub(super) fn disarm_watchdog(&mut self) {
+        if self.watchdog.is_active() {
+            self.watchdog.disarm();
+        }
     }
 
     // ─── Leader lease (L5 time bound, see `lease`) ───
@@ -276,6 +353,7 @@ impl Ha {
     /// rewind-check marker first, then an immediate stop (a failed stop sets
     /// `stop_pending`).
     pub(super) async fn fence_for_lost_lease(&mut self) -> crate::error::Result<()> {
+        self.disarm_watchdog();
         self.is_leader = false;
         self.set_leader_lease(None);
         let stopped = self

@@ -270,10 +270,16 @@ impl Ha {
     }
 
     /// Designated candidate this node will defer to. `None` when the key has
-    /// no candidate, or the candidate is in the member list and the marked-node
-    /// rule says it will not campaign (A25). A missing member is still honoured.
+    /// no candidate, or the candidate is in the member list and may not
+    /// campaign (nofailover, not Running, or D6 ineligible — A25). A missing
+    /// member is still honoured (API already rejected known-bad candidates).
     fn honoured_candidate(&self) -> Option<&str> {
         let candidate = self.cluster.failover.as_ref()?.candidate.as_deref()?;
+        if let Some(m) = self.cluster.get_member(candidate)
+            && (m.is_nofailover() || m.state != crate::cluster::MemberState::Running)
+        {
+            return None;
+        }
         let may = self
             .cluster
             .get_member(candidate)
