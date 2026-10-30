@@ -71,6 +71,8 @@ pub struct ApiSnapshot {
     pub pending_restart: bool,
     /// Graceful shutdown in progress (`/primary` is 503 from the signal on).
     pub shutting_down: bool,
+    /// `pg-ha.rewind_check` present: may hold forked WAL; `/replica` is 503 (H2).
+    pub rewind_check: bool,
 }
 
 /// Hook that writes an [`ApiSnapshot`] into the REST API state. The HA engine
@@ -150,6 +152,10 @@ pub struct Ha {
     /// never started again, management commands are rejected, and a cycle
     /// that finds PostgreSQL stopped neither releases the lock nor starts it.
     shutting_down: bool,
+
+    /// Hardware watchdog (W2): armed only while this node is a writable
+    /// primary under a valid leader lease.
+    watchdog: crate::watchdog::Watchdog,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -165,6 +171,7 @@ impl Ha {
         postgresql: Postgresql,
     ) -> (Self, CommandSender) {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let watchdog = crate::watchdog::Watchdog::new(config.watchdog.clone());
         let ha = Self {
             config,
             dcs,
@@ -188,6 +195,7 @@ impl Ha {
             fence_deadline_tx: tokio::sync::watch::Sender::new(None),
             state_publisher: None,
             shutting_down: false,
+            watchdog,
         };
         (ha, cmd_tx)
     }
@@ -209,6 +217,7 @@ impl Ha {
             is_paused: self.is_paused,
             pending_restart: self.pending_restart(),
             shutting_down: self.shutting_down,
+            rewind_check: self.has_rewind_check_marker(),
         }
     }
 
@@ -333,7 +342,7 @@ impl Ha {
             warn!(
                 "Graceful shutdown: PostgreSQL is still running without the leader lock; stopping it again (immediate)"
             );
-            let _ = self.stop_after_demotion_write("immediate").await;
+            let _ = self.retry_pending_stop("immediate").await;
             return CycleResult::Error(
                 "graceful shutdown: PostgreSQL stop is still pending (not holding the leader lock)"
                     .into(),
@@ -377,7 +386,8 @@ impl Ha {
                         warn!(
                             "PostgreSQL stop is still pending; holding the leader lock and fencing again"
                         );
-                        let _ = self.stop_after_demotion_write("fast").await;
+                        self.disarm_watchdog();
+                        let _ = self.retry_pending_stop("fast").await;
                         return CycleResult::Error(
                             "leader lock held but PostgreSQL stop is still pending".into(),
                         );
@@ -430,6 +440,12 @@ impl Ha {
             LeaderAction::Hold => {
                 if self.lease_lost() {
                     return self.fence_at_lease_check("reporting the leader role").await;
+                }
+                self.sync_watchdog_for_writable_primary();
+                if self.lease_lost() {
+                    return self
+                        .fence_at_lease_check("activating the required watchdog")
+                        .await;
                 }
                 self.postgresql.set_role(MemberRole::Primary);
                 let _ = self.touch_member().await;
@@ -517,6 +533,12 @@ impl Ha {
         self.confirm_promote(&pending).await;
         let _ = self.touch_member().await;
         self.enforce_synchronous_replication().await;
+        self.sync_watchdog_for_writable_primary();
+        if self.lease_lost() {
+            return self
+                .fence_at_lease_check("activating the required watchdog")
+                .await;
+        }
         info!("PostgreSQL promoted to primary and confirmed out of recovery");
         CycleResult::Leader(format!(
             "promoted to primary. I am ({}), the leader with the lock",
@@ -524,14 +546,19 @@ impl Ha {
         ))
     }
 
-    /// The lock holder is in a recovery pg-ha did not create: give the lock
-    /// back so a node pg-ha manages can take over, and leave this node to the
-    /// operator. Never promote it: nothing proves it should become primary.
+    /// The lock holder is in a recovery pg-ha did not create: stop PostgreSQL
+    /// first (L5), then give the lock back so a node pg-ha manages can take
+    /// over, and leave this node to the operator. Never promote it: nothing
+    /// proves it should become primary. With `recovery.signal`, do not write
+    /// `standby.signal` (operator PITR intent). Without either signal, write
+    /// demotion config before the stop (D2). A failed stop keeps the lock and
+    /// sets `stop_pending` (same as switchover / graceful shutdown).
     ///
     /// In pause mode the lock is kept (W1: no automatic failover), but the
     /// node still does not claim primary.
     async fn relinquish_unmanaged_recovery(&mut self) -> CycleResult {
-        let cause = if self.has_recovery_signal() {
+        let has_recovery_signal = self.has_recovery_signal();
+        let cause = if has_recovery_signal {
             "recovery.signal present (archive or point-in-time recovery)"
         } else {
             "neither standby.signal nor recovery.signal present"
@@ -552,18 +579,39 @@ impl Ha {
         error!(
             cause,
             "Holding the leader lock while PostgreSQL is in recovery pg-ha did not create; \
-             releasing the lock. Operator action required: finish the recovery and promote \
-             manually, or recreate standby.signal to hand the node back to pg-ha"
+             stopping PostgreSQL before releasing the lock. Operator action required: finish \
+             the recovery and promote manually, or recreate standby.signal to hand the node \
+             back to pg-ha"
         );
-        if let Some(leader) = self.cluster.leader.clone() {
-            match self.dcs.delete_leader(&leader).await {
-                Ok(true) => info!("Released leader lock"),
-                Ok(false) => warn!("Leader lock was not ours to release"),
-                Err(e) => warn!("Failed to release leader lock, will retry next cycle: {e}"),
+
+        let stop_result = if has_recovery_signal {
+            self.stop_preserving_recovery_intent("fast").await
+        } else {
+            if let Err(e) = self
+                .prepare_demotion(None, Some("unmanaged recovery without standby.signal"))
+                .await
+            {
+                error!(
+                    "Failed to write standby configuration before stopping PostgreSQL: {e}; stopping it anyway"
+                );
             }
+            self.stop_after_demotion_write("fast").await
+        };
+
+        if stop_result.is_err() || self.postgresql.is_running() {
+            let _ = self.touch_member().await;
+            return CycleResult::Error(format!(
+                "holding the leader lock in unmanaged recovery ({cause}); stop failed, fencing until stopped"
+            ));
         }
-        self.is_leader = false;
-        self.reset_sync_cache();
+
+        if !self.release_leader_lock_if_stopped().await {
+            let _ = self.touch_member().await;
+            return CycleResult::Error(format!(
+                "stopped PostgreSQL in unmanaged recovery ({cause}), but the leader lock was not released"
+            ));
+        }
+
         let _ = self.touch_member().await;
         CycleResult::Error(format!(
             "released leader lock: PostgreSQL in unmanaged recovery ({cause}); operator action required"
@@ -700,6 +748,7 @@ impl Ha {
     /// failed write still stops PostgreSQL (L5 first) and reports an error.
     async fn demote(&mut self) -> CycleResult {
         warn!("Demoting: writing standby.signal, then stopping PostgreSQL immediately");
+        self.disarm_watchdog();
         self.reset_sync_cache();
         let written = self
             .prepare_demotion(None, Some("demoted after losing the leader lock"))
@@ -962,7 +1011,7 @@ impl Ha {
             // A demotion stop failed earlier: keep trying to stop PostgreSQL
             // even while the DCS is unreachable (A19).
             if self.stop_pending && self.postgresql.is_running() {
-                let _ = self.stop_after_demotion_write("fast").await;
+                let _ = self.retry_pending_stop("fast").await;
             }
             CycleResult::Error("DCS unreachable".into())
         }
@@ -1005,7 +1054,9 @@ impl Ha {
             return;
         }
 
-        // Apply HA parameter changes immediately
+        // Apply HA parameter changes immediately. Lock TTL and DCS write
+        // timeout live in the DCS adapter: keep them aligned with the lease
+        // (which uses dcs.ttl()), not only the HA memory copy.
         if changes.ha_params_changed {
             if let Some(lw) = new_config.loop_wait {
                 self.config.loop_wait = lw;
@@ -1016,6 +1067,8 @@ impl Ha {
             if let Some(rt) = new_config.retry_timeout {
                 self.config.retry_timeout = rt;
             }
+            self.dcs
+                .set_lock_timing(self.config.ttl, self.config.retry_timeout);
         }
 
         // Apply PG reload-only parameter changes via pg_ctl reload
@@ -1121,6 +1174,8 @@ mod tests {
         cluster: Mutex<Cluster>,
         leader_held_by: Mutex<Option<String>>,
         last_failover_value: Mutex<Option<String>>,
+        /// When set, `set_failover_value` returns Err.
+        fail_failover_writes: std::sync::atomic::AtomicBool,
         /// When set, leader-lock writes return Err (a DCS write failure).
         fail_leader_writes: std::sync::atomic::AtomicBool,
         /// When set, `delete_leader` returns Err and the lock stays.
@@ -1142,6 +1197,8 @@ mod tests {
         lock_ttl: std::sync::atomic::AtomicU64,
         /// Number of `touch_member` calls.
         touch_count: std::sync::atomic::AtomicUsize,
+        /// Dynamic `/config` value for `get_config_value`.
+        config_value: Mutex<Option<String>>,
     }
 
     impl MockDcs {
@@ -1150,6 +1207,7 @@ mod tests {
                 cluster: Mutex::new(Cluster::empty()),
                 leader_held_by: Mutex::new(None),
                 last_failover_value: Mutex::new(None),
+                fail_failover_writes: std::sync::atomic::AtomicBool::new(false),
                 fail_leader_writes: std::sync::atomic::AtomicBool::new(false),
                 fail_delete_leader: std::sync::atomic::AtomicBool::new(false),
                 timeline: Mutex::new(ClusterTimeline::Absent),
@@ -1160,6 +1218,7 @@ mod tests {
                 leader_write_delay: Mutex::new(std::time::Duration::ZERO),
                 lock_ttl: std::sync::atomic::AtomicU64::new(30),
                 touch_count: std::sync::atomic::AtomicUsize::new(0),
+                config_value: Mutex::new(None),
             }
         }
 
@@ -1176,6 +1235,7 @@ mod tests {
                 cluster: Mutex::new(cluster),
                 leader_held_by: Mutex::new(Some(name.to_string())),
                 last_failover_value: Mutex::new(None),
+                fail_failover_writes: std::sync::atomic::AtomicBool::new(false),
                 fail_leader_writes: std::sync::atomic::AtomicBool::new(false),
                 fail_delete_leader: std::sync::atomic::AtomicBool::new(false),
                 timeline: Mutex::new(ClusterTimeline::Absent),
@@ -1186,6 +1246,7 @@ mod tests {
                 leader_write_delay: Mutex::new(std::time::Duration::ZERO),
                 lock_ttl: std::sync::atomic::AtomicU64::new(30),
                 touch_count: std::sync::atomic::AtomicUsize::new(0),
+                config_value: Mutex::new(None),
             }
         }
 
@@ -1221,6 +1282,11 @@ mod tests {
 
         fn fail_delete_leader(&self) {
             self.fail_delete_leader
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn fail_failover_writes(&self) {
+            self.fail_failover_writes
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -1317,6 +1383,14 @@ mod tests {
         }
 
         async fn set_failover_value(&self, value: &str) -> Result<bool> {
+            if self
+                .fail_failover_writes
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::Dcs(
+                    "injected /failover write failure".into(),
+                ));
+            }
             *self.last_failover_value.lock().unwrap() = Some(value.to_string());
             Ok(true)
         }
@@ -1325,12 +1399,13 @@ mod tests {
             Ok(true)
         }
 
-        async fn set_config_value(&self, _value: &str) -> Result<bool> {
+        async fn set_config_value(&self, value: &str) -> Result<bool> {
+            *self.config_value.lock().unwrap() = Some(value.to_string());
             Ok(true)
         }
 
         async fn get_config_value(&self) -> Result<Option<String>> {
-            Ok(None)
+            Ok(self.config_value.lock().unwrap().clone())
         }
 
         async fn write_cluster_timeline(
@@ -1364,6 +1439,10 @@ mod tests {
         }
         fn loop_wait(&self) -> u64 {
             10
+        }
+        fn set_lock_timing(&self, ttl: u64, _retry_timeout: u64) {
+            self.lock_ttl
+                .store(ttl.max(1), std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -2006,10 +2085,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lock_holder_in_unmanaged_recovery_releases_lock() {
+    async fn test_lock_holder_in_unmanaged_recovery_keeps_lock_when_stop_fails() {
+        // no_bin_dir: stop fails → lock must stay (L5); previously this path
+        // released the lock while PostgreSQL was still running.
         let dcs = Arc::new(MockDcs::with_leader("test_node"));
-        let (mut ha, dir) =
-            identity_test_ha("test_node", "id-relinquish", dcs.clone(), Some(true), false);
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "id-relinquish-fail",
+            dcs.clone(),
+            Some(true),
+            false,
+        );
+        ha.cluster = leader_cluster("test_node", "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("stop failed")),
+            "got: {result}"
+        );
+        assert_eq!(
+            lock_held_by(&dcs).as_deref(),
+            Some("test_node"),
+            "lock must stay while PostgreSQL may still run"
+        );
+        assert!(ha.is_leader());
+        assert!(ha.stop_pending);
+        assert!(dir.join("standby.signal").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_lock_holder_in_unmanaged_recovery_stops_before_releasing_lock() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "test_node",
+            "id-relinquish-ok",
+            dcs.clone(),
+            Some(true),
+            false,
+            Some(fake_pg_bin(FakeBin::PgCtlStopOk)),
+        );
         ha.cluster = leader_cluster("test_node", "node2");
 
         let result = ha.process_healthy_cluster().await;
@@ -2018,9 +2134,41 @@ mod tests {
             matches!(result, CycleResult::Error(ref m) if m.contains("released leader lock")),
             "got: {result}"
         );
-        assert_eq!(lock_held_by(&dcs), None, "lock must be released");
+        assert_eq!(lock_held_by(&dcs), None, "lock released only after stop");
         assert!(!ha.is_leader());
-        assert_ne!(ha.postgresql().role(), &MemberRole::Primary);
+        assert!(!ha.postgresql().is_running());
+        assert!(dir.join("standby.signal").is_file());
+        assert!(!ha.stop_pending);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_lock_holder_with_recovery_signal_stops_without_standby_signal() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "test_node",
+            "id-relinquish-recovery-signal",
+            dcs.clone(),
+            Some(true),
+            false,
+            Some(fake_pg_bin(FakeBin::PgCtlStopOk)),
+        );
+        std::fs::write(dir.join("recovery.signal"), "").unwrap();
+        ha.cluster = leader_cluster("test_node", "node2");
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m.contains("released leader lock")),
+            "got: {result}"
+        );
+        assert_eq!(lock_held_by(&dcs), None);
+        assert!(
+            !dir.join("standby.signal").exists(),
+            "must not alter PITR intent"
+        );
+        assert!(dir.join("recovery.signal").is_file());
+        assert!(!ha.postgresql().is_running());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2603,12 +2751,13 @@ mod tests {
     #[tokio::test]
     async fn test_releasing_lock_in_unmanaged_recovery_resets_sync_cache() {
         let dcs = Arc::new(MockDcs::with_leader("test_node"));
-        let (mut ha, dir) = identity_test_ha(
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
             "test_node",
             "c1-relinquish-sync",
             dcs.clone(),
             Some(true),
             false,
+            Some(fake_pg_bin(FakeBin::PgCtlStopOk)),
         );
         ha.cluster = leader_cluster("test_node", "node2");
         ha.applied_sync_standby_names = applied_sync();
@@ -4331,14 +4480,28 @@ mod tests {
         );
         ha.is_leader = true;
         ha.cluster = leader_cluster("node1", "node2");
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let rec = published.clone();
+        ha.set_state_publisher(Arc::new(move |snapshot| {
+            rec.lock().unwrap().push(snapshot);
+            Box::pin(async {})
+        }));
 
         let resp = send_cmd(&mut ha, &tx, ManagementCommand::Restart).await;
 
         assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
         assert!(resp.message.starts_with("Stop failed"), "{}", resp.message);
+        assert!(resp.message.contains("keeps fencing"), "{}", resp.message);
         assert!(!dir.join("standby.signal").exists());
         assert_eq!(marker(&dir), None);
-        assert!(!ha.stop_pending);
+        assert!(ha.stop_pending, "failed leader restart must keep fencing");
+        let snaps = published.lock().unwrap();
+        assert!(
+            snaps
+                .iter()
+                .any(|s| !s.is_leader && s.pg_in_recovery.is_none()),
+            "must publish not-primary before/after the stop attempt: {snaps:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5746,6 +5909,160 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn test_failover_rejects_nofailover_and_not_running_candidates() {
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node3",
+            "c4-failover-tags",
+            dcs.clone(),
+            Some(true),
+            true,
+            None,
+        );
+        let mut nofailover = running_member("node2", 100);
+        nofailover
+            .tags
+            .insert("nofailover".into(), serde_json::json!(true));
+        let mut stopped = running_member("node1", 100);
+        stopped.state = crate::cluster::MemberState::Stopped;
+        ha.cluster = unlocked(
+            vec![running_member("node3", 100), nofailover, stopped],
+            None,
+        );
+
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Failover {
+                candidate: Some("node2".into()),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, CommandStatus::Rejected);
+        assert!(resp.message.contains("nofailover"), "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Failover {
+                candidate: Some("node1".into()),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, CommandStatus::Rejected);
+        assert!(resp.message.contains("not running"), "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_failover_write_failure_is_not_accepted() {
+        let dcs = Arc::new(MockDcs::new());
+        dcs.fail_failover_writes();
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node3",
+            "c4-failover-write-fail",
+            dcs.clone(),
+            Some(true),
+            true,
+            None,
+        );
+        ha.cluster = unlocked(
+            vec![running_member("node3", 100), running_member("node2", 100)],
+            None,
+        );
+
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Failover {
+                candidate: Some("node2".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(resp.status, CommandStatus::Error, "{}", resp.message);
+        assert!(resp.message.contains("/failover"), "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_ttl_updates_dcs_lock_ttl() {
+        let dcs = Arc::new(MockDcs::new());
+        assert_eq!(dcs.ttl(), 30);
+        let (mut ha, dir) = identity_test_ha("node1", "dyn-ttl", dcs.clone(), Some(false), false);
+        *dcs.config_value.lock().unwrap() =
+            Some(serde_json::json!({"ttl": 60, "loop_wait": 10, "retry_timeout": 10}).to_string());
+
+        ha.process_dynamic_config().await;
+
+        assert_eq!(ha.config().ttl, 60);
+        assert_eq!(dcs.ttl(), 60, "lock TTL must follow dynamic /config");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_switchover_is_rejected() {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node1",
+            "c4-scheduled-rejected",
+            dcs.clone(),
+            Some(false),
+            false,
+            None,
+        );
+        ha.is_leader = true;
+        ha.cluster = leader_cluster("node1", "node2");
+
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Switchover {
+                leader: Some("node1".into()),
+                candidate: Some("node2".into()),
+                scheduled_at: Some("2026-10-17T01:00:00Z".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(resp.status, CommandStatus::Rejected);
+        assert!(resp.message.contains("not implemented"), "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        assert!(ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_nofailover_designated_candidate_is_not_honoured() {
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir) =
+            identity_test_ha("node3", "c4-nofailover-honour", dcs, Some(true), true);
+        let mut nofailover = running_member("node2", 9999);
+        nofailover
+            .tags
+            .insert("nofailover".into(), serde_json::json!(true));
+        ha.cluster = unlocked(vec![running_member("node3", 100), nofailover], Some(1));
+        ha.cluster.failover = Some(crate::cluster::Failover {
+            leader: None,
+            candidate: Some("node2".into()),
+            scheduled_at: None,
+        });
+        put_history(&dir, 1);
+
+        // Without the fix, peers would defer forever to a nofailover candidate.
+        assert!(ha.is_healthiest_node());
+        let result = ha.process_unhealthy_cluster().await;
+        assert!(
+            !matches!(result, CycleResult::Follower(ref m) if m.contains("deferring")),
+            "must not defer to nofailover designated candidate; got: {result}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ─────────────────── Rewind check (D4) and rewind failure hold (D5) ───────────────────
 
     use crate::standby_config::REWIND_HOLD_FILE;
@@ -7085,6 +7402,27 @@ mod tests {
             }
             assert!(!text.contains(DIRECT_STOP), "{what}: direct stop");
         }
+
+        // UnmanagedRecovery lock holder: stop (with or without demotion write)
+        // before releasing the lock; never delete_leader while PG may run.
+        let relinquish = body(mod_rs, "async fn relinquish_unmanaged_recovery");
+        assert_before(
+            relinquish,
+            "stop_after_demotion_write(",
+            "release_leader_lock_if_stopped(",
+            "relinquish (no recovery.signal) stops before release",
+        );
+        assert_before(
+            relinquish,
+            "stop_preserving_recovery_intent(",
+            "release_leader_lock_if_stopped(",
+            "relinquish (recovery.signal) stops before release",
+        );
+        assert!(
+            !relinquish.contains("delete_leader("),
+            "relinquish must release only through release_leader_lock_if_stopped"
+        );
+        assert!(!relinquish.contains(DIRECT_STOP), "relinquish: direct stop");
 
         // Paths that stop through fence_primary.
         let election_fence = section(

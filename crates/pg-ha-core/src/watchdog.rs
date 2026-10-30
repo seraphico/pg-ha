@@ -13,6 +13,9 @@ use tracing::{debug, error, info, warn};
 /// Watchdog device handler
 pub struct Watchdog {
     config: WatchdogConfig,
+    /// Kernel watchdog timeout in seconds (`ttl − safety_margin` when armed
+    /// for the leader lease).
+    timeout_secs: u64,
     /// File descriptor for the watchdog device (Linux only)
     #[cfg(target_os = "linux")]
     fd: Option<std::os::unix::io::RawFd>,
@@ -25,19 +28,23 @@ impl Watchdog {
     pub fn new(config: WatchdogConfig) -> Self {
         Self {
             config,
+            timeout_secs: 30,
             #[cfg(target_os = "linux")]
             fd: None,
             is_active: false,
         }
     }
 
-    /// Activate the watchdog (open the device).
-    /// Called when this node becomes the primary.
-    pub fn activate(&mut self) -> bool {
+    /// Activate the watchdog (open the device) with the given timeout.
+    /// `timeout_secs` should be `dcs.ttl() − safety_margin` so a hung HA
+    /// loop is rebooted before another node can promote over a writable
+    /// primary (W2 / L5).
+    pub fn activate(&mut self, timeout_secs: u64) -> bool {
         if self.config.mode == WatchdogMode::Off {
             debug!("Watchdog is disabled");
             return true;
         }
+        self.timeout_secs = timeout_secs.max(1);
 
         #[cfg(target_os = "linux")]
         {
@@ -104,7 +111,6 @@ impl Watchdog {
     #[cfg(target_os = "linux")]
     fn activate_linux(&mut self) -> bool {
         use std::ffi::CString;
-        use std::os::unix::io::RawFd;
 
         let path = CString::new(self.config.device.as_str()).unwrap();
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
@@ -120,16 +126,19 @@ impl Watchdog {
             }
         }
 
-        // Set watchdog timeout via ioctl
-        // WDIOC_SETTIMEOUT = 0xC0045706
-        let timeout: libc::c_int = 30; // Will be overridden by safety calculation
+        // Set watchdog timeout via ioctl (WDIOC_SETTIMEOUT = 0xC0045706).
+        let timeout: libc::c_int = self.timeout_secs as libc::c_int;
         unsafe {
             libc::ioctl(fd, 0xC004_5706, &timeout);
         }
 
         self.fd = Some(fd);
         self.is_active = true;
-        info!(device = %self.config.device, "Watchdog activated");
+        info!(
+            device = %self.config.device,
+            timeout_secs = self.timeout_secs,
+            "Watchdog activated"
+        );
         true
     }
 
@@ -175,7 +184,7 @@ mod tests {
             safety_margin: 5,
         };
         let mut wd = Watchdog::new(config);
-        assert!(wd.activate()); // always succeeds when off
+        assert!(wd.activate(25)); // always succeeds when off
         assert!(!wd.is_active());
         assert!(!wd.is_required());
     }
@@ -189,7 +198,7 @@ mod tests {
         };
         let mut wd = Watchdog::new(config);
         // On non-Linux (macOS in test), activate succeeds but is_active is false
-        assert!(wd.activate());
+        assert!(wd.activate(25));
         assert!(!wd.is_active());
     }
 
@@ -202,7 +211,7 @@ mod tests {
         };
         let mut wd = Watchdog::new(config);
         // On non-Linux, required mode fails
-        assert!(!wd.activate());
+        assert!(!wd.activate(25));
         assert!(wd.is_required());
     }
 

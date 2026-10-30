@@ -67,6 +67,8 @@ pub struct NodeState {
     /// Graceful shutdown in progress: `/primary` is 503 from the signal on,
     /// while the other endpoints keep reporting the real state.
     pub shutting_down: bool,
+    /// `pg-ha.rewind_check` present: may hold forked history; `/replica` is 503.
+    pub rewind_check: bool,
 }
 
 impl AppState {
@@ -92,6 +94,7 @@ impl AppState {
                 failsafe_active: false,
                 pg_in_recovery: None,
                 shutting_down: false,
+                rewind_check: false,
             })),
             dcs: None,
             lease_timing: None,
@@ -129,6 +132,7 @@ impl AppState {
                 failsafe_active: false,
                 pg_in_recovery: None,
                 shutting_down: false,
+                rewind_check: false,
             })),
             dcs: Some(dcs),
             lease_timing: Some(lease_timing),
@@ -176,6 +180,7 @@ impl NodeState {
         self.is_paused = snapshot.is_paused;
         self.pending_restart = snapshot.pending_restart;
         self.shutting_down = snapshot.shutting_down;
+        self.rewind_check = snapshot.rewind_check;
     }
 
     /// H1: `/primary` is 200 exactly when this node holds the leader lock,
@@ -194,13 +199,15 @@ impl NodeState {
             && !self.shutting_down
     }
 
-    /// H2: a healthy replica is running, recorded as a replica, and observed
-    /// in recovery. A server observed out of recovery is never served as a
-    /// replica, whatever its recorded role.
+    /// H2: a healthy replica is running, recorded as a replica, observed in
+    /// recovery, and not waiting for a rewind check (forked history must not
+    /// be served on the RO path). A server observed out of recovery is never
+    /// served as a replica, whatever its recorded role.
     pub fn is_healthy_replica(&self) -> bool {
         self.state == MemberState::Running
             && self.role == MemberRole::Replica
             && self.pg_in_recovery == Some(true)
+            && !self.rewind_check
     }
 
     /// True if this node is a standby leader

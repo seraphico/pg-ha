@@ -74,12 +74,17 @@ impl Ha {
                 // with pg_rewind once the leader runs as a primary; until
                 // then keep it running read-only (the live probe runs in
                 // rejoin_as_replica, before anything is stopped).
+                //
+                // Publish rewind_check to DCS before waiting or rejoining so
+                // peers apply A21 (failover / switchover / election) while
+                // this node may still hold forked history (H2 uses the local
+                // marker via api_snapshot on the same cycle).
+                let _ = self.touch_member().await;
                 if !identity::leader_ready_in_dcs(
                     Some(lock_owner),
                     lock_owner,
                     self.cluster.get_member(lock_owner),
                 ) {
-                    let _ = self.touch_member().await;
                     return CycleResult::Follower(format!(
                         "rewind-check marker present; waiting for {lock_owner} to run as a primary before pg_rewind"
                     ));

@@ -148,6 +148,17 @@ async fn test_replica_returns_200_when_healthy() {
 }
 
 #[tokio::test]
+async fn test_replica_returns_503_when_rewind_check() {
+    let state = test_state();
+    set_replica(&state).await;
+    state.update(|s| s.rewind_check = true).await;
+    assert_eq!(
+        status_of(state, "/replica").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
 async fn test_replica_returns_503_when_primary() {
     let state = test_state();
     set_primary(&state).await;

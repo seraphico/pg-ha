@@ -52,9 +52,16 @@ pub trait DcsAdapter: Send + Sync {
         expected: Option<u64>,
     ) -> Result<bool>;
 
-    /// Get the configured TTL
+    /// Get the configured TTL written into the leader lock
     fn ttl(&self) -> u64;
 
     /// Get the configured loop_wait
     fn loop_wait(&self) -> u64;
+
+    /// Update the TTL written into the leader lock and the DCS write timeout
+    /// (from dynamic `/config`). Defaults to a no-op for adapters that ignore
+    /// dynamic timing; RaftDcs applies both so the lease and lock stay aligned.
+    fn set_lock_timing(&self, ttl: u64, retry_timeout: u64) {
+        let _ = (ttl, retry_timeout);
+    }
 }

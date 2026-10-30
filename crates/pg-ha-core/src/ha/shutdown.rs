@@ -107,6 +107,7 @@ impl Ha {
     async fn begin_shutdown(&mut self) {
         info!("Initiating graceful shutdown");
         self.shutting_down = true;
+        self.disarm_watchdog();
         self.postgresql.block_starts();
         if let Some(publish) = self.state_publisher.as_ref() {
             publish(self.api_snapshot()).await;

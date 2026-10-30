@@ -156,7 +156,7 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
   -H 'Content-Type: application/json' \
   -d '{"leader": "node1"}'
 
-# 计划执行：带 scheduled_at（ISO 8601）时只记在本进程内存里
+# scheduled_at 尚未实现：带该字段会 409 rejected（不要依赖「已调度」）
 curl -u admin:secret -X POST http://localhost:8008/switchover \
   -H 'Content-Type: application/json' \
   -d '{"leader": "node1", "candidate": "node2", "scheduled_at": "2026-10-17T01:00:00Z"}'
@@ -168,7 +168,7 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
 {"status": "accepted", "message": "Switchover initiated, leader lock released"}
 ```
 
-带 `scheduled_at` 时 HTTP 200，`message` 为 `Switchover scheduled`（请求留在本进程内存，重启即丢失）。`status` 一律小写：`accepted`、`rejected`、`error`。不合格候选（sync 开启且不在 `/sync`）返回 HTTP 409：
+带 `scheduled_at` 时 HTTP 409，`message` 含 `scheduled switchover is not implemented`。`status` 一律小写：`accepted`、`rejected`、`error`。不合格候选（sync 开启且不在 `/sync`）返回 HTTP 409：
 
 ```json
 {"status": "rejected", "message": "Candidate 'node3' is not a synchronous standby (sync mode requires /sync membership)"}
@@ -188,15 +188,11 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
 {"status": "rejected", "message": "No other running member can take over; refusing switchover without a candidate"}
 ```
 
-**取消已计划的 switchover：**
-
-```bash
-curl -u admin:secret -X DELETE http://localhost:8008/switchover
-```
+**取消已计划的 switchover：** `DELETE /switchover` 仍可清除本进程里残留的 `pending_switchover`（历史字段）；定时 switchover 未实现，生产请勿依赖。
 
 **立即 Switchover 在发起节点上的动作**（没有先跑 CHECKPOINT；CHECKPOINT 只在进程收到 SIGTERM/SIGINT 的停机路径里）：
 
-1. 校验候选（含同步复制资格）
+1. 校验候选（存在、Running、非 nofailover、无 rewind 标记、含同步复制资格）；写 `/failover` 失败则中止并返回 error，不停库
 2. 把 `{leader, candidate}` 写入 DCS `/failover`
 3. 续一次 leader lock（命令执行期间 HA 循环不跑）；续锁失败则按租约到期围栏，返回 error `Switchover aborted: leader lock renewal failed; ...`
 4. 写入 `standby.signal` 并 fsync；有 candidate 时把 `postgresql.auto.conf` 的 `primary_conninfo` 指到候选，没有时删除 `primary_conninfo`；`postgresql.auto.conf` 的其他设置保留

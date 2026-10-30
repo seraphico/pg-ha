@@ -37,15 +37,15 @@ pub struct RaftDcs {
     /// Base path for all keys in this cluster: /namespace/scope/
     base_path: String,
 
-    /// TTL for leader lock in seconds
-    ttl: u64,
+    /// TTL for leader lock in seconds (updated by dynamic `/config`)
+    ttl: std::sync::atomic::AtomicU64,
 
     /// HA loop wait interval
     loop_wait: u64,
 
-    /// Upper bound for one DCS write (`retry_timeout`), covering both the
-    /// local Raft commit and the forward to the Raft leader
-    write_timeout: std::time::Duration,
+    /// Upper bound in seconds for one DCS write (`retry_timeout`), covering
+    /// both the local Raft commit and the forward to the Raft leader
+    write_timeout_secs: std::sync::atomic::AtomicU64,
 
     /// Notification channel for waking up watchers
     notify: Arc<Notify>,
@@ -152,13 +152,25 @@ impl RaftDcs {
             store,
             node_name,
             base_path,
-            ttl,
+            ttl: std::sync::atomic::AtomicU64::new(ttl),
             loop_wait,
-            write_timeout: std::time::Duration::from_secs(retry_timeout.max(1)),
+            write_timeout_secs: std::sync::atomic::AtomicU64::new(retry_timeout.max(1)),
             notify: Arc::new(Notify::new()),
             http_client,
             tls_enabled,
         })
+    }
+
+    fn lock_ttl(&self) -> u64 {
+        self.ttl.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn write_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.write_timeout_secs
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1),
+        )
     }
 
     /// Get the Raft instance (for RPC server use)
@@ -317,7 +329,7 @@ impl RaftDcs {
     /// lock write is a CAS ordered in the Raft log, so a late renewal either
     /// fails against a newer holder or extends a lock nobody else took.
     async fn propose(&self, request: Request) -> Result<Response> {
-        bounded_write(self.write_timeout, self.propose_unbounded(request)).await
+        bounded_write(self.write_timeout(), self.propose_unbounded(request)).await
     }
 
     async fn propose_unbounded(&self, request: Request) -> Result<Response> {
@@ -504,7 +516,7 @@ impl DcsAdapter for RaftDcs {
         let request = Request::Set {
             key: self.leader_path(),
             value: self.node_name.clone(),
-            ttl: Some(self.ttl),
+            ttl: Some(self.lock_ttl()),
             prev_exist: Some(false), // Only succeed if key does NOT exist
             prev_value: None,
             prev_version: None,
@@ -528,7 +540,7 @@ impl DcsAdapter for RaftDcs {
         let request = Request::Set {
             key: self.leader_path(),
             value: self.node_name.clone(),
-            ttl: Some(self.ttl),
+            ttl: Some(self.lock_ttl()),
             prev_exist: None,
             prev_value: Some(self.node_name.clone()),
             prev_version: None,
@@ -568,7 +580,7 @@ impl DcsAdapter for RaftDcs {
         let request = Request::Set {
             key: self.member_path(),
             value,
-            ttl: Some(self.ttl),
+            ttl: Some(self.lock_ttl()),
             prev_exist: None,
             prev_value: None,
             prev_version: None,
@@ -683,11 +695,24 @@ impl DcsAdapter for RaftDcs {
     }
 
     fn ttl(&self) -> u64 {
-        self.ttl
+        self.lock_ttl()
     }
 
     fn loop_wait(&self) -> u64 {
         self.loop_wait
+    }
+
+    fn set_lock_timing(&self, ttl: u64, retry_timeout: u64) {
+        let ttl = ttl.max(1);
+        let retry = retry_timeout.max(1);
+        self.ttl.store(ttl, std::sync::atomic::Ordering::Relaxed);
+        self.write_timeout_secs
+            .store(retry, std::sync::atomic::Ordering::Relaxed);
+        info!(
+            ttl,
+            retry_timeout = retry,
+            "Updated DCS lock timing from dynamic config"
+        );
     }
 }
 
