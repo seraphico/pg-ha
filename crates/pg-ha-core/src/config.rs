@@ -8,17 +8,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Log output format
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
+    #[default]
     Text,
     Json,
-}
-
-impl Default for LogFormat {
-    fn default() -> Self {
-        Self::Text
-    }
 }
 
 /// Raft RPC TLS configuration

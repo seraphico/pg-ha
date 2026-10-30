@@ -182,12 +182,9 @@ async fn main() -> anyhow::Result<()> {
 
     let mut bootstrapped = false;
     loop {
-        match dcs.wait_for_leader(2).await {
-            Ok(()) => {
-                info!("Raft cluster ready");
-                break;
-            }
-            Err(_) => {}
+        if let Ok(()) = dcs.wait_for_leader(2).await {
+            info!("Raft cluster ready");
+            break;
         }
 
         if tokio::time::Instant::now() >= deadline {

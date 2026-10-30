@@ -715,10 +715,9 @@ impl Postgresql {
         for line in stdout.lines() {
             if line.contains("Latest checkpoint's TimeLineID")
                 && let Some(val) = line.split(':').nth(1)
+                && let Ok(tl) = val.trim().parse::<u64>()
             {
-                if let Ok(tl) = val.trim().parse::<u64>() {
-                    return Ok(tl);
-                }
+                return Ok(tl);
             }
         }
         Err(Error::Postgres(

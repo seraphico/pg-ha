@@ -241,7 +241,6 @@ mod tests {
     /// Verifies that NetworkFactory correctly constructs URLs from target_addr
     /// with and without "http" prefix, and that NetworkConnection objects hold
     /// valid client and target_addr fields after creation.
-
     /// Strategy: generate valid network addresses (ip:port, hostname:port)
     /// both with and without the "http://" prefix.
     fn arb_addr_without_http() -> impl Strategy<Value = String> {

@@ -342,36 +342,28 @@ impl Member {
 }
 
 /// PostgreSQL member state
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberState {
     Running,
     Stopped,
     Starting,
     Crashed,
+
+    #[default]
     Unknown,
 }
 
-impl Default for MemberState {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
-
 /// PostgreSQL member role
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberRole {
     Primary,
     Replica,
     StandbyLeader,
-    Uninitialized,
-}
 
-impl Default for MemberRole {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
+    #[default]
+    Uninitialized,
 }
 
 impl std::fmt::Display for MemberRole {
