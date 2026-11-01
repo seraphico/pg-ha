@@ -306,7 +306,7 @@ raft:
     ca_cert: <path>                # 校验对端证书的 CA (可选)
     client_cert: <path>            # 出站客户端证书 (可选)
     client_key: <path>             # 出站客户端私钥 (可选)
-    require_client_cert: <bool>    # 配置里有该字段，启动代码尚未强制校验客户端证书
+    require_client_cert: <bool>    # true 时服务端强制 mTLS，针对 ca_cert 校验客户端证书（需设置 ca_cert）；默认 false 为仅服务端认证 TLS
 
 # ─── TCP Proxy 配置 (必填) ───
 proxy:
@@ -453,7 +453,7 @@ sudo chmod 644 /etc/pg-ha/tls/*.crt
 
 把路径写进每台节点的 `raft.tls`（见上面的生产 YAML）。服务端用 `cert` + `key` 把 2380 换成 HTTPS；出站客户端用 `ca_cert` 校验对端，并在同时提供 `client_cert` / `client_key` 时带上客户端证书。
 
-`require_client_cert` 可以写在 YAML 里，但 `src/main.rs` 创建 Rustls 配置时没有读取它，服务端不会拒绝没有客户端证书的连接。不要把它当成已经生效的 mTLS。
+把 `require_client_cert` 设为 `true` 即开启服务端 mTLS：服务端会要求对端出示客户端证书，并针对 `ca_cert` 配置的 CA 校验，拒绝未提供证书或证书不受信任的连接。此时必须设置 `ca_cert`，否则启动即报错退出。默认 `false` 时行为与以往一致，为仅服务端认证的单向 TLS。开启后请确保每个节点都配置了 `client_cert` / `client_key`，否则节点间互相连接会被拒绝。
 
 REST API（8008）不受 `raft.tls` 影响，始终是 HTTP。
 

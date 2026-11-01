@@ -32,6 +32,11 @@ docker/tls/*.srl
 .aider*
 
 # Local agent / worktree scratch
+# .agents/ holds local AI task notes, versioned in the separate private
+# repo pg-ha-agents (isolated git dir .agents-git), NOT in this product repo.
+.agents/
+.agents-git/
+.gitignore.agents
 .worktrees/
 .superpowers/
 

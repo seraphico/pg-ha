@@ -35,7 +35,9 @@ pingora-proxy = "0.8"
 pingora-load-balancing = "0.8"
 axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
 tokio-postgres = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"] }
@@ -58,6 +60,8 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

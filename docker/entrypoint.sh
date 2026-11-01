@@ -102,7 +102,7 @@ cat << TLSEOF
     ca_cert: ${PG_HA_RAFT_TLS_CA_CERT}
     client_cert: ${PG_HA_RAFT_TLS_CLIENT_CERT}
     client_key: ${PG_HA_RAFT_TLS_CLIENT_KEY}
-    require_client_cert: false
+    require_client_cert: ${PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT:-false}
 TLSEOF
 fi)
 

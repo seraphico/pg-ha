@@ -139,10 +139,20 @@ async fn main() -> anyhow::Result<()> {
         use axum_server::tls_rustls::RustlsConfig;
         // Install rustls crypto provider (required by rustls 0.23+)
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let rustls_config = RustlsConfig::from_pem_file(&tls_cfg.cert, &tls_cfg.key)
-            .await
-            .map_err(|e| anyhow::anyhow!("Raft TLS config error: {e}"))?;
-        info!(%raft_addr, "Raft RPC listening (TLS)");
+        let rustls_config = if tls_cfg.require_client_cert {
+            // mTLS: require and verify client certificates against the configured CA.
+            let server_config = build_mtls_server_config(tls_cfg)
+                .map_err(|e| anyhow::anyhow!("Raft mTLS config error: {e}"))?;
+            info!(%raft_addr, "Raft RPC listening (mTLS: client certificate required)");
+            RustlsConfig::from_config(Arc::new(server_config))
+        } else {
+            // Server-auth-only TLS (default): no client certificate verification.
+            let cfg = RustlsConfig::from_pem_file(&tls_cfg.cert, &tls_cfg.key)
+                .await
+                .map_err(|e| anyhow::anyhow!("Raft TLS config error: {e}"))?;
+            info!(%raft_addr, "Raft RPC listening (TLS)");
+            cfg
+        };
         tokio::spawn(async move {
             if let Err(e) = axum_server::bind_rustls(raft_addr, rustls_config)
                 .serve(raft_router.into_make_service())
@@ -533,6 +543,83 @@ async fn resolve_addr(addr: &str) -> Option<SocketAddr> {
     }
     // DNS lookup
     tokio::net::lookup_host(addr).await.ok()?.next()
+}
+
+/// Build a rustls `ServerConfig` that requires and verifies client certificates
+/// (server-side mTLS) for the Raft RPC listener.
+///
+/// The client certificate chain must validate against the CA at `ca_cert`;
+/// connections presenting no certificate or a certificate signed by an untrusted
+/// CA are rejected during the TLS handshake. Fails fast with a clear error when
+/// `ca_cert` is missing or unreadable.
+fn build_mtls_server_config(
+    tls_cfg: &pg_ha_core::config::RaftTlsConfig,
+) -> anyhow::Result<rustls::ServerConfig> {
+    use rustls::RootCertStore;
+    use rustls::server::WebPkiClientVerifier;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    // require_client_cert demands a CA to verify client certificates against.
+    let ca_path = tls_cfg.ca_cert.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "require_client_cert is true but raft.tls.ca_cert is not set; \
+             a CA certificate is required to verify client certificates"
+        )
+    })?;
+
+    // Load the trust anchor(s) used to verify presented client certificates.
+    let ca_pem = std::fs::read(ca_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read ca_cert '{}': {e}", ca_path.display()))?;
+    let ca_certs = rustls_pemfile::certs(&mut ca_pem.as_slice())
+        .collect::<Result<Vec<CertificateDer>, _>>()
+        .map_err(|e| anyhow::anyhow!("Invalid ca_cert '{}': {e}", ca_path.display()))?;
+    if ca_certs.is_empty() {
+        anyhow::bail!("ca_cert '{}' contains no certificates", ca_path.display());
+    }
+    let mut roots = RootCertStore::empty();
+    for cert in ca_certs {
+        roots
+            .add(cert)
+            .map_err(|e| anyhow::anyhow!("Failed to add ca_cert to trust store: {e}"))?;
+    }
+
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {e}"))?;
+
+    // Load this server's own certificate chain and private key.
+    let cert_pem = std::fs::read(&tls_cfg.cert).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read server cert '{}': {e}",
+            tls_cfg.cert.display()
+        )
+    })?;
+    let cert_chain = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<CertificateDer>, _>>()
+        .map_err(|e| anyhow::anyhow!("Invalid server cert '{}': {e}", tls_cfg.cert.display()))?;
+    if cert_chain.is_empty() {
+        anyhow::bail!(
+            "server cert '{}' contains no certificates",
+            tls_cfg.cert.display()
+        );
+    }
+
+    let key_pem = std::fs::read(&tls_cfg.key).map_err(|e| {
+        anyhow::anyhow!("Failed to read server key '{}': {e}", tls_cfg.key.display())
+    })?;
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .map_err(|e| anyhow::anyhow!("Invalid server key '{}': {e}", tls_cfg.key.display()))?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in '{}'", tls_cfg.key.display()))?;
+    let key: PrivateKeyDer = key;
+
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| anyhow::anyhow!("Failed to build server TLS config: {e}"))?;
+    // Match axum-server's default ALPN so HTTP/2 and HTTP/1.1 both negotiate.
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(server_config)
 }
 
 #[cfg(test)]
@@ -1045,5 +1132,246 @@ mod tests {
              Fix: after each run_cycle(), compare ha.config().loop_wait with current interval \
              period and recreate interval if changed."
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // SB-2: Raft RPC server-side mTLS (client certificate verification)
+    //
+    // `build_mtls_server_config` must fail fast when require_client_cert is
+    // set but ca_cert is missing, and the resulting ServerConfig must reject a
+    // client certificate signed by an untrusted CA while accepting one signed
+    // by the configured CA.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use pg_ha_core::config::RaftTlsConfig;
+
+    /// Fail fast when require_client_cert is true but ca_cert is not configured.
+    #[test]
+    fn test_mtls_config_requires_ca_cert() {
+        let tls_cfg = RaftTlsConfig {
+            cert: PathBuf::from("/nonexistent/server.crt"),
+            key: PathBuf::from("/nonexistent/server.key"),
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
+            require_client_cert: true,
+        };
+        let err = build_mtls_server_config(&tls_cfg).expect_err("missing ca_cert must be rejected");
+        assert!(
+            err.to_string().contains("ca_cert"),
+            "error should mention the missing ca_cert, got: {err}"
+        );
+    }
+
+    /// Fail fast when ca_cert points at an unreadable path.
+    #[test]
+    fn test_mtls_config_unreadable_ca_cert() {
+        let tls_cfg = RaftTlsConfig {
+            cert: PathBuf::from("/nonexistent/server.crt"),
+            key: PathBuf::from("/nonexistent/server.key"),
+            ca_cert: Some(PathBuf::from("/nonexistent/ca.crt")),
+            client_cert: None,
+            client_key: None,
+            require_client_cert: true,
+        };
+        let err =
+            build_mtls_server_config(&tls_cfg).expect_err("unreadable ca_cert must be rejected");
+        assert!(
+            err.to_string().contains("Failed to read ca_cert"),
+            "error should report the unreadable ca_cert, got: {err}"
+        );
+    }
+
+    // Helpers for the handshake test: generate a CA and a leaf cert with openssl.
+    fn openssl_available() -> bool {
+        std::process::Command::new("openssl")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn run_openssl(args: &[&str]) {
+        let status = std::process::Command::new("openssl")
+            .args(args)
+            .status()
+            .expect("failed to spawn openssl");
+        assert!(status.success(), "openssl {args:?} failed");
+    }
+
+    /// Generate a self-signed CA (`<name>-ca.crt`/`.key`) and a leaf cert
+    /// (`<name>.crt`/`.key`) signed by it, under `dir`. The leaf carries a SAN
+    /// matching `cn` and both server+client EKUs so it validates in a real
+    /// rustls handshake in either role.
+    fn gen_ca_and_leaf(dir: &std::path::Path, name: &str, cn: &str) {
+        let p = |suffix: &str| {
+            dir.join(format!("{name}{suffix}"))
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        // CA key + self-signed CA cert
+        run_openssl(&["genrsa", "-out", &p("-ca.key"), "2048"]);
+        run_openssl(&[
+            "req",
+            "-x509",
+            "-new",
+            "-nodes",
+            "-key",
+            &p("-ca.key"),
+            "-sha256",
+            "-days",
+            "1",
+            "-subj",
+            &format!("/CN={cn}-ca"),
+            "-out",
+            &p("-ca.crt"),
+        ]);
+        // Extension file: SAN + EKU required by webpki for leaf validation.
+        let ext_path = dir.join(format!("{name}.ext"));
+        std::fs::write(
+            &ext_path,
+            format!(
+                "subjectAltName=DNS:{cn}\n\
+                 extendedKeyUsage=serverAuth,clientAuth\n\
+                 basicConstraints=CA:FALSE\n"
+            ),
+        )
+        .unwrap();
+        // Leaf key + CSR + CA-signed leaf cert
+        run_openssl(&["genrsa", "-out", &p(".key"), "2048"]);
+        run_openssl(&[
+            "req",
+            "-new",
+            "-key",
+            &p(".key"),
+            "-subj",
+            &format!("/CN={cn}"),
+            "-out",
+            &p(".csr"),
+        ]);
+        run_openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            &p(".csr"),
+            "-CA",
+            &p("-ca.crt"),
+            "-CAkey",
+            &p("-ca.key"),
+            "-CAcreateserial",
+            "-days",
+            "1",
+            "-sha256",
+            "-extfile",
+            ext_path.to_str().unwrap(),
+            "-out",
+            &p(".crt"),
+        ]);
+    }
+
+    fn load_certs(path: &std::path::Path) -> Vec<rustls_pki_types::CertificateDer<'static>> {
+        let pem = std::fs::read(path).unwrap();
+        rustls_pemfile::certs(&mut pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn load_key(path: &std::path::Path) -> rustls_pki_types::PrivateKeyDer<'static> {
+        let pem = std::fs::read(path).unwrap();
+        rustls_pemfile::private_key(&mut pem.as_slice())
+            .unwrap()
+            .unwrap()
+    }
+
+    /// End-to-end: the ServerConfig built by `build_mtls_server_config` accepts a
+    /// client cert signed by the configured CA and rejects one signed by a
+    /// different CA. Runs a real rustls handshake in-memory (no sockets).
+    #[test]
+    fn test_mtls_accepts_trusted_and_rejects_untrusted_client() {
+        if !openssl_available() {
+            eprintln!("skipping mTLS handshake test: openssl not available");
+            return;
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = std::env::temp_dir().join(format!("pg-ha-mtls-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Server CA + server leaf; a separate client CA + client leaf (trusted);
+        // and an unrelated "rogue" CA + leaf (untrusted by the server).
+        gen_ca_and_leaf(&dir, "server", "pg-ha-server");
+        gen_ca_and_leaf(&dir, "client", "pg-ha-client");
+        gen_ca_and_leaf(&dir, "rogue", "pg-ha-rogue");
+
+        // Server trusts the *client* CA for verifying presented client certs.
+        let tls_cfg = RaftTlsConfig {
+            cert: dir.join("server.crt"),
+            key: dir.join("server.key"),
+            ca_cert: Some(dir.join("client-ca.crt")),
+            client_cert: None,
+            client_key: None,
+            require_client_cert: true,
+        };
+        let server_config =
+            build_mtls_server_config(&tls_cfg).expect("valid mTLS server config should build");
+        let server_config = Arc::new(server_config);
+
+        // Client trusts the server CA (so it validates the server cert).
+        let mut server_roots = rustls::RootCertStore::empty();
+        for c in load_certs(&dir.join("server-ca.crt")) {
+            server_roots.add(c).unwrap();
+        }
+
+        let build_client_config = |cert: &str, key: &str| {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(server_roots.clone())
+                .with_client_auth_cert(load_certs(&dir.join(cert)), load_key(&dir.join(key)))
+                .unwrap()
+        };
+
+        let server_name = rustls_pki_types::ServerName::try_from("pg-ha-server").unwrap();
+
+        // Drive a handshake between in-memory client/server connections.
+        let do_handshake = |client_cfg: rustls::ClientConfig| -> Result<(), rustls::Error> {
+            let mut server = rustls::ServerConnection::new(server_config.clone()).unwrap();
+            let mut client =
+                rustls::ClientConnection::new(Arc::new(client_cfg), server_name.clone()).unwrap();
+            // Pump bytes back and forth until both sides finish or error.
+            for _ in 0..16 {
+                let mut buf = Vec::new();
+                client.write_tls(&mut buf).ok();
+                if !buf.is_empty() {
+                    server.read_tls(&mut buf.as_slice()).unwrap();
+                    server.process_new_packets()?;
+                }
+                let mut buf2 = Vec::new();
+                server.write_tls(&mut buf2).ok();
+                if !buf2.is_empty() {
+                    client.read_tls(&mut buf2.as_slice()).unwrap();
+                    client.process_new_packets().map_err(|e| e)?;
+                }
+                if !client.is_handshaking() && !server.is_handshaking() {
+                    return Ok(());
+                }
+            }
+            Err(rustls::Error::General("handshake did not complete".into()))
+        };
+
+        // Trusted client (signed by client-ca) must succeed.
+        let trusted = build_client_config("client.crt", "client.key");
+        assert!(
+            do_handshake(trusted).is_ok(),
+            "client cert signed by the configured CA should be accepted"
+        );
+
+        // Untrusted client (signed by rogue CA) must be rejected by the server.
+        let rogue = build_client_config("rogue.crt", "rogue.key");
+        assert!(
+            do_handshake(rogue).is_err(),
+            "client cert signed by an untrusted CA must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
