@@ -19,7 +19,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 **已实现的关键能力**：
 
 - 自动 failover、手动 switchover / failover（同步复制开启时强制候选属于 DCS `/sync`）
-- Raft RPC TLS（`raft.tls`；开发用 `docker-compose.yml` 已挂载证书）。服务端目前只使用 `cert`/`key`，`require_client_cert` 未接入
+- Raft RPC TLS（`raft.tls`；开发用 `docker-compose.yml` 已挂载证书）。`require_client_cert: true` 时服务端强制校验客户端证书（针对 `ca_cert`），拒绝未提供或不受信任证书的连接；默认 `false` 为仅服务端认证 TLS
 - Raft 日志 append-only WAL（`raft_log.wal`，超过 4 MiB 压缩）+ `hard_state.json` / `state_machine.json` / `membership.json`
 - Watchdog（Linux `/dev/watchdog`；仅可写主 + 有效租约时喂狗，超时 = TTL − `safety_margin`；默认 `mode: off`）
 - 优雅停机：等待 `shutdown.drain_timeout_secs`（期间续锁）→ Leader 上 CHECKPOINT + 停库（`-m fast`，失败再 `-m immediate`），受 leader 租约限制 → 停库后才释放 leader lock；停不掉时不退出

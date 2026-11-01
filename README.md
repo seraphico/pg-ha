@@ -9,7 +9,7 @@ pg-ha is a Rust-based PostgreSQL HA solution providing complete feature parity w
 - **No etcd/ZooKeeper/Consul** — embedded Raft consensus via [openraft](https://github.com/databendlabs/openraft)
 - **No HAProxy** — built-in TCP proxy with active health checking
 - **Single binary deployment** — one process per node, zero external services required
-- **TLS encrypted** — Raft RPC communication secured with TLS/mTLS
+- **TLS encrypted** — Raft RPC secured with TLS; set `raft.tls.require_client_cert: true` to enforce mutual TLS (client certificates verified against `ca_cert`). Default is server-auth-only TLS.
 - **Graceful shutdown** — drain (renewing the leader lock), CHECKPOINT + stop bounded by the leader lease, lock release only after PostgreSQL stopped
 
 ## Documentation
