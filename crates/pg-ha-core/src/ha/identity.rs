@@ -331,6 +331,38 @@ pub(crate) fn reconcile_role(current: MemberRole, identity: PgIdentity) -> Membe
     }
 }
 
+/// W2: what happens to an armed watchdog at the end of a cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchdogAction {
+    /// Writable primary under a valid lease: keep it alive.
+    Pet,
+    /// PostgreSQL may be writable without a valid lease (lease expired, or a
+    /// stop failed after losing the lock): stop petting but keep it armed,
+    /// so the machine is reset if the fence does not finish in time.
+    Hold,
+    /// PostgreSQL cannot write (stopped, or observed in recovery), or pause
+    /// mode (W1: no automatic fencing): disarm.
+    Disarm,
+}
+
+/// `lease_valid`: this node holds the lock under an unexpired lease. A
+/// server not observed this cycle (`in_recovery == None`) may be writable.
+pub(crate) fn watchdog_action(
+    pg_running: bool,
+    in_recovery: Option<bool>,
+    paused: bool,
+    lease_valid: bool,
+) -> WatchdogAction {
+    let cannot_write = !pg_running || in_recovery == Some(true);
+    if cannot_write || paused {
+        WatchdogAction::Disarm
+    } else if lease_valid {
+        WatchdogAction::Pet
+    } else {
+        WatchdogAction::Hold
+    }
+}
+
 /// Member state this node advertises in DCS and in its REST API.
 ///
 /// `Running` means "running, and pg-ha can vouch for its role". Other nodes
@@ -689,6 +721,34 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_is_disarmed_only_when_postgres_cannot_write() {
+        use WatchdogAction::*;
+        let rec = [None, Some(false), Some(true)];
+        for running in [false, true] {
+            for in_recovery in rec {
+                for paused in [false, true] {
+                    for lease in [false, true] {
+                        let action = watchdog_action(running, in_recovery, paused, lease);
+                        let may_write = running && in_recovery != Some(true);
+                        let expected = match (may_write, paused, lease) {
+                            (false, _, _) => Disarm,
+                            (true, true, _) => Disarm,
+                            (true, false, true) => Pet,
+                            (true, false, false) => Hold,
+                        };
+                        assert_eq!(
+                            action, expected,
+                            "{running} {in_recovery:?} {paused} {lease}"
+                        );
+                        // Never petted without a valid lease.
+                        assert!(action != Pet || lease);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn advertised_state_table() {
         for id in ALL_IDENTITIES {
             assert_eq!(
@@ -726,6 +786,7 @@ mod tests {
             version: None,
             rewind_check: false,
             lineage: None,
+            watchdog_failed: false,
         }
     }
 

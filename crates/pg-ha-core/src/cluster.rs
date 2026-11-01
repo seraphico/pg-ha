@@ -297,6 +297,11 @@ pub struct Member {
     /// prove it is on the latest timeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<Lineage>,
+
+    /// W2: the member's watchdog is `required` but cannot be armed, so it
+    /// will not take the leader role. Older versions do not publish it.
+    #[serde(default)]
+    pub watchdog_failed: bool,
 }
 
 impl Member {
@@ -537,6 +542,7 @@ mod tests {
             version: None,
             rewind_check: false,
             lineage: None,
+            watchdog_failed: false,
         };
         assert!(member.is_nofailover());
         assert_eq!(member.failover_priority(), 0);
@@ -563,6 +569,7 @@ mod tests {
                     version: None,
                     rewind_check: false,
                     lineage: None,
+                    watchdog_failed: false,
                 },
                 Member {
                     name: "node2".to_string(),
@@ -576,6 +583,7 @@ mod tests {
                     version: None,
                     rewind_check: false,
                     lineage: None,
+                    watchdog_failed: false,
                 },
             ],
             ..Default::default()

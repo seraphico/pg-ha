@@ -246,6 +246,8 @@ pub(crate) enum Ineligible {
         node: String,
     },
     LatestUnknown(UnknownReason),
+    /// W2: `required` watchdog that cannot be armed on that node.
+    WatchdogUnavailable,
 }
 
 impl std::fmt::Display for Ineligible {
@@ -272,6 +274,12 @@ impl std::fmt::Display for Ineligible {
                 "a promote by {node} may have created a newer timeline and is not resolved"
             ),
             Self::LatestUnknown(r) => write!(f, "the latest timeline is unknown: {r}"),
+            Self::WatchdogUnavailable => {
+                write!(
+                    f,
+                    "the watchdog is required but cannot be used on this node"
+                )
+            }
         }
     }
 }
@@ -557,6 +565,7 @@ mod tests {
                 postmaster_start: Some("run1".into()),
                 generation: 0,
             }),
+            watchdog_failed: false,
         }
     }
 

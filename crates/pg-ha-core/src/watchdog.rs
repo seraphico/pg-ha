@@ -101,6 +101,27 @@ impl Watchdog {
         self.config.mode == WatchdogMode::Required
     }
 
+    /// W2: may this node take the leader role as far as the watchdog is
+    /// concerned? Only `required` mode can say no: true when the watchdog is
+    /// already armed, or the device exists and is writable (checked without
+    /// opening it, because opening arms it). Non-Linux: never in `required`.
+    pub fn is_usable(&self) -> bool {
+        if self.config.mode != WatchdogMode::Required || self.is_active {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(path) = std::ffi::CString::new(self.config.device.as_str()) else {
+                return false;
+            };
+            unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     /// Get the safety margin in seconds
     pub fn safety_margin(&self) -> u64 {
         self.config.safety_margin
@@ -113,7 +134,10 @@ impl Watchdog {
         use std::ffi::CString;
 
         let path = CString::new(self.config.device.as_str()).unwrap();
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
+        // O_CLOEXEC: PostgreSQL and every tool pg-ha starts must not inherit
+        // the device; a child holding it keeps it open after disarm (the
+        // kernel stops the timer only when the last descriptor closes).
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
 
         if fd < 0 {
             let err = std::io::Error::last_os_error();
@@ -166,11 +190,11 @@ impl Watchdog {
     }
 }
 
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        self.disarm();
-    }
-}
+// No `Drop` that disarms: if the HA engine panics or is dropped while the
+// watchdog is armed, PostgreSQL may still be writable. The device stays open
+// and is no longer petted, and on process exit it is closed without the
+// magic character, so the kernel resets the machine (W2). Only
+// [`Watchdog::disarm`], called once PostgreSQL cannot write, stops it.
 
 #[cfg(test)]
 mod tests {
@@ -293,5 +317,17 @@ mod tests {
              which writes to self.fd even when watchdog is not active.\n\
              Fix: change `if !self.is_active {{}}` to `if !self.is_active {{ return; }}`"
         );
+    }
+
+    #[test]
+    fn test_usable_only_matters_in_required_mode() {
+        let config = |mode| WatchdogConfig {
+            mode,
+            device: "/nonexistent/pg-ha-test-watchdog".to_string(),
+            safety_margin: 5,
+        };
+        assert!(Watchdog::new(config(WatchdogMode::Off)).is_usable());
+        assert!(Watchdog::new(config(WatchdogMode::Automatic)).is_usable());
+        assert!(!Watchdog::new(config(WatchdogMode::Required)).is_usable());
     }
 }

@@ -116,7 +116,7 @@
   5. 确认 PG 已停之后才 `delete_leader`（DCS 写有上限，最多等 `retry_timeout`），日志 `Leader lock released after PostgreSQL stopped`；删除失败或被拒绝时锁留下，按 TTL 过期（`Leader lock kept: the delete failed or was rejected; it expires after its TTL`）。
   6. PG 可能可写却停不掉（快速和立即停库都失败，或围栏的立即停库失败，即 `stop_pending`）时进程**不退出**：继续跑正常的 HA 循环（持锁时每轮续锁，并按 `stop_pending` 每轮重试停库，不 promote；不持锁时每轮只再 `-m immediate` 停一次库，不参选、不跟随、不 promote，WARN `Graceful shutdown: PostgreSQL is still running without the leader lock; stopping it again (immediate)`），不启动 PG，拒绝管理命令，每轮记 ERROR `Graceful shutdown could not stop PostgreSQL; pg-ha keeps running instead of exiting while PostgreSQL may be writable (...). Stop PostgreSQL manually as the PostgreSQL OS user: <bin_dir>/pg_ctl stop -D <data_dir> -m immediate; pg-ha then releases the lock and exits`。之后的 SIGTERM / SIGINT 只记 WARN `Received <sig> during graceful shutdown; pg-ha exits only after PostgreSQL has stopped` 并让下一轮立即运行（立即重试停库），不会让进程退出。PG 停掉后，持锁时释放锁再退出；围栏过、已不持锁的节点直接退出。「可能可写」包括观测在 recovery 的两种情况：本节点持锁（promote 失败、正在 promote，或信号打断了抢锁和 promote 之间的周期，pg-ha 会 promote 它），以及没有 `standby.signal` 的 recovery（如 `recovery.signal`，recovery 结束时自己 promote）；这两种停不掉时也设 `stop_pending`、不退出，后者不写 `standby.signal`（不改动运维人员的 recovery）。只有不持锁、观测在 recovery 且有 `standby.signal` 的备库停不掉时才记 ERROR `PostgreSQL (a standby with standby.signal, not the leader lock holder) could not be stopped; exiting, nothing promotes it` 后退出（`identity::shutdown_may_leave_running`）。
   - switchover 同样先停库再释放锁，停库失败时锁留下，下一轮持锁继续围栏。
-- 不覆盖：HA 循环被同步调用阻塞、tokio worker 被占满、进程被 SIGSTOP 或 VM 冻结时，赛跑无法执行，只有 watchdog 能兜底；watchdog 尚未接入（W2，第 9 节）。进程被 SIGKILL 时（systemd `TimeoutStopSec` 到期、`docker stop -t` 到期）关停规则无法执行：systemd 用 `KillMode=mixed` 时最后的 SIGKILL 会杀掉 unit cgroup 里的所有进程，包括 pg-ha 启动的 PG，PG 崩溃而不是留着可写；PG 不在 pg-ha 的 cgroup 里时它会继续可写，没有人围栏。docker 里容器的 PID 1 是 pg-ha，它退出时 PG 一起被杀。
+- 不覆盖：HA 循环被同步调用阻塞、tokio worker 被占满、进程被 SIGSTOP 或 VM 冻结时，赛跑无法执行，只有 watchdog 能兜底（W2；默认 `mode: off`，需要配置 `automatic` 或 `required`）。进程被 SIGKILL 时（systemd `TimeoutStopSec` 到期、`docker stop -t` 到期）关停规则无法执行：systemd 用 `KillMode=mixed` 时最后的 SIGKILL 会杀掉 unit cgroup 里的所有进程，包括 pg-ha 启动的 PG，PG 崩溃而不是留着可写；PG 不在 pg-ha 的 cgroup 里时它会继续可写，没有人围栏。docker 里容器的 PID 1 是 pg-ha，它退出时 PG 一起被杀。
 - 降级时 leader 未知（`demote`、`handle_dcs_error`、无 candidate 的 switchover、优雅关停）就删除 `postgresql.auto.conf` 里的 `primary_conninfo`，不保留猜测。上游只由跟随路径按观测到的 leader 配置，包括 `postgresql.auto.conf` 里没有 `primary_conninfo` 的情况。
 - 写备库配置时，`postgresql.auto.conf` 只替换 `primary_conninfo` 和 `recovery_target_timeline` 两项，其他行（`ALTER SYSTEM` 写入的内容，如 `synchronous_standby_names`）一律保留；文件经临时文件 + rename 写入并 fsync。成员 `conn_url` 没有 `host=` 时按 leader 未知处理，不写指向 `127.0.0.1` 的 `primary_conninfo`。节点每次离开主库角色或重写备库配置后，pg-ha 都忘掉上次应用的 `synchronous_standby_names`，下一个主任期第一次一定重新 `ALTER SYSTEM` 并写 `/sync`（C4）。
 
@@ -299,7 +299,12 @@
 | W1 | `pause`（或等价维护模式）下：不自动抢锁 / 不自动 failover（与运维「暂停」语义一致）。 | 持有 |
 | W2 | Watchdog 仅在「本节点自认可写 Primary」路径喂狗；失去 lock 或不再是 Primary 时必须停止喂狗，防止僵尸主。 | 持有 |
 
-**W2 实现**：`Ha` 持有 `Watchdog`；仅在持锁、租约有效、观测为 Primary、非 pause、非关停、非 `stop_pending` 时 `activate(ttl − safety_margin)` 并每轮 `keepalive`；降级、租约围栏、关停、`stop_pending` 时 `disarm`。默认 `mode: off`；`required` 且激活失败则清租约并围栏。`watchdog.safety_margin` 同时用于 leader 租约（L5）。
+**W2 实现**：`Ha` 持有 `Watchdog`。
+- **能否当主**：`required` 模式下设备不存在或不可写（不打开设备检查，打开即装填；非 Linux 一律不可用）时，本节点不竞选初始化、不参选（INFO/ERROR `Not taking part in the election: the watchdog is required but cannot be used on this node`），并在成员记录发布 `watchdog_failed: true`；其他节点不让位给它，`POST /switchover`、`POST /failover` 拒绝它作为 candidate（409，`Candidate '<c>' cannot use its required watchdog`）。D6 强制参选（`pg-ha.accept_timeline_loss`）不能绕过这一条。
+- **装填**：`pg_ctl promote` 之前（也在写 D6 pending 之前）装填，超时 `ttl − safety_margin`；`required` 下装填失败就不 promote，PostgreSQL 仍是备库，立即释放锁。Hold 时（例如 pg-ha 在主库运行中重启）尚未装填则装填，`required` 下失败则按租约丢失围栏。
+- **喂狗与解除**（`reconcile_watchdog`，每轮结束、每次租约围栏后、关停的每一步调用，唯一的喂狗/解除点）：持锁且租约有效 → 喂狗（含 `stop_pending` 重试停库期间）；PostgreSQL 已停或观测在 recovery → 解除；pause → 解除（W1）；其余情况（PostgreSQL 可能可写而租约已失效，例如围栏停库失败）→ **不喂、不解除**，停库没在超时内完成时由内核重置机器。本轮的启动 / 停库让观测失效时，先实时观测一次（有超时）再判断，不把刚以备库启动的 PostgreSQL 当作可能可写；停库确认成功后立刻判断，在之后的启动之前解除。设备以 `O_CLOEXEC` 打开：PostgreSQL 和 pg-ha 启动的其他进程不继承它，否则子进程持有设备，解除后内核计时也不会停。降级、租约围栏、关停开始时都不再提前解除。
+- **退出**：`Watchdog` 没有会解除的 `Drop`；HA 引擎 panic 或进程未经解除退出时，设备在没有 magic 字符的情况下关闭，内核到期重置。优雅关停只在 PostgreSQL 已停（或是不持锁的备库）时解除后退出。
+- 默认 `mode: off`。`watchdog.safety_margin` 同时用于 leader 租约（L5）。已知不闭合：超时从喂狗时刻起算而不是从续锁锚点起算，见第 9 节。
 
 **相关**：运维暂停与维护；架构 / 代码 `watchdog.rs`。
 
@@ -344,6 +349,7 @@
 | ~~带标记、等待 rewind 检查的备库对外是健康副本~~ | H2 / S4 | **已闭合（2026-10-30）**：带 `pg-ha.rewind_check` 时 `/replica` 503（H2）；节点仍可只读运行并等待 rewind，但不经 Proxy RO 对外服务 |
 | 分区节点重新加入 Raft 会引发 Raft 重选 | L4 / L5 | openraft 0.9 没有 pre-vote：分区节点的 term 在分区期间上涨，重新连上后迫使集群重选 Raft leader；重选期间当前锁持有者续锁失败而被降级（多一次 failover，timeline +1）。任务 3 在 docker 集群上复现分区场景时每次都出现，不在任务 3 处理 |
 | ~~watchdog 未接入租约~~ | W2 / L5 | **已闭合（2026-10-30）**：见 W2；默认仍 `mode: off`，生产建议 `automatic` 或 `required` |
+| watchdog 超时从喂狗时刻起算 | W2 / L5 | 超时设为 `ttl − safety_margin`，从喂狗时刻起算；租约从续锁开始前的锚点起算，喂狗晚于锚点（最多一个 `retry_timeout`）。所以只有在「续锁耗时 + 墙钟偏差 < safety_margin」时，HA 循环卡死后的机器重置才保证早于其他节点可以抢锁。另外 `WDIOC_SETTIMEOUT` 的返回值和设备实际超时没有读回；装填后动态改小 `ttl` 不会更新超时。候选修法：每次喂狗按租约剩余时间重设超时 |
 | ~~动态修改 `ttl` 不改变写入锁的 TTL~~ | L5 / C1 | **已闭合（2026-10-30）**：`process_dynamic_config` 在应用 HA 参数后调用 `DcsAdapter::set_lock_timing`；`RaftDcs` 用原子值更新锁 TTL 与写超时，租约继续读 `dcs.ttl()` |
 | TTL 过期仍受 Raft leader 墙钟影响 | L5 | 写入日志前由 Raft leader 用自己的时钟覆盖 `now`（`stamp_leader_time`），发起节点的时钟不再决定锁是否过期。本地读取仍用读取节点的墙钟，所以时钟快的节点可能在本地视图里认为锁已过期，但抢锁要经过 leader 的 `now`，在 leader 认为锁还在时会失败。Raft leader 的时钟比锁持有者快超过 `safety_margin`（减去约 0.1 秒）时，新主仍可能在旧主围栏前出现 |
 | 停库一直失败时锁一直被占（switchover 与优雅关停） | L5 / S1 | 用可用性换安全：持锁节点每轮续锁、重试停库，集群不换主，没有可写主对外（`/primary` 503）。运维处理见运维指南「关停卡住」「switchover 卡住」 |
@@ -355,6 +361,8 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-11-01 | W2 实测（colima Ubuntu 虚拟机 + `softdog soft_noboot=1`）发现并修正两处：switchover 后旧主停库、以备库重启，观测被清空，按「可能可写」保持装填，10 秒后触发（生产上会重启一台健康的机器）；设备未用 `O_CLOEXEC` 打开，之后启动的 postmaster 继承了它，解除后设备仍被占用、计时继续并触发，之后再装填报 EBUSY。现在 reconcile 先实时观测，停库确认后立即解除，设备以 `O_CLOEXEC` 打开 |
+| 2026-11-01 | W2 修正：`required` 且不可用的 watchdog 不再导致「当选 → promote → 围栏」循环：不竞选初始化、不参选、发布 `watchdog_failed`，peer 不让位、API 拒绝其作为 candidate；promote 前（写 pending 前）装填，失败则以备库身份释放锁。PostgreSQL 可能仍可写时不再解除 watchdog（降级、租约围栏、`stop_pending`、关停开始、`Drop`）；统一由 `reconcile_watchdog` 决定喂狗 / 保持 / 解除。第 9 节登记超时起算点问题 |
 | 2026-10-30 | 闭合「UnmanagedRecovery 持锁时在 PG 仍运行时释放锁」：先停库再 `delete_leader`；有 `recovery.signal` 时不写 `standby.signal`；停不掉则保留锁并 `stop_pending` 每轮围栏（与 switchover / 关停一致）。闭合「动态 `ttl` 不改变写入锁的 TTL」：`set_lock_timing` 同步 RaftDcs。闭合「带 rewind_check 的 `/replica` 仍 200」：H2 要求无标记。闭合 W2：watchdog 在可写主 + 有效租约时喂狗（超时 = ttl − safety_margin），降级/关停停喂。运维：failover 与 switchover 候选校验对齐；`/failover` 写失败不 accepted；拒绝未实现的 `scheduled_at`；持锁 `/restart` 停前 `/primary` 503 且停失败 `stop_pending` |
 | 2026-10-27 | D6 重写：`/timeline` 记录最新已确认 timeline 的身份（编号 + 起点 LSN）和 promote 前的 pending，不再预写猜测值，闭合「`/timeline` 偏移后带标记节点永远不能参选」。只有在最新 timeline 上的节点参选，带不带标记都一样，防止编号重复和丢掉整任主库的写入；「谁最健康」只比 LSN。旧格式和缺失的 key 在全部节点上报后推断。新增历史代 `pg-ha.generation` 与运维强制参选 `pg-ha.accept_timeline_loss`：旧代数据不参选、不启动、不跟随、不 rewind，只能 reinitialize。第 9 节相应调整 |
 | 2026-10-27 | 第 9 节登记「`/timeline` 偏移后带标记节点永远不能参选」（只登记，代码未改），operations-guide 增加「场景 4a」人工恢复步骤 |

@@ -69,7 +69,9 @@ impl Ha {
         self.begin_shutdown().await;
 
         if self.shutdown_fence_if_lease_expired().await {
-            return self.outcome_after_fence().await;
+            let outcome = self.outcome_after_fence().await;
+            self.watchdog_after_shutdown(outcome).await;
+            return outcome;
         }
 
         info!(
@@ -77,7 +79,9 @@ impl Ha {
             "Draining in-flight connections (the leader lock is renewed every loop_wait)"
         );
         if self.drain_renewing_leader_lock(drain).await {
-            return self.outcome_after_fence().await;
+            let outcome = self.outcome_after_fence().await;
+            self.watchdog_after_shutdown(outcome).await;
+            return outcome;
         }
 
         if self.is_leader
@@ -90,10 +94,13 @@ impl Ha {
             );
         }
 
-        if !self.stop_postgres_within_lease().await {
-            return self.outcome_after_fence().await;
-        }
-        self.finish_shutdown().await
+        let outcome = if self.stop_postgres_within_lease().await {
+            self.finish_shutdown().await
+        } else {
+            self.outcome_after_fence().await
+        };
+        self.watchdog_after_shutdown(outcome).await;
+        outcome
     }
 
     /// Called by src/main.rs after every HA cycle while the shutdown is in
@@ -101,13 +108,33 @@ impl Ha {
     /// `graceful_shutdown`. Awaits a DCS write (the lock delete) only once
     /// PostgreSQL is stopped.
     pub async fn continue_shutdown(&mut self) -> ShutdownOutcome {
-        self.finish_shutdown().await
+        let outcome = self.finish_shutdown().await;
+        self.watchdog_after_shutdown(outcome).await;
+        outcome
+    }
+
+    /// W2 at the end of a shutdown step. pg-ha exits on every outcome but
+    /// KeepRunning, and the device is closed on exit, so it must be disarmed
+    /// first when PostgreSQL cannot write: stopped (the outcome says so), or
+    /// a standby left running (nothing promotes it). KeepRunning: the HA
+    /// loop goes on and pets or holds it as usual.
+    async fn watchdog_after_shutdown(&mut self, outcome: ShutdownOutcome) {
+        match outcome {
+            ShutdownOutcome::KeepRunning => self.reconcile_watchdog().await,
+            ShutdownOutcome::StandbyLeftRunning => self.watchdog.disarm(),
+            ShutdownOutcome::Released
+            | ShutdownOutcome::StoppedLockKept
+            | ShutdownOutcome::Fenced => {
+                // These outcomes are only returned with PostgreSQL stopped;
+                // reconcile re-checks that before disarming.
+                self.reconcile_watchdog().await;
+            }
+        }
     }
 
     async fn begin_shutdown(&mut self) {
         info!("Initiating graceful shutdown");
         self.shutting_down = true;
-        self.disarm_watchdog();
         self.postgresql.block_starts();
         if let Some(publish) = self.state_publisher.as_ref() {
             publish(self.api_snapshot()).await;

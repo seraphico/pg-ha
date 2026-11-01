@@ -120,6 +120,7 @@ mod tests {
             version: None,
             rewind_check: false,
             lineage: None,
+            watchdog_failed: false,
         }
     }
 
@@ -136,6 +137,7 @@ mod tests {
             version: None,
             rewind_check: false,
             lineage: None,
+            watchdog_failed: false,
         }
     }
 
