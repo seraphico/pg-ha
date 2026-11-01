@@ -277,44 +277,69 @@ impl Ha {
 
     // ─── Watchdog (W2) ───
 
-    /// Arm and pet the hardware watchdog only while this node is a writable
-    /// primary under a valid leader lease. Timeout = `dcs.ttl() −
-    /// safety_margin`. Otherwise disarm so a zombie primary cannot keep the
-    /// machine alive past the lease.
-    pub(super) fn sync_watchdog_for_writable_primary(&mut self) {
-        let lease_ok = !self.lease_lost();
-        let writable_primary = self.is_leader
-            && lease_ok
-            && !self.is_paused
-            && !self.shutting_down
-            && !self.stop_pending
-            && self.pg_identity() == identity::PgIdentity::Primary;
-        if writable_primary {
-            let timeout = self
-                .dcs
-                .ttl()
-                .saturating_sub(self.config.watchdog.safety_margin)
-                .max(1);
-            if !self.watchdog.is_active() {
-                if !self.watchdog.activate(timeout) && self.watchdog.is_required() {
-                    error!(
-                        "Watchdog required but could not be activated; refusing to stay primary"
-                    );
-                    // Caller must demote; mark lease lost so the next check fences.
-                    self.set_leader_lease(None);
-                    return;
-                }
-            }
-            self.watchdog.keepalive();
+    /// W2: arm the watchdog before this node acts as a writable primary
+    /// (before `pg_ctl promote`, and in Hold when it is not armed yet).
+    /// Timeout = `dcs.ttl() − safety_margin`. Err only in `required` mode
+    /// when the device cannot be armed.
+    pub(super) fn arm_watchdog(&mut self) -> std::result::Result<(), String> {
+        if self.watchdog.is_active() {
+            return Ok(());
+        }
+        let timeout = self
+            .dcs
+            .ttl()
+            .saturating_sub(self.config.watchdog.safety_margin)
+            .max(1);
+        if self.watchdog.activate(timeout) {
+            Ok(())
         } else {
-            self.disarm_watchdog();
+            Err("the watchdog is required but could not be activated".into())
         }
     }
 
-    pub(super) fn disarm_watchdog(&mut self) {
-        if self.watchdog.is_active() {
-            self.watchdog.disarm();
+    /// W2: `required` watchdog that cannot be armed on this node. Such a node
+    /// never takes the leader role, and publishes it (`watchdog_failed`) so
+    /// peers do not defer to it.
+    pub(super) fn watchdog_blocks_leadership(&self) -> bool {
+        !self.watchdog.is_usable()
+    }
+
+    /// W2: the only place an armed watchdog is petted or disarmed. Called at
+    /// the end of every cycle, after every lease fence and during shutdown.
+    /// It is disarmed only once PostgreSQL cannot write; while it may write
+    /// without a valid lease it stays armed and is not petted, so a fence
+    /// that hangs ends in a machine reset instead of a zombie primary.
+    pub(super) fn reconcile_watchdog(&mut self) {
+        if !self.watchdog.is_active() {
+            return;
         }
+        let lease_valid = self.is_leader && self.leader_lease.is_some_and(|l| !l.is_expired());
+        match identity::watchdog_action(
+            self.postgresql.is_running(),
+            self.postgresql.observed_in_recovery(),
+            self.is_paused,
+            lease_valid,
+        ) {
+            identity::WatchdogAction::Pet => self.watchdog.keepalive(),
+            identity::WatchdogAction::Hold => error!(
+                "Watchdog armed and no longer petted: PostgreSQL may be writable without a valid leader lease; the machine is reset unless PostgreSQL is confirmed stopped first"
+            ),
+            identity::WatchdogAction::Disarm => self.watchdog.disarm(),
+        }
+    }
+
+    /// Give the lock back while PostgreSQL is still a standby (it never
+    /// became writable in this term).
+    pub(super) async fn release_lock_as_standby(&mut self) {
+        if let Some(leader) = self.cluster.leader.clone() {
+            match self.dcs.delete_leader(&leader).await {
+                Ok(_) => info!("Released the leader lock; PostgreSQL stays a standby"),
+                Err(e) => warn!("Failed to release the leader lock: {e}; it expires after its TTL"),
+            }
+        }
+        self.is_leader = false;
+        self.set_leader_lease(None);
+        self.reset_sync_cache();
     }
 
     // ─── Leader lease (L5 time bound, see `lease`) ───
@@ -353,13 +378,14 @@ impl Ha {
     /// rewind-check marker first, then an immediate stop (a failed stop sets
     /// `stop_pending`).
     pub(super) async fn fence_for_lost_lease(&mut self) -> crate::error::Result<()> {
-        self.disarm_watchdog();
         self.is_leader = false;
         self.set_leader_lease(None);
         let stopped = self
             .fence_primary("immediate", LEASE_EXPIRED_REASON, None)
             .await;
         self.postgresql.set_role(MemberRole::Replica);
+        // W2: disarmed only if the stop succeeded; otherwise kept armed.
+        self.reconcile_watchdog();
         stopped
     }
 
@@ -439,7 +465,9 @@ impl Ha {
         }
         let deadline = tokio::time::Instant::now() + drain;
         loop {
-            if !self.renew_held_lock().await {
+            let renewed = self.renew_held_lock().await;
+            self.reconcile_watchdog();
+            if !renewed {
                 if self.is_paused {
                     warn!(
                         "Leader lock renewal failed during shutdown drain in pause mode; not fencing (pause mode), continuing the shutdown"
@@ -781,6 +809,8 @@ impl Ha {
             "role": format!("{}", self.postgresql.role()),
             // A18: other nodes apply the marked-node election rule to us.
             "rewind_check": self.has_rewind_check_marker(),
+            // W2: peers must not defer to a node that cannot be primary.
+            "watchdog_failed": self.watchdog_blocks_leadership(),
         });
 
         if let Some(pos) = wal_position {
@@ -839,12 +869,19 @@ impl Ha {
         &self,
         member: &crate::cluster::Member,
     ) -> std::result::Result<(), lineage::Ineligible> {
+        if member.watchdog_failed {
+            return Err(lineage::Ineligible::WatchdogUnavailable);
+        }
         lineage::eligibility(member, &self.latest_timeline())
     }
 
     /// I3 for this node, from its own published record (the value every
     /// node uses when judging it, A9), plus the operator override.
     pub(super) fn own_eligibility(&self) -> OwnEligibility {
+        // W2: not overridable, a promote would fail to arm the watchdog.
+        if self.watchdog_blocks_leadership() {
+            return OwnEligibility::Ineligible(lineage::Ineligible::WatchdogUnavailable);
+        }
         let verdict = match self.cluster.get_member(&self.config.name) {
             Some(m) => self.member_eligibility(m),
             None => Err(lineage::Ineligible::NoEvidence),

@@ -323,6 +323,8 @@ shutdown:
 # ─── Watchdog 配置 (可选) ───
 watchdog:
   mode: <string>                   # "off" | "automatic" | "required" (默认: "off")
+                                   # required: 设备不可用的节点不参选、不初始化集群 (发布 watchdog_failed)
+                                   # Docker 入口: 环境变量 PG_HA_WATCHDOG_MODE (默认 off)
   device: <string>                 # 看门狗设备路径 (默认: "/dev/watchdog")
   safety_margin: <u64>             # 安全边际秒数 (默认: 5)。也用于 leader 租约: 锁持有者在最后一次续锁开始后
                                    # ttl - safety_margin 秒内没能再续锁就停掉 PostgreSQL。须大于节点间墙钟偏差

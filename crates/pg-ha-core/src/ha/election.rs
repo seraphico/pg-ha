@@ -115,7 +115,8 @@ impl Ha {
             match &why {
                 Ineligible::DifferentHistory { .. }
                 | Ineligible::UnrecordedNewer { .. }
-                | Ineligible::LatestUnknown(_) => self.log_timeline_problem(message),
+                | Ineligible::LatestUnknown(_)
+                | Ineligible::WatchdogUnavailable => self.log_timeline_problem(message),
                 _ => info!("{message}"),
             }
             let result = format!("not taking part in the election: {why}");

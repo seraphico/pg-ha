@@ -81,6 +81,9 @@ impl Ha {
             Some(m) if m.rewind_check => Some(CommandResponse::rejected(marked_candidate_message(
                 candidate,
             ))),
+            Some(m) if m.watchdog_failed => Some(CommandResponse::rejected(format!(
+                "Candidate '{candidate}' cannot use its required watchdog"
+            ))),
             _ => self.reject_if_sync_ineligible_candidate(candidate),
         }
     }

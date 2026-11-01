@@ -106,7 +106,7 @@ proxy:
   ro_port: ${PROXY_RO_PORT}
 
 watchdog:
-  mode: "off"
+  mode: "${PG_HA_WATCHDOG_MODE:-off}"
 
 bootstrap:
   initdb:

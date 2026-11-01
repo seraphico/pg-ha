@@ -1009,6 +1009,7 @@ mod tests {
             version: None,
             rewind_check: false,
             lineage: None,
+            watchdog_failed: false,
         }]);
         drop(tx);
         tokio::time::timeout(std::time::Duration::from_secs(5), task)

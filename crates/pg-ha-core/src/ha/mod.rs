@@ -241,6 +241,7 @@ impl Ha {
                 if !self.is_leader {
                     self.set_leader_lease(None);
                 }
+                self.reconcile_watchdog();
                 result
             }
             None => {
@@ -386,7 +387,8 @@ impl Ha {
                         warn!(
                             "PostgreSQL stop is still pending; holding the leader lock and fencing again"
                         );
-                        self.disarm_watchdog();
+                        // W2: the lease is valid, so the watchdog keeps being
+                        // petted (reconcile_watchdog) while the stop is retried.
                         let _ = self.retry_pending_stop("fast").await;
                         return CycleResult::Error(
                             "leader lock held but PostgreSQL stop is still pending".into(),
@@ -441,8 +443,11 @@ impl Ha {
                 if self.lease_lost() {
                     return self.fence_at_lease_check("reporting the leader role").await;
                 }
-                self.sync_watchdog_for_writable_primary();
-                if self.lease_lost() {
+                // W2: a primary under the lock is always covered by the
+                // watchdog (e.g. pg-ha restarted while PostgreSQL ran).
+                if let Err(e) = self.arm_watchdog() {
+                    error!("Not staying primary: {e}");
+                    self.set_leader_lease(None);
                     return self
                         .fence_at_lease_check("activating the required watchdog")
                         .await;
@@ -492,6 +497,16 @@ impl Ha {
     /// `pg_ctl promote` succeeding is not enough to claim primary: the role
     /// becomes `Primary` only after `pg_is_in_recovery()` returns false.
     async fn promote_and_confirm(&mut self) -> CycleResult {
+        // W2: arm the watchdog before PostgreSQL can become writable, and
+        // before the pending promote is written (a pending entry this node
+        // cannot complete would keep every other node out). PostgreSQL is
+        // still a standby, so the lock can be given back at once.
+        if let Err(e) = self.arm_watchdog() {
+            error!("Not promoting: {e}; releasing the leader lock (PostgreSQL is still a standby)");
+            self.release_lock_as_standby().await;
+            return CycleResult::Error(format!("not promoting: {e}"));
+        }
+
         // D6 (I2): record a pending promote before promoting, so no other
         // node campaigns on the base timeline while this one may be creating
         // the next. If the write fails, do not promote.
@@ -533,12 +548,6 @@ impl Ha {
         self.confirm_promote(&pending).await;
         let _ = self.touch_member().await;
         self.enforce_synchronous_replication().await;
-        self.sync_watchdog_for_writable_primary();
-        if self.lease_lost() {
-            return self
-                .fence_at_lease_check("activating the required watchdog")
-                .await;
-        }
         info!("PostgreSQL promoted to primary and confirmed out of recovery");
         CycleResult::Leader(format!(
             "promoted to primary. I am ({}), the leader with the lock",
@@ -748,7 +757,6 @@ impl Ha {
     /// failed write still stops PostgreSQL (L5 first) and reports an error.
     async fn demote(&mut self) -> CycleResult {
         warn!("Demoting: writing standby.signal, then stopping PostgreSQL immediately");
-        self.disarm_watchdog();
         self.reset_sync_cache();
         let written = self
             .prepare_demotion(None, Some("demoted after losing the leader lock"))
@@ -877,6 +885,15 @@ impl Ha {
         }
 
         if self.cluster.is_unlocked() && self.cluster.initialize.is_none() {
+            // W2: the bootstrap winner starts PostgreSQL as a primary at once;
+            // a node whose required watchdog cannot be armed leaves the race
+            // to the others (it would be fenced right after).
+            if self.watchdog_blocks_leadership() {
+                let _ = self.touch_member().await;
+                return CycleResult::Follower(
+                    "not bootstrapping: the watchdog is required but cannot be used on this node; waiting for another node to initialize the cluster".into(),
+                );
+            }
             // No cluster exists yet — race for initialization via Bootstrap
             let mut bootstrap = Bootstrap::new(&self.config, &mut self.postgresql, &self.dcs);
             match bootstrap.bootstrap_new_cluster().await {
@@ -1559,6 +1576,7 @@ mod tests {
                     version: None,
                     rewind_check: false,
                     lineage: Some(test_lineage(1)),
+                    watchdog_failed: false,
                 },
                 Member {
                     name: "node2".to_string(),
@@ -1572,6 +1590,7 @@ mod tests {
                     version: None,
                     rewind_check: false,
                     lineage: Some(test_lineage(1)),
+                    watchdog_failed: false,
                 },
             ],
             ..Default::default()
@@ -1605,6 +1624,7 @@ mod tests {
                     version: None,
                     rewind_check: false,
                     lineage: Some(test_lineage(1)),
+                    watchdog_failed: false,
                 },
                 Member {
                     name: "node2".to_string(),
@@ -1618,6 +1638,7 @@ mod tests {
                     version: None,
                     rewind_check: false,
                     lineage: Some(test_lineage(1)),
+                    watchdog_failed: false,
                 },
             ],
             ..Default::default()
@@ -1650,6 +1671,7 @@ mod tests {
                     version: None,
                     rewind_check: false,
                     lineage: Some(test_lineage(1)),
+                    watchdog_failed: false,
                 },
                 Member {
                     name: "node2".to_string(),
@@ -1663,6 +1685,7 @@ mod tests {
                     version: None,
                     rewind_check: false,
                     lineage: Some(test_lineage(1)),
+                    watchdog_failed: false,
                 },
             ],
             ..Default::default()
@@ -1703,6 +1726,7 @@ mod tests {
             version: None,
             rewind_check: false,
             lineage: Some(test_lineage(1)),
+            watchdog_failed: false,
         }
     }
 
@@ -5291,6 +5315,145 @@ mod tests {
         assert_eq!(lineage.generation, 2);
         assert_eq!(lineage.postmaster_start, Some(fake_run()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────── Watchdog (W2) ───────────────────
+
+    /// `required` with a device that does not exist (any platform).
+    fn require_missing_watchdog(ha: &mut Ha) {
+        ha.watchdog = crate::watchdog::Watchdog::new(WatchdogConfig {
+            mode: WatchdogMode::Required,
+            device: "/nonexistent/pg-ha-test-watchdog".into(),
+            safety_margin: 5,
+        });
+    }
+
+    #[tokio::test]
+    async fn test_required_unusable_watchdog_does_not_campaign_and_says_so() {
+        // Healthiest node on the latest timeline, but it could not stay
+        // primary: before the fix it won, promoted, then fenced, in a loop.
+        let dcs = Arc::new(MockDcs::new().with_timeline(1));
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "w2-required", dcs.clone(), Some(true), true);
+        require_missing_watchdog(&mut ha);
+        ha.cluster = unlocked(
+            vec![
+                member_with_tl("test_node", 900, 1),
+                member_with_tl("node2", 100, 1),
+            ],
+            Some(1),
+        );
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            follower_msg(&result).contains("watchdog is required but cannot be used"),
+            "{result}"
+        );
+        assert_eq!(lock_held_by(&dcs), None);
+        assert!(!ha.is_healthiest_node());
+        let data = dcs.last_member_data.lock().unwrap().clone().unwrap();
+        assert_eq!(data["watchdog_failed"], serde_json::json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_peer_with_failed_watchdog_is_not_deferred_to() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(1));
+        let (mut ha, dir) = identity_test_ha("node2", "w2-peer", dcs, Some(true), true);
+        let failed = Member {
+            watchdog_failed: true,
+            ..member_with_tl("node1", 900, 1)
+        };
+        ha.cluster = unlocked(
+            vec![failed.clone(), member_with_tl("node2", 100, 1)],
+            Some(1),
+        );
+        assert!(ha.is_healthiest_node(), "node1 will not campaign");
+        assert!(ha.member_eligibility(&failed).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_lock_holder_without_required_watchdog_releases_before_promote() {
+        // Holds the lock as a standby (e.g. the device vanished after the
+        // election): no pending promote, no pg_ctl promote, lock given back.
+        let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "w2-promote", dcs.clone(), Some(true), true);
+        put_history(&dir, 2);
+        require_missing_watchdog(&mut ha);
+        ha.cluster = self_led(Some(2), Some(2));
+        ha.cluster.timeline = dcs.timeline_value();
+        ha.is_leader = true;
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m)
+                if m.starts_with("not promoting: the watchdog is required")),
+            "{result}"
+        );
+        assert!(dcs.timeline_writes().is_empty(), "no pending written");
+        assert_eq!(ha.postgresql().observed_in_recovery(), Some(true));
+        assert_eq!(lock_held_by(&dcs), None);
+        assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_switchover_rejects_a_candidate_with_a_failed_watchdog() {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir, tx) =
+            identity_test_ha_with_cmd("node1", "w2-cand", dcs, Some(false), false, None);
+        ha.is_leader = true;
+        let mut cluster = leader_cluster("node1", "node2");
+        cluster.members[1].watchdog_failed = true;
+        ha.cluster = cluster;
+
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Switchover {
+                leader: Some("node1".into()),
+                candidate: Some("node2".into()),
+                scheduled_at: None,
+            },
+        )
+        .await;
+
+        assert_eq!(resp.status, CommandStatus::Rejected);
+        assert!(
+            resp.message.contains("required watchdog"),
+            "{}",
+            resp.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W2: the watchdog is disarmed in exactly two places, both only once
+    /// PostgreSQL cannot write, and never on Drop (a panicking HA engine
+    /// must leave it armed).
+    #[test]
+    fn test_watchdog_disarm_call_sites_are_audited() {
+        let files = [
+            ("mod.rs", include_str!("mod.rs")),
+            ("helpers.rs", include_str!("helpers.rs")),
+            ("election.rs", include_str!("election.rs")),
+            ("follow.rs", include_str!("follow.rs")),
+            ("commands.rs", include_str!("commands.rs")),
+            ("shutdown.rs", include_str!("shutdown.rs")),
+        ];
+        let total: usize = files
+            .iter()
+            .map(|(_, src)| production(src).matches("watchdog.disarm()").count())
+            .sum();
+        assert_eq!(
+            total, 2,
+            "reconcile_watchdog (Disarm) and watchdog_after_shutdown (standby left running)"
+        );
+        let wd = production(include_str!("../watchdog.rs"));
+        assert!(!wd.contains("impl Drop for Watchdog"), "no disarm on Drop");
     }
 
     #[tokio::test]
