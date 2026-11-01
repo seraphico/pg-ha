@@ -241,7 +241,7 @@ impl Ha {
                 if !self.is_leader {
                     self.set_leader_lease(None);
                 }
-                self.reconcile_watchdog();
+                self.reconcile_watchdog().await;
                 result
             }
             None => {

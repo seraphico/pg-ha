@@ -248,6 +248,9 @@ impl Ha {
             return Err(e);
         }
         self.stop_pending = false;
+        // W2: confirmed stopped, so the watchdog can go now, before anything
+        // else is started.
+        self.reconcile_watchdog().await;
         let limit = std::time::Duration::from_secs(self.config.loop_wait.max(1));
         match tokio::time::timeout(limit, self.touch_member()).await {
             Ok(Ok(())) => {}
@@ -309,9 +312,16 @@ impl Ha {
     /// It is disarmed only once PostgreSQL cannot write; while it may write
     /// without a valid lease it stays armed and is not petted, so a fence
     /// that hangs ends in a machine reset instead of a zombie primary.
-    pub(super) fn reconcile_watchdog(&mut self) {
+    pub(super) async fn reconcile_watchdog(&mut self) {
         if !self.watchdog.is_active() {
             return;
+        }
+        // A start / stop in this cycle cleared the observation. Ask the
+        // server now (bounded) instead of guessing: a standby pg-ha just
+        // started must be disarmed, not held (that would reset a healthy
+        // machine after a switchover).
+        if self.postgresql.is_running() && self.postgresql.observed_in_recovery().is_none() {
+            self.postgresql.observe_recovery().await;
         }
         let lease_valid = self.is_leader && self.leader_lease.is_some_and(|l| !l.is_expired());
         match identity::watchdog_action(
@@ -385,7 +395,7 @@ impl Ha {
             .await;
         self.postgresql.set_role(MemberRole::Replica);
         // W2: disarmed only if the stop succeeded; otherwise kept armed.
-        self.reconcile_watchdog();
+        self.reconcile_watchdog().await;
         stopped
     }
 
@@ -466,7 +476,7 @@ impl Ha {
         let deadline = tokio::time::Instant::now() + drain;
         loop {
             let renewed = self.renew_held_lock().await;
-            self.reconcile_watchdog();
+            self.reconcile_watchdog().await;
             if !renewed {
                 if self.is_paused {
                     warn!(

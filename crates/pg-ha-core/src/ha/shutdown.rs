@@ -70,7 +70,7 @@ impl Ha {
 
         if self.shutdown_fence_if_lease_expired().await {
             let outcome = self.outcome_after_fence().await;
-            self.watchdog_after_shutdown(outcome);
+            self.watchdog_after_shutdown(outcome).await;
             return outcome;
         }
 
@@ -80,7 +80,7 @@ impl Ha {
         );
         if self.drain_renewing_leader_lock(drain).await {
             let outcome = self.outcome_after_fence().await;
-            self.watchdog_after_shutdown(outcome);
+            self.watchdog_after_shutdown(outcome).await;
             return outcome;
         }
 
@@ -99,7 +99,7 @@ impl Ha {
         } else {
             self.outcome_after_fence().await
         };
-        self.watchdog_after_shutdown(outcome);
+        self.watchdog_after_shutdown(outcome).await;
         outcome
     }
 
@@ -109,7 +109,7 @@ impl Ha {
     /// PostgreSQL is stopped.
     pub async fn continue_shutdown(&mut self) -> ShutdownOutcome {
         let outcome = self.finish_shutdown().await;
-        self.watchdog_after_shutdown(outcome);
+        self.watchdog_after_shutdown(outcome).await;
         outcome
     }
 
@@ -118,16 +118,16 @@ impl Ha {
     /// first when PostgreSQL cannot write: stopped (the outcome says so), or
     /// a standby left running (nothing promotes it). KeepRunning: the HA
     /// loop goes on and pets or holds it as usual.
-    fn watchdog_after_shutdown(&mut self, outcome: ShutdownOutcome) {
+    async fn watchdog_after_shutdown(&mut self, outcome: ShutdownOutcome) {
         match outcome {
-            ShutdownOutcome::KeepRunning => self.reconcile_watchdog(),
+            ShutdownOutcome::KeepRunning => self.reconcile_watchdog().await,
             ShutdownOutcome::StandbyLeftRunning => self.watchdog.disarm(),
             ShutdownOutcome::Released
             | ShutdownOutcome::StoppedLockKept
             | ShutdownOutcome::Fenced => {
                 // These outcomes are only returned with PostgreSQL stopped;
                 // reconcile re-checks that before disarming.
-                self.reconcile_watchdog();
+                self.reconcile_watchdog().await;
             }
         }
     }

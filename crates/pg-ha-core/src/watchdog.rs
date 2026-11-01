@@ -134,7 +134,10 @@ impl Watchdog {
         use std::ffi::CString;
 
         let path = CString::new(self.config.device.as_str()).unwrap();
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
+        // O_CLOEXEC: PostgreSQL and every tool pg-ha starts must not inherit
+        // the device; a child holding it keeps it open after disarm (the
+        // kernel stops the timer only when the last descriptor closes).
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
 
         if fd < 0 {
             let err = std::io::Error::last_os_error();

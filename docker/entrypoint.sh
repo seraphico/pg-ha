@@ -41,6 +41,13 @@ mkdir -p "$PG_DATA"
 chown postgres:postgres "$PG_DATA"
 chmod 0700 "$PG_DATA"
 
+# Watchdog device (when passed in with --device): pg-ha runs as postgres and
+# opens it only when it becomes primary.
+WATCHDOG_DEVICE=${PG_HA_WATCHDOG_DEVICE:-/dev/watchdog}
+if [ "${PG_HA_WATCHDOG_MODE:-off}" != "off" ] && [ -c "$WATCHDOG_DEVICE" ]; then
+    chown postgres:postgres "$WATCHDOG_DEVICE"
+fi
+
 # Ensure Raft data directory exists with correct permissions
 RAFT_DATA_DIR="/var/lib/pg-ha/raft"
 mkdir -p "$RAFT_DATA_DIR"

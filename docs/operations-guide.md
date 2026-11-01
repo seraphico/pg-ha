@@ -913,6 +913,28 @@ curl -s http://node1:8008/cluster | jq .
 
 **确认恢复**：恰好一个节点 `/primary` 返回 200，其他节点 `/replica` 返回 200；所有成员的 `pg-ha.generation` 相同，等于 `/timeline` 的 `generation`。
 
+### 测试 watchdog（开发环境）
+
+Docker Desktop 没有 watchdog 设备；colima 的 Ubuntu 虚拟机内核带 `softdog`，可以用来实测。`soft_noboot=1` 让超时只在内核日志记一条 `softdog: Triggered - Reboot ignored`，不重启虚拟机：
+
+```bash
+colima ssh -- sudo modprobe softdog soft_noboot=1
+# 只给一个节点设备（/dev/watchdog 同一时间只能被一个进程打开）
+cat > /tmp/wd-dev.yml <<'EOF'
+services:
+  node1:
+    environment:
+      PG_HA_WATCHDOG_MODE: required
+    devices:
+      - /dev/watchdog:/dev/watchdog
+EOF
+docker compose -f docker-compose.yml -f /tmp/wd-dev.yml up -d
+colima ssh -- cat /sys/class/watchdog/watchdog0/state     # 主库上为 active
+colima ssh -- sudo dmesg | grep -c 'softdog: Triggered'   # 触发次数
+```
+
+正常 switchover / failover 后旧主上应为 `inactive` 且没有新增触发；租约丢失而停库失败时应保持 `active` 并触发一次。测完 `colima ssh -- sudo rmmod softdog`。
+
 ### 场景 5：DCS (Raft) 数据损坏
 
 ```bash
