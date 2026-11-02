@@ -112,6 +112,27 @@ pub struct WalStatus {
     pub in_recovery: bool,
 }
 
+/// Primary-side snapshot of replication progress from `pg_stat_replication`.
+///
+/// `flush_lsn` is the fixed lag measure (decision: OPTION B); lag for a
+/// standby is `primary_flush_lsn - replica.flush_lsn`.
+#[derive(Debug, Clone)]
+pub struct ReplicationSnapshot {
+    /// The primary's current flush LSN in bytes (`pg_current_wal_flush_lsn()`).
+    pub primary_flush_lsn: u64,
+    /// One row per connected standby in `pg_stat_replication`.
+    pub replicas: Vec<ReplicaRow>,
+}
+
+/// One standby's progress, keyed by `application_name` (= member name).
+#[derive(Debug, Clone)]
+pub struct ReplicaRow {
+    /// `application_name` from `pg_stat_replication` (equals the member name).
+    pub application_name: String,
+    /// The standby's flushed WAL position in bytes.
+    pub flush_lsn: u64,
+}
+
 /// Timeline and flushed LSN the WAL receiver last reported.
 ///
 /// Kept after the receiver stops: when the upstream dies, the receiver exits
@@ -960,6 +981,70 @@ impl Postgresql {
                 in_recovery: false,
             })
         }
+    }
+
+    /// Primary-side replication snapshot: each standby's flushed LSN keyed by
+    /// `application_name` (= member name), plus the primary's current flush
+    /// LSN. This is the lag data source (OPTION B); `flush_lsn` is the fixed
+    /// measure and is read unconditionally (not branched on
+    /// `synchronous_commit`). On connection/query failure returns `Err`, which
+    /// the caller treats as "make no change this cycle".
+    pub async fn replication_status(&self) -> Result<ReplicationSnapshot> {
+        let connstr = self.connection_string();
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
+
+        tokio::spawn(async move {
+            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
+                Ok(Err(e)) => debug!("Connection closed: {e}"),
+                Err(_) => warn!("PG connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Ok(Ok(())) => {}
+            }
+        });
+
+        // Per-standby flushed LSN, keyed by application_name (= member name).
+        // Rows whose flush_lsn is NULL/unparseable are skipped.
+        let mut replicas = Vec::new();
+        {
+            let rows = client
+                .simple_query("SELECT application_name, flush_lsn - '0/0' FROM pg_stat_replication")
+                .await
+                .map_err(|e| Error::Postgres(format!("Replication status query failed: {e}")))?;
+            for msg in rows {
+                if let tokio_postgres::SimpleQueryMessage::Row(row) = msg
+                    && let Some(name) = row.get(0)
+                    && let Some(flush_lsn) = row.get(1).and_then(|v| v.parse::<u64>().ok())
+                {
+                    replicas.push(ReplicaRow {
+                        application_name: name.to_owned(),
+                        flush_lsn,
+                    });
+                }
+            }
+        }
+
+        // The primary's current flush LSN, the reference for lag.
+        let primary_flush_lsn = {
+            let rows = client
+                .simple_query("SELECT pg_current_wal_flush_lsn() - '0/0'")
+                .await
+                .map_err(|e| Error::Postgres(format!("Primary flush LSN query failed: {e}")))?;
+            let mut lsn: u64 = 0;
+            for msg in rows {
+                if let tokio_postgres::SimpleQueryMessage::Row(row) = msg
+                    && let Some(val) = row.get(0)
+                {
+                    lsn = val.parse().unwrap_or(0);
+                }
+            }
+            lsn
+        };
+
+        Ok(ReplicationSnapshot {
+            primary_flush_lsn,
+            replicas,
+        })
     }
 
     /// Query current WAL position from PostgreSQL.
