@@ -1,10 +1,10 @@
 # pg-ha TODO — 生产就绪路线图
 
-本文对照当前代码（2026-10）。已落地的项标为完成；仍开放的项按代码里的实际缺口描述，不沿用过时现状。
+本文对照当前代码（2026-11，`main` `eb0f8ec`，标签 `v0.1.19`）。已落地的项标为完成；仍开放的项按代码里的实际缺口描述，不沿用过时现状。
 
 ## 项目概述
 
-pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供与 Patroni 功能对等的能力，同时消除外部依赖（无需 etcd/ZooKeeper/Consul、无需 HAProxy）。
+pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni 那类能力（自动故障切换、同步复制、健康检查），同时去掉 etcd/ZooKeeper/Consul 和 HAProxy。不逐项照搬 Patroni 的外部依赖和全部开关。
 
 **核心架构**：每个节点运行单个 `pg-ha` 二进制进程，内含：
 
@@ -13,7 +13,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 - **REST API** — axum 实现的健康检查和管理端点（默认端口 8008，明文 HTTP）
 - **TCP Proxy** — 读写分离代理（RW:6432, RO:6433），带主动 HTTP 健康检查、fall/rise 和每后端 `maxconn`
 
-**当前版本**：0.1.17（与 git tag `v0.1.17` 一致）  
+**当前版本**：0.1.19（与 git tag `v0.1.19` 一致）  
 **代码结构**：Cargo workspace，`edition = "2024"`。核心 crate：`pg-ha-core`（HA 逻辑）、`pg-ha-dcs`（Raft）、`pg-ha-proxy`（代理）、`pg-ha-api`（REST）、`pg-ha-ctl`（CLI）
 
 **已实现的关键能力**：
@@ -28,11 +28,13 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 - 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
 - Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
 
-**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Failsafe、REST TLS 见下文。同步侧的 `maximum_lag_on_syncnode` 已接入（SB-01）；仍开放的是选举侧的 `maximum_lag_on_failover`（SB-11）和 REST `replication_lag` 填充（SB-10）。
+**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Failsafe、REST TLS、`/failover` 无 TTL、Raft 快照不落盘、成员 `conn_url` 含密码，见下文。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
 
 ---
 
 ## P0 — 阻塞上线（必须在生产部署前完成）
+
+编号 1、13、14、15 仍开放。编号 2 已完成，留在这里是因为同步复制的 Quorum、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
 
 ### 1. REST API TLS 支持
 
@@ -48,6 +50,37 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 - `src/main.rs` — REST 与 Raft 的监听分支
 - `crates/pg-ha-core/src/config.rs` — `RestApiConfig`（尚无 TLS 字段）、`RaftTlsConfig`
 - `crates/pg-ha-api/src/lib.rs` — 路由组装，不含传输层
+
+---
+
+### 13. `/failover` 键没有 TTL
+
+**现状**：`RaftDcs::set_failover_value` 写入时 `ttl: None`。指定的候选节点死了或不在成员列表里时，其他节点继续让位，集群可能一直选不出主库。集群健康时发出的手动 failover 也会留在这个键里，直到以后某次选举才生效。候选资格校验本身已经有了，缺的是过期。  
+**目标**：给 `/failover` 一个 TTL，并在运维文档里写明过期后选举恢复为「谁最健康」。  
+**相关文件**：
+
+- `crates/pg-ha-dcs/src/raft_dcs.rs` — `set_failover_value`
+- `crates/pg-ha-core/src/ha/election.rs` — 对候选让位
+
+---
+
+### 14. Raft 快照不落盘
+
+**现状**：`build_snapshot` 把快照放在内存里。`new_persistent` 重启时读回 `hard_state.json`、`state_machine.json`、`raft_log.wal`、`membership.json`，不读快照。重启之后、下一次自动快照之前，若有落后很多的节点需要快照才能追上，会报 snapshot not found，并停掉该领导者的 Raft。  
+**目标**：重启时若 `last_purged` 非空，从已加载的状态机立刻重建快照，或把快照写到磁盘再读回。  
+**相关文件**：
+
+- `crates/pg-ha-dcs/src/store.rs` — `new_persistent`、`build_snapshot`、`get_current_snapshot`
+
+---
+
+### 15. 成员 `conn_url` 把超级用户密码写进 Raft 日志
+
+**现状**：发布成员时 `conn_url` 拼上 `password={pw}`，经 `touch_member` 进入 Raft 日志和磁盘。代理和跟随上游多数只用主机和端口，密码来自本机配置。密码没有对 `'`、空格、`\` 做转义。  
+**目标**：先定一条：密码进不进 DCS。不进，就从 `conn_url` 去掉；要进，就按 conninfo 规则转义。  
+**相关文件**：
+
+- `crates/pg-ha-core/src/ha/helpers.rs` — 组装 `conn_url`
 
 ---
 
@@ -94,7 +127,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 
 **现状**（比「只缺 DCS 持久化」更靠前）：
 
-- `GlobalConfig.failsafe_mode` 能通过 `PATCH /config` 写入 DCS，但 `process_dynamic_config` 从不调用 `Failsafe::set_enabled`。默认 `enabled = false`，DCS 不可达时走 `FailsafeResult::Disabled` 并 demote
+- `GlobalConfig.failsafe_mode` 能通过 `PATCH /config` 写入 DCS，但 `process_dynamic_config` 从不调用 `Failsafe::set_enabled`。`RaftDcs::get_cluster` 是本地读取，正常不会因「DCS 不可达」返回错误，因此 `handle_dcs_error` 这条入口在 Raft 上到不了。开关写进去也不生效
 - `Failsafe::check_topology` 会 `POST {api_url}/failsafe`，路由表里没有该端点
 - `raft_dcs.rs` 的 `get_cluster()` 仍是 `failsafe: None // TODO: read /failsafe key`，不读 `/failsafe`
 - `pg_ha_failsafe_active` 在 `main` 的状态更新里没有赋值，进程内保持初始值 `0`
@@ -164,7 +197,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 ### 10. Standby cluster / 多区域
 
 **已有**：`StandbyClusterConfig`（`host`、`port`、`primary_slot_name`、`restore_command`、`create_replica_methods`）放在动态配置 `standby_cluster` 下。HA 循环在持锁节点上调用远端跟随；`Ha::cascade_promote` 能从 DCS 去掉该配置并 promote。  
-**未做**：没有 REST/CLI 触发 `cascade_promote`；运维文档此前未描述该配置。跨区域网络、槽位和归档的运行手册仍缺。
+**未做**：没有 REST 或 `pg-ha-ctl` 触发 `cascade_promote`（运维指南已经写了这个配置和这个限制）。跨区域网络、槽位和归档的运行手册仍缺。
 
 ### 11. Web Dashboard
 
@@ -183,8 +216,11 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 | 位置 | 内容 | 关联任务 |
 |------|------|----------|
 | `crates/pg-ha-dcs/src/raft_dcs.rs`（`get_cluster`） | `TODO: read /failsafe key` | #4 |
-| `crates/pg-ha-core/src/ha/election.rs` | `maximum_lag_on_failover` 未参与候选过滤 | SB-11（#2 剩余） |
-| REST `/patroni` `replication_lag` | 字段始终为 0，未计算填充 | SB-10（#2 剩余） |
+| `crates/pg-ha-dcs/src/raft_dcs.rs`（`set_failover_value`） | `ttl: None` | #13 |
+| `crates/pg-ha-dcs/src/store.rs`（`build_snapshot` / `new_persistent`） | 快照只在内存，重启不加载 | #14 |
+| `crates/pg-ha-core/src/ha/helpers.rs`（组装 `conn_url`） | `password=` 进入 Raft 日志 | #15 |
+| `crates/pg-ha-core/src/ha/election.rs` | `maximum_lag_on_failover` 未参与候选过滤 | #2 剩余 |
+| REST `/patroni` `replication_lag` | 字段始终为 0，未计算填充 | #2 剩余 |
 
 ---
 
