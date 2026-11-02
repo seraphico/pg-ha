@@ -28,7 +28,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 - 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
 - Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
 
-**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Failsafe、REST TLS、`max_lag_on_syncnode` 见下文。
+**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Failsafe、REST TLS 见下文。同步侧的 `maximum_lag_on_syncnode` 已接入（SB-01）；仍开放的是选举侧的 `maximum_lag_on_failover`（SB-11）和 REST `replication_lag` 填充（SB-10）。
 
 ---
 
@@ -55,10 +55,13 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 
 **已实现**：`synchronous_mode` 启用时，自动选举与指定 `candidate` 的 Failover/Switchover 均强制候选属于 DCS `/sync.sync_standby`；名单缺失、空或为 `*` 时不晋升；不合格候选返回 409，`status` 为 `rejected`。权威来源仅为 DCS `/sync`。`synchronous_mode_strict` 只影响写阻塞，不参与选举。
 
+**SB-01 已补齐（同步侧）**：`maximum_lag_on_syncnode`（动态配置，单位字节，`None`=关闭）已接入——`enforce_synchronous_replication` 从 `pg_stat_replication` 读实时 lag，只有实际在流复制且 lag 在阈值内的备库才算合格并被加进 `/sync`。两阶段写入（DCS `/sync` 始终是 PG `synchronous_standby_names` 的子集，加/删对称顺序）落地；strict 用不可满足的占位名单真正阻塞写入（不是 `'*'`）。详见 [invariants.md](invariants.md) S5 与 [operations-guide.md](operations-guide.md)「两阶段过渡窗口」。
+
 **仍开放**：
 
-- `max_lag_on_syncnode`：`SyncManager::set_max_lag` 存在，但 `compute_sync_standby_names` 在配置了阈值时仍把任意 `wal_position` 都算作合格（`sync.rs` 的 `TODO: compute actual lag`）。HA 循环也没有调用 `set_max_lag`
-- Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但 `enforce_synchronous_replication` 固定使用 `SyncMode::Priority`，动态配置没有模式开关
+- Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但 `enforce_synchronous_replication` 固定使用 `SyncMode::Priority`，动态配置没有模式开关（仅 Priority / `FIRST N` 可用）
+- **SB-11**：`maximum_lag_on_failover` 仍不被选举读取——动态配置能写入该值，但 `ha/election.rs` 侧不用它过滤候选（与已接入的 `maximum_lag_on_syncnode` 不同）
+- **SB-10**：REST `/patroni` 的 `replication_lag` 字段从不被填充，始终为 `0`，没有代码计算并写入它
 
 **相关文件**：
 
@@ -179,8 +182,9 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，目标是提供�
 
 | 位置 | 内容 | 关联任务 |
 |------|------|----------|
-| `crates/pg-ha-core/src/sync.rs`（lag 过滤） | `TODO: compute actual lag` | #2 剩余：`max_lag_on_syncnode` |
 | `crates/pg-ha-dcs/src/raft_dcs.rs`（`get_cluster`） | `TODO: read /failsafe key` | #4 |
+| `crates/pg-ha-core/src/ha/election.rs` | `maximum_lag_on_failover` 未参与候选过滤 | SB-11（#2 剩余） |
+| REST `/patroni` `replication_lag` | 字段始终为 0，未计算填充 | SB-10（#2 剩余） |
 
 ---
 
