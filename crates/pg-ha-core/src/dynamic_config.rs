@@ -35,6 +35,14 @@ pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_lag_on_failover: Option<u64>,
 
+    /// Maximum replication lag (bytes) tolerated on a synchronous standby
+    /// before it is excluded from the synchronous set.
+    ///
+    /// `None` = off: because `u64` cannot be negative there is no numeric
+    /// "disable" sentinel, so `None` is the only off state. Units are bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_lag_on_syncnode: Option<u64>,
+
     /// Enable synchronous replication mode
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synchronous_mode: Option<bool>,
@@ -181,6 +189,7 @@ pub fn detect_changes(old: &GlobalConfig, new: &GlobalConfig) -> ConfigChanges {
         || old.ttl != new.ttl
         || old.retry_timeout != new.retry_timeout
         || old.maximum_lag_on_failover != new.maximum_lag_on_failover
+        || old.maximum_lag_on_syncnode != new.maximum_lag_on_syncnode
         || old.synchronous_mode != new.synchronous_mode
         || old.synchronous_mode_strict != new.synchronous_mode_strict
         || old.synchronous_node_count != new.synchronous_node_count
@@ -384,6 +393,7 @@ mod tests {
             ttl: Some(30),
             retry_timeout: Some(10),
             maximum_lag_on_failover: Some(1048576),
+            maximum_lag_on_syncnode: Some(8388608),
             synchronous_mode: Some(false),
             synchronous_mode_strict: None,
             synchronous_node_count: Some(1),
@@ -401,6 +411,29 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: GlobalConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn test_maximum_lag_on_syncnode_roundtrip_and_detect_and_patch() {
+        // Round-trip: the field survives serialize/deserialize.
+        let config = GlobalConfig {
+            maximum_lag_on_syncnode: Some(8388608),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: GlobalConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, parsed);
+        assert_eq!(parsed.maximum_lag_on_syncnode, Some(8388608));
+
+        // detect_changes flags ha_params_changed when only this field differs.
+        let old = GlobalConfig::default();
+        let changes = detect_changes(&old, &config);
+        assert!(changes.ha_params_changed);
+
+        // patch_config with null removes the field.
+        let patch = serde_json::json!({ "maximum_lag_on_syncnode": null });
+        let result = patch_config(&config, &patch).unwrap();
+        assert_eq!(result.maximum_lag_on_syncnode, None);
     }
 
     #[test]
