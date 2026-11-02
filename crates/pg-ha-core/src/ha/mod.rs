@@ -639,8 +639,36 @@ impl Ha {
         let desired = if !enabled {
             String::new()
         } else {
+            // Real replication snapshot from pg_stat_replication; on error make
+            // no change this cycle (treat like wal_status failure).
+            let snapshot = match self.postgresql.replication_status().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to read replication_status: {e}");
+                    return;
+                }
+            };
+            let threshold = cfg.maximum_lag_on_syncnode;
+            let current_voters: Vec<String> = self
+                .cluster
+                .sync_state
+                .as_ref()
+                .map(|s| {
+                    s.sync_standby_names()
+                        .into_iter()
+                        .map(|n| n.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let manager = SyncManager::new(SyncMode::Priority, count, strict);
-            match manager.compute_sync_standby_names(&self.cluster.members, &self.config.name) {
+            match manager.compute_sync_standby_names(
+                &self.cluster.members,
+                &self.config.name,
+                &snapshot,
+                threshold,
+                &current_voters,
+            ) {
                 Some(v) => v,
                 None => return,
             }
