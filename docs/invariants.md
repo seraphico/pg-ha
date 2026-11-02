@@ -234,7 +234,7 @@
 | S2 | **Failover**：在 lock 过期或主库确认不可用后，仅合格候选参与选举；胜出者 promote 并写入 lock；完成后 L\* 与 H\* 成立。 | 持有 |
 | S3 | 切换完成后，`GET /cluster`、成员 role/state、以及 history 中的事件与真实拓扑一致。 | 持有 |
 | S4 | 旧 Primary 回归：不得形成双主；须走检测 → rewind / basebackup / rejoin 故事，最终成为指向当前 leader 的 Replica（或维护态）。 | 持有 |
-| S5 | 当 `synchronous_mode` 启用时，Failover / Switchover 候选必须属于 DCS `/sync.sync_standby`；`/sync` 缺失、空或为 `*` 时任何节点均不得晋升。`synchronous_mode_strict` 仅影响写阻塞，不参与选举。 | 持有 |
+| S5 | **DCS `/sync` 始终是 PG `synchronous_standby_names` 的子集**：发布进 `/sync` 的名字必在 PG 当前的同步名单内，且已确认追上（`flush_lsn` 达到 PG 名单变更时记录的 Primary flush LSN，在 `maximum_lag_on_syncnode` 之内）、实际在 `pg_stat_replication` 中流复制。两次写有对称顺序保证子集在 cycle 被打断时也成立：**加入**——先扩 PG 名单、确认追上，再扩 `/sync`；**移除**——先缩 `/sync`，再缩 PG 名单。当 `synchronous_mode` 启用时，Failover / Switchover 候选必须属于 `/sync.sync_standby`；`/sync` 缺失、空或为不可满足的 strict 占位时任何节点均不得晋升。存在**过渡窗口**：新 promote 的主库先发布空/仅自身的 `/sync`、备库追上后再补入，期间 `/sync` 可能短暂收缩甚至为空，此时无节点可晋升（failover 暂时禁止但安全）。`synchronous_mode_strict` 仅影响写阻塞（用不可满足的占位名单，不是 `*`），不参与选举。仅 Priority（`FIRST N`）模式接入运行路径。 | 持有 |
 
 **无 candidate 的 switchover**（S1）：`/failover` 为 `{"leader": "<旧主>", "candidate": null}`。旧主停库后以备库启动，WAL 往往最高，且 timeline 仍等于 `/timeline`，rewind 检查标记不会把它排除在选举之外。因此选举不按 WAL 把锁还给它：`failover.leader` 不抢锁（日志 `Not taking part in the election: this node is the leader switchover asked to step down`），其他节点比较「谁最健康」时跳过它。指定了 candidate 且该 candidate 仍可参选时，只有 candidate 抢锁，不额外排除。手动 failover 不写 `leader`，不排除任何人。没有其他合格节点时 `POST /switchover` 在降级之前拒绝（409，`No other running member can take over; refusing switchover without a candidate`），不写 `/failover`、不停库。`/failover` 只在有人抢到锁之后清除；没有合格节点却已经写下 key 时（例如受理之后唯一的副本停了），集群保持无主，直到出现合格节点或 key 被清掉。
 
@@ -354,6 +354,8 @@
 | TTL 过期仍受 Raft leader 墙钟影响 | L5 | 写入日志前由 Raft leader 用自己的时钟覆盖 `now`（`stamp_leader_time`），发起节点的时钟不再决定锁是否过期。本地读取仍用读取节点的墙钟，所以时钟快的节点可能在本地视图里认为锁已过期，但抢锁要经过 leader 的 `now`，在 leader 认为锁还在时会失败。Raft leader 的时钟比锁持有者快超过 `safety_margin`（减去约 0.1 秒）时，新主仍可能在旧主围栏前出现 |
 | 停库一直失败时锁一直被占（switchover 与优雅关停） | L5 / S1 | 用可用性换安全：持锁节点每轮续锁、重试停库，集群不换主，没有可写主对外（`/primary` 503）。运维处理见运维指南「关停卡住」「switchover 卡住」 |
 | 主库正常关停期间写不可用 | H4 / S1 | drain（默认 30 秒，只等待，不看连接是否清零）+ CHECKPOINT + 停库期间 `/primary` 503 且锁被续着，别的节点不接管。先 switchover 再停主库，或把主库的 `drain_timeout_secs` 调短 |
+| `maximum_lag_on_failover` 未接入选举（SB-11） | S5 / S2 | 动态配置能写入 `maximum_lag_on_failover`，但选举侧不读取它，lag 不参与候选过滤。与同步侧的 `maximum_lag_on_syncnode`（已接入）不同 |
+| REST `replication_lag` 从不填充（SB-10） | H2 | `/patroni` 的 `replication_lag` 字段始终为 0，没有代码计算并写入它；不要据此告警或做 lag 阈值判断 |
 
 ---
 
@@ -361,6 +363,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-11-02 | SB-01：S5 重写为「DCS `/sync` 始终是 PG `synchronous_standby_names` 的子集」，写明对称的两阶段 add/remove 顺序、追上确认（`maximum_lag_on_syncnode` + 实际在 `pg_stat_replication` 流复制）、过渡窗口期间无节点可晋升，并澄清 strict 用不可满足的占位名单（不是 `*`）、仅 Priority 模式接入。第 9 节登记 SB-11（`maximum_lag_on_failover` 未接入选举）、SB-10（REST `replication_lag` 从不填充） |
 | 2026-11-01 | W2 实测（colima Ubuntu 虚拟机 + `softdog soft_noboot=1`）发现并修正两处：switchover 后旧主停库、以备库重启，观测被清空，按「可能可写」保持装填，10 秒后触发（生产上会重启一台健康的机器）；设备未用 `O_CLOEXEC` 打开，之后启动的 postmaster 继承了它，解除后设备仍被占用、计时继续并触发，之后再装填报 EBUSY。现在 reconcile 先实时观测，停库确认后立即解除，设备以 `O_CLOEXEC` 打开 |
 | 2026-11-01 | W2 修正：`required` 且不可用的 watchdog 不再导致「当选 → promote → 围栏」循环：不竞选初始化、不参选、发布 `watchdog_failed`，peer 不让位、API 拒绝其作为 candidate；promote 前（写 pending 前）装填，失败则以备库身份释放锁。PostgreSQL 可能仍可写时不再解除 watchdog（降级、租约围栏、`stop_pending`、关停开始、`Drop`）；统一由 `reconcile_watchdog` 决定喂狗 / 保持 / 解除。第 9 节登记超时起算点问题 |
 | 2026-10-30 | 闭合「UnmanagedRecovery 持锁时在 PG 仍运行时释放锁」：先停库再 `delete_leader`；有 `recovery.signal` 时不写 `standby.signal`；停不掉则保留锁并 `stop_pending` 每轮围栏（与 switchover / 关停一致）。闭合「动态 `ttl` 不改变写入锁的 TTL」：`set_lock_timing` 同步 RaftDcs。闭合「带 rewind_check 的 `/replica` 仍 200」：H2 要求无标记。闭合 W2：watchdog 在可写主 + 有效租约时喂狗（超时 = ttl − safety_margin），降级/关停停喂。运维：failover 与 switchover 候选校验对齐；`/failover` 写失败不 accepted；拒绝未实现的 `scheduled_at`；持锁 `/restart` 停前 `/primary` 503 且停失败 `stop_pending` |

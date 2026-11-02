@@ -772,8 +772,12 @@ impl Ha {
     /// Forget what was applied to synchronous_standby_names so the next
     /// primary term re-applies it (ALTER SYSTEM content may have been replaced
     /// by a clone or pg_rewind, and the node may have been a standby since).
+    ///
+    /// Also clears the recorded primary-flush-LSN mark so the next term's
+    /// catch-up confirmation for freshly added standbys starts fresh.
     pub(super) fn reset_sync_cache(&mut self) {
         self.applied_sync_standby_names = None;
+        self.sync_pg_list_changed_flush_lsn = None;
     }
 
     /// Update member info in DCS (heartbeat)

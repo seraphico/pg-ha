@@ -363,7 +363,7 @@ curl -u admin:secret -X PUT http://localhost:8008/config \
 | 参数类型 | 生效方式 | 示例 |
 |---------|---------|------|
 | HA 参数 | 下一 cycle 立即应用 | `loop_wait`, `ttl`, `pause` |
-| 同步复制参数 | Primary 下一 cycle：改 PG + 写 DCS `/sync` | `synchronous_mode`, `synchronous_mode_strict`, `synchronous_node_count` |
+| 同步复制参数 | Primary 下一 cycle：改 PG + 写 DCS `/sync`（两阶段） | `synchronous_mode`, `synchronous_mode_strict`, `synchronous_node_count`, `maximum_lag_on_syncnode` |
 | PG reload 参数 | 自动执行 `pg_ctl reload` | `work_mem`, `effective_cache_size` |
 | PG restart 参数 | 设置 `pending_restart` 标志，不自动重启 | `max_connections`, `shared_buffers`, `wal_level`, `max_wal_senders` |
 | `failsafe_mode` | 会写入 DCS `/config`，HA 循环不读取 | 见 [TODO #4](TODO.md) |
@@ -434,20 +434,30 @@ ANY 2 (node1,node2,node3) -- Quorum 模式：任意 2 个节点确认即可
 pg-ha 在每个 HA cycle 中（仅 Primary 执行）：
 
 1. 从 DCS 读取动态配置（`synchronous_mode` 等参数）
-2. 获取所有集群成员的状态（Running/Crashed、角色、WAL position）
+2. 获取所有集群成员的状态（Running/Crashed、角色、WAL position），并从本机 `pg_stat_replication` 读取每个备库的实时流复制状态（`flush_lsn` 等）
 3. 按筛选条件和优先级计算出 `synchronous_standby_names` 目标值
-4. 如果与上次不同 → `ALTER SYSTEM SET synchronous_standby_names = '...'` + `pg_ctl reload`。每个主任期第一次总会执行（降级或重写备库配置时 pg-ha 会忘掉上次应用的值）
-5. 将当前 sync 状态写入 DCS `/sync` key（供健康检查 API 使用）
+4. 按**两阶段顺序**（见下文「两阶段过渡窗口」）把目标值应用到 PG（`ALTER SYSTEM SET synchronous_standby_names = '...'` + reload）并发布到 DCS `/sync`。每个主任期第一次总会执行一次 PG 写（降级或重写备库配置时 pg-ha 会忘掉上次应用的值）
 
 **筛选条件**（同时满足才能成为 sync standby 候选）：
 - 不是 Primary 自己
 - 节点状态为 Running
 - 节点角色为 Replica
 - 没有 `nosync: true` 标签
+- **实际正在流复制**：该成员必须出现在 Primary 的 `pg_stat_replication` 里（`application_name` = 成员名）。只在 DCS 里登记为 Running、但没有真正连上 Primary 的节点不算合格，不会被加进 `/sync`
+- 配置了 `maximum_lag_on_syncnode` 时，该备库的 lag（Primary 的 `flush_lsn` 减去备库 `flush_lsn`）必须不超过阈值
 
 **排序规则**：
 - `sync_priority` 标签值越大越靠前
 - 优先级相同时按节点名字字母序
+
+### 两阶段过渡窗口
+
+DCS `/sync` 名单与 PG 的 `synchronous_standby_names` 不是一次写完，而是按固定顺序分两步写，保证**任意时刻 DCS `/sync` 都是 PG `synchronous_standby_names` 的子集**（不变量 S5）。顺序是对称的：
+
+- **加入一个备库**：先把它写进 PG 的 `synchronous_standby_names`，确认它的 `flush_lsn` 已追上（达到 PG 名单变更那一刻记录的 Primary flush LSN，且在 `maximum_lag_on_syncnode` 之内）之后，才把它写进 DCS `/sync`
+- **移除一个备库**：先把它从 DCS `/sync` 删掉，再把它从 PG 的 `synchronous_standby_names` 删掉
+
+这样即使某个 cycle 在两步之间被打断，`/sync` 也绝不会指向一个 PG 还没真正在等它、或已经不等它的备库。副作用是存在一个**过渡窗口**：新 promote 的主库首个 cycle 会先发布空的（或只含自己的）`/sync`，等备库逐个追上后再补进去；期间 `/sync` 可能短暂收缩甚至为空。按 S5，`/sync` 为空时**不允许任何节点晋升**——此时 Failover / Switchover 被暂时禁止，但这是安全的：宁可短时间没有合格继任者，也不会把一个还没确认同步的节点抬成主库而丢数据。窗口会在备库追上后自动闭合。
 
 ### 场景分析
 
@@ -469,7 +479,9 @@ PG 自动将 node3 提升为 sync。写入不中断。
 #### 所有 Replica 都挂了
 
 - `strict_mode = false`：设为空字符串 `''`，PG 退化为异步，写入不阻塞
-- `strict_mode = true`：设为 `'*'`，PG 阻塞所有 COMMIT，直到有 Replica 恢复
+- `strict_mode = true`：设为一个**不可满足的占位名单** `FIRST 1 ("_pg_ha_no_eligible_sync_standby_")`，PG 阻塞所有 COMMIT，直到有合格 Replica 恢复
+
+> ⚠️ **不是 `'*'`**：strict 阻塞**不能**用 `synchronous_standby_names = '*'`。PostgreSQL 把 `'*'` 读成「任意已连接的备库」，只要有一个 walreceiver 连上就算满足，**不会**阻塞写入。真正阻塞 COMMIT 的办法是写一个永远不会有备库匹配的占位名字（上面的 `_pg_ha_no_eligible_sync_standby_`），让 PG 一直等不到确认。
 
 #### 节点重新加入
 
@@ -498,9 +510,14 @@ node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
 |------|------|--------|------|
 | `synchronous_mode` | bool | `false` | 是否启用同步复制。关闭时 `synchronous_standby_names` 被清空 |
 | `synchronous_mode_strict` | bool | `false` | 无可用 sync standby 时的行为：`false` = 退化为异步继续写入；`true` = 阻塞所有写入 |
-| `synchronous_node_count` | u32 | `1` | 需要多少个同步备库确认。`FIRST N` 或 `ANY N` 中的 N |
+| `synchronous_node_count` | u32 | `1` | 需要多少个同步备库确认。`FIRST N` 中的 N（仅 Priority 模式，见下文） |
+| `maximum_lag_on_syncnode` | u64（字节） | 不设 = 关闭 | 备库落后 Primary 超过这么多字节（`flush_lsn` 差值）时，不把它算作合格同步备库、不加进 `/sync`。没有「禁用」哨兵值，`None`（不设置或 PATCH 为 `null`）就是关闭 |
 
-**Failover / Switchover：** 启用 `synchronous_mode` 后，只有当前 `/sync` 名单中的节点可以成为新主；指定不在名单中的 `candidate` 会返回 409。名单为空时不会自动晋升（保已确认事务）。
+**`maximum_lag_on_syncnode` 如何取值**：这是对**同步备库**的 lag 门槛，lag 从 Primary 的 `pg_stat_replication` 实时计算（单位字节）。取一个明显高于正常峰值 lag 的值：设太小会在写入高峰时频繁把备库踢出 `/sync`、触发两阶段过渡窗口；设太大则失去意义。先用 `SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn) FROM pg_stat_replication;` 观察正常和高峰时段的实际 lag，再取峰值之上的量级（例如峰值 10 MB 则设 64 MB）。不确定时先不设（关闭），只靠「实际正在流复制」这一条筛选。
+
+**Failover / Switchover：** 启用 `synchronous_mode` 后，只有当前 `/sync` 名单中的节点可以成为新主；指定不在名单中的 `candidate` 会返回 409。名单为空时（包括两阶段过渡窗口中 `/sync` 暂时收缩为空）不会自动晋升（保已确认事务）。
+
+**仅支持 Priority（FIRST N）模式**：HA 循环固定使用 `SyncMode::Priority`，即只生成 `FIRST N (...)`。Quorum（`ANY N`）**没有接到运行路径上**——`SyncManager` 能生成 `ANY N (...)`，但没有任何动态配置项把它选中。不要指望通过配置切到 Quorum。
 
 **如何选择**：
 - 大多数场景用 `synchronous_mode: true, strict: false, count: 1` — 正常时同步保护，极端时不停服务
@@ -579,10 +596,11 @@ bootstrap:
 
 ### 当前范围与限制
 
-- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（HA 循环固定用 Priority / `FIRST N`）、节点变动时自动更新、发布 DCS `/sync`、`/sync` `/async` 健康检查、Failover / Switchover 时强制 `/sync` 成员资格
-- 尚未实现：
-  - Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但运行路径没有配置项把它选中
-  - `max_lag_on_syncnode`：`SyncManager` 留了过滤入口，lag 比较仍是占位，HA 循环也不调用 `set_max_lag`
+- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（HA 循环固定用 Priority / `FIRST N`）、节点变动时自动更新、两阶段写入（DCS `/sync` 始终是 PG 名单的子集）、`maximum_lag_on_syncnode` lag 门槛、「实际正在流复制」筛选（必须出现在 `pg_stat_replication`）、strict 用不可满足的占位名单真正阻塞写入（不是 `'*'`）、发布 DCS `/sync`、`/sync` `/async` 健康检查、Failover / Switchover 时强制 `/sync` 成员资格
+- 尚未实现（登记在 [TODO.md](TODO.md)）：
+  - Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但运行路径没有配置项把它选中（仅 Priority 可用）
+  - `maximum_lag_on_failover`：选举侧仍不读取这个阈值（SB-11）
+  - REST `/patroni` 的 `replication_lag` 字段从不被填充，始终为 0（SB-10）
 
 ---
 

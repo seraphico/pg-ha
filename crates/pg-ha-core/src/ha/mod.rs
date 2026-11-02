@@ -112,6 +112,14 @@ pub struct Ha {
     /// Used to skip redundant ALTER SYSTEM + reload every HA cycle.
     applied_sync_standby_names: Option<String>,
 
+    /// The primary's flush LSN captured the last time the PG
+    /// `synchronous_standby_names` list changed. A freshly ADDED standby is
+    /// only published into DCS `/sync` once its `flush_lsn` has caught up to
+    /// this mark (within `maximum_lag_on_syncnode`), so `/sync` never names a
+    /// standby PostgreSQL has not actually synced to. Cleared by
+    /// `reset_sync_cache` alongside `applied_sync_standby_names`.
+    sync_pg_list_changed_flush_lsn: Option<u64>,
+
     /// A stop after writing standby.signal on a demotion / fence path failed
     /// and PostgreSQL was not confirmed stopped since (A19). While set, an
     /// unobserved server is fenced again every cycle, and a primary is fenced
@@ -185,6 +193,7 @@ impl Ha {
             pending_switchover: None,
             start_fail_count: 0,
             applied_sync_standby_names: None,
+            sync_pg_list_changed_flush_lsn: None,
             stop_pending: false,
             promote_pending: None,
             timeline_problem_logged: None,
@@ -627,78 +636,237 @@ impl Ha {
         ))
     }
 
-    /// Apply synchronous replication settings when this node is the primary.
+    /// Apply synchronous replication settings when this node is the primary,
+    /// in the Patroni-aligned two-phase form.
     ///
-    /// Skips PG reload / DCS write when the desired value is unchanged.
+    /// The invariant at every step is: the set of names published in DCS
+    /// `/sync` is always a SUBSET of PostgreSQL's `synchronous_standby_names`.
+    /// Writes have a fixed, asymmetric order so the invariant holds even if a
+    /// cycle is interrupted between the two writes:
+    ///
+    /// * REMOVING a standby: first shrink DCS `/sync`, THEN shrink the PG list.
+    /// * ADDING a standby: first grow the PG list and confirm the new standby
+    ///   has caught up, THEN grow DCS `/sync`.
+    ///
+    /// On a `replication_status` error no change is made this cycle (neither
+    /// PG nor `/sync` is touched), exactly like a `wal_status` failure.
     async fn enforce_synchronous_replication(&mut self) {
         let cfg = &self.dynamic_config_state.last_config;
         let enabled = cfg.synchronous_mode.unwrap_or(false);
         let strict = cfg.synchronous_mode_strict.unwrap_or(false);
         let count = cfg.synchronous_node_count.unwrap_or(1) as usize;
+        let threshold = cfg.maximum_lag_on_syncnode;
 
-        let desired = if !enabled {
-            String::new()
-        } else {
-            let manager = SyncManager::new(SyncMode::Priority, count, strict);
-            match manager.compute_sync_standby_names(&self.cluster.members, &self.config.name) {
-                Some(v) => v,
-                None => return,
-            }
+        // The /sync voters this node is allowed to treat as "already published".
+        // At promote time /sync may still hold the OLD leader's voters; a node
+        // that is not the recorded /sync leader must treat voters as EMPTY so a
+        // freshly promoted primary first publishes an empty/own-only /sync and
+        // re-adds standbys only after they catch up.
+        let current_voters: Vec<String> = match self.cluster.sync_state.as_ref() {
+            Some(s) if s.leader.eq_ignore_ascii_case(&self.config.name) => s
+                .sync_standby_names()
+                .into_iter()
+                .map(|n| n.to_string())
+                .collect(),
+            _ => Vec::new(),
         };
 
-        if self.applied_sync_standby_names.as_deref() == Some(desired.as_str()) {
-            return;
-        }
+        // Desired PG value. Sync disabled -> empty (async, no sync standbys).
+        let (desired_pg, snapshot_primary_flush_lsn, snapshot) = if !enabled {
+            (String::new(), None, None)
+        } else {
+            // Real replication snapshot from pg_stat_replication; on error make
+            // no change this cycle (treat like a wal_status failure).
+            let snapshot = match self.postgresql.replication_status().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to read replication_status; no sync change this cycle: {e}");
+                    return;
+                }
+            };
 
-        if let Err(e) = self
-            .postgresql
-            .set_synchronous_standby_names(&desired)
-            .await
+            // SyncMode::Priority is hardcoded: quorum (ANY N) is intentionally
+            // NOT wired for SB-01, so Priority (FIRST N) is the only supported
+            // mode. See decision 10 in the SB-01 plan.
+            let manager = SyncManager::new(SyncMode::Priority, count, strict);
+            let desired = match manager.compute_sync_standby_names(
+                &self.cluster.members,
+                &self.config.name,
+                &snapshot,
+                threshold,
+                &current_voters,
+            ) {
+                Some(v) => v,
+                None => return,
+            };
+            (desired, Some(snapshot.primary_flush_lsn), Some(snapshot))
+        };
+
+        let desired_names = Self::extract_names_from_sync_value(Some(desired_pg.as_str()));
+        let current_sync_names = Self::sync_name_set(&current_voters);
+
+        // Idempotent short-circuit: PG already carries the desired list AND
+        // /sync already names exactly the desired set.
+        if self.applied_sync_standby_names.as_deref() == Some(desired_pg.as_str())
+            && current_sync_names == desired_names
         {
-            warn!("Failed to set synchronous_standby_names: {e}");
             return;
         }
 
-        let sync_standby = Self::extract_names_from_sync_value(&desired);
+        // ── Phase 1: REMOVALS — shrink DCS /sync before shrinking the PG list ──
+        // Anything currently in /sync but no longer desired is dropped from
+        // /sync first, so /sync never names a standby PG is about to stop
+        // waiting on.
+        if !current_sync_names.is_subset(&desired_names) {
+            let reduced: std::collections::BTreeSet<String> = current_sync_names
+                .intersection(&desired_names)
+                .cloned()
+                .collect();
+            if !self.write_sync_state(&reduced, enabled, count).await {
+                return;
+            }
+        }
+
+        // ── Phase 2: update the PG list (ALTER SYSTEM) if it changed ──
+        if self.applied_sync_standby_names.as_deref() != Some(desired_pg.as_str()) {
+            if let Err(e) = self
+                .postgresql
+                .set_synchronous_standby_names(&desired_pg)
+                .await
+            {
+                warn!("Failed to set synchronous_standby_names: {e}");
+                return;
+            }
+            self.applied_sync_standby_names = Some(desired_pg);
+            // Record the primary flush LSN at the moment the PG list changed;
+            // a newly ADDED standby must catch up to at least this mark before
+            // it is published into /sync.
+            self.sync_pg_list_changed_flush_lsn = snapshot_primary_flush_lsn;
+        }
+
+        // ── Phase 3: ADDITIONS — grow DCS /sync only for caught-up standbys ──
+        // The desired set now matches the PG list. Publish into /sync only the
+        // desired standbys that have confirmed catch-up; names still catching
+        // up stay out of /sync and are re-tried next cycle.
+        let publishable: std::collections::BTreeSet<String> = desired_names
+            .iter()
+            .filter(|name| {
+                current_sync_names.contains(*name)
+                    || self.sync_standby_caught_up(name, snapshot.as_ref(), threshold)
+            })
+            .cloned()
+            .collect();
+
+        if publishable != current_sync_names {
+            let _ = self.write_sync_state(&publishable, enabled, count).await;
+        }
+    }
+
+    /// Whether a desired standby has caught up enough to be published into
+    /// `/sync`: its `flush_lsn` must reach the primary flush LSN recorded when
+    /// the PG list last changed, within `maximum_lag_on_syncnode`.
+    ///
+    /// Returns `false` when there is no snapshot (sync disabled) or no
+    /// recorded mark yet. A missing snapshot row for the name means it is not
+    /// streaming, so it is not caught up.
+    fn sync_standby_caught_up(
+        &self,
+        name: &str,
+        snapshot: Option<&crate::postgresql::ReplicationSnapshot>,
+        threshold: Option<u64>,
+    ) -> bool {
+        let Some(snapshot) = snapshot else {
+            return false;
+        };
+        let Some(mark) = self.sync_pg_list_changed_flush_lsn else {
+            return false;
+        };
+        let Some(row) = snapshot
+            .replicas
+            .iter()
+            .find(|r| r.application_name.eq_ignore_ascii_case(name))
+        else {
+            return false;
+        };
+        let allowed = threshold.unwrap_or(0);
+        mark.saturating_sub(row.flush_lsn) <= allowed
+    }
+
+    /// Serialize and write a `/sync` state holding exactly `names`.
+    /// Returns false (and logs) on a serialize or DCS write failure, so the
+    /// caller aborts the rest of the cycle.
+    async fn write_sync_state(
+        &mut self,
+        names: &std::collections::BTreeSet<String>,
+        enabled: bool,
+        count: usize,
+    ) -> bool {
+        let sync_standby = if names.is_empty() {
+            None
+        } else {
+            Some(names.iter().cloned().collect::<Vec<_>>().join(","))
+        };
         let state = SyncState {
             leader: self.config.name.clone(),
             sync_standby,
             quorum: if enabled { count as u32 } else { 0 },
         };
-
         match serde_json::to_string(&state) {
             Ok(json) => {
                 if let Err(e) = self.dcs.set_sync_value(&json).await {
                     warn!("Failed to write /sync: {e}");
-                    return;
+                    return false;
                 }
+                true
             }
             Err(e) => {
                 warn!("Failed to serialize SyncState: {e}");
-                return;
+                false
             }
         }
-
-        self.applied_sync_standby_names = Some(desired);
     }
 
-    /// "FIRST 1 (node2,node3)" → Some("node2,node3")
-    /// "" / "*" → None / Some("*")
-    fn extract_names_from_sync_value(pg_value: &str) -> Option<String> {
-        if pg_value.is_empty() {
-            return None;
+    /// The comma-separated `/sync` member names as a case-folded set (for
+    /// subset / equality checks against the desired set).
+    fn sync_name_set(names: &[String]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|n| n.to_ascii_lowercase()).collect()
+    }
+
+    /// Parse the member names out of a `synchronous_standby_names` value into a
+    /// case-folded set. Handles the quoted `FIRST N ("a","b")` form produced by
+    /// `SyncManager`, the bare `FIRST N (a,b)` form, `"*"`, and the empty
+    /// (async) value.
+    ///
+    /// `"*"` means "any connected standby" and is not a concrete member, so it
+    /// yields an empty set. The strict no-eligible placeholder names a member
+    /// that matches no real node, so it correctly never becomes a voter.
+    fn extract_names_from_sync_value(pg_value: Option<&str>) -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        let Some(pg_value) = pg_value else {
+            return set;
+        };
+        let pg_value = pg_value.trim();
+        if pg_value.is_empty() || pg_value == "*" {
+            return set;
         }
-        if pg_value == "*" {
-            return Some("*".into());
+        // Extract the parenthesized list; everything before it is `FIRST N` /
+        // `ANY N`. A value with no parentheses carries no member names.
+        let (Some(start), Some(end)) = (pg_value.find('('), pg_value.rfind(')')) else {
+            return set;
+        };
+        for raw in pg_value[start + 1..end].split(',') {
+            // Strip surrounding double quotes and un-double embedded quotes,
+            // reversing SyncManager's quote_ident.
+            let name = raw.trim();
+            let name = name.strip_prefix('"').unwrap_or(name);
+            let name = name.strip_suffix('"').unwrap_or(name);
+            let name = name.replace("\"\"", "\"");
+            let name = name.trim();
+            if !name.is_empty() {
+                set.insert(name.to_ascii_lowercase());
+            }
         }
-        let start = pg_value.find('(')? + 1;
-        let end = pg_value.rfind(')')?;
-        let names = pg_value[start..end].trim();
-        if names.is_empty() {
-            None
-        } else {
-            Some(names.to_string())
-        }
+        set
     }
     /// Enforce standby leader role: hold leader lock but replicate from remote.
     ///
@@ -1191,6 +1359,9 @@ mod tests {
         cluster: Mutex<Cluster>,
         leader_held_by: Mutex<Option<String>>,
         last_failover_value: Mutex<Option<String>>,
+        /// Every value passed to `set_sync_value`, in order, so tests can
+        /// assert what was written to `/sync` (and that nothing was written).
+        sync_writes: Mutex<Vec<String>>,
         /// When set, `set_failover_value` returns Err.
         fail_failover_writes: std::sync::atomic::AtomicBool,
         /// When set, leader-lock writes return Err (a DCS write failure).
@@ -1224,6 +1395,7 @@ mod tests {
                 cluster: Mutex::new(Cluster::empty()),
                 leader_held_by: Mutex::new(None),
                 last_failover_value: Mutex::new(None),
+                sync_writes: Mutex::new(Vec::new()),
                 fail_failover_writes: std::sync::atomic::AtomicBool::new(false),
                 fail_leader_writes: std::sync::atomic::AtomicBool::new(false),
                 fail_delete_leader: std::sync::atomic::AtomicBool::new(false),
@@ -1252,6 +1424,7 @@ mod tests {
                 cluster: Mutex::new(cluster),
                 leader_held_by: Mutex::new(Some(name.to_string())),
                 last_failover_value: Mutex::new(None),
+                sync_writes: Mutex::new(Vec::new()),
                 fail_failover_writes: std::sync::atomic::AtomicBool::new(false),
                 fail_leader_writes: std::sync::atomic::AtomicBool::new(false),
                 fail_delete_leader: std::sync::atomic::AtomicBool::new(false),
@@ -1412,7 +1585,8 @@ mod tests {
             Ok(true)
         }
 
-        async fn set_sync_value(&self, _value: &str) -> Result<bool> {
+        async fn set_sync_value(&self, value: &str) -> Result<bool> {
+            self.sync_writes.lock().unwrap().push(value.to_string());
             Ok(true)
         }
 
@@ -2726,6 +2900,47 @@ mod tests {
         assert_eq!(ha.applied_sync_standby_names, None);
         assert!(!ha.is_leader());
         assert_eq!(ha.postgresql().role(), &MemberRole::Replica);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_replication_status_error_leaves_sync_unwritten() {
+        // A primary with synchronous_mode on, but no reachable PostgreSQL:
+        // replication_status() fails, so enforce_synchronous_replication must
+        // make NO change this cycle — no /sync write and the applied cache
+        // (both the PG value and the recorded flush-LSN mark) unchanged.
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "c1-repl-status-err",
+            dcs.clone(),
+            Some(false),
+            false,
+        );
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.cluster.sync_state = Some(SyncState {
+            leader: "test_node".into(),
+            sync_standby: Some("node2".into()),
+            quorum: 1,
+        });
+        ha.is_leader = true;
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(true),
+            ..Default::default()
+        });
+        let before = applied_sync();
+        ha.applied_sync_standby_names = before.clone();
+        ha.sync_pg_list_changed_flush_lsn = Some(4242);
+
+        ha.enforce_synchronous_replication().await;
+
+        // No /sync write happened and the applied cache is untouched.
+        assert!(
+            dcs.sync_writes.lock().unwrap().is_empty(),
+            "no /sync write expected on a replication_status error"
+        );
+        assert_eq!(ha.applied_sync_standby_names, before);
+        assert_eq!(ha.sync_pg_list_changed_flush_lsn, Some(4242));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
