@@ -236,9 +236,11 @@
 | S4 | 旧 Primary 回归：不得形成双主；须走检测 → rewind / basebackup / rejoin 故事，最终成为指向当前 leader 的 Replica（或维护态）。 | 持有 |
 | S5 | **DCS `/sync` 始终是 PG `synchronous_standby_names` 的子集**：发布进 `/sync` 的名字必在 PG 当前的同步名单内，且已确认追上（`flush_lsn` 达到 PG 名单变更时记录的 Primary flush LSN，在 `maximum_lag_on_syncnode` 之内）、实际在 `pg_stat_replication` 中流复制。两次写有对称顺序保证子集在 cycle 被打断时也成立：**加入**——先扩 PG 名单、确认追上，再扩 `/sync`；**移除**——先缩 `/sync`，再缩 PG 名单。当 `synchronous_mode` 启用时，Failover / Switchover 候选必须属于 `/sync.sync_standby`；`/sync` 缺失、空或为不可满足的 strict 占位时任何节点均不得晋升。存在**过渡窗口**：新 promote 的主库先发布空/仅自身的 `/sync`、备库追上后再补入，期间 `/sync` 可能短暂收缩甚至为空，此时无节点可晋升（failover 暂时禁止但安全）。`synchronous_mode_strict` 仅影响写阻塞（用不可满足的占位名单，不是 `*`），不参与选举。仅 Priority（`FIRST N`）模式接入运行路径。 | 持有 |
 
-**无 candidate 的 switchover**（S1）：`/failover` 为 `{"leader": "<旧主>", "candidate": null}`。旧主停库后以备库启动，WAL 往往最高，且 timeline 仍等于 `/timeline`，rewind 检查标记不会把它排除在选举之外。因此选举不按 WAL 把锁还给它：`failover.leader` 不抢锁（日志 `Not taking part in the election: this node is the leader switchover asked to step down`），其他节点比较「谁最健康」时跳过它。指定了 candidate 且该 candidate 仍可参选时，只有 candidate 抢锁，不额外排除。手动 failover 不写 `leader`，不排除任何人。没有其他合格节点时 `POST /switchover` 在降级之前拒绝（409，`No other running member can take over; refusing switchover without a candidate`），不写 `/failover`、不停库。`/failover` 只在有人抢到锁之后清除；没有合格节点却已经写下 key 时（例如受理之后唯一的副本停了），集群保持无主，直到出现合格节点或 key 被清掉。
+**无 candidate 的 switchover**（S1）：`/failover` 为 `{"leader": "<旧主>", "candidate": null}`。旧主停库后以备库启动，WAL 往往最高，且 timeline 仍等于 `/timeline`，rewind 检查标记不会把它排除在选举之外。因此选举不按 WAL 把锁还给它：`failover.leader` 不抢锁（日志 `Not taking part in the election: this node is the leader switchover asked to step down`），其他节点比较「谁最健康」时跳过它。指定了 candidate 且该 candidate 仍可参选时，只有 candidate 抢锁，不额外排除。手动 failover 不写 `leader`，不排除任何人。没有其他合格节点时 `POST /switchover` 在降级之前拒绝（409，`No other running member can take over; refusing switchover without a candidate`），不写 `/failover`、不停库。`/failover` 只在有人抢到锁之后清除；没有合格节点却已经写下 key 时（例如受理之后唯一的副本停了），集群暂时无主。
 
-**相关**：架构「Failover 时序」「选举流程」；运维「手动 Switchover / Failover」；架构同步复制章节「当前范围与限制」。
+**`/failover` 意图自过期（S3，SB-05）**：一条非空 switchover / failover 意图在写入 `/failover` 时带上集群 `ttl`（leader-lease 的同一个 TTL，复用而非新增配置；`RaftDcs::set_failover_value` 对非空值设 `ttl: Some(lock_ttl())`，由状态机按墙钟过期）。因此「写下 key 却无人接管」是**有界**的：指定的 candidate 若在约 `ttl` 秒内没有抢到锁（它死了、从不在成员列表、或从成员列表里消失），key 到期后被过滤出集群视图，让位逻辑随即看不到被指定的 candidate，选举回到正常「谁最健康」。这保证了**选举终止性**——一个死掉的 candidate 不再能把集群永久留在无主状态（S2 的活性前提）。清除语义不变：抢锁成功后写空串仍清掉 key（空值不带 TTL）。定时 switchover 未实现，`/failover` 只承载立即意图，短 TTL 不会截断未来计划。
+
+**相关**：架构「Failover 时序」「选举流程」；运维「手动 Switchover / Failover」及其「`/failover` key 的 TTL」；架构同步复制章节「当前范围与限制」。
 
 ---
 

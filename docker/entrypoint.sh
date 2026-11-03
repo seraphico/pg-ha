@@ -22,6 +22,13 @@ PROXY_RO_PORT=${PG_HA_PROXY_RO_PORT:-6433}
 RAFT_SELF=${PG_HA_RAFT_SELF:-$(hostname):${RAFT_PORT}}
 RAFT_PARTNERS=${PG_HA_RAFT_PARTNERS:-}
 
+# Lease timing. Defaults keep the historical dev values; overridable via env so
+# tests can widen the window. Constraint: ttl >= loop_wait + retry_timeout +
+# watchdog.safety_margin (see config.rs).
+LOOP_WAIT=${PG_HA_LOOP_WAIT:-5}
+TTL=${PG_HA_TTL:-15}
+RETRY_TIMEOUT=${PG_HA_RETRY_TIMEOUT:-5}
+
 # Build partner_addrs YAML list
 PARTNER_YAML=""
 IFS=',' read -ra PARTNERS <<< "$RAFT_PARTNERS"
@@ -58,9 +65,9 @@ cat > /etc/pg-ha.yml << EOF
 name: ${NODE_NAME}
 scope: ${SCOPE}
 namespace: service
-loop_wait: 5
-ttl: 15
-retry_timeout: 5
+loop_wait: ${LOOP_WAIT}
+ttl: ${TTL}
+retry_timeout: ${RETRY_TIMEOUT}
 
 postgresql:
   data_dir: ${PG_DATA}
@@ -129,8 +136,8 @@ bootstrap:
     - data-checksums
     - encoding: UTF8
   dcs:
-    loop_wait: 5
-    ttl: 15
+    loop_wait: ${LOOP_WAIT}
+    ttl: ${TTL}
     maximum_lag_on_failover: 1048576
 EOF
 

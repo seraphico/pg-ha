@@ -625,10 +625,18 @@ impl DcsAdapter for RaftDcs {
         }
     }
     async fn set_failover_value(&self, value: &str) -> Result<bool> {
+        // A non-empty failover/switchover intent carries the cluster lease TTL
+        // (the same source the leader lock uses, honoring dynamic `/config`
+        // changes) so a stale intent — e.g. a named candidate that died or was
+        // never a member — self-expires after ~ttl seconds instead of blocking
+        // the cluster forever. The empty-string clear (election.rs after a
+        // successful lock acquisition) keeps its existing behavior: it blanks
+        // the key so it no longer parses as an intent.
+        let ttl = (!value.is_empty()).then(|| self.lock_ttl());
         let request = Request::Set {
             key: self.failover_path(),
             value: value.to_string(),
-            ttl: None,
+            ttl,
             prev_exist: None,
             prev_value: None,
             prev_version: None,
@@ -1039,5 +1047,96 @@ mod tests {
         assert_eq!(stored(&loaded).record(), Some(&record(3)));
         assert_eq!(loaded.get(KEY).unwrap().expire_at, None);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    const FAILOVER_KEY: &str = "/service/test/failover";
+
+    /// The `/failover` key that `set_failover_value` writes: a non-empty
+    /// intent carries the lease TTL and the state machine's wall-clock expiry
+    /// filters it out of the cluster view once the window passes, so a dead or
+    /// non-member candidate stops blocking the cluster (SB-05). The
+    /// empty-string clear still removes the intent regardless of TTL.
+    #[test]
+    fn failover_intent_expires_and_clear_still_works() {
+        // Mirror set_failover_value: a non-empty intent gets ttl = lease TTL.
+        let ttl = 30u64;
+        let intent = r#"{"leader":"node1","candidate":"node2"}"#;
+        let set_intent = |now: u64| Request::Set {
+            key: FAILOVER_KEY.into(),
+            value: intent.into(),
+            ttl: (!intent.is_empty()).then_some(ttl),
+            prev_exist: None,
+            prev_value: None,
+            prev_version: None,
+            now,
+        };
+        // How raft_dcs reads the key back into the cluster view.
+        let honored = |sm: &KvStateMachine| -> Option<Failover> {
+            sm.get(FAILOVER_KEY)
+                .and_then(|e| serde_json::from_str::<Failover>(&e.value).ok())
+        };
+
+        // The TTL-respecting reads (`get` / `get_prefix`) compare `expire_at`
+        // against the wall clock, so anchor writes to `current_millis()` and
+        // drive expiry through the write time.
+        let now = current_millis();
+
+        // A fresh intent written now is within the TTL window, so honored.
+        let mut sm = KvStateMachine::new();
+        sm.apply(&set_intent(now), 10);
+        let within = sm.get(FAILOVER_KEY).expect("live intent is present");
+        assert_eq!(
+            within.expire_at,
+            Some(now + ttl * 1000),
+            "non-empty intent carries the lease TTL"
+        );
+        assert_eq!(
+            honored(&sm).and_then(|f| f.candidate),
+            Some("node2".into()),
+            "intent honored inside the TTL window"
+        );
+
+        // A stale intent written ttl+ seconds ago (candidate died / was never
+        // a member, so the clear line never ran): its expire_at is already in
+        // the past, so the TTL-respecting read drops it from the cluster view
+        // and the leader's periodic ExpireKeys removes it from the store.
+        let stale_now = now - (ttl + 5) * 1000;
+        let mut sm = KvStateMachine::new();
+        sm.apply(&set_intent(stale_now), 10);
+        assert!(
+            sm.get(FAILOVER_KEY).is_none(),
+            "expired intent no longer honored"
+        );
+        assert!(
+            honored(&sm).is_none(),
+            "cluster view sees no failover intent"
+        );
+        sm.apply(&Request::ExpireKeys { now }, 11);
+        assert!(
+            sm.get_prefix(FAILOVER_KEY).is_empty(),
+            "ExpireKeys removes the expired intent from the store"
+        );
+
+        // The empty-string clear path (election.rs after acquiring the lock)
+        // blanks the key with no TTL; it no longer parses as an intent.
+        let mut sm = KvStateMachine::new();
+        sm.apply(&set_intent(now), 10);
+        assert!(honored(&sm).is_some(), "live intent before clear");
+        sm.apply(
+            &Request::Set {
+                key: FAILOVER_KEY.into(),
+                value: String::new(),
+                ttl: None, // empty clear keeps today's behavior: no TTL
+                prev_exist: None,
+                prev_value: None,
+                prev_version: None,
+                now,
+            },
+            11,
+        );
+        assert!(
+            honored(&sm).is_none(),
+            "cleared intent is no longer honored"
+        );
     }
 }
