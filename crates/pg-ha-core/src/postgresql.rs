@@ -562,22 +562,35 @@ impl Postgresql {
         }
     }
 
+    /// SB-07: the peer superuser password for the disaster-recovery commands
+    /// (pg_basebackup/pg_rewind/liveness probe) is sourced from this node's own
+    /// local `postgresql.superuser.password` and passed via the child process
+    /// `PGPASSWORD` env — never on argv and never through the DCS conn_url. The
+    /// deployment model uses a cluster-uniform superuser, so the local password
+    /// matches the peer's. `None` means no PGPASSWORD is set (unchanged from the
+    /// password-less behaviour).
+    fn superuser_pgpassword(&self) -> Option<&str> {
+        self.config.superuser.password.as_deref()
+    }
+
     /// Clone from another node using pg_basebackup
     pub async fn basebackup(&self, source_connstr: &str) -> Result<()> {
         info!(source = %redact_connstr(source_connstr), "Running pg_basebackup");
 
-        let output = Command::new(self.pg_basebackup_bin())
-            .args([
-                "-D",
-                self.data_dir_str(),
-                "-d",
-                source_connstr,
-                "--checkpoint=fast",
-                "--wal-method=stream",
-                "--no-password",
-            ])
-            .output()
-            .await?;
+        let mut command = Command::new(self.pg_basebackup_bin());
+        command.args([
+            "-D",
+            self.data_dir_str(),
+            "-d",
+            source_connstr,
+            "--checkpoint=fast",
+            "--wal-method=stream",
+            "--no-password",
+        ]);
+        if let Some(pw) = self.superuser_pgpassword() {
+            command.env("PGPASSWORD", pw);
+        }
+        let output = command.output().await?;
 
         if output.status.success() {
             info!("pg_basebackup completed successfully");
@@ -593,16 +606,18 @@ impl Postgresql {
     pub async fn rewind(&self, source_connstr: &str) -> Result<()> {
         info!(source = %redact_connstr(source_connstr), "Running pg_rewind");
 
-        let output = Command::new(self.pg_rewind_bin())
-            .args([
-                "--target-pgdata",
-                self.data_dir_str(),
-                "--source-server",
-                source_connstr,
-                "--progress",
-            ])
-            .output()
-            .await?;
+        let mut command = Command::new(self.pg_rewind_bin());
+        command.args([
+            "--target-pgdata",
+            self.data_dir_str(),
+            "--source-server",
+            source_connstr,
+            "--progress",
+        ]);
+        if let Some(pw) = self.superuser_pgpassword() {
+            command.env("PGPASSWORD", pw);
+        }
+        let output = command.output().await?;
 
         if output.status.success() {
             info!("pg_rewind completed successfully");
@@ -620,7 +635,8 @@ impl Postgresql {
     /// timeout). Some(true) = it answers as a primary, Some(false) = it is in
     /// recovery, None = no usable answer.
     pub async fn source_answers_as_primary(&self, conn_url: &str) -> Option<bool> {
-        let probe = Command::new(self.psql_bin())
+        let mut command = Command::new(self.psql_bin());
+        command
             .args([
                 "-X",
                 "-tAq",
@@ -632,8 +648,11 @@ impl Postgresql {
             ])
             .env("PGCONNECT_TIMEOUT", "5")
             .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
+            .kill_on_drop(true);
+        if let Some(pw) = self.superuser_pgpassword() {
+            command.env("PGPASSWORD", pw);
+        }
+        let probe = command.output();
         let output = match tokio::time::timeout(SOURCE_PROBE_TIMEOUT, probe).await {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
@@ -1365,6 +1384,87 @@ mod tests {
             pg.source_answers_as_primary("host=node1 port=5432").await,
             None
         );
+    }
+
+    /// SB-07: the disaster-recovery commands must authenticate to the peer
+    /// with the local superuser password supplied via the child `PGPASSWORD`
+    /// env, and the source connstr argv must carry no `password=`. One fixture
+    /// exercises both pg_rewind and the psql probe (pg_basebackup shares the
+    /// same `.env("PGPASSWORD", ...)` code path).
+    #[tokio::test]
+    async fn recovery_commands_get_pgpassword_from_env_not_argv() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin_dir = std::env::temp_dir().join(format!(
+            "pg-ha-sb07-pgpass-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let data_dir = bin_dir.join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // pg_rewind --target-pgdata <dir> --source-server <connstr> --progress:
+        // record PGPASSWORD and the source connstr ($4) for assertion.
+        let rewind_body = "printf '%s' \"$PGPASSWORD\" > \"$2/rewind.pgpass\"\n\
+             printf '%s' \"$4\" > \"$2/rewind.connstr\"\n\
+             echo 'pg_rewind: no rewind required'\nexit 0\n";
+        // psql -X -tAq -w -d <connstr> -c ...: $5 is the connstr. The probe has
+        // no data dir arg, so record into the fixed bin_dir via an env the test
+        // sets below ($PGHA_TEST_OUT).
+        let psql_body = "printf '%s' \"$PGPASSWORD\" > \"$PGHA_TEST_OUT/psql.pgpass\"\n\
+             printf '%s' \"$5\" > \"$PGHA_TEST_OUT/psql.connstr\"\n\
+             echo f\nexit 0\n";
+        for (tool, body) in [("pg_rewind", rewind_body), ("psql", psql_body)] {
+            let path = bin_dir.join(tool);
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(format!("#!/bin/sh\n{body}").as_bytes())
+                .unwrap();
+            f.sync_all().unwrap();
+            drop(f);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut config = test_config();
+        config.bin_dir = bin_dir.clone();
+        config.data_dir = data_dir.clone();
+        let pg = Postgresql::new(config);
+
+        // A password-free member conn_url, as SB-07 now produces.
+        let source = "host=peer port=5432 dbname=postgres user=postgres";
+
+        pg.rewind(source).await.expect("fake pg_rewind succeeds");
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("rewind.pgpass")).unwrap(),
+            "secret",
+            "pg_rewind must receive the local superuser password via PGPASSWORD"
+        );
+        let rewind_connstr = std::fs::read_to_string(data_dir.join("rewind.connstr")).unwrap();
+        assert_eq!(rewind_connstr, source);
+        assert!(
+            !rewind_connstr.contains("password="),
+            "the source connstr argv must not carry a password: {rewind_connstr}"
+        );
+
+        // SAFETY: single-threaded within this test; set PGHA_TEST_OUT so the
+        // fake psql can write where the child has a known path.
+        unsafe { std::env::set_var("PGHA_TEST_OUT", &bin_dir) };
+        assert_eq!(pg.source_answers_as_primary(source).await, Some(true));
+        unsafe { std::env::remove_var("PGHA_TEST_OUT") };
+        assert_eq!(
+            std::fs::read_to_string(bin_dir.join("psql.pgpass")).unwrap(),
+            "secret",
+            "the liveness probe must receive the local superuser password via PGPASSWORD"
+        );
+        let psql_connstr = std::fs::read_to_string(bin_dir.join("psql.connstr")).unwrap();
+        assert!(
+            !psql_connstr.contains("password="),
+            "the probe connstr argv must not carry a password: {psql_connstr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&bin_dir);
     }
 
     #[test]

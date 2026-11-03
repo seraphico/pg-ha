@@ -280,7 +280,7 @@ postgresql:
   port: <u16>                      # PG 端口 (默认: 5432)
   superuser:                       # 超级用户连接参数 (必填)
     username: <string>             # 用户名 (必填)
-    password: <string>             # 密码 (可选)
+    password: <string>             # 密码 (可选；见下方「跨节点灾备凭据」——各节点须一致)
     dbname: <string>               # 数据库名 (默认: "postgres")
   replication:                     # 复制用户连接参数 (必填)
     username: <string>             # 用户名 (必填)
@@ -289,6 +289,11 @@ postgresql:
   remove_data_directory_on_rewind_failure: <bool>  # pg_rewind 失败时删除数据目录并用 pg_basebackup 重建 (默认: false；false 时节点停库等运维，见运维指南场景 3)
   parameters:                      # PG 参数 (可选, map<string, string>)
     <param_name>: <value>
+```
+
+> **跨节点灾备凭据（SB-07，重要）**：超级用户密码**不写入 DCS/Raft**，成员 `conn_url` 只含 host/port/dbname/user。但三条灾备路径——`pg_rewind`、`pg_basebackup`（bootstrap 克隆与 rejoin 重建）、rewind 前的 `psql` 存活探测——需要以超级用户连到**对端**节点，它们改从本节点**本地**的 `postgresql.superuser.password` 取密码（经子进程 `PGPASSWORD` 传入，不落盘、不进 argv、日志脱敏）。因此 **`postgresql.superuser.username` / `postgresql.superuser.password` 必须在集群所有节点上完全一致**（集群同一 superuser）；否则跨节点 rewind / clone / 探测会因认证失败而失效。若 `superuser.password` 留空，则这些命令不设 `PGPASSWORD`，依赖 PostgreSQL 的 trust/peer/ident 或 `.pgpass` 等本机认证。
+
+```yaml
 
 # ─── REST API 配置 (必填) ───
 restapi:

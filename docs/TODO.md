@@ -29,13 +29,13 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 - 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
 - Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
 
-**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Failsafe、`/failover` 无 TTL、Raft 快照不落盘、成员 `conn_url` 含密码，见下文。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
+**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Failsafe、`/failover` 无 TTL、Raft 快照不落盘，见下文（成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS）。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
 
 ---
 
 ## P0 — 阻塞上线（必须在生产部署前完成）
 
-编号 13、14、15 仍开放。编号 1（REST API TLS，SB-03）与编号 2 已完成；编号 2 留在这里是因为同步复制的 Quorum、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
+编号 13、14 仍开放；编号 15（成员 `conn_url` 含密码）已由 SB-07 Option A 闭合。编号 1（REST API TLS，SB-03）与编号 2 已完成；编号 2 留在这里是因为同步复制的 Quorum、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
 
 ### 1. REST API TLS 支持 ✅ 已完成（SB-03）
 
@@ -74,13 +74,13 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 
 ---
 
-### 15. 成员 `conn_url` 把超级用户密码写进 Raft 日志
+### 15. 成员 `conn_url` 把超级用户密码写进 Raft 日志 — ✅ 已完成（SB-07 Option A）
 
-**现状**：发布成员时 `conn_url` 拼上 `password={pw}`，经 `touch_member` 进入 Raft 日志和磁盘。代理和跟随上游多数只用主机和端口，密码来自本机配置。密码没有对 `'`、空格、`\` 做转义。  
-**目标**：先定一条：密码进不进 DCS。不进，就从 `conn_url` 去掉；要进，就按 conninfo 规则转义。  
+**裁定（Option A，彻底修复）**：成员 `conn_url` **不再写入超级用户密码**，`touch_member` 组装的 `conn_url` 只含 `host/port/dbname/user`，各字段过 `libpq_quote` 转义——因此密码不再进入 Raft 日志 / `raft_log.wal` / `state_machine.json` / snapshot。灾备路径（`pg_rewind`、`pg_basebackup`、rewind 前 `psql` 探测）改从本节点本地 `postgresql.superuser.password` 取对端凭据，经子进程 `PGPASSWORD` 传入（不落盘、不进 argv、日志脱敏）。要求集群所有节点 superuser 密码一致。docker 集群验证：三节点 Raft 状态 grep `password=secret` 全部 CLEAN；pg_rewind / pg_basebackup / 探测在无密码 `conn_url` 下端到端成功重新加入流复制。详见 invariants.md R3、operations-guide.md、deployment-guide.md。  
 **相关文件**：
 
-- `crates/pg-ha-core/src/ha/helpers.rs` — 组装 `conn_url`
+- `crates/pg-ha-core/src/ha/helpers.rs` — 组装 `conn_url`（已去除 `password=`）
+- `crates/pg-ha-core/src/postgresql.rs` — `basebackup` / `rewind` / `source_answers_as_primary` 注入 `PGPASSWORD`
 
 ---
 
@@ -218,7 +218,7 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 | `crates/pg-ha-dcs/src/raft_dcs.rs`（`get_cluster`） | `TODO: read /failsafe key` | #4 |
 | `crates/pg-ha-dcs/src/raft_dcs.rs`（`set_failover_value`） | `ttl: None` | #13 |
 | `crates/pg-ha-dcs/src/store.rs`（`build_snapshot` / `new_persistent`） | 快照只在内存，重启不加载 | #14 |
-| `crates/pg-ha-core/src/ha/helpers.rs`（组装 `conn_url`） | `password=` 进入 Raft 日志 | #15 |
+| ~~`crates/pg-ha-core/src/ha/helpers.rs`（组装 `conn_url`）~~ | ~~`password=` 进入 Raft 日志~~ → 已移除（#15，SB-07） | #15 ✅ |
 | `crates/pg-ha-core/src/ha/election.rs` | `maximum_lag_on_failover` 未参与候选过滤 | #2 剩余 |
 | REST `/patroni` `replication_lag` | 字段始终为 0，未计算填充 | #2 剩余 |
 

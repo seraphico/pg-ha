@@ -790,16 +790,21 @@ impl Ha {
             .split(':')
             .next()
             .unwrap_or("127.0.0.1");
-        let mut conn_url = format!(
+        // SB-07: the superuser password is NEVER written into conn_url, so it
+        // never reaches the DCS/Raft log/state_machine.json/snapshots on disk.
+        // conn_url carries host/port/dbname/user only; the disaster-recovery
+        // paths (pg_rewind/pg_basebackup/liveness probe) obtain the peer
+        // credential from the node's own local postgresql.superuser.password at
+        // command time (see postgresql.rs). Remaining conninfo values are
+        // libpq-quoted (defensive, reusing the SB-01 helper).
+        use crate::standby_config::libpq_quote;
+        let conn_url = format!(
             "host={} port={} dbname={} user={}",
-            reachable_host,
+            libpq_quote(reachable_host),
             self.config.postgresql.port,
-            self.config.postgresql.superuser.dbname,
-            self.config.postgresql.superuser.username,
+            libpq_quote(&self.config.postgresql.superuser.dbname),
+            libpq_quote(&self.config.postgresql.superuser.username),
         );
-        if let Some(ref pw) = self.config.postgresql.superuser.password {
-            conn_url.push_str(&format!(" password={pw}"));
-        }
 
         // Query real-time WAL position and timeline from PostgreSQL
         let (wal_position, timeline) = if self.postgresql.is_running() {

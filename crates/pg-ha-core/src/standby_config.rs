@@ -361,7 +361,7 @@ fn format_utc(unix_secs: u64) -> String {
 
 /// libpq conninfo value: quoted when empty or containing whitespace, `'` or
 /// `\`; inside quotes `\` and `'` are backslash-escaped.
-fn libpq_quote(value: &str) -> String {
+pub(crate) fn libpq_quote(value: &str) -> String {
     let needs_quotes = value.is_empty()
         || value
             .chars()
