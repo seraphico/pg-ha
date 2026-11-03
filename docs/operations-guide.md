@@ -244,6 +244,8 @@ pg_rewind succeeded; removed the rewind-check marker
 
 正常 switchover 没有分叉，pg_rewind 报 `no rewind required`。所以每次 switchover 后旧主都会多一次「以备库启动 → 停库 → pg_rewind → 再启动」，期间短暂不可用于只读流量。在这次检查完成之前，以旧主为 candidate 的反向 switchover / failover 会被拒绝（409，`Candidate '<old>' has a rewind-check marker (not yet verified with pg_rewind)`），等日志出现 `pg_rewind succeeded` 后再发。
 
+> **凭据来源（SB-07）**：`pg_rewind` 与 rewind 前的 `psql` 存活探测都要以**超级用户**身份连到当前主库。成员 `conn_url` **不含密码**（只有 host/port/dbname/user，密码不落 DCS），这些命令改从本节点**本地** `postgresql.superuser.password` 取密码，经子进程 `PGPASSWORD` 传入。因此**每个节点的 `postgresql.superuser.password` 必须与集群其它节点一致**（集群同一 superuser），否则 rewind / 探测会连不上对端主库。日志里连接串经 `redact_connstr` 脱敏为 `password=***`，密码不出现在命令行参数或磁盘上。密码为空时不设 `PGPASSWORD`（等价于 trust/peer/ident 认证）。
+
 ---
 
 ## 手动 Failover

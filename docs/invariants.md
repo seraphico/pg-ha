@@ -262,11 +262,11 @@
 |----|------|------|
 | R1 | 稳态下，Replica 的复制上游（`primary_conninfo` 或级联上游）指向当前 leader，或文档明确允许的 cascade 源。 | 持有 |
 | R2 | 成员发布的 timeline / wal_position 与选举、lag 判断所依据的规则一致（同一套度量，禁止各读各的）。 | 持有 |
-| R3 | 跨节点 clone / rewind / basebackup 所需的地址信息来自 DCS 成员（至少 host/port）；**密码是否写入 DCS** 必须在文档中唯一裁定，并与实现一致。 | **待裁定** |
+| R3 | 跨节点 clone / rewind / basebackup 所需的地址信息来自 DCS 成员（至少 host/port）；**超级用户密码不写入 DCS**，灾备路径从本地配置取凭据。 | 持有 |
 
 **例外（R2，D6）**：参选资格比较的是成员发布的 timeline（`wal_position` 所在的 timeline；副本拿不到精确值时是下界，见 1a）和本地 history 证据，与 `/timeline` 记录的身份比对。下界只会让判定更严格；所有节点判定同一个成员时用的都是它发布的同一组值（A9）。有资格的成员都在同一 timeline 上，「谁最健康」只比 `wal_position`（LSN）。
 
-**说明（R3）**：当前实现由 `touch_member` 将 superuser 密码写入 `conn_url` 并进入 Raft 日志；多数运行路径（Proxy、重配 upstream）仅需 host/port，密码来自本地配置。产品语义应二选一写死，避免「磁盘有密、代码有时又不用」的双故事。
+**说明（R3，SB-07 Option A 已裁定 2026-11-03）**：`touch_member` 构造的成员 `conn_url` **只含 `host/port/dbname/user`，绝不写入 superuser 密码**，因此密码不再进入 Raft 日志 / `raft_log.wal` / `state_machine.json` / snapshot（这些文件磁盘上不再有明文密钥）。各字段过 `libpq_quote` 转义。多数运行路径（Proxy、重配 upstream、复制）仅需 host/port，复制凭据来自本地 `postgresql.replication`。三条灾备路径——`pg_rewind`、`pg_basebackup`（bootstrap 克隆 + rejoin 重建）、rewind 前的 `psql` 存活探测——需要**对端**超级用户密码，它们在运行命令时从本节点自己的本地 `postgresql.superuser.password` 取密码，经子进程 `PGPASSWORD` 环境变量传入（绝不出现在 argv、不落盘、日志经 `redact_connstr` 脱敏）。因为 pg-ha 部署模型是集群同一 superuser，本地密码即对端密码。`superuser.password` 为空时不设 `PGPASSWORD`，行为与无密码连接一致。
 
 **相关**：架构 DCS KV `members/*`；运维集群成员字段。
 
@@ -341,7 +341,7 @@
 | 项 | 相关 ID | 说明 |
 |----|---------|------|
 | Failsafe 持久化 | P3 | 架构列出 `/failsafe`；实现仍有「未读 key」类缺口 |
-| Member `conn_url` 含密码 | R3 | 落盘与最小密钥面目标冲突，需先裁定再改 |
+| ~~Member `conn_url` 含密码~~ | R3 | **已闭合（2026-11-03，SB-07 Option A）**：`conn_url` 不再写入 superuser 密码（仅 host/port/dbname/user，各字段 `libpq_quote` 转义），磁盘上的 Raft 状态不再含明文密钥；灾备路径（rewind/basebackup/探测）改从本地 `postgresql.superuser.password` 经 `PGPASSWORD` 取对端凭据 |
 | 最新 timeline 的持有者全部永久丢失时需要运维强制参选 | D6 / S4 | I3 的代价：不再自动选落后节点（以前会丢掉整任主库的写入并重复编号）。新主库刚 promote、其他副本还没切过来它就永久丢失，或 pending 发起者在 promote 那一刻永久丢失，都属于这种情况。处理见 [operations-guide.md](operations-guide.md)「场景 4a」；强制参选后其他旧节点必须 reinitialize，pg-ha 用历史代强制 |
 | 升级前遗留的同编号、同起点历史无法区分 | D6 | 升级前已经发生的编号重复，如果两条历史连起点 LSN 也相同，身份比对分不出来。升级后由 I3 保证不再产生；强制参选产生的重复由历史代区分 |
 | 混合版本滚动升级 | D6 | 旧版本 leader 会把 `/timeline` 写回数字格式；旧版本节点不发布 `lineage`，新版本节点判定它们不能参选。新版本节点持锁后改回新格式。建议一次升级完所有节点 |
