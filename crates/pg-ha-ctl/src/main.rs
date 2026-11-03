@@ -3,10 +3,12 @@
 //! Communicates exclusively via the REST API.
 
 mod credentials;
+mod tls;
 
 use clap::{Parser, Subcommand};
 use credentials::{apply_basic_auth, format_http_result, resolve_credentials, CredentialError};
 use serde_json::Value;
+use tls::{build_client, resolve_tls_paths, TlsPathError};
 
 /// pg-ha-ctl: Command-line tool for managing pg-ha clusters
 #[derive(Parser)]
@@ -23,6 +25,19 @@ struct Cli {
     /// REST password. Overrides the PG_HA_PASSWORD environment variable.
     #[arg(long)]
     password: Option<String>,
+
+    /// CA certificate for the REST server. Overrides PG_HA_CACERT.
+    /// Required when the server certificate is signed by a private CA.
+    #[arg(long)]
+    cacert: Option<String>,
+
+    /// Client certificate for REST mTLS. Overrides PG_HA_CERT.
+    #[arg(long)]
+    cert: Option<String>,
+
+    /// Client private key for REST mTLS. Overrides PG_HA_KEY.
+    #[arg(long)]
+    key: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -86,7 +101,38 @@ async fn run() -> Result<(), i32> {
         }
     };
 
-    let client = reqwest::Client::new();
+    let env_cacert = std::env::var("PG_HA_CACERT").ok();
+    let env_cert = std::env::var("PG_HA_CERT").ok();
+    let env_key = std::env::var("PG_HA_KEY").ok();
+    let tls = match resolve_tls_paths(
+        cli.cacert.as_deref(),
+        cli.cert.as_deref(),
+        cli.key.as_deref(),
+        env_cacert.as_deref(),
+        env_cert.as_deref(),
+        env_key.as_deref(),
+    ) {
+        Ok(tls) => tls,
+        Err(TlsPathError::MissingCert) => {
+            eprintln!(
+                "client certificate is required when a client key is set; pass --cert or set PG_HA_CERT"
+            );
+            return Err(2);
+        }
+        Err(TlsPathError::MissingKey) => {
+            eprintln!(
+                "client key is required when a client certificate is set; pass --key or set PG_HA_KEY"
+            );
+            return Err(2);
+        }
+    };
+    let client = match build_client(&tls) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("{err}");
+            return Err(1);
+        }
+    };
     let sent_auth = creds.is_some();
 
     match cli.command {
@@ -249,5 +295,24 @@ mod tests {
         .unwrap();
         assert_eq!(cli.username.as_deref(), Some("alice"));
         assert_eq!(cli.password.as_deref(), Some("secret"));
+        assert_eq!(cli.cacert.as_deref(), None);
+    }
+
+    #[test]
+    fn tls_flags_parse_on_list() {
+        let cli = Cli::try_parse_from([
+            "pg-ha-ctl",
+            "--cacert",
+            "ca.crt",
+            "--cert",
+            "client.crt",
+            "--key",
+            "client.key",
+            "list",
+        ])
+        .unwrap();
+        assert_eq!(cli.cacert.as_deref(), Some("ca.crt"));
+        assert_eq!(cli.cert.as_deref(), Some("client.crt"));
+        assert_eq!(cli.key.as_deref(), Some("client.key"));
     }
 }
