@@ -1668,6 +1668,7 @@ mod tests {
                 port: 8008,
                 username: None,
                 password: None,
+                tls: None,
             },
             raft: RaftConfig {
                 self_addr: "127.0.0.1:2380".to_string(),

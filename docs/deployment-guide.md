@@ -20,7 +20,7 @@
 **网络要求：**
 
 - 集群节点间网络延迟 < 5ms（Raft 共识性能依赖低延迟）
-- 节点间以下端口互通：2380（Raft RPC，配置了 `raft.tls` 时为 HTTPS）、8008（REST API，当前为 HTTP）、5432（PostgreSQL 复制）
+- 节点间以下端口互通：2380（Raft RPC，配置了 `raft.tls` 时为 HTTPS）、8008（REST API，配置了 `restapi.tls` 时为 HTTPS，否则明文 HTTP）、5432（PostgreSQL 复制）
 
 ---
 
@@ -154,7 +154,13 @@ restapi:
   port: 8008
   username: admin
   password: "CHANGE_ME_api_password"
-  # REST 目前只有 HTTP。管理端口不要暴露到公网；需要加密时在前面放 TLS 终结。
+  tls:                              # 可选。省略则 REST API 为明文 HTTP（与以往一致）
+    cert: /etc/pg-ha/tls/server.crt # cert + key 同时设置即启用 HTTPS
+    key: /etc/pg-ha/tls/server.key
+    ca_cert: /etc/pg-ha/tls/ca.crt  # mTLS 用：校验客户端证书的 CA
+    require_client_cert: true       # true 时强制 mTLS（需设置 ca_cert）；默认 false 为仅服务端 TLS
+  # Basic Auth 凭据只有在启用 TLS 后才不会以明文在网络上传输。未配置 tls 时端口仍是明文 HTTP，
+  # 不要暴露到公网。
 
 raft:
   self_addr: "10.0.1.1:2380"  # 每台不同: .1, .2, .3
@@ -290,7 +296,12 @@ restapi:
   port: <u16>                      # API 端口 (默认: 8008)
   username: <string>               # Basic Auth 用户名 (可选, 设置后管理端点要求认证)
   password: <string>               # Basic Auth 密码 (可选)
-  # 没有 tls 字段。健康检查始终明文；管理端点在配置了 username 时要求 Basic Auth
+  tls:                             # 可选。省略则 REST API 为明文 HTTP（与以往一致）
+    cert: <path>                   # 服务端证书 PEM (与 key 同时设置即启用 HTTPS)
+    key: <path>                    # 服务端私钥 PEM
+    ca_cert: <path>                # 可选。mTLS 用：校验客户端证书的 CA
+    require_client_cert: <bool>    # true 时强制 mTLS（需设置 ca_cert），拒绝无证书/外部 CA 的连接；默认 false 为仅服务端 TLS
+  # Basic Auth 凭据只有在启用 TLS 后才在传输中受保护；明文 HTTP 下凭据会以明文传输。
 
 # ─── Raft DCS 配置 (必填) ───
 raft:
@@ -388,8 +399,9 @@ Docker 入口 `docker/entrypoint.sh` 是另一层：它用下面这些变量**�
 | `PG_HA_API_PORT` / `PG_HA_PROXY_RW_PORT` / `PG_HA_PROXY_RO_PORT` | API 与代理端口 |
 | `PG_HA_RAFT_SELF` / `PG_HA_RAFT_PARTNERS` | 本节点地址，以及逗号分隔的对端列表 |
 | `PG_HA_RAFT_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | 设置了 `PG_HA_RAFT_TLS_CERT` 就写入 `raft.tls` |
+| `PG_HA_RESTAPI_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_REQUIRE_CLIENT_CERT` | 设置了 `PG_HA_RESTAPI_TLS_CERT` 就写入 `restapi.tls`（REST API HTTPS/mTLS）；默认不设置即明文 HTTP |
 
-开发集群 `docker-compose.yml` 会设置 Raft TLS，并把 `./docker/tls` 挂到 `/etc/pg-ha/tls`。入口生成的 HA 参数是 `loop_wait: 5`、`ttl: 15`、`retry_timeout: 5`（`watchdog.safety_margin` 用默认 5，正好满足 `ttl >= loop_wait + retry_timeout + safety_margin`），REST 认证为 `admin` / `secret`。
+开发集群 `docker-compose.yml` 会设置 Raft TLS，并把 `./docker/tls` 挂到 `/etc/pg-ha/tls`。REST API TLS 默认关闭（`PG_HA_RESTAPI_TLS_CERT` 为空即明文 HTTP）；要启用，设置 `PG_HA_RESTAPI_TLS_CERT=/etc/pg-ha/tls/server.crt`，mTLS 再加 `PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT=true`（`ca_cert` 默认 `/etc/pg-ha/tls/ca.crt`）。入口生成的 HA 参数是 `loop_wait: 5`、`ttl: 15`、`retry_timeout: 5`（`watchdog.safety_margin` 用默认 5，正好满足 `ttl >= loop_wait + retry_timeout + safety_margin`），REST 认证为 `admin` / `secret`。
 
 ---
 
@@ -455,7 +467,19 @@ sudo chmod 644 /etc/pg-ha/tls/*.crt
 
 把 `require_client_cert` 设为 `true` 即开启服务端 mTLS：服务端会要求对端出示客户端证书，并针对 `ca_cert` 配置的 CA 校验，拒绝未提供证书或证书不受信任的连接。此时必须设置 `ca_cert`，否则启动即报错退出。默认 `false` 时行为与以往一致，为仅服务端认证的单向 TLS。开启后请确保每个节点都配置了 `client_cert` / `client_key`，否则节点间互相连接会被拒绝。
 
-REST API（8008）不受 `raft.tls` 影响，始终是 HTTP。
+### REST API TLS / mTLS（8008）
+
+REST 管理 API 也支持内建 HTTPS，配置形状与 `raft.tls` 的服务端部分一致（字段名相同），可复用同一套 CA 与证书：
+
+- 在 `restapi.tls` 下设置 `cert` + `key` 即把 8008 从明文 HTTP 换成 HTTPS（仅服务端认证）。
+- 再设置 `ca_cert` 并把 `require_client_cert` 设为 `true`，即开启 mTLS：服务端要求客户端出示由 `ca_cert` 签发的证书，拒绝无证书（TLS alert 116 `certificate_required`）或外部 CA 证书（TLS alert 48 `unknown_ca`）的连接。`require_client_cert=true` 时若 `ca_cert` 缺失/不可读/为空，启动即报错退出（fail-fast）。
+- 省略整个 `restapi.tls` 时行为与以往完全一致：明文 HTTP，现有部署不受影响。
+
+**Basic Auth 与 TLS 的关系**：Basic Auth 本身不变，启用 TLS 后依然生效。但 Basic Auth 凭据只有在 REST API 启用 TLS 后才在传输中受保护；在明文 HTTP 下，凭据与所有管理命令（switchover/failover/restart/reinitialize/config 等）都以明文传输。生产环境请务必为 REST API 启用 TLS。
+
+> 注意：TCP 代理的节点间健康检查（`/primary`、`/replica`）目前走明文 `http://`。若把 REST TLS 全集群开启，这些健康检查需要相应的 HTTPS 客户端支持——不在 SB-03 范围内，留待后续。
+
+`raft.tls` 不影响 REST API，`restapi.tls` 也不影响 Raft RPC（2380），二者各自独立配置。
 
 ---
 
