@@ -29,7 +29,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 - 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
 - Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
 
-**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。`/failover` 无 TTL、Raft 快照不落盘，见下文（成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS；Failsafe 已由 SB-04 裁定为 NO-GO 并移除表面代码，见下文 #4）。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
+**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Raft 快照不落盘，见下文（`/failover` 无 TTL 已由 SB-05 闭合——非空意图带集群 `ttl` 自过期，见下文 #13；成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS；Failsafe 已由 SB-04 裁定为 NO-GO 并移除表面代码，见下文 #4）。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
 
 ---
 
@@ -53,14 +53,15 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 
 ---
 
-### 13. `/failover` 键没有 TTL
+### 13. `/failover` 键没有 TTL —— ✅ 已修复（SB-05）
 
-**现状**：`RaftDcs::set_failover_value` 写入时 `ttl: None`。指定的候选节点死了或不在成员列表里时，其他节点继续让位，集群可能一直选不出主库。集群健康时发出的手动 failover 也会留在这个键里，直到以后某次选举才生效。候选资格校验本身已经有了，缺的是过期。  
-**目标**：给 `/failover` 一个 TTL，并在运维文档里写明过期后选举恢复为「谁最健康」。  
-**相关文件**：
+**现状（已闭合）**：`RaftDcs::set_failover_value` 现在对**非空**意图写入 `ttl: Some(lock_ttl())`，复用集群 `ttl`（leader-lease 的同一个 TTL，默认 30s，随动态 `ttl` 变化；未新增配置项）。指定的候选节点死了或从成员列表里消失时，`/failover` key 在约 `ttl` 秒后按状态机墙钟过期、被过滤出集群视图，选举回到正常「谁最健康」——不再被死 candidate 永久卡成无主。清除语义不变：抢锁成功后写空串仍清掉 key（空值不带 TTL）。  
+**落点**：
 
-- `crates/pg-ha-dcs/src/raft_dcs.rs` — `set_failover_value`
-- `crates/pg-ha-core/src/ha/election.rs` — 对候选让位
+- `crates/pg-ha-dcs/src/raft_dcs.rs` — `set_failover_value`（非空值带 `ttl: Some(lock_ttl())`）
+- 单测 `raft_dcs::tests::failover_intent_expires_and_clear_still_works`
+- Docker 验收 `tests/e2e/test_failover_ttl.sh`
+- 文档 `docs/operations-guide.md`「`/failover` key 的 TTL」、`docs/invariants.md` S3
 
 ---
 
@@ -214,7 +215,7 @@ pg-ha 明确不支持外部 DCS，保留 failsafe 只会误导，故移除。
 | 位置 | 内容 | 关联任务 |
 |------|------|----------|
 | ~~`crates/pg-ha-dcs/src/raft_dcs.rs`（`get_cluster`）~~ | ~~`TODO: read /failsafe key`~~ → 已移除（#4，SB-04 NO-GO） | #4 ✅ |
-| `crates/pg-ha-dcs/src/raft_dcs.rs`（`set_failover_value`） | `ttl: None` | #13 |
+| ~~`crates/pg-ha-dcs/src/raft_dcs.rs`（`set_failover_value`）~~ | ~~`ttl: None`~~ → 非空意图带集群 `ttl`（#13，SB-05） | #13 ✅ |
 | `crates/pg-ha-dcs/src/store.rs`（`build_snapshot` / `new_persistent`） | 快照只在内存，重启不加载 | #14 |
 | ~~`crates/pg-ha-core/src/ha/helpers.rs`（组装 `conn_url`）~~ | ~~`password=` 进入 Raft 日志~~ → 已移除（#15，SB-07） | #15 ✅ |
 | `crates/pg-ha-core/src/ha/election.rs` | `maximum_lag_on_failover` 未参与候选过滤 | #2 剩余 |

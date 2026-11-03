@@ -273,6 +273,18 @@ curl -u admin:secret -X POST http://localhost:8008/failover \
 > - **未开 sync**：Failover 可能丢失尚未复制到副本的 WAL。Primary 仍可达时请优先 Switchover。
 > - **已开 sync**：切到 `/sync` 名单内节点时，已向客户端确认的提交应仍在新主上；若名单为空或候选不合格，系统宁可不切换，也不会为了可用性抬升异步副本。
 
+### `/failover` key 的 TTL（意图有效期，SB-05）
+
+switchover / failover 把意图写进 DCS `/failover` key；正常路径里，有人抢到 leader lock 之后这个 key 被清空（写空串）。但指定的 candidate 在抢锁之前死掉、或写下之后从成员列表里消失时，清除那一步永远跑不到，旧的实现里这个 key 没有 TTL、会**永久**留下，其他节点一直让位给这个拿不到锁的 candidate——集群可能一直无主，哪怕 Raft 仍有多数派。健康集群里发出的手动意图也会一直滞留，直到以后某次选举才"借尸还魂"。
+
+SB-05 起，`/failover` key 复用集群的 **`ttl`**（leader-lease 的同一个 TTL，默认 30s，随 `PATCH /config` 的动态 `ttl` 变化；**不是新增配置项**）：
+
+- 一条 **非空**意图最多有效约 `ttl` 秒。指定的 candidate 若在这个窗口内没有接管，key 到期自动消失，集群回到正常「谁最健康」选举，不会再被一个死掉的 candidate 永久卡住无主。
+- **清除**语义不变：抢锁成功后写空串仍然把 key 清掉（空值不带 TTL，读出来也不解析成意图）。
+- 由于定时 switchover 未实现（`scheduled_at` 一律 409），`/failover` 只承载"立即"意图，短 TTL 没有截断未来计划的风险。
+
+因此发出 switchover / failover 后，若预期的切换没有在约 `ttl` 秒内发生（例如 candidate 挂了），无需手动清 key——它会自己过期，集群随后正常选主。
+
 ---
 
 ## 动态配置变更
