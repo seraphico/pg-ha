@@ -108,8 +108,10 @@ test_quorum_loss_no_election() {
     docker_pause "pg-ha-node3"
 
     # The current primary (node1, presumably) should eventually lose its
-    # leader lock because Raft can't commit without majority.
-    # With failsafe off, it should demote.
+    # leader lock because Raft can't commit without majority. Under pg-ha's
+    # embedded RaftDcs there is no failsafe: lease-expiry fencing (R19) fences
+    # the primary once it cannot renew within ttl - safety_margin, so it must
+    # demote.
     log_info "Waiting to see if primary demotes without quorum..."
     sleep 20
 
@@ -123,15 +125,14 @@ test_quorum_loss_no_election() {
     docker_unpause "pg-ha-node3"
 
     TESTS_RUN=$((TESTS_RUN + 1))
-    # Without quorum, the node should have either demoted or detected the issue
-    # The exact behavior depends on failsafe configuration
+    # Without quorum the primary cannot renew its lock; lease-expiry fencing
+    # (R19) must take it out of the primary role.
     if [ "$node1_role" != "primary" ] && [ "$node1_role" != "master" ]; then
         TESTS_PASSED=$((TESTS_PASSED + 1))
         log_pass "Primary demoted when Raft quorum lost (role: $node1_role)"
     else
-        # If failsafe is enabled, primary might stay — that's also valid
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        log_pass "Primary retained role during quorum loss (failsafe may be active)"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        log_fail "Primary retained role during quorum loss (lease fencing should have demoted it)"
     fi
 
     # Wait for recovery

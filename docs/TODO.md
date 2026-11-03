@@ -29,7 +29,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 - 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
 - Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
 
-**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Failsafe、`/failover` 无 TTL、Raft 快照不落盘，见下文（成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS）。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
+**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。`/failover` 无 TTL、Raft 快照不落盘，见下文（成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS；Failsafe 已由 SB-04 裁定为 NO-GO 并移除表面代码，见下文 #4）。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
 
 ---
 
@@ -123,24 +123,22 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 
 ---
 
-### 4. Failsafe 未接通
+### 4. Failsafe —— 已裁定 NO-GO，表面代码已移除（SB-04）✅
 
-**现状**（比「只缺 DCS 持久化」更靠前）：
+**裁定**：failsafe 在 pg-ha 的内嵌 RaftDcs 架构下**不适用**，已删除其误导性表面代码。
 
-- `GlobalConfig.failsafe_mode` 能通过 `PATCH /config` 写入 DCS，但 `process_dynamic_config` 从不调用 `Failsafe::set_enabled`。`RaftDcs::get_cluster` 是本地读取，正常不会因「DCS 不可达」返回错误，因此 `handle_dcs_error` 这条入口在 Raft 上到不了。开关写进去也不生效
-- `Failsafe::check_topology` 会 `POST {api_url}/failsafe`，路由表里没有该端点
-- `raft_dcs.rs` 的 `get_cluster()` 仍是 `failsafe: None // TODO: read /failsafe key`，不读 `/failsafe`
-- `pg_ha_failsafe_active` 在 `main` 的状态更新里没有赋值，进程内保持初始值 `0`
+Patroni 的 failsafe 为**外部 DCS**（etcd/consul）设计：DCS 挂了但 PostgreSQL 集群健康时，primary 通过 REST 向所有成员确认拓扑而不是降级。pg-ha 用**与进程同处一地的内嵌 Raft DCS**，所以：
 
-**目标**：`failsafe_mode` 真正开关内存状态；成员间有可响应的确认端点；启用状态与成员列表在重启后仍可从 DCS 恢复；指标反映 `Failsafe::is_active()`。
+- `RaftDcs::get_cluster` 是本地读，永不返回 `Err` → failsafe 入口 `handle_dcs_error` 不可达；
+- 「无法到达共识」已由**租约到期 fencing**（见 [invariants.md](invariants.md) L5 的时间界与「租约到期围栏」小节，SB-04 称 R19）更保守地处理（primary 在 `ttl - safety_margin` 内未能续约即自我 fence，不等 DCS）。
 
-**相关文件**：
+pg-ha 明确不支持外部 DCS，保留 failsafe 只会误导，故移除。
 
-- `crates/pg-ha-core/src/failsafe.rs`
-- `crates/pg-ha-core/src/ha/mod.rs` — `handle_dcs_error`、`process_dynamic_config`
-- `crates/pg-ha-dcs/src/raft_dcs.rs` — `get_cluster()`
-- `crates/pg-ha-api/src/routes/mod.rs` — 尚无 `/failsafe`
-- `src/main.rs` — API 状态刷新
+**已删除**：`crates/pg-ha-core/src/failsafe.rs`（整文件及模块声明）、HA 中的 `Failsafe` 字段与接线、`Cluster.failsafe` 字段、`raft_dcs.rs` 的 `failsafe: None // TODO` 与 `failsafe_path()`、`pg_ha_failsafe_active` 指标与 `AppState.failsafe_active`。`handle_dcs_error` 简化为「leader 读 DCS 出错即降级防脑裂」（仅为满足 `DcsAdapter::get_cluster` 的可错 trait 契约而保留，RaftDcs 下不可达）。
+
+**向后兼容**：`GlobalConfig.failsafe_mode` 字段仍可解析（旧配置不报错），但为 **no-op**（不再参与任何行为，不进 `detect_changes`）。
+
+详见 [invariants.md](invariants.md) P3 裁定记录。
 
 ---
 
@@ -215,7 +213,7 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 
 | 位置 | 内容 | 关联任务 |
 |------|------|----------|
-| `crates/pg-ha-dcs/src/raft_dcs.rs`（`get_cluster`） | `TODO: read /failsafe key` | #4 |
+| ~~`crates/pg-ha-dcs/src/raft_dcs.rs`（`get_cluster`）~~ | ~~`TODO: read /failsafe key`~~ → 已移除（#4，SB-04 NO-GO） | #4 ✅ |
 | `crates/pg-ha-dcs/src/raft_dcs.rs`（`set_failover_value`） | `ttl: None` | #13 |
 | `crates/pg-ha-dcs/src/store.rs`（`build_snapshot` / `new_persistent`） | 快照只在内存，重启不加载 | #14 |
 | ~~`crates/pg-ha-core/src/ha/helpers.rs`（组装 `conn_url`）~~ | ~~`password=` 进入 Raft 日志~~ → 已移除（#15，SB-07） | #15 ✅ |

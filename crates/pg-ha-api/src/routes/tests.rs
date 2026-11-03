@@ -350,7 +350,6 @@ async fn test_metrics_returns_prometheus_format() {
             s.replication_lag = Some(0);
             s.pending_restart = false;
             s.is_paused = false;
-            s.failsafe_active = false;
             s.dcs_last_seen = Some(std::time::Instant::now());
         })
         .await;
@@ -384,7 +383,6 @@ async fn test_metrics_returns_prometheus_format() {
     assert!(text.contains("pg_ha_pg_state{state=\"running\"} 1"));
     assert!(text.contains("pg_ha_replication_lag_bytes 0"));
     assert!(text.contains("pg_ha_timeline 3"));
-    assert!(text.contains("pg_ha_failsafe_active 0"));
     assert!(text.contains("pg_ha_pending_restart 0"));
     assert!(text.contains("pg_ha_is_paused 0"));
     assert!(text.contains("pg_ha_dcs_last_seen_seconds"));
@@ -402,7 +400,6 @@ async fn test_metrics_with_replica_state() {
             s.replication_lag = Some(1024);
             s.pending_restart = true;
             s.is_paused = true;
-            s.failsafe_active = true;
         })
         .await;
     let app = build_router(state);
@@ -422,7 +419,6 @@ async fn test_metrics_with_replica_state() {
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("pg_ha_node_role{role=\"replica\"} 1"));
     assert!(text.contains("pg_ha_replication_lag_bytes 1024"));
-    assert!(text.contains("pg_ha_failsafe_active 1"));
     assert!(text.contains("pg_ha_pending_restart 1"));
     assert!(text.contains("pg_ha_is_paused 1"));
 }

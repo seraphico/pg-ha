@@ -237,7 +237,6 @@ flowchart LR
 ├── config          → {loop_wait, ttl, synchronous_mode, postgresql: {...}}
 ├── failover        → {leader, candidate}  (switchover 请求)
 ├── sync            → {leader, sync_standby, quorum}
-├── failsafe        → {node1: api_url, ...}
 └── history         → [{timestamp, event_type, old_leader, new_leader}]
 ```
 
@@ -277,7 +276,6 @@ pg-ha (binary)
 │   ├── postgresql.rs   pg_ctl start/stop/promote/rewind/reload
 │   ├── bootstrap.rs    initdb / clone / custom bootstrap
 │   ├── dynamic_config.rs  GlobalConfig + 变更检测 + patch
-│   ├── failsafe.rs     DCS 故障时的安全模式
 │   ├── slots.rs        复制槽管理
 │   ├── sync.rs         同步复制管理
 │   ├── cascading.rs    级联复制

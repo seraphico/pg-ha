@@ -59,7 +59,6 @@ test_expected_metrics_present() {
         "pg_ha_replication_lag_bytes"
         "pg_ha_timeline"
         "pg_ha_dcs_last_seen_seconds"
-        "pg_ha_failsafe_active"
         "pg_ha_loop_duration_seconds"
     )
 

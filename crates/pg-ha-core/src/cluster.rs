@@ -27,9 +27,6 @@ pub struct Cluster {
     /// Pending failover/switchover request from DCS /failover key
     pub failover: Option<Failover>,
 
-    /// Failsafe topology from DCS /failsafe key
-    pub failsafe: Option<HashMap<String, String>>,
-
     /// Cluster history (timeline changes)
     pub history: Vec<HistoryEntry>,
 
