@@ -260,7 +260,16 @@ async fn main() -> anyhow::Result<()> {
     let ro_addr: SocketAddr = format!("{}:{}", config.proxy.ro_listen, config.proxy.ro_port)
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid proxy RO address: {e}"))?;
-    let proxy = Arc::new(PgProxy::new(rw_addr, ro_addr));
+    let health_client = pg_ha_proxy::build_health_client(
+        config.restapi.tls.as_ref(),
+        pg_ha_proxy::HealthCheckConfig::default().timeout,
+    )?;
+    let proxy = Arc::new(PgProxy::with_health_client(
+        rw_addr,
+        ro_addr,
+        pg_ha_proxy::HealthCheckConfig::default(),
+        health_client,
+    ));
 
     // ─── Initialize Raft RPC server ───
     // (Already started above before bootstrap)
@@ -286,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
         members_rx,
         proxy.clone(),
         config.restapi.port,
+        config.restapi.tls.is_some(),
     ));
 
     // REST API server: spawned so it keeps serving during graceful shutdown
@@ -517,6 +527,7 @@ async fn refresh_proxy_backends(
     mut members_rx: tokio::sync::watch::Receiver<Vec<Member>>,
     proxy: Arc<PgProxy>,
     api_port: u16,
+    https: bool,
 ) {
     while members_rx.changed().await.is_ok() {
         let members = members_rx.borrow_and_update().clone();
@@ -531,10 +542,10 @@ async fn refresh_proxy_backends(
                 continue;
             };
             let api_url = if m.api_url.is_empty() {
-                api_url_from_conn_url(&m.conn_url, api_port)
-                    .unwrap_or_else(|| format!("http://{}:{}", addr.ip(), api_port))
+                api_url_from_conn_url(&m.conn_url, api_port, https)
+                    .unwrap_or_else(|| rest_base_url(&addr.ip().to_string(), api_port, https))
             } else {
-                m.api_url.clone()
+                align_api_scheme(&m.api_url, https)
             };
             backends.push(PgBackend {
                 addr,
@@ -574,9 +585,25 @@ async fn resolve_pg_addr(conn_url: &str) -> Option<SocketAddr> {
 }
 
 /// Build REST health-check base URL from conn_url host (prefer hostname over raw IP).
-fn api_url_from_conn_url(conn_url: &str, api_port: u16) -> Option<String> {
+fn api_url_from_conn_url(conn_url: &str, api_port: u16, https: bool) -> Option<String> {
     let (host, _) = parse_pg_host_port(conn_url)?;
-    Some(format!("http://{host}:{api_port}"))
+    Some(rest_base_url(&host, api_port, https))
+}
+
+fn rest_base_url(host: &str, api_port: u16, https: bool) -> String {
+    let scheme = if https { "https" } else { "http" };
+    format!("{scheme}://{host}:{api_port}")
+}
+
+/// Published member URLs may still say `http://` after REST TLS is turned on.
+/// The probe has to use the scheme this node is actually listening with.
+fn align_api_scheme(url: &str, https: bool) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let scheme = if https { "https" } else { "http" };
+    format!("{scheme}://{rest}")
 }
 
 /// Resolve a host:port string to a SocketAddr (supports DNS names)
@@ -1123,7 +1150,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
         ));
         let (tx, rx) = tokio::sync::watch::channel(Vec::<Member>::new());
-        let task = tokio::spawn(refresh_proxy_backends(rx, proxy.clone(), 8008));
+        let task = tokio::spawn(refresh_proxy_backends(rx, proxy.clone(), 8008, false));
         tx.send_replace(vec![Member {
             name: "node1".to_string(),
             conn_url: "host=10.0.0.1 port=5433".to_string(),
@@ -1149,6 +1176,55 @@ mod tests {
         assert_eq!(primary.name, "node1");
         assert_eq!(primary.addr, "10.0.0.1:5433".parse::<SocketAddr>().unwrap());
         assert_eq!(primary.api_url, "http://10.0.0.1:8008");
+    }
+
+    /// A member record that still says `http://` is probed with `https://`
+    /// once this node is serving REST over TLS.
+    #[tokio::test]
+    async fn test_refresh_proxy_backends_rewrites_scheme_for_rest_tls() {
+        let proxy = Arc::new(PgProxy::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        ));
+        let (tx, rx) = tokio::sync::watch::channel(Vec::<Member>::new());
+        let task = tokio::spawn(refresh_proxy_backends(rx, proxy.clone(), 8008, true));
+        tx.send_replace(vec![Member {
+            name: "node1".to_string(),
+            conn_url: "host=10.0.0.1 port=5433".to_string(),
+            api_url: "http://10.0.0.1:8008".to_string(),
+            state: MemberState::Running,
+            role: MemberRole::Primary,
+            wal_position: None,
+            timeline: None,
+            tags: Default::default(),
+            version: None,
+            rewind_check: false,
+            lineage: None,
+            watchdog_failed: false,
+        }]);
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("refresher did not end after the sender was dropped")
+            .unwrap();
+        let upstream = proxy.upstream_handle();
+        let state = upstream.read().await;
+        let primary = state.primary().expect("primary backend registered");
+        assert_eq!(primary.api_url, "https://10.0.0.1:8008");
+    }
+
+    #[test]
+    fn test_health_client_loads_dev_cluster_mtls_material() {
+        use pg_ha_core::config::RestApiTlsConfig;
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/docker/tls");
+        let tls = RestApiTlsConfig {
+            cert: format!("{root}/server.crt").into(),
+            key: format!("{root}/server.key").into(),
+            ca_cert: Some(format!("{root}/ca.crt").into()),
+            require_client_cert: true,
+        };
+        pg_ha_proxy::build_health_client(Some(&tls), std::time::Duration::from_secs(5))
+            .expect("dev cluster REST PEMs should load");
     }
 
     #[test]

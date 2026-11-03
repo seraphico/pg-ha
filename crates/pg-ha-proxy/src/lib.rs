@@ -13,4 +13,4 @@
 
 pub mod proxy;
 
-pub use proxy::{HealthCheckConfig, PgBackend, PgProxy, UpstreamState};
+pub use proxy::{HealthCheckConfig, PgBackend, PgProxy, UpstreamState, build_health_client};
