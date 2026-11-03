@@ -141,8 +141,13 @@ async fn main() -> anyhow::Result<()> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let rustls_config = if tls_cfg.require_client_cert {
             // mTLS: require and verify client certificates against the configured CA.
-            let server_config = build_mtls_server_config(tls_cfg)
-                .map_err(|e| anyhow::anyhow!("Raft mTLS config error: {e}"))?;
+            let server_config = build_mtls_server_config(
+                &tls_cfg.cert,
+                &tls_cfg.key,
+                tls_cfg.ca_cert.as_deref(),
+                "raft.tls",
+            )
+            .map_err(|e| anyhow::anyhow!("Raft mTLS config error: {e}"))?;
             info!(%raft_addr, "Raft RPC listening (mTLS: client certificate required)");
             RustlsConfig::from_config(Arc::new(server_config))
         } else {
@@ -285,20 +290,59 @@ async fn main() -> anyhow::Result<()> {
 
     // REST API server: spawned so it keeps serving during graceful shutdown
     // (/primary is 503 from the signal on, the other endpoints stay truthful).
-    let api_listener = match tokio::net::TcpListener::bind(api_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(%api_addr, "Failed to bind REST API: {e}");
-            std::process::exit(1);
-        }
-    };
-    info!(%api_addr, "REST API listening");
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(api_listener, api_router).await {
-            error!("REST API server fatal error: {e}");
-            std::process::exit(1);
-        }
-    });
+    // TLS / mTLS mirrors the Raft RPC port: cert+key -> HTTPS, plus a CA and
+    // require_client_cert -> mTLS. No TLS config -> plaintext HTTP, as before.
+    if let Some(ref tls_cfg) = config.restapi.tls {
+        use axum_server::tls_rustls::RustlsConfig;
+        // Install rustls crypto provider (required by rustls 0.23+). Idempotent
+        // if the Raft TLS path already installed it.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Build the TLS config before spawning so mTLS misconfiguration (e.g.
+        // require_client_cert without a readable CA) fails fast at startup.
+        let rustls_config = if tls_cfg.require_client_cert {
+            // mTLS: require and verify client certificates against the configured CA.
+            let server_config = build_mtls_server_config(
+                &tls_cfg.cert,
+                &tls_cfg.key,
+                tls_cfg.ca_cert.as_deref(),
+                "restapi.tls",
+            )
+            .map_err(|e| anyhow::anyhow!("REST API mTLS config error: {e}"))?;
+            info!(%api_addr, "REST API listening (HTTPS, mTLS: client certificate required)");
+            RustlsConfig::from_config(Arc::new(server_config))
+        } else {
+            // Server-auth-only TLS (default): no client certificate verification.
+            let cfg = RustlsConfig::from_pem_file(&tls_cfg.cert, &tls_cfg.key)
+                .await
+                .map_err(|e| anyhow::anyhow!("REST API TLS config error: {e}"))?;
+            info!(%api_addr, "REST API listening (HTTPS)");
+            cfg
+        };
+        tokio::spawn(async move {
+            if let Err(e) = axum_server::bind_rustls(api_addr, rustls_config)
+                .serve(api_router.into_make_service())
+                .await
+            {
+                error!("REST API TLS server fatal error: {e}");
+                std::process::exit(1);
+            }
+        });
+    } else {
+        let api_listener = match tokio::net::TcpListener::bind(api_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!(%api_addr, "Failed to bind REST API: {e}");
+                std::process::exit(1);
+            }
+        };
+        info!(%api_addr, "REST API listening (HTTP)");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(api_listener, api_router).await {
+                error!("REST API server fatal error: {e}");
+                std::process::exit(1);
+            }
+        });
+    }
 
     let mut signals = ShutdownSignals::new()?;
 
@@ -546,23 +590,27 @@ async fn resolve_addr(addr: &str) -> Option<SocketAddr> {
 }
 
 /// Build a rustls `ServerConfig` that requires and verifies client certificates
-/// (server-side mTLS) for the Raft RPC listener.
+/// (server-side mTLS). Shared by the Raft RPC listener and the REST API.
 ///
 /// The client certificate chain must validate against the CA at `ca_cert`;
 /// connections presenting no certificate or a certificate signed by an untrusted
 /// CA are rejected during the TLS handshake. Fails fast with a clear error when
-/// `ca_cert` is missing or unreadable.
+/// `ca_cert` is missing / unreadable / empty. `what` names the caller (e.g.
+/// `"raft.tls"` or `"restapi.tls"`) so errors point at the right config block.
 fn build_mtls_server_config(
-    tls_cfg: &pg_ha_core::config::RaftTlsConfig,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    ca_cert: Option<&std::path::Path>,
+    what: &str,
 ) -> anyhow::Result<rustls::ServerConfig> {
     use rustls::RootCertStore;
     use rustls::server::WebPkiClientVerifier;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
     // require_client_cert demands a CA to verify client certificates against.
-    let ca_path = tls_cfg.ca_cert.as_ref().ok_or_else(|| {
+    let ca_path = ca_cert.ok_or_else(|| {
         anyhow::anyhow!(
-            "require_client_cert is true but raft.tls.ca_cert is not set; \
+            "require_client_cert is true but {what}.ca_cert is not set; \
              a CA certificate is required to verify client certificates"
         )
     })?;
@@ -588,28 +636,20 @@ fn build_mtls_server_config(
         .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {e}"))?;
 
     // Load this server's own certificate chain and private key.
-    let cert_pem = std::fs::read(&tls_cfg.cert).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to read server cert '{}': {e}",
-            tls_cfg.cert.display()
-        )
-    })?;
+    let cert_pem = std::fs::read(cert)
+        .map_err(|e| anyhow::anyhow!("Failed to read server cert '{}': {e}", cert.display()))?;
     let cert_chain = rustls_pemfile::certs(&mut cert_pem.as_slice())
         .collect::<Result<Vec<CertificateDer>, _>>()
-        .map_err(|e| anyhow::anyhow!("Invalid server cert '{}': {e}", tls_cfg.cert.display()))?;
+        .map_err(|e| anyhow::anyhow!("Invalid server cert '{}': {e}", cert.display()))?;
     if cert_chain.is_empty() {
-        anyhow::bail!(
-            "server cert '{}' contains no certificates",
-            tls_cfg.cert.display()
-        );
+        anyhow::bail!("server cert '{}' contains no certificates", cert.display());
     }
 
-    let key_pem = std::fs::read(&tls_cfg.key).map_err(|e| {
-        anyhow::anyhow!("Failed to read server key '{}': {e}", tls_cfg.key.display())
-    })?;
+    let key_pem = std::fs::read(key)
+        .map_err(|e| anyhow::anyhow!("Failed to read server key '{}': {e}", key.display()))?;
     let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .map_err(|e| anyhow::anyhow!("Invalid server key '{}': {e}", tls_cfg.key.display()))?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in '{}'", tls_cfg.key.display()))?;
+        .map_err(|e| anyhow::anyhow!("Invalid server key '{}': {e}", key.display()))?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in '{}'", key.display()))?;
     let key: PrivateKeyDer = key;
 
     let mut server_config = rustls::ServerConfig::builder()
@@ -1156,7 +1196,13 @@ mod tests {
             client_key: None,
             require_client_cert: true,
         };
-        let err = build_mtls_server_config(&tls_cfg).expect_err("missing ca_cert must be rejected");
+        let err = build_mtls_server_config(
+            &tls_cfg.cert,
+            &tls_cfg.key,
+            tls_cfg.ca_cert.as_deref(),
+            "raft.tls",
+        )
+        .expect_err("missing ca_cert must be rejected");
         assert!(
             err.to_string().contains("ca_cert"),
             "error should mention the missing ca_cert, got: {err}"
@@ -1174,8 +1220,13 @@ mod tests {
             client_key: None,
             require_client_cert: true,
         };
-        let err =
-            build_mtls_server_config(&tls_cfg).expect_err("unreadable ca_cert must be rejected");
+        let err = build_mtls_server_config(
+            &tls_cfg.cert,
+            &tls_cfg.key,
+            tls_cfg.ca_cert.as_deref(),
+            "raft.tls",
+        )
+        .expect_err("unreadable ca_cert must be rejected");
         assert!(
             err.to_string().contains("Failed to read ca_cert"),
             "error should report the unreadable ca_cert, got: {err}"
@@ -1313,8 +1364,13 @@ mod tests {
             client_key: None,
             require_client_cert: true,
         };
-        let server_config =
-            build_mtls_server_config(&tls_cfg).expect("valid mTLS server config should build");
+        let server_config = build_mtls_server_config(
+            &tls_cfg.cert,
+            &tls_cfg.key,
+            tls_cfg.ca_cert.as_deref(),
+            "raft.tls",
+        )
+        .expect("valid mTLS server config should build");
         let server_config = Arc::new(server_config);
 
         // Client trusts the server CA (so it validates the server cert).
@@ -1372,6 +1428,68 @@ mod tests {
             "client cert signed by an untrusted CA must be rejected"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── SB-03: REST API TLS uses the shared mTLS builder ───
+
+    use pg_ha_core::config::RestApiTlsConfig;
+
+    /// REST mTLS fails fast at startup when require_client_cert is set but
+    /// restapi.tls.ca_cert is missing — the error names the REST config block.
+    #[test]
+    fn test_rest_mtls_config_requires_ca_cert() {
+        let tls_cfg = RestApiTlsConfig {
+            cert: PathBuf::from("/nonexistent/server.crt"),
+            key: PathBuf::from("/nonexistent/server.key"),
+            ca_cert: None,
+            require_client_cert: true,
+        };
+        let err = build_mtls_server_config(
+            &tls_cfg.cert,
+            &tls_cfg.key,
+            tls_cfg.ca_cert.as_deref(),
+            "restapi.tls",
+        )
+        .expect_err("missing ca_cert must be rejected for REST mTLS");
+        assert!(
+            err.to_string().contains("restapi.tls.ca_cert"),
+            "error should name the REST config block, got: {err}"
+        );
+    }
+
+    /// REST mTLS ServerConfig builds from a test CA + server leaf: proves the
+    /// REST path wires the shared verifier/builder correctly.
+    #[test]
+    fn test_rest_mtls_server_config_builds_from_test_ca() {
+        if !openssl_available() {
+            eprintln!("skipping REST mTLS build test: openssl not available");
+            return;
+        }
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = std::env::temp_dir().join(format!("pg-ha-rest-mtls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        gen_ca_and_leaf(&dir, "server", "pg-ha-rest");
+        gen_ca_and_leaf(&dir, "client", "pg-ha-rest-client");
+
+        let tls_cfg = RestApiTlsConfig {
+            cert: dir.join("server.crt"),
+            key: dir.join("server.key"),
+            ca_cert: Some(dir.join("client-ca.crt")),
+            require_client_cert: true,
+        };
+        let built = build_mtls_server_config(
+            &tls_cfg.cert,
+            &tls_cfg.key,
+            tls_cfg.ca_cert.as_deref(),
+            "restapi.tls",
+        );
+        assert!(
+            built.is_ok(),
+            "REST mTLS ServerConfig should build from a valid test CA: {:?}",
+            built.err()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

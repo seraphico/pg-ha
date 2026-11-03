@@ -88,6 +88,15 @@ restapi:
   port: ${API_PORT}
   username: admin
   password: secret
+$(if [ -n "$PG_HA_RESTAPI_TLS_CERT" ]; then
+cat << TLSEOF
+  tls:
+    cert: ${PG_HA_RESTAPI_TLS_CERT}
+    key: ${PG_HA_RESTAPI_TLS_KEY}
+    ca_cert: ${PG_HA_RESTAPI_TLS_CA_CERT}
+    require_client_cert: ${PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT:-false}
+TLSEOF
+fi)
 
 raft:
   self_addr: "${RAFT_SELF}"

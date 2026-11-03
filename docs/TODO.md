@@ -10,7 +10,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 
 - **HA Engine** — 周期性决策循环，管理 failover 和 promotion
 - **Raft DCS** — 基于 openraft 0.9 的嵌入式共识，替代 etcd
-- **REST API** — axum 实现的健康检查和管理端点（默认端口 8008，明文 HTTP）
+- **REST API** — axum 实现的健康检查和管理端点（默认端口 8008，默认明文 HTTP；配置 `restapi.tls` 后为 HTTPS，可选 mTLS）
 - **TCP Proxy** — 读写分离代理（RW:6432, RO:6433），带主动 HTTP 健康检查、fall/rise 和每后端 `maxconn`
 
 **当前版本**：0.1.19（与 git tag `v0.1.19` 一致）  
@@ -20,6 +20,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 
 - 自动 failover、手动 switchover / failover（同步复制开启时强制候选属于 DCS `/sync`）
 - Raft RPC TLS（`raft.tls`；开发用 `docker-compose.yml` 已挂载证书）。`require_client_cert: true` 时服务端强制校验客户端证书（针对 `ca_cert`），拒绝未提供或不受信任证书的连接；默认 `false` 为仅服务端认证 TLS
+- REST API TLS（`restapi.tls`，SB-03）：`cert` + `key` 启用 HTTPS，加 `ca_cert` + `require_client_cert: true` 启用 mTLS（fail-closed，拒绝无证书/外部 CA）；省略即明文 HTTP。与 Raft TLS 共用同一套服务端 mTLS 机制
 - Raft 日志 append-only WAL（`raft_log.wal`，超过 4 MiB 压缩）+ `hard_state.json` / `state_machine.json` / `membership.json`
 - Watchdog（Linux `/dev/watchdog`；仅可写主 + 有效租约时喂狗，超时 = TTL − `safety_margin`；默认 `mode: off`）
 - 优雅停机：等待 `shutdown.drain_timeout_secs`（期间续锁）→ Leader 上 CHECKPOINT + 停库（`-m fast`，失败再 `-m immediate`），受 leader 租约限制 → 停库后才释放 leader lock；停不掉时不退出
@@ -28,28 +29,27 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 - 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
 - Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
 
-**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Failsafe、REST TLS、`/failover` 无 TTL、Raft 快照不落盘、成员 `conn_url` 含密码，见下文。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
+**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Failsafe、`/failover` 无 TTL、Raft 快照不落盘、成员 `conn_url` 含密码，见下文。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
 
 ---
 
 ## P0 — 阻塞上线（必须在生产部署前完成）
 
-编号 1、13、14、15 仍开放。编号 2 已完成，留在这里是因为同步复制的 Quorum、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
+编号 13、14、15 仍开放。编号 1（REST API TLS，SB-03）与编号 2 已完成；编号 2 留在这里是因为同步复制的 Quorum、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
 
-### 1. REST API TLS 支持
+### 1. REST API TLS 支持 ✅ 已完成（SB-03）
 
-**现状**：管理端点（switchover、failover、restart、reinitialize、config）是 HTTP + 可选 Basic Auth。`src/main.rs` 对 REST 使用 `axum::serve` 明文监听。`axum-server` 的 `tls-rustls` 只用于 Raft RPC（配置了 `raft.tls` 时 `bind_rustls`）。  
-**目标**：REST 内建 HTTPS，或在部署文档中把「前置 TLS 终结」写成强制要求并给出可复制的反代示例。当前 [部署指南](deployment-guide.md) 只说明了 Raft 证书，没有 REST TLS。  
-**实现方向**：
+**已实现**：走路线 A（内建 HTTPS），`src/main.rs` 对 REST 的监听分支与 Raft 对称：`restapi.tls` 省略时保持 `axum::serve` 明文 HTTP（现有部署不受影响）；设置 `cert` + `key` 时用 `axum_server::bind_rustls` + `RustlsConfig::from_pem_file` 提供仅服务端认证的 HTTPS；再设置 `ca_cert` 并把 `require_client_cert` 设为 `true` 时走共享的 `build_mtls_server_config`（`WebPkiClientVerifier`，fail-closed），`require_client_cert=true` 而 `ca_cert` 缺失/不可读时启动即报错退出。`build_mtls_server_config` 已泛化为同时服务 Raft 与 REST 两个平面。配置形状与 `raft.tls` 的服务端字段一致（`cert`/`key`/`ca_cert`/`require_client_cert`）。
 
-- 在 `restapi` 增加可选的 `tls_cert` / `tls_key`（及 CA）
-- 配置了 TLS 时用 `axum_server::bind_rustls()`，否则保持 HTTP（开发模式）
+docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，默认关闭（空 cert = 明文）。文档见 [部署指南](deployment-guide.md) 的「REST API TLS / mTLS」。Docker 验收证据（含 mTLS alert 116 / 48）见命令中心任务目录的 `docker-evidence.md`。
 
-**相关文件**：
+**已实现文件**：
 
-- `src/main.rs` — REST 与 Raft 的监听分支
-- `crates/pg-ha-core/src/config.rs` — `RestApiConfig`（尚无 TLS 字段）、`RaftTlsConfig`
-- `crates/pg-ha-api/src/lib.rs` — 路由组装，不含传输层
+- `src/main.rs` — REST 与 Raft 的监听分支；共享的 `build_mtls_server_config`
+- `crates/pg-ha-core/src/config.rs` — `RestApiTlsConfig`、`RestApiConfig.tls`、`RaftTlsConfig`
+- `crates/pg-ha-api/src/lib.rs` — 路由组装，不含传输层（不变）
+
+**遗留（非 SB-03 范围）**：TCP 代理的节点间健康检查（`/primary`、`/replica`）仍走明文 `http://`；若全集群开启 REST TLS，需要为这些健康检查加 HTTPS 客户端支持，留待后续。
 
 ---
 

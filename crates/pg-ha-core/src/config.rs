@@ -37,6 +37,25 @@ pub struct RaftTlsConfig {
     pub require_client_cert: bool,
 }
 
+/// REST management API TLS configuration.
+///
+/// Mirrors [`RaftTlsConfig`]'s server-side field names so TLS is configured the
+/// same way across the Raft RPC port and the REST API. `cert` + `key` together
+/// enable HTTPS; adding `ca_cert` + `require_client_cert = true` enables mTLS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestApiTlsConfig {
+    /// Server certificate file path (PEM)
+    pub cert: PathBuf,
+    /// Server private key file path (PEM)
+    pub key: PathBuf,
+    /// CA certificate path for verifying client certificates (mTLS)
+    #[serde(default)]
+    pub ca_cert: Option<PathBuf>,
+    /// Whether to require client certificates (server-side mTLS verification)
+    #[serde(default)]
+    pub require_client_cert: bool,
+}
+
 /// Graceful shutdown configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShutdownConfig {
@@ -178,6 +197,14 @@ pub struct RestApiConfig {
     /// HTTP Basic Auth password
     #[serde(default)]
     pub password: Option<String>,
+
+    /// TLS configuration (if absent, plain HTTP is used, as today).
+    ///
+    /// Set `cert` + `key` to serve HTTPS; add `ca_cert` + `require_client_cert`
+    /// to require client certificates (mTLS). Basic Auth credentials only
+    /// travel safely once TLS is enabled.
+    #[serde(default)]
+    pub tls: Option<RestApiTlsConfig>,
 }
 
 /// Raft consensus configuration
@@ -622,6 +649,7 @@ impl Config {
                 port: 8008,
                 username: None,
                 password: None,
+                tls: None,
             },
             raft: RaftConfig {
                 self_addr: "node1:2380".to_string(),
@@ -876,5 +904,50 @@ proxy:
         assert_eq!(config.watchdog.mode, WatchdogMode::Off);
         assert_eq!(config.watchdog.device, "/dev/watchdog");
         assert_eq!(config.watchdog.safety_margin, 5);
+    }
+
+    // ─── SB-03: REST API TLS config ───
+
+    /// Without a `restapi.tls` block the REST API stays plaintext (absent = no TLS).
+    #[test]
+    fn test_restapi_tls_absent_defaults_to_plaintext() {
+        let config = Config::from_yaml(MINIMAL_YAML).unwrap();
+        assert!(config.restapi.tls.is_none());
+    }
+
+    /// `restapi.tls` round-trips: cert+key enable HTTPS, and the optional mTLS
+    /// fields (ca_cert, require_client_cert) parse when present and default off.
+    #[test]
+    fn test_restapi_tls_fields_round_trip() {
+        const PLAIN_RESTAPI: &str = "restapi:\n  listen: \"0.0.0.0\"\n  port: 8008\n";
+
+        // Server-auth-only: cert + key, no mTLS fields.
+        let tls_restapi = "restapi:\n  listen: \"0.0.0.0\"\n  port: 8008\n  tls:\n    cert: /etc/pg-ha/tls/server.crt\n    key: /etc/pg-ha/tls/server.key\n";
+        let yaml = MINIMAL_YAML.replace(PLAIN_RESTAPI, tls_restapi);
+        assert_ne!(
+            yaml, MINIMAL_YAML,
+            "restapi block should have been replaced"
+        );
+        let config = Config::from_yaml(&yaml).unwrap();
+        let tls = config.restapi.tls.expect("tls block should parse");
+        assert_eq!(tls.cert, PathBuf::from("/etc/pg-ha/tls/server.crt"));
+        assert_eq!(tls.key, PathBuf::from("/etc/pg-ha/tls/server.key"));
+        assert!(tls.ca_cert.is_none());
+        assert!(!tls.require_client_cert); // defaults off
+
+        // mTLS: ca_cert + require_client_cert present.
+        let mtls_restapi = "restapi:\n  listen: \"0.0.0.0\"\n  port: 8008\n  tls:\n    cert: /etc/pg-ha/tls/server.crt\n    key: /etc/pg-ha/tls/server.key\n    ca_cert: /etc/pg-ha/tls/ca.crt\n    require_client_cert: true\n";
+        let yaml = MINIMAL_YAML.replace(PLAIN_RESTAPI, mtls_restapi);
+        let config = Config::from_yaml(&yaml).unwrap();
+        let tls = config.restapi.tls.as_ref().expect("tls block should parse");
+        assert_eq!(tls.ca_cert, Some(PathBuf::from("/etc/pg-ha/tls/ca.crt")));
+        assert!(tls.require_client_cert);
+
+        // Re-serialize and re-parse to confirm the round-trip is stable.
+        let serialized = serde_yaml::to_string(&config).unwrap();
+        let reparsed = Config::from_yaml(&serialized).unwrap();
+        let tls = reparsed.restapi.tls.expect("tls block should round-trip");
+        assert!(tls.require_client_cert);
+        assert_eq!(tls.ca_cert, Some(PathBuf::from("/etc/pg-ha/tls/ca.crt")));
     }
 }

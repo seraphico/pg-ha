@@ -301,7 +301,7 @@ pg-ha (binary)
 
 ## TLS 加密通信
 
-Raft RPC 层使用 TLS 加密所有节点间通信，防止集群共识数据在网络上被窃取或篡改。REST API 端口保持 HTTP，仅在内部网络暴露。
+Raft RPC 层使用 TLS 加密所有节点间通信，防止集群共识数据在网络上被窃取或篡改。REST 管理 API 同样支持内建 TLS（`restapi.tls`）：默认不配置时为明文 HTTP（与以往一致，仅在内部网络暴露），配置 `cert` + `key` 后为 HTTPS，再加 `ca_cert` + `require_client_cert: true` 即为 mTLS。两个平面共用同一套服务端 mTLS 机制与证书材料。
 
 ```mermaid
 flowchart TB
@@ -311,15 +311,15 @@ flowchart TB
 
     subgraph InternalNet["内部集群网络"]
         subgraph Node1["Node 1"]
-            API1[REST API :8008 HTTP]
+            API1[REST API :8008 HTTP 默认 / HTTPS 可选]
             RAFT1[Raft RPC :2380 HTTPS/TLS]
         end
         subgraph Node2["Node 2"]
-            API2[REST API :8008 HTTP]
+            API2[REST API :8008 HTTP 默认 / HTTPS 可选]
             RAFT2[Raft RPC :2380 HTTPS/TLS]
         end
         subgraph Node3["Node 3"]
-            API3[REST API :8008 HTTP]
+            API3[REST API :8008 HTTP 默认 / HTTPS 可选]
             RAFT3[Raft RPC :2380 HTTPS/TLS]
         end
     end
@@ -328,9 +328,9 @@ flowchart TB
     RAFT2 <-->|mTLS 双向认证| RAFT3
     RAFT1 <-->|mTLS 双向认证| RAFT3
 
-    CLIENT -->|HTTP 内网| API1
-    CLIENT -->|HTTP 内网| API2
-    CLIENT -->|HTTP 内网| API3
+    CLIENT -->|HTTP 默认 / HTTPS 可选| API1
+    CLIENT -->|HTTP 默认 / HTTPS 可选| API2
+    CLIENT -->|HTTP 默认 / HTTPS 可选| API3
 ```
 
 **TLS 配置要点：**
@@ -338,13 +338,13 @@ flowchart TB
 | 组件 | 端口 | 协议 | 说明 |
 |------|------|------|------|
 | Raft RPC | 2380 | HTTPS (TLS 1.2+) | 节点间共识通信，支持 mTLS |
-| REST API | 8008 | HTTP | 内网管理端点，依赖网络隔离 |
+| REST API | 8008 | HTTP（默认）/ HTTPS | `restapi.tls` 省略时明文 HTTP；设置 `cert`+`key` 为 HTTPS，加 `ca_cert`+`require_client_cert` 为 mTLS |
 | PostgreSQL | 5432 | TCP | PG 原生协议，可独立配置 `ssl` |
 | Proxy RW/RO | 6432/6433 | TCP | 透传 PG 连接 |
 
 - Raft RPC 启用 TLS 后，所有 `AppendEntries`、`RequestVote`、`InstallSnapshot` RPC 均通过加密通道传输
 - mTLS（双向 TLS）可选启用：每个节点同时验证对端证书，防止未授权节点加入集群
-- REST API 保持 HTTP 是因为它仅在内部网络暴露，由 Basic Auth 保护管理端点
+- REST API 默认明文 HTTP，仅在内部网络暴露并由 Basic Auth 保护管理端点；需要加密时配置 `restapi.tls` 启用 HTTPS/mTLS。**Basic Auth 凭据只有在启用 REST TLS 后才在传输中受保护**
 
 ## 认证与安全
 
