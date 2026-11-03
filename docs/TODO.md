@@ -29,7 +29,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 - 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
 - Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
 
-**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。Raft 快照不落盘，见下文（`/failover` 无 TTL 已由 SB-05 闭合——非空意图带集群 `ttl` 自过期，见下文 #13；成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS；Failsafe 已由 SB-04 裁定为 NO-GO 并移除表面代码，见下文 #4）。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
+**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。（Raft 快照落盘已由 SB-06 闭合——快照持久化到 `snapshot.json`、重启读回，见下文 #14；`/failover` 无 TTL 已由 SB-05 闭合——非空意图带集群 `ttl` 自过期，见下文 #13；成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS；Failsafe 已由 SB-04 裁定为 NO-GO 并移除表面代码，见下文 #4）。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
 
 ---
 
@@ -65,10 +65,9 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 
 ---
 
-### 14. Raft 快照不落盘
+### 14. Raft 快照不落盘 — ✅ 已完成（SB-06）
 
-**现状**：`build_snapshot` 把快照放在内存里。`new_persistent` 重启时读回 `hard_state.json`、`state_machine.json`、`raft_log.wal`、`membership.json`，不读快照。重启之后、下一次自动快照之前，若有落后很多的节点需要快照才能追上，会报 snapshot not found，并停掉该领导者的 Raft。  
-**目标**：重启时若 `last_purged` 非空，从已加载的状态机立刻重建快照，或把快照写到磁盘再读回。  
+**已实现**：Raft 快照现在落盘到 `snapshot.json`，`new_persistent` 重启时连同 `hard_state.json`、`state_machine.json`、`raft_log.wal`、`membership.json` 一起读回。`get_current_snapshot` 因此在重启后仍能返回快照——重启之后、下一次自动快照之前，落后很多需要快照才能追上的节点不再触发 snapshot not found、不再停掉领导者的 Raft。  
 **相关文件**：
 
 - `crates/pg-ha-dcs/src/store.rs` — `new_persistent`、`build_snapshot`、`get_current_snapshot`
@@ -216,7 +215,7 @@ pg-ha 明确不支持外部 DCS，保留 failsafe 只会误导，故移除。
 |------|------|----------|
 | ~~`crates/pg-ha-dcs/src/raft_dcs.rs`（`get_cluster`）~~ | ~~`TODO: read /failsafe key`~~ → 已移除（#4，SB-04 NO-GO） | #4 ✅ |
 | ~~`crates/pg-ha-dcs/src/raft_dcs.rs`（`set_failover_value`）~~ | ~~`ttl: None`~~ → 非空意图带集群 `ttl`（#13，SB-05） | #13 ✅ |
-| `crates/pg-ha-dcs/src/store.rs`（`build_snapshot` / `new_persistent`） | 快照只在内存，重启不加载 | #14 |
+| ~~`crates/pg-ha-dcs/src/store.rs`（`build_snapshot` / `new_persistent`）~~ | ~~快照只在内存，重启不加载~~ → 落盘到 `snapshot.json`、重启读回（#14，SB-06） | #14 ✅ |
 | ~~`crates/pg-ha-core/src/ha/helpers.rs`（组装 `conn_url`）~~ | ~~`password=` 进入 Raft 日志~~ → 已移除（#15，SB-07） | #15 ✅ |
 | `crates/pg-ha-core/src/ha/election.rs` | `maximum_lag_on_failover` 未参与候选过滤 | #2 剩余 |
 | REST `/patroni` `replication_lag` | 字段始终为 0，未计算填充 | #2 剩余 |

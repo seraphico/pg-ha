@@ -224,6 +224,21 @@ impl MemStore {
             }
         }
 
+        // Load snapshot. A missing snapshot is normal (none built yet), so it
+        // must not fail startup; a corrupt one is logged and treated as none.
+        let snapshot_path = data_dir.join("snapshot.json");
+        if let Ok(json) = std::fs::read_to_string(&snapshot_path) {
+            if let Ok(snap) = serde_json::from_str::<StoredSnapshot>(&json) {
+                info!(
+                    "Loaded snapshot from disk: last_log_id={:?}",
+                    snap.meta.last_log_id
+                );
+                inner.snapshot = Some(snap);
+            } else {
+                warn!("Failed to parse snapshot.json — treating as no snapshot");
+            }
+        }
+
         Self {
             inner: Arc::new(RwLock::new(inner)),
             data_dir: Some(data_dir),
@@ -423,6 +438,28 @@ impl MemStore {
         join_io(result, "persist_membership")
     }
 
+    /// Persist the current snapshot to `snapshot.json`.
+    ///
+    /// Without a snapshot restart would leave `get_current_snapshot` empty while
+    /// the WAL's `last_purged` is non-empty, so a far-behind follower could not
+    /// catch up and the leader's Raft core would stop. Returns `Ok(())` without
+    /// writing when the store is in-memory only or no snapshot exists yet.
+    async fn persist_snapshot(&self, inner: &MemStoreInner) -> std::io::Result<()> {
+        let Some(dir) = &self.data_dir else {
+            return Ok(());
+        };
+        let Some(snapshot) = &inner.snapshot else {
+            return Ok(());
+        };
+        let path = dir.join("snapshot.json");
+        let json = serde_json::to_string(snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let result =
+            tokio::task::spawn_blocking(move || Self::atomic_write_json(&path, json.as_bytes()))
+                .await;
+        join_io(result, "persist_snapshot")
+    }
+
     /// Atomically write bytes via temp file + fsync + rename.
     fn atomic_write_json(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
@@ -495,6 +532,19 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<MemStore> {
             meta: meta.clone(),
             data: data.clone(),
         });
+
+        // The snapshot must be durable before this returns (same requirement as
+        // the in-memory store above): on restart get_current_snapshot reads it
+        // back so a far-behind follower can still catch up. Persist inside the
+        // write lock so the on-disk copy matches the state machine it was built
+        // from.
+        self.persist_snapshot(&inner).await.map_err(|e| {
+            storage_err(
+                ErrorSubject::Snapshot(Some(meta.signature())),
+                ErrorVerb::Write,
+                e,
+            )
+        })?;
 
         Ok(Snapshot {
             meta,
@@ -684,6 +734,9 @@ impl RaftStorage<TypeConfig> for Arc<MemStore> {
             .await
             .map_err(|e| storage_err(snapshot_subject(), ErrorVerb::Write, e))?;
         self.persist_membership(&inner)
+            .await
+            .map_err(|e| storage_err(snapshot_subject(), ErrorVerb::Write, e))?;
+        self.persist_snapshot(&inner)
             .await
             .map_err(|e| storage_err(snapshot_subject(), ErrorVerb::Write, e))?;
         self.persist_hard_state(&inner)
@@ -1391,6 +1444,67 @@ mod tests {
             built.snapshot.into_inner(),
             "stored snapshot bytes must match the snapshot that was built"
         );
+    }
+
+    /// A snapshot built before a restart must survive it: the store persists it
+    /// to disk and `new_persistent` reloads it, so `get_current_snapshot` returns
+    /// the same snapshot (meta + bytes) even though `last_purged` is non-empty.
+    /// Otherwise a far-behind follower hits "snapshot not found" and stops the
+    /// leader's Raft core (SB-06).
+    #[tokio::test]
+    async fn snapshot_survives_restart_via_new_persistent() {
+        let dir = tempdir();
+
+        // Build a snapshot and purge the log so last_purged is non-empty, the
+        // exact window where a missing snapshot is fatal.
+        let built_meta;
+        let built_bytes;
+        {
+            let mut store = Arc::new(MemStore::new_persistent(dir.clone()));
+            store
+                .apply_to_state_machine(&[blank_entry(1), blank_entry(2)])
+                .await
+                .expect("apply");
+
+            let built = store.build_snapshot().await.expect("build snapshot");
+            built_meta = built.meta.clone();
+            built_bytes = built.snapshot.into_inner();
+
+            // Purge logs so the WAL carries a non-empty last_purged on reload.
+            store
+                .purge_logs_upto(LogId::new(openraft::CommittedLeaderId::new(1, 1), 2))
+                .await
+                .expect("purge");
+        }
+
+        // Restart: recreate the store from the same data_dir.
+        let mut reloaded = Arc::new(MemStore::new_persistent(dir.clone()));
+
+        {
+            let inner = reloaded.inner.read().await;
+            assert!(
+                inner.last_purged.is_some(),
+                "last_purged should be non-empty after reload"
+            );
+        }
+
+        let current = reloaded
+            .get_current_snapshot()
+            .await
+            .expect("get snapshot")
+            .expect("snapshot must be reloaded from disk, not empty, after restart");
+
+        assert_eq!(
+            current.meta, built_meta,
+            "reloaded snapshot meta must match the built snapshot"
+        );
+        assert_eq!(
+            current.snapshot.into_inner(),
+            built_bytes,
+            "reloaded snapshot bytes must match the built snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ─── Helper functions ───
