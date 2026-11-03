@@ -47,7 +47,7 @@ curl -s http://localhost:8008/patroni | jq .
 
 健康检查（`/primary`、`/replica`、`/health`、`/liveness`、`/sync`、`/async`、`/cluster`、`/patroni`、`/metrics`、`/history`）不要求认证。`/switchover`、`/failover`、`/restart`、`/reinitialize`、`/config` 在 YAML 里设置了 `restapi.username` 时要求 HTTP Basic Auth。Docker 入口默认用户名 `admin`、密码 `secret`。
 
-> **TLS / HTTPS**：下面的示例用 `http://`，是 REST API 的默认明文形态。配置了 `restapi.tls`（`cert` + `key`）后，REST API 改为 HTTPS，所有示例请把 `http://` 换成 `https://`，并用 `--cacert <ca.crt>` 提供信任根；开启 mTLS（`require_client_cert: true`）时还需 `--cert <client.crt> --key <client.key>`。**Basic Auth 凭据只有在启用 TLS 后才在传输中受保护**——明文 HTTP 下凭据与管理命令都以明文传输，生产环境请为 REST API 启用 TLS（配置见部署指南的「REST API TLS / mTLS」）。
+> **TLS / HTTPS**：下面的示例用 `http://`，是 REST API 的默认明文形态。配置了 `restapi.tls`（`cert` + `key`）后，REST API 改为 HTTPS，所有示例请把 `http://` 换成 `https://`，并用 `--cacert <ca.crt>` 提供信任根；开启 mTLS（`require_client_cert: true`）时还需 `--cert <client.crt> --key <client.key>`。代理探活 `/primary` 和 `/replica` 使用同一套材料：HTTPS 时信任 `ca_cert`，mTLS 时出示本节点自己的服务端证书。**Basic Auth 凭据只有在启用 TLS 后才在传输中受保护**——明文 HTTP 下凭据与管理命令都以明文传输，生产环境请为 REST API 启用 TLS（配置见部署指南的「REST API TLS / mTLS」）。
 
 ### Primary 检查
 

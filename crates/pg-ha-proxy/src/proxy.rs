@@ -125,6 +125,9 @@ pub struct PgProxy {
     upstream: Arc<RwLock<UpstreamState>>,
     health_state: Arc<RwLock<HashMap<String, BackendHealth>>>,
     health_config: HealthCheckConfig,
+    /// Client used for `/primary` and `/replica` probes. Carries the REST CA
+    /// and client certificate when the API is HTTPS or mTLS.
+    health_client: reqwest::Client,
     _ro_counter: AtomicUsize,
 }
 
@@ -138,12 +141,28 @@ impl PgProxy {
         ro_addr: SocketAddr,
         health_config: HealthCheckConfig,
     ) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(health_config.timeout)
+            .build()
+            .unwrap_or_default();
+        Self::with_health_client(rw_addr, ro_addr, health_config, client)
+    }
+
+    /// Same as [`Self::with_health_config`], but probes with `client`.
+    /// The caller sets the timeout and any TLS material on that client.
+    pub fn with_health_client(
+        rw_addr: SocketAddr,
+        ro_addr: SocketAddr,
+        health_config: HealthCheckConfig,
+        health_client: reqwest::Client,
+    ) -> Self {
         Self {
             rw_addr,
             ro_addr,
             upstream: Arc::new(RwLock::new(UpstreamState::default())),
             health_state: Arc::new(RwLock::new(HashMap::new())),
             health_config,
+            health_client,
             _ro_counter: AtomicUsize::new(0),
         }
     }
@@ -235,8 +254,9 @@ impl PgProxy {
         let hc_upstream = upstream.clone();
         let hc_health = health_state.clone();
         let hc_config = health_config.clone();
+        let hc_client = self.health_client.clone();
         tokio::spawn(async move {
-            run_health_checker(hc_upstream, hc_health, hc_config).await;
+            run_health_checker(hc_upstream, hc_health, hc_config, hc_client).await;
         });
 
         // Spawn RW listener
@@ -286,18 +306,59 @@ impl PgProxy {
 
 // ─────────────────── Health Checker ───────────────────
 
+/// Proxy probes use the REST TLS material. mTLS presents this node's own
+/// server certificate; peers verify it with the same CA.
+pub fn build_health_client(
+    tls: Option<&pg_ha_core::config::RestApiTlsConfig>,
+    timeout: Duration,
+) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if let Some(tls) = tls {
+        if let Some(ca_path) = &tls.ca_cert {
+            let pem = std::fs::read(ca_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to read REST CA certificate {}: {err}",
+                    ca_path.display()
+                )
+            })?;
+            let cert = reqwest::Certificate::from_pem(&pem).map_err(|err| {
+                anyhow::anyhow!("invalid REST CA certificate {}: {err}", ca_path.display())
+            })?;
+            builder = builder.add_root_certificate(cert);
+        }
+        if tls.require_client_cert {
+            let cert_pem = std::fs::read(&tls.cert).map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to read REST certificate {}: {err}",
+                    tls.cert.display()
+                )
+            })?;
+            let key_pem = std::fs::read(&tls.key).map_err(|err| {
+                anyhow::anyhow!("failed to read REST key {}: {err}", tls.key.display())
+            })?;
+            let mut identity_pem = cert_pem;
+            if !identity_pem.ends_with(b"\n") {
+                identity_pem.push(b'\n');
+            }
+            identity_pem.extend(key_pem);
+            let identity = reqwest::Identity::from_pem(&identity_pem)
+                .map_err(|err| anyhow::anyhow!("invalid REST client identity: {err}"))?;
+            builder = builder.identity(identity);
+        }
+    }
+    builder
+        .build()
+        .map_err(|err| anyhow::anyhow!("failed to build proxy health client: {err}"))
+}
+
 /// Active health checker that polls backends periodically.
 /// Equivalent to HAProxy's `option httpchk` with `inter`, `fall`, `rise`.
 async fn run_health_checker(
     upstream: Arc<RwLock<UpstreamState>>,
     health_state: Arc<RwLock<HashMap<String, BackendHealth>>>,
     config: HealthCheckConfig,
+    client: reqwest::Client,
 ) {
-    let client = reqwest::Client::builder()
-        .timeout(config.timeout)
-        .build()
-        .unwrap_or_default();
-
     let mut interval = tokio::time::interval(config.interval);
 
     loop {

@@ -823,7 +823,12 @@ impl Ha {
         let mut data = serde_json::json!({
             "name": self.config.name,
             "conn_url": conn_url,
-            "api_url": format!("http://{}:{}", reachable_host, self.config.restapi.port),
+            "api_url": format!(
+                "{}://{}:{}",
+                if self.config.restapi.tls.is_some() { "https" } else { "http" },
+                reachable_host,
+                self.config.restapi.port
+            ),
             "state": self.advertised_state(),
             "role": format!("{}", self.postgresql.role()),
             // A18: other nodes apply the marked-node election rule to us.
