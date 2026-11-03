@@ -2,6 +2,8 @@
 //!
 //! Communicates exclusively via the REST API.
 
+mod credentials;
+
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
