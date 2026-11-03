@@ -83,14 +83,25 @@ mod tests {
 
     #[test]
     fn flag_overrides_the_same_env_field() {
-        let resolved = resolve_credentials(
-            Some("flag-user"),
-            None,
-            Some("env-user"),
-            Some("env-pass"),
-        )
-        .unwrap();
+        let resolved =
+            resolve_credentials(Some("flag-user"), None, Some("env-user"), Some("env-pass"))
+                .unwrap();
         assert_eq!(resolved, Some(creds("flag-user", "env-pass")));
+    }
+
+    #[test]
+    fn password_flag_overrides_the_env_password() {
+        let resolved =
+            resolve_credentials(None, Some("flag-pass"), Some("env-user"), Some("env-pass"))
+                .unwrap();
+        assert_eq!(resolved, Some(creds("env-user", "flag-pass")));
+    }
+
+    #[test]
+    fn empty_flag_falls_through_to_env() {
+        let resolved =
+            resolve_credentials(Some(""), Some(""), Some("env-user"), Some("env-pass")).unwrap();
+        assert_eq!(resolved, Some(creds("env-user", "env-pass")));
     }
 
     #[test]
@@ -139,13 +150,22 @@ mod tests {
         let request = apply_basic_auth(client.post("http://127.0.0.1:8008/switchover"), None)
             .build()
             .unwrap();
-        assert!(request.headers().get(reqwest::header::AUTHORIZATION).is_none());
+        assert!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
     }
 
     #[test]
     fn unauthorized_without_credentials_names_the_flags() {
-        let err = format_http_result(StatusCode::UNAUTHORIZED, &json!({"error": "Unauthorized"}), false)
-            .unwrap_err();
+        let err = format_http_result(
+            StatusCode::UNAUTHORIZED,
+            &json!({"error": "Unauthorized"}),
+            false,
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             "[401] Unauthorized\nset --username and --password, or PG_HA_USERNAME and PG_HA_PASSWORD"
@@ -154,8 +174,12 @@ mod tests {
 
     #[test]
     fn unauthorized_with_credentials_has_no_hint() {
-        let err = format_http_result(StatusCode::UNAUTHORIZED, &json!({"error": "Unauthorized"}), true)
-            .unwrap_err();
+        let err = format_http_result(
+            StatusCode::UNAUTHORIZED,
+            &json!({"error": "Unauthorized"}),
+            true,
+        )
+        .unwrap_err();
         assert_eq!(err, "[401] Unauthorized");
     }
 
@@ -169,6 +193,9 @@ mod tests {
             true,
         )
         .unwrap_err();
+        assert_eq!(err, "[400] nope");
+        let err = format_http_result(StatusCode::BAD_REQUEST, &json!({"error": "nope"}), false)
+            .unwrap_err();
         assert_eq!(err, "[400] nope");
     }
 }
