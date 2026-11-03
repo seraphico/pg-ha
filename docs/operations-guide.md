@@ -1117,7 +1117,13 @@ journalctl -u pg-ha --no-pager | jq 'select(.message | contains("failover") or c
 
 ### pg-ha-ctl CLI 工具
 
-CLI 只访问 REST。参数是 `--endpoint`（默认 `http://127.0.0.1:8008`），不是 `--url`。它**不发送** Basic Auth。Docker 和管理 YAML 默认开了认证时，`switchover` / `failover` / `restart` / `reinitialize` / `pause` / `resume` 会 401。`list` 打的是免认证的 `/patroni`，而且只打印这一台节点，不是 `/cluster` 的全体成员。
+CLI 只访问 REST。参数是 `--endpoint`（默认 `http://127.0.0.1:8008`），不是 `--url`。
+
+管理接口在配置了 `restapi.username` 和 `restapi.password` 时要求 Basic Auth。`--username` 覆盖环境变量 `PG_HA_USERNAME`，`--password` 覆盖 `PG_HA_PASSWORD`。两个都空则不发送 `Authorization`，认证关闭的集群与以前相同。只给了其中一个时，进程以退出码 2 结束，不发请求。两个都有时，每个请求都带 Basic Auth，包括 `list`。密码用环境变量，避免出现在进程列表里。非 2xx（含 401）退出码为 1，并打印状态码和响应里的 `error` 或 `message`。
+
+REST 为 HTTPS 时把 `--endpoint` 改成 `https://`。服务器证书由私有 CA 签发时加 `--cacert`（覆盖 `PG_HA_CACERT`）。`require_client_cert: true` 时再加 `--cert` 和 `--key`（分别覆盖 `PG_HA_CERT`、`PG_HA_KEY`）。只给证书或只给私钥时退出码 2，不发请求。Basic Auth 解决的是 HTTP 401；没有这三份材料时，mTLS 在握手阶段就失败，到不了 401。
+
+`list` 打的是 `/patroni`，只打印这一台节点，不是 `/cluster` 的全体成员。
 
 ```bash
 pg-ha-ctl --endpoint http://localhost:8008 list
@@ -1127,6 +1133,11 @@ pg-ha-ctl --endpoint http://localhost:8008 restart
 pg-ha-ctl --endpoint http://localhost:8008 reinitialize
 pg-ha-ctl --endpoint http://localhost:8008 pause
 pg-ha-ctl --endpoint http://localhost:8008 resume
+PG_HA_USERNAME=admin PG_HA_PASSWORD=secret pg-ha-ctl --endpoint http://localhost:8008 restart
+PG_HA_USERNAME=admin PG_HA_PASSWORD=secret pg-ha-ctl \
+  --endpoint https://127.0.0.1:8008 \
+  --cacert docker/tls/ca.crt --cert docker/tls/client.crt --key docker/tls/client.key \
+  pause
 ```
 
 `reinitialize` 对应 `POST /reinitialize`：拒绝在 leader 上执行；在副本上会 `pg_ctl stop -m immediate` 并删掉数据目录（包括 `pg-ha.rewind_check`、`pg-ha.rewind_failed`），下一个 HA cycle 再 clone。成功响应的 `message` 是 `Node reinitialized, will clone on next cycle`。它是 pg_rewind 失败后的标准处理（见「场景 3」）。节点上的 PostgreSQL 正以主库运行（不持锁）时，pg-ha 先写 `standby.signal` 和标记再停库；停库失败则返回错误 `Reinitialize: stopping PostgreSQL failed: <错误>; data directory not removed (pg-ha keeps fencing it)`，不删除数据目录。
