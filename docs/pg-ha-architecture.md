@@ -198,7 +198,7 @@ flowchart LR
     subgraph Node1["Node 1"]
         R1[Raft Node]
         SM1[KV StateMachine]
-        DISK1[raft_log.wal hard_state.json state_machine.json membership.json]
+        DISK1[raft_log.wal hard_state.json state_machine.json membership.json snapshot.json]
     end
     subgraph Node2["Node 2"]
         R2[Raft Node]
@@ -222,6 +222,8 @@ flowchart LR
     SM2 --> DISK2
     SM3 --> DISK3
 ```
+
+**持久化文件**：`raft_log.wal`（append-only 日志）、`hard_state.json`、`state_machine.json`、`membership.json`，以及 `snapshot.json`。`snapshot.json` 保存 Raft 快照——快照现在落盘，`new_persistent` 重启时读回，`get_current_snapshot` 因此在重启后仍能返回快照（不再出现重启后、下一次自动快照前的 snapshot not found）。
 
 ## DCS KV 存储结构
 
