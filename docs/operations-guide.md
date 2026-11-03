@@ -397,7 +397,7 @@ ttl >= loop_wait + retry_timeout + watchdog.safety_margin，且 retry_timeout >=
   {"error": "Rejected, configuration not changed: ttl (15) must be >= loop_wait (6) + retry_timeout (5) + watchdog.safety_margin (5) = 16: ..."}
   ```
   动态配置里没有的项按接收请求的节点的静态值计算；`safety_margin` 只有静态值。不改这三项的请求不检查。
-- 已知缺口：动态修改 `ttl` 目前不改变写进锁的 TTL，DCS 写的超时也一直是静态 `retry_timeout`（[invariants.md](invariants.md) 第 9 节）。调大 `loop_wait` 前，先确认静态 `ttl` 也满足约束。
+- 动态修改 `ttl` / `retry_timeout` 会实时生效：写进锁的 TTL 与 DCS 写的超时都从原子变量读取，`PATCH` / `PUT /config` 通过校验后立即更新（`RaftDcs::set_lock_timing`）。无需重启。调大 `loop_wait` 前仍要确认约束 `ttl >= loop_wait + retry_timeout + safety_margin` 成立（否则返回 400、配置不写入）。
 
 **分区下的旧主**：锁持有者与多数派断开后，最晚在最后一次续锁开始后 `ttl − safety_margin` 秒停掉 PostgreSQL（默认 25 秒，docker 10 秒），不论 DCS 调用是否返回；多数派最早在 `ttl` 秒后抢锁。前提是节点间墙钟偏差小于 `safety_margin`。pause 下不围栏。相关日志：
 
