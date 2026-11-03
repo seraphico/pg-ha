@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.21"
+version = "0.1.22"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
