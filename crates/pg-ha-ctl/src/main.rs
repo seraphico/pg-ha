@@ -6,9 +6,9 @@ mod credentials;
 mod tls;
 
 use clap::{Parser, Subcommand};
-use credentials::{apply_basic_auth, format_http_result, resolve_credentials, CredentialError};
+use credentials::{CredentialError, apply_basic_auth, format_http_result, resolve_credentials};
 use serde_json::Value;
-use tls::{build_client, resolve_tls_paths, TlsPathError};
+use tls::{TlsPathError, build_client, resolve_tls_paths};
 
 /// pg-ha-ctl: Command-line tool for managing pg-ha clusters
 #[derive(Parser)]
@@ -138,7 +138,10 @@ async fn run() -> Result<(), i32> {
     match cli.command {
         Commands::List => {
             let body = send_json(
-                apply_basic_auth(client.get(format!("{}/patroni", cli.endpoint)), creds.as_ref()),
+                apply_basic_auth(
+                    client.get(format!("{}/patroni", cli.endpoint)),
+                    creds.as_ref(),
+                ),
                 sent_auth,
             )
             .await?;
@@ -181,7 +184,10 @@ async fn run() -> Result<(), i32> {
         }
         Commands::Restart => {
             let line = send_line(
-                apply_basic_auth(client.post(format!("{}/restart", cli.endpoint)), creds.as_ref()),
+                apply_basic_auth(
+                    client.post(format!("{}/restart", cli.endpoint)),
+                    creds.as_ref(),
+                ),
                 sent_auth,
             )
             .await?;
