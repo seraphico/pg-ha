@@ -1,6 +1,6 @@
 # pg-ha TODO — 生产就绪路线图
 
-本文对照当前代码（2026-11，`main` `eb0f8ec`，标签 `v0.1.19`）。已落地的项标为完成；仍开放的项按代码里的实际缺口描述，不沿用过时现状。
+本文对照当前代码（2026-11，标签 `v0.1.22`）。已落地的项标为完成；仍开放的项按代码里的实际缺口描述，不沿用过时现状。
 
 ## 项目概述
 
@@ -11,9 +11,9 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 - **HA Engine** — 周期性决策循环，管理 failover 和 promotion
 - **Raft DCS** — 基于 openraft 0.9 的嵌入式共识，替代 etcd
 - **REST API** — axum 实现的健康检查和管理端点（默认端口 8008，默认明文 HTTP；配置 `restapi.tls` 后为 HTTPS，可选 mTLS）
-- **TCP Proxy** — 读写分离代理（RW:6432, RO:6433），带主动 HTTP 健康检查、fall/rise 和每后端 `maxconn`
+- **TCP Proxy** — 读写分离代理（RW:6432, RO:6433），带主动健康检查、fall/rise 和每后端 `maxconn`。REST 为明文时探活走 `http://`；配置 `restapi.tls` 后走 `https://`，mTLS 时出示本节点服务端证书。
 
-**当前版本**：0.1.19（与 git tag `v0.1.19` 一致）  
+**当前版本**：0.1.22（与 git tag `v0.1.22` 一致）  
 **代码结构**：Cargo workspace，`edition = "2024"`。核心 crate：`pg-ha-core`（HA 逻辑）、`pg-ha-dcs`（Raft）、`pg-ha-proxy`（代理）、`pg-ha-api`（REST）、`pg-ha-ctl`（CLI）
 
 **已实现的关键能力**：
@@ -49,7 +49,7 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 - `crates/pg-ha-core/src/config.rs` — `RestApiTlsConfig`、`RestApiConfig.tls`、`RaftTlsConfig`
 - `crates/pg-ha-api/src/lib.rs` — 路由组装，不含传输层（不变）
 
-**遗留（非 SB-03 范围）**：TCP 代理的节点间健康检查（`/primary`、`/replica`）仍走明文 `http://`；若全集群开启 REST TLS，需要为这些健康检查加 HTTPS 客户端支持，留待后续。
+**代理探活（SB-21，已完成）**：TCP 代理对 `/primary`、`/replica` 的探活跟着 `restapi.tls`。未配置时仍是明文 `http://`；配置了证书后用 `https://` 和 `ca_cert`；`require_client_cert` 时出示本节点的 REST 服务端证书。
 
 ---
 
@@ -179,7 +179,7 @@ pg-ha 明确不支持外部 DCS，保留 failsafe 只会误导，故移除。
 - 请求限流
 - 管理操作审计日志（谁、何时、哪个端点）
 - CORS（若要做 dashboard）
-- `pg-ha-ctl` 发送 Basic Auth（当前 CLI 不带头，Docker 默认 `admin` / `secret` 时管理子命令会 401）
+- `pg-ha-ctl` Basic Auth 与 REST TLS 客户端已完成（SB-08）：`--username` / `--password`（或 `PG_HA_USERNAME` / `PG_HA_PASSWORD`）发给管理接口；`--cacert` / `--cert` / `--key` 用于 HTTPS 和 mTLS。只给一半凭证或只给证书/私钥时退出码 2。
 
 ---
 

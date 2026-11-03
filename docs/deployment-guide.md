@@ -482,7 +482,7 @@ REST 管理 API 也支持内建 HTTPS，配置形状与 `raft.tls` 的服务端�
 
 **Basic Auth 与 TLS 的关系**：Basic Auth 本身不变，启用 TLS 后依然生效。但 Basic Auth 凭据只有在 REST API 启用 TLS 后才在传输中受保护；在明文 HTTP 下，凭据与所有管理命令（switchover/failover/restart/reinitialize/config 等）都以明文传输。生产环境请务必为 REST API 启用 TLS。
 
-> 注意：TCP 代理的节点间健康检查（`/primary`、`/replica`）目前走明文 `http://`。若把 REST TLS 全集群开启，这些健康检查需要相应的 HTTPS 客户端支持——不在 SB-03 范围内，留待后续。
+代理对 `/primary`、`/replica` 的探活使用同一套 `restapi.tls`。未配置时走明文 `http://`。配置了 `cert` + `key` 后探活改为 `https://`，并用 `ca_cert` 校验服务器证书。`require_client_cert: true` 时，探活出示本节点自己的 REST 服务端证书。
 
 `raft.tls` 不影响 REST API，`restapi.tls` 也不影响 Raft RPC（2380），二者各自独立配置。
 
