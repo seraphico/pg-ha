@@ -312,11 +312,6 @@ impl RaftDcs {
         format!("{}timeline", self.base_path)
     }
 
-    #[allow(dead_code)]
-    fn failsafe_path(&self) -> String {
-        format!("{}failsafe", self.base_path)
-    }
-
     // ─────────── Internal helpers ───────────
 
     /// Propose a write to the Raft cluster and wait for commit, at most
@@ -506,7 +501,6 @@ impl DcsAdapter for RaftDcs {
             config,
             sync_state,
             failover,
-            failsafe: None, // TODO: read /failsafe key
             history: Vec::new(),
             timeline,
             dcs_voters,

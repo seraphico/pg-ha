@@ -278,7 +278,7 @@
 |----|------|------|
 | P1 | 进程崩溃重启后，从本地磁盘恢复的 Raft 日志与状态机，须能重建与崩溃前**已提交**语义一致的集群视图（未提交日志可丢，符合 Raft）。 | 持有 |
 | P2 | 日志存储实现从全量 JSON 改为 append-only WAL 等优化时，必须保持 P1 与对外 HA 语义不变（M2）。 | 持有 |
-| P3 | Failsafe：文档中的 `/failsafe` 与「重启后是否仍生效」必须一致。 | **待裁定** |
+| P3 | Failsafe 在 pg-ha 的内嵌 RaftDcs 架构下**不适用**：无法到达共识的场景由租约到期 fencing（L5 的时间界 / 本文件「租约到期围栏」，SB-04 称 R19）处理；pg-ha 明确不支持外部 DCS，故 failsafe 相关表面已移除。 | **已裁定（NO-GO，SB-04）** |
 | P4 | 本地持久化（含 WAL）若失败，不得长期呈现「内存/Raft 已成功、磁盘未成功」且无 degraded 语义。 | 持有 |
 
 **P4 的 degraded 语义**（`crates/pg-ha-dcs/src/store.rs`）：
@@ -288,7 +288,9 @@
 - 对 HA 的后果：`get_cluster` 读本地状态机，会返回冻结的旧视图，但所有改变身份的动作（抢锁、续锁）都要经过 Raft 写，因此该节点既不能成为 leader，也不能保持 leader。若它正持锁，下一次续锁失败（`Ok(false)` 或 `Err`）或租约到期（1a「leader 租约」）即降级：先写 `standby.signal` 和 rewind 检查标记、再停库；之后 pg-ha 只把它作为备库启动（1a 启动规则）。本地视图里 leader key 按 TTL 过期后，它最多以只读备库参选，抢锁需要 Raft 写而必然失败，所以不会再以可写主出现。集群其余多数派继续服务。
 - 恢复需要人工：修复磁盘后重启 pg-ha。内存先于磁盘更新这一顺序未变（WAL 压缩需要完整内存日志），但分歧不会被报告为已持久化。
 
-**相关**：架构 Raft / DCS；`raft_log.wal` 与 `hard_state.json` 等；代码中 failsafe TODO。
+**相关**：架构 Raft / DCS；`raft_log.wal` 与 `hard_state.json` 等。
+
+**P3 裁定记录（SB-04，NO-GO）**：Patroni 的 failsafe 是为**外部 DCS**（etcd/consul）设计的——当 DCS 挂了但 PostgreSQL 集群仍健康时，primary 通过 REST 向所有成员确认拓扑来继续服务，而不是降级。pg-ha 用的是**与进程同处一地的内嵌 Raft DCS**，所以：(a) `RaftDcs::get_cluster` 是本地读，永不返回 `Err`，failsafe 的入口 `handle_dcs_error` 在 RaftDcs 下不可达；(b)「无法到达共识」的场景已由租约到期 fencing（见 L5 的时间界与本文件「租约到期围栏」小节，SB-04 称 R19：primary 在 `ttl - safety_margin` 内未能续约即自我 fence，不等 DCS）更保守、更符合一致性数据库语义地处理。故 failsafe 在此既不可达又冗余。由于**明确不支持外部 DCS**，保留它只会误导，已移除其表面代码。`failsafe_mode` 配置字段为向后兼容仍可解析，但为 no-op（不再有任何效果）。
 
 ---
 
@@ -340,7 +342,7 @@
 
 | 项 | 相关 ID | 说明 |
 |----|---------|------|
-| Failsafe 持久化 | P3 | 架构列出 `/failsafe`；实现仍有「未读 key」类缺口 |
+| ~~Failsafe 持久化~~ | P3 | **已裁定（SB-04，NO-GO）**：failsafe 在内嵌 RaftDcs 下不适用，表面代码已移除；无法到达共识由租约到期 fencing（L5 / 「租约到期围栏」）处理。详见 P3 裁定记录 |
 | ~~Member `conn_url` 含密码~~ | R3 | **已闭合（2026-11-03，SB-07 Option A）**：`conn_url` 不再写入 superuser 密码（仅 host/port/dbname/user，各字段 `libpq_quote` 转义），磁盘上的 Raft 状态不再含明文密钥；灾备路径（rewind/basebackup/探测）改从本地 `postgresql.superuser.password` 经 `PGPASSWORD` 取对端凭据 |
 | 最新 timeline 的持有者全部永久丢失时需要运维强制参选 | D6 / S4 | I3 的代价：不再自动选落后节点（以前会丢掉整任主库的写入并重复编号）。新主库刚 promote、其他副本还没切过来它就永久丢失，或 pending 发起者在 promote 那一刻永久丢失，都属于这种情况。处理见 [operations-guide.md](operations-guide.md)「场景 4a」；强制参选后其他旧节点必须 reinitialize，pg-ha 用历史代强制 |
 | 升级前遗留的同编号、同起点历史无法区分 | D6 | 升级前已经发生的编号重复，如果两条历史连起点 LSN 也相同，身份比对分不出来。升级后由 I3 保证不再产生；强制参选产生的重复由历史代区分 |

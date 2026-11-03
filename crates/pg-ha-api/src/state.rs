@@ -58,8 +58,6 @@ pub struct NodeState {
     pub ttl_seconds: u64,
     /// Timestamp of last successful DCS query
     pub dcs_last_seen: Option<Instant>,
-    /// Whether failsafe mode is currently active
-    pub failsafe_active: bool,
     /// Last `pg_is_in_recovery()` observation from the HA loop. `None` when
     /// not observed (PostgreSQL stopped, query failed, or a start / stop /
     /// promote ran since). At most one HA cycle old.
@@ -91,7 +89,6 @@ impl AppState {
                 last_loop_at: None,
                 ttl_seconds: ttl,
                 dcs_last_seen: None,
-                failsafe_active: false,
                 pg_in_recovery: None,
                 shutting_down: false,
                 rewind_check: false,
@@ -129,7 +126,6 @@ impl AppState {
                 last_loop_at: None,
                 ttl_seconds: ttl,
                 dcs_last_seen: None,
-                failsafe_active: false,
                 pg_in_recovery: None,
                 shutting_down: false,
                 rewind_check: false,

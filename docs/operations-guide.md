@@ -125,9 +125,6 @@ pg_ha_timeline 1
 # HELP pg_ha_dcs_last_seen_seconds Seconds since last successful DCS communication
 # TYPE pg_ha_dcs_last_seen_seconds gauge
 pg_ha_dcs_last_seen_seconds 2.345
-# HELP pg_ha_failsafe_active Whether failsafe mode is currently active (1 = active)
-# TYPE pg_ha_failsafe_active gauge
-pg_ha_failsafe_active 0
 # HELP pg_ha_pending_restart Whether a PostgreSQL restart is pending (1 = pending)
 # TYPE pg_ha_pending_restart gauge
 pg_ha_pending_restart 0
@@ -136,7 +133,7 @@ pg_ha_pending_restart 0
 pg_ha_is_paused 0
 ```
 
-`pg_ha_failsafe_active` 会输出，但进程启动后没有代码更新它，数值保持 `0`。`failsafe_mode` 写入 DCS 也不会打开 Failsafe。不要按这个指标告警。见 [TODO #4](TODO.md)。
+Failsafe 在 pg-ha 的内嵌 RaftDcs 下不适用，已移除（SB-04 NO-GO），因此没有 `pg_ha_failsafe_active` 指标。无法到达共识的场景由租约到期 fencing（见 [invariants.md](invariants.md) L5 /「租约到期围栏」）处理。见 [TODO #4](TODO.md)。
 
 ---
 
@@ -370,7 +367,7 @@ curl -u admin:secret -X PUT http://localhost:8008/config \
 | 同步复制参数 | Primary 下一 cycle：改 PG + 写 DCS `/sync`（两阶段） | `synchronous_mode`, `synchronous_mode_strict`, `synchronous_node_count`, `maximum_lag_on_syncnode` |
 | PG reload 参数 | 自动执行 `pg_ctl reload` | `work_mem`, `effective_cache_size` |
 | PG restart 参数 | 设置 `pending_restart` 标志，不自动重启 | `max_connections`, `shared_buffers`, `wal_level`, `max_wal_senders` |
-| `failsafe_mode` | 会写入 DCS `/config`，HA 循环不读取 | 见 [TODO #4](TODO.md) |
+| `failsafe_mode` | 向后兼容保留但为 **no-op**（RaftDcs 下 failsafe 不适用，SB-04 NO-GO） | 见 [TODO #4](TODO.md) |
 | `standby_cluster` | 下一 cycle：持锁节点改为跟随远端 | 见下文「Standby cluster」 |
 
 对于需要 restart 的参数，需手动执行：
@@ -1140,7 +1137,7 @@ pg-ha-ctl --endpoint http://localhost:8008 resume
 | 待重启 | `pg_ha_pending_restart` | 需要手动 `POST /restart` |
 | 暂停模式 | `pg_ha_is_paused` | 自动 failover 已禁用 |
 
-`pg_ha_failsafe_active` 有输出，但 agent 不更新，不能当告警条件。
+Failsafe 在内嵌 RaftDcs 下不适用，已移除（SB-04 NO-GO）；没有 `pg_ha_failsafe_active` 指标。
 
 ### 告警阈值建议
 

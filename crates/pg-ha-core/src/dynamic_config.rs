@@ -55,7 +55,10 @@ pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synchronous_node_count: Option<u32>,
 
-    /// Enable failsafe mode for DCS outage handling
+    /// Accepted for backward compatibility but ignored. Failsafe mode is not
+    /// applicable under pg-ha's embedded RaftDcs (unreachable-consensus is
+    /// handled by lease-expiry fencing, R19); see docs/invariants.md P3.
+    /// Existing configs that set it keep parsing; the value has no effect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failsafe_mode: Option<bool>,
 
@@ -193,7 +196,6 @@ pub fn detect_changes(old: &GlobalConfig, new: &GlobalConfig) -> ConfigChanges {
         || old.synchronous_mode != new.synchronous_mode
         || old.synchronous_mode_strict != new.synchronous_mode_strict
         || old.synchronous_node_count != new.synchronous_node_count
-        || old.failsafe_mode != new.failsafe_mode
         || old.pause != new.pause
         || old.standby_cluster != new.standby_cluster
     {

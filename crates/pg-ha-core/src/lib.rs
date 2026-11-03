@@ -7,7 +7,6 @@
 //! - HA decision engine (the loop that manages failover/promotion)
 //! - PostgreSQL lifecycle management (start/stop/promote/rewind)
 //! - Watchdog integration
-//! - Failsafe mode logic
 //! - Replication slot and synchronous replication management
 
 pub mod bootstrap;
@@ -19,7 +18,6 @@ pub mod config;
 pub mod dcs;
 pub mod dynamic_config;
 pub mod error;
-pub mod failsafe;
 pub mod ha;
 pub mod history;
 pub mod postgresql;

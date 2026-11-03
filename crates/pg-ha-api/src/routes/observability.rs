@@ -17,7 +17,6 @@ pub(crate) async fn get_metrics(State(state): State<RouterState>) -> impl IntoRe
     let replication_lag = s.replication_lag.unwrap_or(0);
     let pending_restart: u8 = if s.pending_restart { 1 } else { 0 };
     let is_paused: u8 = if s.is_paused { 1 } else { 0 };
-    let failsafe_active: u8 = if s.failsafe_active { 1 } else { 0 };
 
     let dcs_last_seen_seconds = s
         .dcs_last_seen
@@ -40,9 +39,6 @@ pg_ha_timeline {timeline}
 # HELP pg_ha_dcs_last_seen_seconds Seconds since last successful DCS communication
 # TYPE pg_ha_dcs_last_seen_seconds gauge
 pg_ha_dcs_last_seen_seconds {dcs_last_seen_seconds}
-# HELP pg_ha_failsafe_active Whether failsafe mode is currently active (1 = active)
-# TYPE pg_ha_failsafe_active gauge
-pg_ha_failsafe_active {failsafe_active}
 # HELP pg_ha_pending_restart Whether a PostgreSQL restart is pending (1 = pending)
 # TYPE pg_ha_pending_restart gauge
 pg_ha_pending_restart {pending_restart}

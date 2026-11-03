@@ -95,9 +95,6 @@ pub struct Ha {
     is_leader: bool,
     is_paused: bool,
 
-    // --- Failsafe ---
-    failsafe: crate::failsafe::Failsafe,
-
     // ─── Dynamic configuration ───
     dynamic_config_state: DynamicConfigState,
 
@@ -187,7 +184,6 @@ impl Ha {
             cluster: Cluster::empty(),
             is_leader: false,
             is_paused: false,
-            failsafe: crate::failsafe::Failsafe::new(30),
             dynamic_config_state: DynamicConfigState::new(),
             cmd_rx,
             pending_switchover: None,
@@ -282,14 +278,6 @@ impl Ha {
                     .and_then(|c| c.data.get("pause"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-
-                let failsafe_members: std::collections::HashMap<String, String> = self
-                    .cluster
-                    .members
-                    .iter()
-                    .map(|m| (m.name.clone(), m.api_url.clone()))
-                    .collect();
-                self.failsafe.update_members(failsafe_members);
 
                 // D6: the pending promote belongs to one lock term.
                 if !self.is_lock_owner() {
@@ -1128,69 +1116,41 @@ impl Ha {
         }
     }
 
-    /// Handle DCS communication failure
+    /// Handle DCS communication failure.
+    ///
+    /// Under the embedded `RaftDcs`, `get_cluster` is a local read that never
+    /// returns `Err`, so this path is unreachable in production; it is kept
+    /// only to honour the fallible `DcsAdapter::get_cluster` trait contract
+    /// (a different adapter could error). When a DCS read fails while we hold
+    /// the leader lock the only safe action is to demote and prevent
+    /// split-brain. The "stay primary by confirming topology over REST"
+    /// (Patroni failsafe) behaviour is intentionally absent: unreachable
+    /// consensus is handled, more conservatively, by lease-expiry fencing
+    /// (L5 time bound, see `run_cycle_bounded`; SB-04 calls this R19).
     async fn handle_dcs_error(&mut self) -> CycleResult {
         if self.is_leader {
-            // DCS unreachable while we hold the leader lock.
-            // Before demoting, check if replicas can still see us (failsafe mode).
-            let failsafe_result = self.failsafe.check_topology(&self.config.name).await;
-            match failsafe_result {
-                crate::failsafe::FailsafeResult::AllConfirmed => {
-                    warn!("DCS unreachable but failsafe check passed = continuing as primary");
-                    CycleResult::Error("DCS unreachable: failsafe active, staying primary".into())
+            // DCS read failed while we hold the leader lock: demote to prevent
+            // split-brain.
+            warn!("DCS unreachable while holding leader lock - demoting to prevent split-brain");
+            self.is_leader = false;
+            self.reset_sync_cache();
+            let written = self
+                .prepare_demotion(None, Some("demoted because the DCS is unreachable"))
+                .await;
+            if let Err(e) = &written {
+                error!(
+                    "Failed to write standby configuration before DCS-error demotion: {e}; stopping PostgreSQL anyway"
+                );
+            }
+            let _ = self.stop_after_demotion_write("fast").await;
+            self.postgresql.set_role(MemberRole::Replica);
+            match written {
+                Ok(()) => {
+                    CycleResult::Error("DCS unreachable: demoted to prevent split-brain".into())
                 }
-                crate::failsafe::FailsafeResult::Disabled => {
-                    warn!(
-                        "DCS unreachable while holding leader lock - demoting to prevent split-brain"
-                    );
-                    self.is_leader = false;
-                    self.reset_sync_cache();
-                    let written = self
-                        .prepare_demotion(None, Some("demoted because the DCS is unreachable"))
-                        .await;
-                    if let Err(e) = &written {
-                        error!(
-                            "Failed to write standby configuration before DCS-error demotion: {e}; stopping PostgreSQL anyway"
-                        );
-                    }
-                    let _ = self.stop_after_demotion_write("fast").await;
-                    self.postgresql.set_role(MemberRole::Replica);
-                    match written {
-                        Ok(()) => CycleResult::Error(
-                            "DCS unreachable: demoted to prevent split-brain".into(),
-                        ),
-                        Err(e) => CycleResult::Error(format!(
-                            "DCS unreachable: demoted to prevent split-brain, but standby configuration could not be written: {e}"
-                        )),
-                    }
-                }
-
-                crate::failsafe::FailsafeResult::NotAllConfirmed { failed } => {
-                    warn!(
-                        ?failed,
-                        "DCS unreachable and failsafe check failed - demoting"
-                    );
-                    self.is_leader = false;
-                    self.reset_sync_cache();
-                    let written = self
-                        .prepare_demotion(None, Some("demoted because the DCS is unreachable"))
-                        .await;
-                    if let Err(e) = &written {
-                        error!(
-                            "Failed to write standby configuration before DCS-error demotion: {e}; stopping PostgreSQL anyway"
-                        );
-                    }
-                    let _ = self.stop_after_demotion_write("fast").await;
-                    self.postgresql.set_role(MemberRole::Replica);
-                    match written {
-                        Ok(()) => CycleResult::Error(format!(
-                            "DCS unreachable: failsafe failed ({failed:?}), demoted"
-                        )),
-                        Err(e) => CycleResult::Error(format!(
-                            "DCS unreachable: failsafe failed ({failed:?}), demoted, but standby configuration could not be written: {e}"
-                        )),
-                    }
-                }
+                Err(e) => CycleResult::Error(format!(
+                    "DCS unreachable: demoted to prevent split-brain, but standby configuration could not be written: {e}"
+                )),
             }
         } else {
             // A demotion stop failed earlier: keep trying to stop PostgreSQL
@@ -2680,44 +2640,23 @@ mod tests {
         assert!(renewed, "Lock renewal should succeed for lock owner");
     }
     #[tokio::test]
-    async fn test_handle_dcs_error_with_failsafe_disabled_demotes() {
+    async fn test_handle_dcs_error_as_leader_demotes() {
         let mut config = test_config("node1");
         // Missing data dir: the standby config cannot be written.
-        config.postgresql.data_dir = missing_data_dir("dcs-err-disabled");
+        config.postgresql.data_dir = missing_data_dir("dcs-err-leader");
         let dcs = Arc::new(MockDcs::with_leader("node1"));
         let pg = Postgresql::new(config.postgresql.clone());
         let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
 
         // Simulate: we think we're leader
         ha.is_leader = true;
-        // failsafe is disabled by default (Failsafe::new sets enabled=false)
 
         let result = ha.handle_dcs_error().await;
         let msg = format!("{result}");
 
-        // Should demote because failsafe is disabled
+        // A DCS read error while leader always demotes to prevent split-brain.
         assert!(!ha.is_leader());
         assert!(msg.contains("demoted"));
-        assert!(msg.contains("could not be written"), "{msg}");
-    }
-
-    #[tokio::test]
-    async fn test_handle_dcs_error_with_failsafe_enabled_no_members_demotes() {
-        let mut config = test_config("node1");
-        config.postgresql.data_dir = missing_data_dir("dcs-err-no-members");
-        let dcs = Arc::new(MockDcs::with_leader("node1"));
-        let pg = Postgresql::new(config.postgresql.clone());
-        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
-
-        ha.is_leader = true;
-        ha.failsafe.set_enabled(true);
-        // No members updated → failsafe will return NotAllConfirmed
-
-        let result = ha.handle_dcs_error().await;
-        let msg = format!("{result}");
-
-        assert!(!ha.is_leader());
-        assert!(msg.contains("failsafe failed"));
         assert!(msg.contains("could not be written"), "{msg}");
     }
 
@@ -2947,28 +2886,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_dcs_error_resets_sync_cache() {
-        // Disabled failsafe → Disabled branch; enabled with no members →
-        // NotAllConfirmed branch. Both leave the primary role.
-        for (failsafe_enabled, expected) in [(false, "demoted"), (true, "failsafe failed")] {
-            let label = format!("c1-dcs-error-sync-{failsafe_enabled}");
-            let (mut ha, dir) = identity_test_ha(
-                "node1",
-                &label,
-                Arc::new(MockDcs::with_leader("node1")),
-                Some(false),
-                false,
-            );
-            ha.is_leader = true;
-            ha.failsafe.set_enabled(failsafe_enabled);
-            ha.applied_sync_standby_names = applied_sync();
+        // A DCS read error while leader demotes and clears the sync cache.
+        let (mut ha, dir) = identity_test_ha(
+            "node1",
+            "c1-dcs-error-sync",
+            Arc::new(MockDcs::with_leader("node1")),
+            Some(false),
+            false,
+        );
+        ha.is_leader = true;
+        ha.applied_sync_standby_names = applied_sync();
 
-            let result = ha.handle_dcs_error().await;
+        let result = ha.handle_dcs_error().await;
 
-            assert!(format!("{result}").contains(expected), "got: {result}");
-            assert_eq!(ha.applied_sync_standby_names, None, "{label}");
-            assert!(!ha.is_leader());
-            let _ = std::fs::remove_dir_all(&dir);
-        }
+        assert!(format!("{result}").contains("demoted"), "got: {result}");
+        assert_eq!(ha.applied_sync_standby_names, None);
+        assert!(!ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -3640,7 +3574,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    async fn dcs_error_demotion(label: &str, failsafe_enabled: bool) -> (Ha, PathBuf, String) {
+    async fn dcs_error_demotion(label: &str) -> (Ha, PathBuf, String) {
         let (mut ha, dir) = identity_test_ha(
             "node1",
             label,
@@ -3650,26 +3584,14 @@ mod tests {
         );
         preset_auto_conf(&dir, "old");
         ha.is_leader = true;
-        ha.failsafe.set_enabled(failsafe_enabled);
         let result = ha.handle_dcs_error().await;
         (ha, dir, format!("{result}"))
     }
 
     #[tokio::test]
-    async fn test_handle_dcs_error_disabled_writes_signal_and_marker() {
-        let (ha, dir, msg) = dcs_error_demotion("c2-dcs-disabled", false).await;
+    async fn test_handle_dcs_error_writes_signal_and_marker() {
+        let (ha, dir, msg) = dcs_error_demotion("c2-dcs-error").await;
         assert!(msg.contains("demoted to prevent split-brain"), "{msg}");
-        assert!(!msg.contains("could not be written"), "{msg}");
-        assert_demoted_files(&dir, &ha, "demoted because the DCS is unreachable");
-        assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
-        assert!(!ha.is_leader());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn test_handle_dcs_error_not_all_confirmed_writes_signal_and_marker() {
-        let (ha, dir, msg) = dcs_error_demotion("c2-dcs-not-all", true).await;
-        assert!(msg.contains("failsafe failed"), "{msg}");
         assert!(!msg.contains("could not be written"), "{msg}");
         assert_demoted_files(&dir, &ha, "demoted because the DCS is unreachable");
         assert_eq!(ha.postgresql().observed_in_recovery(), None, "stop called");
@@ -7748,19 +7670,13 @@ mod tests {
 
         // Paths that write through prepare_demotion, then stop.
         let demote = body(mod_rs, "async fn demote");
-        let disabled = section(
-            mod_rs,
-            "FailsafeResult::Disabled =>",
-            &["FailsafeResult::NotAllConfirmed"],
-        );
-        let not_all = section(mod_rs, "FailsafeResult::NotAllConfirmed {", &["} else {"]);
+        let dcs_error = body(mod_rs, "async fn handle_dcs_error");
         let fence = section(follow_rs, "FollowerAction::Fence =>", &["FollowerAction::"]);
         let switchover = body(commands_rs, "async fn handle_switchover_command");
         let fence_primary = body(helpers_rs, "async fn fence_primary");
         for (what, text) in [
             ("demote", demote),
-            ("handle_dcs_error Disabled", disabled),
-            ("handle_dcs_error NotAllConfirmed", not_all),
+            ("handle_dcs_error", dcs_error),
             ("follower Fence", fence),
             ("switchover", switchover),
             ("fence_primary", fence_primary),
