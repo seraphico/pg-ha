@@ -2,6 +2,7 @@
 # Database connection verification tests
 # Tests: direct PG access, replication, read-only enforcement, proxy routing
 
+source "$(dirname "${BASH_SOURCE[0]}")/rest_env.sh"
 PASS=0; FAIL=0
 check() {
   if [ "$1" = "$2" ]; then
@@ -46,7 +47,7 @@ done
 # If no container reports recovery=f, check who the HA engine says is primary
 if [ -z "$PRIMARY_CONTAINER" ]; then
   for port in 8008 8009 8010; do
-    CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/primary)
+    CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" $SCHEME://localhost:$port/primary)
     if [ "$CODE" = "200" ]; then
       case "$port" in
         8008) PRIMARY_CONTAINER="pg-ha-node1" ;;

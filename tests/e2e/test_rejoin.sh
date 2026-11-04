@@ -1,6 +1,7 @@
 #!/bin/bash
 # Test: Old primary rejoin after failover via pg_rewind
 
+source "$(dirname "${BASH_SOURCE[0]}")/rest_env.sh"
 echo "═══════════════════════════════════════════════"
 echo " 旧 Primary 重新加入测试 (pg_rewind)"
 echo "═══════════════════════════════════════════════"
@@ -15,7 +16,7 @@ psql_node() {
 PRIMARY_CONTAINER=""
 PRIMARY_PORT=""
 for port in 8008 8009 8010; do
-  CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/primary)
+  CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" $SCHEME://localhost:$port/primary)
   if [ "$CODE" = "200" ]; then
     PRIMARY_PORT=$port
     case $port in
@@ -47,7 +48,7 @@ for i in $(seq 1 6); do
   sleep 5
   for port in 8008 8009 8010; do
     if [ "$port" = "$PRIMARY_PORT" ]; then continue; fi
-    CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/primary 2>/dev/null)
+    CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" $SCHEME://localhost:$port/primary 2>/dev/null)
     if [ "$CODE" = "200" ]; then
       NEW_PRIMARY=$port
       break 2
@@ -85,7 +86,7 @@ echo ""
 REJOINED=false
 for i in $(seq 1 12); do
   sleep 5
-  STATUS=$(curl -s http://localhost:$PRIMARY_PORT/patroni 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['role']} ({d['state']})\")" 2>/dev/null || echo "not responding")
+  STATUS=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$PRIMARY_PORT/patroni 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['role']} ({d['state']})\")" 2>/dev/null || echo "not responding")
   echo "  ${i}x5s: old primary = $STATUS"
   if echo "$STATUS" | grep -qi "replica.*running\|Replica.*Running"; then
     REJOINED=true
@@ -126,6 +127,6 @@ echo "════════════════════════�
 echo ""
 echo "Final cluster state:"
 for port in 8008 8009 8010; do
-  STATUS=$(curl -s http://localhost:$port/patroni 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['name']}: {d['role']} ({d['state']})\")" 2>/dev/null || echo "not responding")
+  STATUS=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$port/patroni 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['name']}: {d['role']} ({d['state']})\")" 2>/dev/null || echo "not responding")
   echo "  :$port -> $STATUS"
 done
