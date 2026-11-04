@@ -260,6 +260,13 @@ async fn main() -> anyhow::Result<()> {
     let ro_addr: SocketAddr = format!("{}:{}", config.proxy.ro_listen, config.proxy.ro_port)
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid proxy RO address: {e}"))?;
+    if proxy_probe_trusts_system_roots_only(config.restapi.tls.as_ref()) {
+        warn!(
+            "restapi.tls is set without ca_cert: the proxy health probe trusts system root \
+             certificates only and may mark every backend DOWN if the REST certificate is \
+             signed by a private CA. Set restapi.tls.ca_cert to the CA that signed it."
+        );
+    }
     let health_client = pg_ha_proxy::build_health_client(
         config.restapi.tls.as_ref(),
         pg_ha_proxy::HealthCheckConfig::default().timeout,
@@ -529,8 +536,10 @@ async fn refresh_proxy_backends(
     api_port: u16,
     https: bool,
 ) {
+    let mut mismatch_warned = SchemeMismatchWarned::default();
     while members_rx.changed().await.is_ok() {
         let members = members_rx.borrow_and_update().clone();
+        mismatch_warned.retain_members(&members);
         let mut backends: Vec<PgBackend> = Vec::new();
         for m in &members {
             let Some(addr) = resolve_pg_addr(&m.conn_url).await else {
@@ -545,6 +554,16 @@ async fn refresh_proxy_backends(
                 api_url_from_conn_url(&m.conn_url, api_port, https)
                     .unwrap_or_else(|| rest_base_url(&addr.ip().to_string(), api_port, https))
             } else {
+                if mismatch_warned.should_warn(&m.name, &m.api_url, https) {
+                    warn!(
+                        member = %m.name,
+                        api_url = %m.api_url,
+                        local_rest_tls = https,
+                        "Member publishes a REST scheme that differs from this node's REST TLS mode; \
+                         probing with this node's scheme. All nodes must use the same restapi.tls mode \
+                         (mixed clusters are not supported)."
+                    );
+                }
                 align_api_scheme(&m.api_url, https)
             };
             backends.push(PgBackend {
@@ -593,6 +612,44 @@ fn api_url_from_conn_url(conn_url: &str, api_port: u16, https: bool) -> Option<S
 fn rest_base_url(host: &str, api_port: u16, https: bool) -> String {
     let scheme = if https { "https" } else { "http" };
     format!("{scheme}://{host}:{api_port}")
+}
+
+/// True when `restapi.tls` is set but has no `ca_cert`, so the proxy probe
+/// can only verify the REST certificate against system roots.
+fn proxy_probe_trusts_system_roots_only(
+    tls: Option<&pg_ha_core::config::RestApiTlsConfig>,
+) -> bool {
+    tls.is_some_and(|t| t.ca_cert.is_none())
+}
+
+/// True when the URL's scheme differs from this node's REST TLS mode.
+/// URLs without a recognised scheme are not counted as a mismatch.
+fn api_scheme_mismatch(url: &str, https: bool) -> bool {
+    if url.starts_with("https://") {
+        !https
+    } else if url.starts_with("http://") {
+        https
+    } else {
+        false
+    }
+}
+
+/// Remembers which members already got the scheme-mismatch warning so it is
+/// logged once per member, not on every refresh cycle.
+#[derive(Default)]
+struct SchemeMismatchWarned(std::collections::HashSet<String>);
+
+impl SchemeMismatchWarned {
+    /// True the first time `member` is seen with a mismatching `url`.
+    fn should_warn(&mut self, member: &str, url: &str, https: bool) -> bool {
+        api_scheme_mismatch(url, https) && self.0.insert(member.to_string())
+    }
+
+    /// Forget members that left the cluster.
+    fn retain_members(&mut self, members: &[Member]) {
+        self.0
+            .retain(|name| members.iter().any(|m| &m.name == name));
+    }
 }
 
 /// Published member URLs may still say `http://` after REST TLS is turned on.
@@ -726,6 +783,44 @@ mod tests {
                 port,
             )
         })
+    }
+
+    #[test]
+    fn test_proxy_probe_system_roots_warning_condition() {
+        use pg_ha_core::config::RestApiTlsConfig;
+        let mk = |ca: Option<&str>| RestApiTlsConfig {
+            cert: "/c.crt".into(),
+            key: "/c.key".into(),
+            ca_cert: ca.map(Into::into),
+            require_client_cert: false,
+        };
+        assert!(!proxy_probe_trusts_system_roots_only(None));
+        assert!(proxy_probe_trusts_system_roots_only(Some(&mk(None))));
+        assert!(!proxy_probe_trusts_system_roots_only(Some(&mk(Some(
+            "/ca.crt"
+        )))));
+    }
+
+    #[test]
+    fn test_api_scheme_mismatch_detection() {
+        assert!(api_scheme_mismatch("http://n1:8008", true));
+        assert!(api_scheme_mismatch("https://n1:8008", false));
+        assert!(!api_scheme_mismatch("https://n1:8008", true));
+        assert!(!api_scheme_mismatch("http://n1:8008", false));
+        assert!(!api_scheme_mismatch("n1:8008", true));
+    }
+
+    #[test]
+    fn test_scheme_mismatch_warns_once_per_member() {
+        let mut w = SchemeMismatchWarned::default();
+        assert!(w.should_warn("n1", "http://n1:8008", true));
+        // Same member, later refresh cycles: silent.
+        assert!(!w.should_warn("n1", "http://n1:8008", true));
+        // Another member still warns once.
+        assert!(w.should_warn("n2", "http://n2:8008", true));
+        assert!(!w.should_warn("n2", "http://n2:8008", true));
+        // Matching scheme never warns.
+        assert!(!w.should_warn("n3", "https://n3:8008", true));
     }
 
     // Property test: all valid IPv4:port strings resolve to the correct SocketAddr
