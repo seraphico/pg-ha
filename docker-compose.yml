@@ -27,6 +27,8 @@ services:
       # REST API TLS — default OFF (empty cert = plaintext HTTP, as before).
       # Set PG_HA_RESTAPI_TLS_CERT=/etc/pg-ha/tls/server.crt to enable HTTPS,
       # plus PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT=true for mTLS.
+      # Prefer `make up REST_TLS=off|tls|mtls` (sets these variables for you);
+      # `make status` and tests/e2e/*.sh follow REST_TLS (env var, default off).
       PG_HA_RESTAPI_TLS_CERT: ${PG_HA_RESTAPI_TLS_CERT:-}
       PG_HA_RESTAPI_TLS_KEY: ${PG_HA_RESTAPI_TLS_KEY:-/etc/pg-ha/tls/server.key}
       PG_HA_RESTAPI_TLS_CA_CERT: ${PG_HA_RESTAPI_TLS_CA_CERT:-/etc/pg-ha/tls/ca.crt}

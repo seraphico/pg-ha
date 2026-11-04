@@ -10,10 +10,12 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# --- REST scheme / curl options (REST_TLS=off|tls|mtls, default off) ---
+source "$(dirname "${BASH_SOURCE[0]}")/rest_env.sh"
 # --- Node configuration ---
-NODE1_API="http://localhost:8008"
-NODE2_API="http://localhost:8009"
-NODE3_API="http://localhost:8010"
+NODE1_API="$SCHEME://localhost:8008"
+NODE2_API="$SCHEME://localhost:8009"
+NODE3_API="$SCHEME://localhost:8010"
 ALL_NODES=("$NODE1_API" "$NODE2_API" "$NODE3_API")
 
 NODE1_PG_PORT=5432
@@ -116,41 +118,41 @@ assert_http_status() {
     local expected_code="$2"
     local msg="${3:-HTTP status check}"
     local actual_code
-    actual_code=$(curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+    actual_code=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
     assert_eq "$expected_code" "$actual_code" "$msg"
 }
 
 # --- HTTP helpers ---
 http_get() {
     local url="$1"
-    curl -s --max-time 5 "$url" 2>/dev/null || echo ""
+    curl "${CURL_OPTS[@]}" --max-time 5 "$url" 2>/dev/null || echo ""
 }
 
 http_get_status() {
     local url="$1"
-    curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null || echo "000"
+    curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null || echo "000"
 }
 
 http_post() {
     local url="$1"
     local data="${2:-}"
     if [ -n "$data" ]; then
-        curl -s --max-time 10 -X POST -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null || echo ""
+        curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 10 -X POST -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null || echo ""
     else
-        curl -s --max-time 10 -X POST "$url" 2>/dev/null || echo ""
+        curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 10 -X POST "$url" 2>/dev/null || echo ""
     fi
 }
 
 http_patch() {
     local url="$1"
     local data="$2"
-    curl -s --max-time 10 -X PATCH -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null || echo ""
+    curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 10 -X PATCH -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null || echo ""
 }
 
 http_put() {
     local url="$1"
     local data="$2"
-    curl -s --max-time 10 -X PUT -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null || echo ""
+    curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 10 -X PUT -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null || echo ""
 }
 
 # --- Cluster inspection ---

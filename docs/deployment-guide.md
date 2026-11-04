@@ -406,7 +406,7 @@ Docker 入口 `docker/entrypoint.sh` 是另一层：它用下面这些变量**�
 | `PG_HA_RAFT_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | 设置了 `PG_HA_RAFT_TLS_CERT` 就写入 `raft.tls` |
 | `PG_HA_RESTAPI_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_REQUIRE_CLIENT_CERT` | 设置了 `PG_HA_RESTAPI_TLS_CERT` 就写入 `restapi.tls`（REST API HTTPS/mTLS）；默认不设置即明文 HTTP |
 
-开发集群 `docker-compose.yml` 会设置 Raft TLS，并把 `./docker/tls` 挂到 `/etc/pg-ha/tls`。REST API TLS 默认关闭（`PG_HA_RESTAPI_TLS_CERT` 为空即明文 HTTP）；要启用，设置 `PG_HA_RESTAPI_TLS_CERT=/etc/pg-ha/tls/server.crt`，mTLS 再加 `PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT=true`（`ca_cert` 默认 `/etc/pg-ha/tls/ca.crt`）。入口生成的 HA 参数是 `loop_wait: 5`、`ttl: 15`、`retry_timeout: 5`（`watchdog.safety_margin` 用默认 5，正好满足 `ttl >= loop_wait + retry_timeout + safety_margin`），REST 认证为 `admin` / `secret`。
+开发集群 `docker-compose.yml` 会设置 Raft TLS，并把 `./docker/tls` 挂到 `/etc/pg-ha/tls`。REST API TLS 默认关闭（`PG_HA_RESTAPI_TLS_CERT` 为空即明文 HTTP）。推荐用 Makefile 开关切换：`make up REST_TLS=off|tls|mtls`（默认 `off`；也可用 `make up-tls` / `make up-mtls`），它会导出下面的 `PG_HA_RESTAPI_TLS_*` 变量；`make status` 与 `tests/e2e/*.sh` 读取同一个 `REST_TLS`（环境变量，默认 `off`；`tls`/`mtls` 时用 `docker/tls` 下的 CA 与客户端证书访问 HTTPS）。同一个端口只能是明文或 TLS 之一，不能同时监听；切换模式时请先 `make down` 再重新 `make up REST_TLS=...`（这是目前最稳妥的做法）。手动启用时，设置 `PG_HA_RESTAPI_TLS_CERT=/etc/pg-ha/tls/server.crt`，mTLS 再加 `PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT=true`（`ca_cert` 默认 `/etc/pg-ha/tls/ca.crt`）。入口生成的 HA 参数是 `loop_wait: 5`、`ttl: 15`、`retry_timeout: 5`（`watchdog.safety_margin` 用默认 5，正好满足 `ttl >= loop_wait + retry_timeout + safety_margin`），REST 认证为 `admin` / `secret`。
 
 ---
 
@@ -657,7 +657,7 @@ curl -s http://localhost:8008/cluster | jq .
 | 端口 | 协议 | 方向 | 用途 |
 |------|------|------|------|
 | 5432 | TCP | 入站 | PostgreSQL 客户端连接（直连） |
-| 8008 | HTTP | 入站 | REST API（健康检查无需认证；管理端点在配置了 `restapi.username` 时要 Basic Auth）。当前没有内建 TLS |
+| 8008 | HTTP 或 HTTPS | 入站 | REST API（健康检查无需认证；管理端点在配置了 `restapi.username` 时要 Basic Auth）。可配置 `restapi.tls` 启用 HTTPS / mTLS，未配置时为明文 HTTP |
 | 2380 | HTTP 或 HTTPS | 节点间 | Raft RPC。未配置 `raft.tls` 时为 HTTP，配置后为 HTTPS |
 | 6432 | TCP | 入站 | Proxy RW（路由到 Primary） |
 | 6433 | TCP | 入站 | Proxy RO（负载均衡到 Replica） |

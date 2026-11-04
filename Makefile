@@ -7,6 +7,10 @@
 #   make down               # wipe cluster (Raft + PGDATA volumes)
 #   make stop               # stop containers, keep data (power-off simulation)
 #   make restart            # restart containers, keep volumes
+#   make up REST_TLS=tls    # REST API over HTTPS (also: make up-tls)
+#   make up REST_TLS=mtls   # REST API over HTTPS + client certs (also: make up-mtls)
+#                           # REST_TLS=off (default) is plaintext HTTP. Run `make down`
+#                           # between modes. `make status` follows REST_TLS.
 #
 # Detected hosts:
 #   Mac ARM  (arm64)     → aarch64-unknown-linux-gnu / linux/arm64
@@ -51,13 +55,33 @@ export DOCKER_PLATFORM
 PG_VERSION ?= 16
 export PG_VERSION
 
+# REST API mode for the dev cluster: off (plaintext HTTP, default) | tls | mtls
+# Translated into the PG_HA_RESTAPI_TLS_* variables read by docker-compose.yml.
+REST_TLS ?= off
+ifeq ($(REST_TLS),off)
+  REST_SCHEME := http
+  REST_CURL   :=
+else ifeq ($(REST_TLS),tls)
+  REST_SCHEME := https
+  REST_CURL   := --cacert docker/tls/ca.crt
+  export PG_HA_RESTAPI_TLS_CERT := /etc/pg-ha/tls/server.crt
+  export PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT := false
+else ifeq ($(REST_TLS),mtls)
+  REST_SCHEME := https
+  REST_CURL   := --cacert docker/tls/ca.crt --cert docker/tls/client.crt --key docker/tls/client.key
+  export PG_HA_RESTAPI_TLS_CERT := /etc/pg-ha/tls/server.crt
+  export PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT := true
+else
+  $(error Invalid REST_TLS='$(REST_TLS)' (expected off|tls|mtls))
+endif
+export REST_TLS
 COMPOSE       ?= docker compose
 COMPOSE_BUILD := $(COMPOSE) -f docker-compose.build.yml
 COMPOSE_DEV   := $(COMPOSE) -f docker-compose.yml
 
 BIN_DIR := target/$(RUST_TARGET)/release
 
-.PHONY: all build docker-build up down stop restart status logs help clean print-env fmt check lint test
+.PHONY: all build docker-build up up-tls up-mtls down stop restart status logs help clean print-env fmt check lint test
 
 ## fmt: format all Rust source code
 fmt:
@@ -78,8 +102,8 @@ test:
 ## all: compile Linux binaries and start the Docker development cluster
 all: up
 	@echo ""
-	@echo "Dev environment ready ($(UNAME_S)/$(UNAME_M) → $(RUST_TARGET), PG $(PG_VERSION))"
-	@echo "  Cluster API : http://localhost:8008/cluster"
+	@echo "Dev environment ready ($(UNAME_S)/$(UNAME_M) → $(RUST_TARGET), PG $(PG_VERSION), REST_TLS=$(REST_TLS))"
+	@echo "  Cluster API : $(REST_SCHEME)://localhost:8008/cluster"
 	@echo "  Postgres    : localhost:5432  (user=postgres password=secret)"
 	@echo "  Proxy RW/RO : localhost:6432 / 6433"
 	@echo "  make status | make logs | make down"
@@ -114,7 +138,14 @@ docker-build: build
 ## up: build binaries + images and start the 3-node cluster
 up: docker-build
 	@echo "==> Starting cluster"
+	@echo "    REST API mode: REST_TLS=$(REST_TLS) ($(REST_SCHEME))"
 	$(COMPOSE_DEV) up -d
+## up-tls: same as `make up REST_TLS=tls` (REST over HTTPS)
+up-tls:
+	$(MAKE) up REST_TLS=tls
+## up-mtls: same as `make up REST_TLS=mtls` (REST over HTTPS + client cert)
+up-mtls:
+	$(MAKE) up REST_TLS=mtls
 
 ## stop: stop containers but keep Raft + PGDATA volumes (simulates power-off)
 stop:
@@ -132,7 +163,7 @@ restart:
 status:
 	$(COMPOSE_DEV) ps
 	@echo ""
-	@curl -sf http://localhost:8008/cluster && echo || echo "(API not ready yet)"
+	@curl -sf$(if $(REST_CURL), $(REST_CURL)) $(REST_SCHEME)://localhost:8008/cluster && echo || echo "(API not ready yet)"
 
 ## logs: follow cluster logs
 logs:

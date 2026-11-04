@@ -9,6 +9,7 @@
 # 7. 再次手动 switchover
 # 8. 最终全集群一致
 
+source "$(dirname "${BASH_SOURCE[0]}")/rest_env.sh"
 PASS=0; FAIL=0
 check() {
   if [ "$1" = "$2" ]; then echo "  ✅ $3"; PASS=$((PASS+1))
@@ -21,7 +22,7 @@ psql_node() {
 
 find_primary() {
   for port in 8008 8009 8010; do
-    CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/primary 2>/dev/null)
+    CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" $SCHEME://localhost:$port/primary 2>/dev/null)
     if [ "$CODE" = "200" ]; then
       case $port in 8008) echo "pg-ha-node1";; 8009) echo "pg-ha-node2";; 8010) echo "pg-ha-node3";; esac
       return
@@ -105,7 +106,7 @@ REJOINED=false
 OLD_PORT=$(port_of "$PRIMARY")
 for i in $(seq 1 12); do
   sleep 5
-  ROLE=$(curl -s http://localhost:$OLD_PORT/patroni 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['role'])" 2>/dev/null)
+  ROLE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$OLD_PORT/patroni 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['role'])" 2>/dev/null)
   if [ "$ROLE" = "Replica" ]; then
     REJOINED=true
     echo "  ✅ 旧Primary已rejoin为Replica (${i}x5s)"; PASS=$((PASS+1))
@@ -139,7 +140,7 @@ for node in pg-ha-node1 pg-ha-node2 pg-ha-node3; do
   fi
 done
 echo "  switchover: $CURRENT_PRIMARY → $CANDIDATE"
-curl -s -u admin:secret -X POST http://localhost:$CURRENT_PORT/switchover \
+curl "${CURL_OPTS[@]}" -u admin:secret -X POST $SCHEME://localhost:$CURRENT_PORT/switchover \
   -H "Content-Type: application/json" \
   -d "{\"candidate\":\"$CANDIDATE\"}" > /dev/null
 
@@ -170,7 +171,7 @@ echo ""
 # ── Final state ──
 echo "── 最终集群状态 ──"
 for port in 8008 8009 8010; do
-  STATUS=$(curl -s http://localhost:$port/patroni 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['name']}: {d['role']} ({d['state']})\")" 2>/dev/null || echo "not responding")
+  STATUS=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$port/patroni 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['name']}: {d['role']} ({d['state']})\")" 2>/dev/null || echo "not responding")
   echo "  :$port -> $STATUS"
 done
 echo ""

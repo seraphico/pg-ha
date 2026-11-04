@@ -2,6 +2,7 @@
 # 全面自洽性验证：验证 PG 层、HA 层、DCS 层、代理层在各场景下状态一致
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/rest_env.sh"
 PASS=0; FAIL=0
 check() {
   if [ "$1" = "$2" ]; then echo "    ✅ $3"; PASS=$((PASS+1))
@@ -34,7 +35,7 @@ for node in pg-ha-node1 pg-ha-node2 pg-ha-node3; do
   case "$node" in
     pg-ha-node1) PORT=8008 ;; pg-ha-node2) PORT=8009 ;; pg-ha-node3) PORT=8010 ;;
   esac
-  HA_ROLE=$(curl -s http://localhost:$PORT/patroni | jq -r '.role')
+  HA_ROLE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$PORT/patroni | jq -r '.role')
   PG_RECOVERY=$(psql_node "$node" "SELECT pg_is_in_recovery()")
 
   echo ""
@@ -48,8 +49,8 @@ for node in pg-ha-node1 pg-ha-node2 pg-ha-node3; do
   fi
 
   # 2. 代理层：Primary 节点 /primary=200, /replica=503
-  PRIMARY_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:$PORT/primary)
-  REPLICA_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:$PORT/replica)
+  PRIMARY_CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$PORT/primary)
+  REPLICA_CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$PORT/replica)
   if [ "$PG_RECOVERY" = "f" ]; then
     check "$PRIMARY_CODE" "200" "$node: /primary → 200 (is primary)"
     check "$REPLICA_CODE" "503" "$node: /replica → 503 (not replica)"
@@ -101,10 +102,10 @@ if [ -n "$NEW_PRIMARY" ]; then
     pg-ha-node1) NP_PORT=8008 ;; pg-ha-node2) NP_PORT=8009 ;; pg-ha-node3) NP_PORT=8010 ;;
   esac
 
-  NP_HA_ROLE=$(curl -s http://localhost:$NP_PORT/patroni | jq -r '.role')
+  NP_HA_ROLE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$NP_PORT/patroni | jq -r '.role')
   check "$NP_HA_ROLE" "Primary" "新 Primary: HA role = Primary"
 
-  NP_PRIMARY_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:$NP_PORT/primary)
+  NP_PRIMARY_CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$NP_PORT/primary)
   check "$NP_PRIMARY_CODE" "200" "新 Primary: /primary → 200"
 
   # 新 Primary 可写
@@ -119,7 +120,7 @@ if [ -n "$NEW_PRIMARY" ]; then
       pg-ha-node1) R_PORT=8008 ;; pg-ha-node2) R_PORT=8009 ;; pg-ha-node3) R_PORT=8010 ;;
     esac
     R_RECOVERY=$(psql_node "$node" "SELECT pg_is_in_recovery()")
-    R_HA_ROLE=$(curl -s http://localhost:$R_PORT/patroni | jq -r '.role')
+    R_HA_ROLE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$R_PORT/patroni | jq -r '.role')
     check "$R_RECOVERY" "t" "$node: PG in-recovery"
     check "$R_HA_ROLE" "Replica" "$node: HA role = Replica"
     # 数据复制到了存活 Replica
@@ -142,9 +143,9 @@ case "$PRIMARY" in
 esac
 
 OLD_RECOVERY=$(psql_node "$PRIMARY" "SELECT pg_is_in_recovery()")
-OLD_HA_ROLE=$(curl -s http://localhost:$OLD_PORT/patroni | jq -r '.role')
-OLD_PRIMARY_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:$OLD_PORT/primary)
-OLD_REPLICA_CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:$OLD_PORT/replica)
+OLD_HA_ROLE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$OLD_PORT/patroni | jq -r '.role')
+OLD_PRIMARY_CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$OLD_PORT/primary)
+OLD_REPLICA_CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$OLD_PORT/replica)
 
 check "$OLD_RECOVERY" "t" "旧 Primary rejoin: PG in-recovery"
 check "$OLD_HA_ROLE" "Replica" "旧 Primary rejoin: HA role = Replica"
