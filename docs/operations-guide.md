@@ -1142,7 +1142,9 @@ PG_HA_USERNAME=admin PG_HA_PASSWORD=secret pg-ha-ctl \
 
 `reinitialize` 对应 `POST /reinitialize`：拒绝在 leader 上执行；在副本上会 `pg_ctl stop -m immediate` 并删掉数据目录（包括 `pg-ha.rewind_check`、`pg-ha.rewind_failed`），下一个 HA cycle 再 clone。成功响应的 `message` 是 `Node reinitialized, will clone on next cycle`。它是 pg_rewind 失败后的标准处理（见「场景 3」）。节点上的 PostgreSQL 正以主库运行（不持锁）时，pg-ha 先写 `standby.signal` 和标记再停库；停库失败则返回错误 `Reinitialize: stopping PostgreSQL failed: <错误>; data directory not removed (pg-ha keeps fencing it)`，不删除数据目录。
 
-`GET /history` 返回进程内历史数组。HA 循环目前不写入事件，所以线上通常是 `[]`。不要把它当成 failover 审计日志。
+`GET /history` 读 DCS 的 `/history` key，返回 JSON 数组，最旧的在前，所有节点返回同样的内容，节点重启后仍在。每条：`timestamp`（Unix 秒）、`event_type`（`failover` 或 `switchover`；`promote` 当前不使用）、`old_leader`（switchover 取意图里的旧主，其他取 `/timeline` 记录的上一个主，不知道则为 null）、`new_leader`、`reason`、`timeline` 和 `lsn`（新主创建的 timeline 及其起点 LSN，即 promote LSN；旧条目或读不到时缺失为 null）。最多保留 100 条，超出时丢最旧的。
+
+写入时机：新主抢到 leader lock 后，在之后第一个 Hold 周期追加；写失败则每个周期重试，不影响选主和 lease。这是尽力而为：新主在抢锁和追加之间崩溃，这一条会丢。不记录：集群首次 bootstrap 的第一个主（新集群返回 `[]`）、standby cluster 的 standby leader。DCS 读失败时返回 503。不要把它当成完整的 failover 审计日志。
 
 ---
 
@@ -1232,7 +1234,7 @@ groups:
 4. **Timeline 变化**：`pg_ha_timeline` 按节点分组，阶梯图
 5. **节点健康状态**：`pg_ha_pg_state`
 
-`GET /history` 目前不会积累 failover 事件，不要做「切换历史」面板。
+`GET /history` 记录 failover / switchover（最多 100 条，尽力而为，节点崩溃时可能丢最近一条），可以做「切换历史」面板，但不要当作完整审计。
 
 ### Prometheus Scrape 配置
 

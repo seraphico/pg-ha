@@ -232,7 +232,7 @@
 |----|------|------|
 | S1 | **Switchover**：在候选可接位的前提下，旧主降级并释放 lock → 新主获取 lock 并 promote → 副本 upstream 指向新主；完成后 L\* 与 H\* 成立。不指定 candidate 时，新主是除 `/failover.leader` 以外最健康的合格节点；该 leader 不参选，其他节点也不把它算进「谁最健康」。 | 持有 |
 | S2 | **Failover**：在 lock 过期或主库确认不可用后，仅合格候选参与选举；胜出者 promote 并写入 lock；完成后 L\* 与 H\* 成立。 | 持有 |
-| S3 | 切换完成后，`GET /cluster`、成员 role/state、以及 history 中的事件与真实拓扑一致。 | 持有 |
+| S3 | 切换完成后，`GET /cluster`、成员 role/state 与真实拓扑一致；`GET /history`（DCS `/history`）**尽力而为**地记下这次 failover / switchover：新主在抢到锁时只在内存里记一条待写条目（事件类型、旧主、原因），之后第一个 Hold 周期把它 CAS 追加进 `/history`（有界超时，版本冲突最多重试 3 次，失败则下一轮重试）。promote 路径不写 DCS，历史写入失败不改变周期结果、不降级、不围栏。因此新主在抢锁到追加之间崩溃会丢这一条；集群初次 bootstrap 不记录；standby cluster 的 standby leader 不记录。历史不是审计日志。 | 持有（尽力而为） |
 | S4 | 旧 Primary 回归：不得形成双主；须走检测 → rewind / basebackup / rejoin 故事，最终成为指向当前 leader 的 Replica（或维护态）。 | 持有 |
 | S5 | **DCS `/sync` 始终是 PG `synchronous_standby_names` 的子集**：发布进 `/sync` 的名字必在 PG 当前的同步名单内，且已确认追上（`flush_lsn` 达到 PG 名单变更时记录的 Primary flush LSN，在 `maximum_lag_on_syncnode` 之内）、实际在 `pg_stat_replication` 中流复制。两次写有对称顺序保证子集在 cycle 被打断时也成立：**加入**——先扩 PG 名单、确认追上，再扩 `/sync`；**移除**——先缩 `/sync`，再缩 PG 名单。当 `synchronous_mode` 启用时，Failover / Switchover 候选必须属于 `/sync.sync_standby`；`/sync` 缺失、空或为不可满足的 strict 占位时任何节点均不得晋升。存在**过渡窗口**：新 promote 的主库先发布空/仅自身的 `/sync`、备库追上后再补入，期间 `/sync` 可能短暂收缩甚至为空，此时无节点可晋升（failover 暂时禁止但安全）。`synchronous_mode_strict` 仅影响写阻塞（用不可满足的占位名单，不是 `*`），不参与选举。仅 Priority（`FIRST N`）模式接入运行路径。 | 持有 |
 
