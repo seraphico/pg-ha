@@ -1247,3 +1247,23 @@ scrape_configs:
           - "10.0.1.3:8008"
     metrics_path: /metrics
 ```
+
+REST API 启用 `restapi.tls` 后，抓取必须改用 HTTPS 并信任服务器证书的 CA；mTLS 还要带客户端证书：
+
+```yaml
+scrape_configs:
+  - job_name: "pg-ha"
+    scrape_interval: 5s
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/pg-ha-ca.crt
+      # 仅 mTLS（require_client_cert: true）需要：
+      cert_file: /etc/prometheus/pg-ha-client.crt
+      key_file: /etc/prometheus/pg-ha-client.key
+    static_configs:
+      - targets:
+          - "10.0.1.1:8008"
+          - "10.0.1.2:8008"
+          - "10.0.1.3:8008"
+    metrics_path: /metrics
+```

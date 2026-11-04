@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io;
 use tokio::net::{TcpListener, TcpStream};
@@ -89,6 +89,8 @@ struct BackendHealth {
     ro_fail_count: u32,
     /// Consecutive RO check successes
     ro_success_count: u32,
+    /// When the last probe error was logged; `None` while probes are clean
+    last_probe_error_log: Option<Instant>,
     /// Connection limiter
     semaphore: Arc<Semaphore>,
     /// Shutdown signal for active connections (sent when marked down)
@@ -132,15 +134,11 @@ pub struct PgProxy {
 }
 
 impl PgProxy {
+    /// Plain-HTTP proxy with default health settings (tests and tools).
+    /// Production wiring uses [`Self::with_health_client`] so the probe
+    /// carries the REST TLS material.
     pub fn new(rw_addr: SocketAddr, ro_addr: SocketAddr) -> Self {
-        Self::with_health_config(rw_addr, ro_addr, HealthCheckConfig::default())
-    }
-
-    pub fn with_health_config(
-        rw_addr: SocketAddr,
-        ro_addr: SocketAddr,
-        health_config: HealthCheckConfig,
-    ) -> Self {
+        let health_config = HealthCheckConfig::default();
         let client = reqwest::Client::builder()
             .timeout(health_config.timeout)
             .build()
@@ -148,8 +146,8 @@ impl PgProxy {
         Self::with_health_client(rw_addr, ro_addr, health_config, client)
     }
 
-    /// Same as [`Self::with_health_config`], but probes with `client`.
-    /// The caller sets the timeout and any TLS material on that client.
+    /// Probes with `health_client`. The caller sets the timeout and any TLS
+    /// material on that client.
     pub fn with_health_client(
         rw_addr: SocketAddr,
         ro_addr: SocketAddr,
@@ -194,12 +192,13 @@ impl PgProxy {
         // Register / refresh backends for health checking
         let mut health = self.health_state.write().await;
         for backend in &backends {
-            let api_url = if backend.api_url.is_empty() {
-                // Last resort: derive from resolved PG address (IPs break Docker hostnames)
-                format!("http://{}:8008", backend.addr.ip())
-            } else {
-                backend.api_url.clone()
-            };
+            if backend.api_url.is_empty() {
+                // No safe guess: the port and scheme come from restapi config,
+                // which the caller already applied when building `api_url`.
+                warn!(node = %backend.name, "Skipping proxy backend: no REST API URL for health checks");
+                continue;
+            }
+            let api_url = backend.api_url.clone();
 
             if let Some(existing) = health.get_mut(&backend.name) {
                 existing.addr = backend.addr;
@@ -220,6 +219,7 @@ impl PgProxy {
                         rw_success_count: 0,
                         ro_fail_count: 0,
                         ro_success_count: 0,
+                        last_probe_error_log: None,
                         semaphore: Arc::new(Semaphore::new(self.health_config.max_connections)),
                         shutdown_tx,
                     },
@@ -351,6 +351,52 @@ pub fn build_health_client(
         .map_err(|err| anyhow::anyhow!("failed to build proxy health client: {err}"))
 }
 
+/// Minimum gap between probe-error log lines for one backend that keeps failing.
+const PROBE_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Decide whether this cycle's probe error should be logged. The first error
+/// after a clean cycle is logged at once; while the backend keeps failing,
+/// at most one line per `interval`. A clean cycle resets the limiter.
+fn probe_error_log_due(
+    last: &mut Option<Instant>,
+    now: Instant,
+    interval: Duration,
+    had_error: bool,
+) -> bool {
+    if !had_error {
+        *last = None;
+        return false;
+    }
+    match *last {
+        Some(prev) if now.duration_since(prev) < interval => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
+/// Render an error with its `source()` chain (`outer: inner: root`).
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut cur = err.source();
+    while let Some(e) = cur {
+        out.push_str(": ");
+        out.push_str(&e.to_string());
+        cur = e.source();
+    }
+    out
+}
+
+/// One HEAD probe. Transport failures (connect, TLS, timeout) are `Err` with
+/// the rendered chain; any HTTP response is `Ok(is_success)`.
+async fn probe(client: &reqwest::Client, url: &str) -> Result<bool, String> {
+    match client.head(url).send().await {
+        Ok(r) => Ok(r.status().is_success()),
+        Err(e) => Err(error_chain(&e)),
+    }
+}
+
 /// Active health checker that polls backends periodically.
 /// Equivalent to HAProxy's `option httpchk` with `inter`, `fall`, `rise`.
 async fn run_health_checker(
@@ -386,19 +432,9 @@ async fn run_health_checker(
                 let name = name.clone();
                 let api_url = api_url.clone();
                 async move {
-                    let rw_ok = client
-                        .head(format!("{api_url}/primary"))
-                        .send()
-                        .await
-                        .map(|r| r.status().is_success())
-                        .unwrap_or(false);
-                    let ro_ok = client
-                        .head(format!("{api_url}/replica"))
-                        .send()
-                        .await
-                        .map(|r| r.status().is_success())
-                        .unwrap_or(false);
-                    (name, rw_ok, ro_ok)
+                    let rw = probe(&client, &format!("{api_url}/primary")).await;
+                    let ro = probe(&client, &format!("{api_url}/replica")).await;
+                    (name, api_url, rw, ro)
                 }
             })
             .collect();
@@ -407,15 +443,38 @@ async fn run_health_checker(
 
         let mut rw_results: Vec<(String, bool)> = Vec::new();
         let mut ro_results: Vec<(String, bool)> = Vec::new();
-        for (name, rw_ok, ro_ok) in results {
-            rw_results.push((name.clone(), rw_ok));
-            ro_results.push((name, ro_ok));
+        let mut probe_errors: Vec<(String, String, Option<String>)> = Vec::new();
+        for (name, api_url, rw, ro) in results {
+            let err = rw.as_ref().err().or(ro.as_ref().err()).cloned();
+            probe_errors.push((name.clone(), api_url, err));
+            rw_results.push((name.clone(), rw.unwrap_or(false)));
+            ro_results.push((name, ro.unwrap_or(false)));
         }
 
         // Apply fall/rise logic and update upstream state
         let mut upstream_changed = false;
         {
             let mut health = health_state.write().await;
+
+            let now = Instant::now();
+            for (name, api_url, err) in &probe_errors {
+                if let Some(backend) = health.get_mut(name)
+                    && probe_error_log_due(
+                        &mut backend.last_probe_error_log,
+                        now,
+                        PROBE_ERROR_LOG_INTERVAL,
+                        err.is_some(),
+                    )
+                {
+                    warn!(
+                        node = %name,
+                        url = %api_url,
+                        error = %err.as_deref().unwrap_or_default(),
+                        "Health probe failed (repeats suppressed for {}s)",
+                        PROBE_ERROR_LOG_INTERVAL.as_secs()
+                    );
+                }
+            }
 
             for (name, rw_ok) in &rw_results {
                 if let Some(backend) = health.get_mut(name) {
@@ -689,6 +748,87 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_probe_error_log_rate_limited() {
+        let interval = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let mut last = None;
+        // Clean cycle: nothing logged.
+        assert!(!probe_error_log_due(&mut last, t0, interval, false));
+        // First error after a clean cycle logs at once.
+        assert!(probe_error_log_due(&mut last, t0, interval, true));
+        // Repeats inside the interval are suppressed.
+        assert!(!probe_error_log_due(
+            &mut last,
+            t0 + Duration::from_secs(30),
+            interval,
+            true
+        ));
+        // After the interval it logs again.
+        assert!(probe_error_log_due(
+            &mut last,
+            t0 + Duration::from_secs(61),
+            interval,
+            true
+        ));
+        // Recovery resets, so the next failure logs immediately.
+        assert!(!probe_error_log_due(
+            &mut last,
+            t0 + Duration::from_secs(62),
+            interval,
+            false
+        ));
+        assert!(probe_error_log_due(
+            &mut last,
+            t0 + Duration::from_secs(63),
+            interval,
+            true
+        ));
+    }
+
+    #[test]
+    fn test_error_chain_includes_sources() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "inner")
+            }
+        }
+        impl std::error::Error for Inner {}
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "outer")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        assert_eq!(error_chain(&Outer(Inner)), "outer: inner");
+    }
+
+    #[tokio::test]
+    async fn test_update_backends_skips_empty_api_url() {
+        let proxy = PgProxy::new(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        proxy
+            .update_backends(vec![PgBackend {
+                addr: "10.0.0.1:5432".parse().unwrap(),
+                name: "node1".into(),
+                is_primary: true,
+                is_healthy: true,
+                api_url: String::new(),
+            }])
+            .await;
+        assert!(proxy.health_state.read().await.is_empty());
+    }
 
     #[test]
     fn test_upstream_state_primary() {
