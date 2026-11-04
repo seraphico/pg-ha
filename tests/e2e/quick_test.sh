@@ -14,7 +14,14 @@ for p in 8008 8009 8010; do
   CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" $SCHEME://localhost:$p/primary)
   if [ "$CODE" = "200" ]; then PRIMARY_PORT=$p; fi
 done
-check "${PRIMARY_PORT:-none}" "8010" "node3 is primary"
+# Bootstrap leader is whichever node wins the Raft election; do not assume node3.
+check "$([ -n "$PRIMARY_PORT" ] && echo yes || echo none)" "yes" "a primary is elected"
+case "$PRIMARY_PORT" in
+  8008) PRIMARY_CTR=pg-ha-node1; REPLICA_PORT=8009 ;;
+  8009) PRIMARY_CTR=pg-ha-node2; REPLICA_PORT=8010 ;;
+  *)    PRIMARY_CTR=pg-ha-node3; REPLICA_PORT=8008; PRIMARY_PORT=${PRIMARY_PORT:-8010} ;;
+esac
+echo "  primary: $PRIMARY_CTR (:$PRIMARY_PORT)"
 
 REPLICA_COUNT=0
 for p in 8008 8009 8010; do
@@ -23,12 +30,12 @@ for p in 8008 8009 8010; do
 done
 check "$REPLICA_COUNT" "2" "2 replicas"
 
-PG_OK=$(docker exec pg-ha-node3 bash -c 'PGPASSWORD=secret psql -h localhost -U postgres -d postgres -t -A -c "SELECT 1"' 2>/dev/null || echo "fail")
+PG_OK=$(docker exec $PRIMARY_CTR bash -c 'PGPASSWORD=secret psql -h localhost -U postgres -d postgres -t -A -c "SELECT 1"' 2>/dev/null || echo "fail")
 check "$PG_OK" "1" "Primary PG accepting connections"
 echo ""
 
 echo "── Metrics ──"
-METRICS=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:8010/metrics)
+METRICS=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$PRIMARY_PORT/metrics)
 HAS_ROLE=$(echo "$METRICS" | grep -c '^pg_ha_node_role' || echo "0")
 HAS_LAG=$(echo "$METRICS" | grep -c '^pg_ha_replication_lag_bytes' || echo "0")
 check "$HAS_ROLE" "1" "/metrics has pg_ha_node_role"
@@ -36,21 +43,23 @@ check "$HAS_LAG" "1" "/metrics has replication_lag"
 echo ""
 
 echo "── Dynamic Config ──"
-curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" -X PUT $SCHEME://localhost:8010/config -H "Content-Type: application/json" -d '{}' > /dev/null
+curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" -X PUT $SCHEME://localhost:$PRIMARY_PORT/config -H "Content-Type: application/json" -d '{}' > /dev/null
 sleep 1
-R=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:8010/config)
+R=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" $SCHEME://localhost:$PRIMARY_PORT/config)
 check "$R" "{}" "config reset to empty"
 
-curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" -X PUT $SCHEME://localhost:8010/config -H "Content-Type: application/json" \
+curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" -X PUT $SCHEME://localhost:$PRIMARY_PORT/config -H "Content-Type: application/json" \
   -d '{"loop_wait":10,"ttl":30}' > /dev/null
 sleep 2
-LW=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:8008/config | python3 -c "import sys,json; print(json.load(sys.stdin).get('loop_wait',0))")
+LW=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" $SCHEME://localhost:$REPLICA_PORT/config | python3 -c "import sys,json; print(json.load(sys.stdin).get('loop_wait',0))")
 check "$LW" "10" "config visible on replica"
 
-curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" -X PATCH $SCHEME://localhost:8010/config -H "Content-Type: application/json" \
-  -d '{"ttl":null}' > /dev/null
+curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" -X PATCH $SCHEME://localhost:$PRIMARY_PORT/config -H "Content-Type: application/json" \
+  -d '{"loop_wait":null}' > /dev/null
 sleep 1
-HAS_TTL=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:8010/config | python3 -c "import sys,json; print('ttl' in json.load(sys.stdin))")
+# Remove loop_wait (not ttl): dropping ttl back to 15 with loop_wait=10 is rightly
+# rejected by the ttl >= loop_wait + retry_timeout + safety_margin check.
+HAS_TTL=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" $SCHEME://localhost:$PRIMARY_PORT/config | python3 -c "import sys,json; print('loop_wait' in json.load(sys.stdin))")
 check "$HAS_TTL" "False" "PATCH null removes key"
 echo ""
 

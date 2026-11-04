@@ -9,8 +9,9 @@
 #   make restart            # restart containers, keep volumes
 #   make up REST_TLS=tls    # REST API over HTTPS (also: make up-tls)
 #   make up REST_TLS=mtls   # REST API over HTTPS + client certs (also: make up-mtls)
-#                           # REST_TLS=off (default) is plaintext HTTP. Run `make down`
-#                           # between modes. `make status` follows REST_TLS.
+#                           # REST_TLS=off (default) is plaintext HTTP. To switch modes just
+#                           # `make up REST_TLS=<new>` (containers are recreated, volumes kept);
+#                           # `make restart` does NOT switch. `make status` follows REST_TLS.
 #
 # Detected hosts:
 #   Mac ARM  (arm64)     → aarch64-unknown-linux-gnu / linux/arm64
