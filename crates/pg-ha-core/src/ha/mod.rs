@@ -27,6 +27,7 @@ mod commands;
 pub(crate) mod election;
 mod follow;
 mod helpers;
+mod history_log;
 pub(crate) mod identity;
 mod lease;
 mod lineage;
@@ -128,6 +129,10 @@ pub struct Ha {
     /// lock is not ours and after the confirmed record is written.
     promote_pending: Option<crate::cluster::PendingPromote>,
 
+    /// A failover / switchover noted at lock acquisition, waiting to be
+    /// appended to `/history` by a Hold cycle (see `history_log`). Cleared
+    /// when the lock is not ours.
+    pending_history: Option<history_log::PendingHistory>,
     /// Last D6 problem logged at ERROR, so it is not repeated every cycle.
     timeline_problem_logged: Option<String>,
 
@@ -192,6 +197,7 @@ impl Ha {
             sync_pg_list_changed_flush_lsn: None,
             stop_pending: false,
             promote_pending: None,
+            pending_history: None,
             timeline_problem_logged: None,
             rewind_hold: false,
             rewind_hold_persisted: false,
@@ -282,6 +288,7 @@ impl Ha {
                 // D6: the pending promote belongs to one lock term.
                 if !self.is_lock_owner() {
                     self.promote_pending = None;
+                    self.pending_history = None;
                     // Another node (or nobody) holds the lock: no lease left
                     // to race; the follower / election paths fence a primary.
                     self.set_leader_lease(None);
@@ -454,6 +461,8 @@ impl Ha {
                 // D6: /timeline must not be below this primary's timeline.
                 self.record_cluster_timeline().await;
                 self.enforce_synchronous_replication().await;
+                // Best effort and last: never changes the cycle result.
+                self.append_pending_history().await;
                 CycleResult::Leader(format!(
                     "no action. I am ({}), the leader with the lock",
                     self.config.name
@@ -1315,6 +1324,19 @@ mod tests {
     use std::sync::Mutex;
 
     /// Mock DCS for testing HA logic without Raft
+    /// The mock's /history key.
+    #[derive(Default)]
+    struct HistoryMock {
+        /// Stored entries and key version (None: absent).
+        stored: Mutex<(Vec<crate::history::HistoryEntry>, Option<u64>)>,
+        /// Number of write_history calls, failed or not.
+        writes: std::sync::atomic::AtomicUsize,
+        /// When set, write_history returns Err.
+        fail: std::sync::atomic::AtomicBool,
+        /// Number of upcoming writes answered `Ok(false)` after another
+        /// writer "changed" the key (the version moves on).
+        conflicts: std::sync::atomic::AtomicUsize,
+    }
     struct MockDcs {
         cluster: Mutex<Cluster>,
         leader_held_by: Mutex<Option<String>>,
@@ -1332,6 +1354,8 @@ mod tests {
         timeline: Mutex<ClusterTimeline>,
         /// Every write_cluster_timeline record, including rejected ones.
         timeline_writes: Mutex<Vec<TimelineRecord>>,
+        /// The /history key and its fault injection.
+        history: HistoryMock,
         /// When set, write_cluster_timeline returns Err.
         fail_timeline_writes: std::sync::atomic::AtomicBool,
         /// The last data passed to touch_member.
@@ -1361,6 +1385,7 @@ mod tests {
                 fail_delete_leader: std::sync::atomic::AtomicBool::new(false),
                 timeline: Mutex::new(ClusterTimeline::Absent),
                 timeline_writes: Mutex::new(Vec::new()),
+                history: HistoryMock::default(),
                 fail_timeline_writes: std::sync::atomic::AtomicBool::new(false),
                 last_member_data: Mutex::new(None),
                 hang_leader_writes: std::sync::atomic::AtomicBool::new(false),
@@ -1390,6 +1415,7 @@ mod tests {
                 fail_delete_leader: std::sync::atomic::AtomicBool::new(false),
                 timeline: Mutex::new(ClusterTimeline::Absent),
                 timeline_writes: Mutex::new(Vec::new()),
+                history: HistoryMock::default(),
                 fail_timeline_writes: std::sync::atomic::AtomicBool::new(false),
                 last_member_data: Mutex::new(None),
                 hang_leader_writes: std::sync::atomic::AtomicBool::new(false),
@@ -1559,6 +1585,37 @@ mod tests {
             Ok(self.config_value.lock().unwrap().clone())
         }
 
+        async fn read_history(&self) -> Result<(Vec<crate::history::HistoryEntry>, Option<u64>)> {
+            Ok(self.history.stored.lock().unwrap().clone())
+        }
+        async fn write_history(
+            &self,
+            entries: &[crate::history::HistoryEntry],
+            expected: Option<u64>,
+        ) -> Result<bool> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.history.writes.fetch_add(1, SeqCst);
+            if self.history.fail.load(SeqCst) {
+                return Err(crate::error::Error::Dcs(
+                    "injected history write failure".into(),
+                ));
+            }
+            let mut stored = self.history.stored.lock().unwrap();
+            if self
+                .history
+                .conflicts
+                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                stored.1 = Some(stored.1.unwrap_or(0) + 1);
+                return Ok(false);
+            }
+            if stored.1 != expected {
+                return Ok(false);
+            }
+            *stored = (entries.to_vec(), Some(stored.1.unwrap_or(0) + 1));
+            Ok(true)
+        }
         async fn write_cluster_timeline(
             &self,
             record: &TimelineRecord,
@@ -5205,6 +5262,203 @@ mod tests {
 
         // run_cycle observes again (port 1: unobserved → Wait), pending kept.
         assert_eq!(ha.promote_pending, Some(some_pending()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── /history (SB-09) ───
+
+    fn pending_failover() -> history_log::PendingHistory {
+        history_log::PendingHistory {
+            timestamp: 1_700_000_000,
+            event_type: crate::history::HistoryEventType::Failover,
+            old_leader: Some("node1".into()),
+            reason: "automatic failover: the leader lock was free".into(),
+            prev_timeline: None,
+        }
+    }
+
+    fn history_writes(dcs: &MockDcs) -> usize {
+        dcs.history.writes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn stored_history(dcs: &MockDcs) -> Vec<crate::history::HistoryEntry> {
+        dcs.history.stored.lock().unwrap().0.clone()
+    }
+
+    #[tokio::test]
+    async fn test_acquisition_notes_pending_history_without_a_dcs_write() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(3));
+        let (mut ha, dir) = identity_test_ha("node3", "h-acquire", dcs.clone(), Some(true), true);
+        ha.cluster = Cluster {
+            leader: None,
+            timeline: rec(3),
+            failover: Some(Failover {
+                leader: Some("node1".into()),
+                candidate: Some("node3".into()),
+                scheduled_at: None,
+            }),
+            members: vec![
+                member_with_tl("node1", 9000, 3),
+                member_with_tl("node3", 1000, 3),
+            ],
+            ..Default::default()
+        };
+        let _ = ha.process_unhealthy_cluster().await;
+        assert!(ha.is_leader());
+        let pending = ha.pending_history.as_ref().expect("pending entry");
+        assert_eq!(
+            pending.event_type,
+            crate::history::HistoryEventType::Switchover
+        );
+        assert_eq!(pending.old_leader.as_deref(), Some("node1"));
+        assert_eq!(pending.prev_timeline, Some(3));
+        assert_eq!(
+            history_writes(&dcs),
+            0,
+            "the promote path never writes /history"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_classify_acquisition() {
+        use crate::history::HistoryEventType as E;
+        let tl = ClusterTimeline::Record {
+            record: TimelineRecord {
+                primary: "node1".into(),
+                ..test_record(3)
+            },
+            version: 1,
+        };
+        let switchover = Failover {
+            leader: Some("node1".into()),
+            candidate: Some("node2".into()),
+            scheduled_at: None,
+        };
+        let (t, old, _) =
+            history_log::classify_acquisition(Some(&switchover), &ClusterTimeline::Absent);
+        assert_eq!((t, old.as_deref()), (E::Switchover, Some("node1")));
+        let manual = Failover {
+            leader: None,
+            candidate: Some("node2".into()),
+            scheduled_at: None,
+        };
+        let (t, old, _) = history_log::classify_acquisition(Some(&manual), &tl);
+        assert_eq!((t, old.as_deref()), (E::Failover, Some("node1")));
+        let (t, old, _) = history_log::classify_acquisition(None, &tl);
+        assert_eq!((t, old.as_deref()), (E::Failover, Some("node1")));
+        let (t, old, _) = history_log::classify_acquisition(None, &ClusterTimeline::Absent);
+        assert_eq!((t, old), (E::Failover, None));
+    }
+
+    #[tokio::test]
+    async fn test_hold_appends_pending_history_once() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "h-append", dcs.clone(), Some(false), false);
+        ha.cluster = self_led(Some(1), None);
+        ha.pending_history = Some(pending_failover());
+        let result = ha.process_healthy_cluster().await;
+        assert!(matches!(result, CycleResult::Leader(_)), "got: {result}");
+        let stored = stored_history(&dcs);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].new_leader.as_deref(), Some("test_node"));
+        assert_eq!(stored[0].old_leader.as_deref(), Some("node1"));
+        assert_eq!(stored[0].timestamp, 1_700_000_000);
+        assert!(ha.pending_history.is_none());
+        // Nothing pending: later Hold cycles do not write.
+        let _ = ha.process_healthy_cluster().await;
+        assert_eq!(history_writes(&dcs), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_history_append_retries_on_version_conflict() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        dcs.history
+            .conflicts
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let (mut ha, dir) = identity_test_ha("test_node", "h-cas", dcs.clone(), Some(false), false);
+        ha.cluster = self_led(Some(1), None);
+        ha.pending_history = Some(pending_failover());
+        let _ = ha.process_healthy_cluster().await;
+        assert_eq!(history_writes(&dcs), 3, "two conflicts, then success");
+        assert_eq!(stored_history(&dcs).len(), 1);
+        assert!(ha.pending_history.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_history_append_gives_up_after_bounded_conflicts_and_keeps_pending() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        dcs.history
+            .conflicts
+            .store(100, std::sync::atomic::Ordering::SeqCst);
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "h-cas-bound", dcs.clone(), Some(false), false);
+        ha.cluster = self_led(Some(1), None);
+        ha.pending_history = Some(pending_failover());
+        let result = ha.process_healthy_cluster().await;
+        assert!(matches!(result, CycleResult::Leader(_)), "got: {result}");
+        assert_eq!(history_writes(&dcs), 3);
+        assert!(ha.pending_history.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_failed_history_write_keeps_pending_and_never_alters_the_cycle() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "h-fail", dcs.clone(), Some(false), false);
+        ha.cluster = self_led(Some(1), None);
+
+        // Baseline: the cycle without anything pending.
+        let baseline = ha.process_healthy_cluster().await.to_string();
+
+        dcs.history
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        ha.pending_history = Some(pending_failover());
+        let result = ha.process_healthy_cluster().await;
+        assert_eq!(result.to_string(), baseline, "same cycle result");
+        assert!(ha.is_leader(), "no demotion");
+        assert!(ha.pending_history.is_some(), "kept for the next cycle");
+        assert!(stored_history(&dcs).is_empty());
+
+        // The DCS recovers: the next Hold cycle writes the same entry.
+        dcs.history
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let result = ha.process_healthy_cluster().await;
+        assert_eq!(result.to_string(), baseline);
+        assert_eq!(stored_history(&dcs).len(), 1);
+        assert!(ha.pending_history.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_history_append_does_not_duplicate_an_entry_that_landed_late() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = identity_test_ha("test_node", "h-dup", dcs.clone(), Some(false), false);
+        ha.cluster = self_led(Some(1), None);
+        ha.pending_history = Some(pending_failover());
+        let _ = ha.process_healthy_cluster().await;
+        // A write we gave up on committed anyway; the entry is pending again.
+        ha.pending_history = Some(pending_failover());
+        let _ = ha.process_healthy_cluster().await;
+        assert_eq!(stored_history(&dcs).len(), 1);
+        assert!(ha.pending_history.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_pending_history_dropped_when_lock_lost() {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir) = identity_test_ha("test_node", "h-drop", dcs.clone(), Some(true), true);
+        ha.pending_history = Some(pending_failover());
+        let _ = ha.run_cycle().await;
+        assert!(ha.pending_history.is_none());
+        assert_eq!(history_writes(&dcs), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

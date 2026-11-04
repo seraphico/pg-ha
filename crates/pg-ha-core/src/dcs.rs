@@ -4,6 +4,7 @@
 
 use crate::Result;
 use crate::cluster::{Cluster, Leader, TimelineRecord};
+use crate::history::HistoryEntry;
 
 /// Abstract DCS interface.
 ///
@@ -51,6 +52,16 @@ pub trait DcsAdapter: Send + Sync {
         record: &TimelineRecord,
         expected: Option<u64>,
     ) -> Result<bool>;
+
+    /// Read the persistent `/history` key: the entries (oldest first) and the
+    /// key version for `write_history` (`None` when the key does not exist).
+    async fn read_history(&self) -> Result<(Vec<HistoryEntry>, Option<u64>)>;
+
+    /// Write the whole `/history` key (no TTL) only if it still has version
+    /// `expected` (`None`: the key must not exist). Ok(true) when written,
+    /// Ok(false) when the key changed since it was read. Callers append and
+    /// cap the entries (`history::History`); this never merges values.
+    async fn write_history(&self, entries: &[HistoryEntry], expected: Option<u64>) -> Result<bool>;
 
     /// Get the configured TTL written into the leader lock
     fn ttl(&self) -> u64;

@@ -445,21 +445,18 @@ async fn test_history_returns_empty_array() {
 }
 
 #[tokio::test]
-async fn test_history_returns_recorded_events() {
-    use pg_ha_core::history::HistoryEventType;
-
-    let state = test_state();
-    // Record an event via the shared history
-    {
-        let mut history = state.history().write().await;
-        history.record_event(
-            HistoryEventType::Failover,
-            Some("node1".into()),
-            Some("node2".into()),
-            "leader lock expired".into(),
-        );
-    }
-
+async fn test_history_reads_the_dcs() {
+    use pg_ha_core::history::{HistoryEntry, HistoryEventType};
+    let (state, dcs) = config_state("{}");
+    *dcs.history.lock().unwrap() = vec![HistoryEntry {
+        timestamp: 10,
+        event_type: HistoryEventType::Failover,
+        old_leader: Some("node1".into()),
+        new_leader: Some("node2".into()),
+        reason: "leader lock expired".into(),
+        timeline: Some(2),
+        lsn: Some(64),
+    }];
     let app = build_router(state);
     let resp = app
         .oneshot(
@@ -471,7 +468,6 @@ async fn test_history_returns_recorded_events() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-
     let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
     let entries: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
     assert_eq!(entries.len(), 1);
@@ -479,13 +475,15 @@ async fn test_history_returns_recorded_events() {
     assert_eq!(entries[0]["old_leader"], "node1");
     assert_eq!(entries[0]["new_leader"], "node2");
     assert_eq!(entries[0]["reason"], "leader lock expired");
+    assert_eq!(entries[0]["timeline"], 2);
+    assert_eq!(entries[0]["lsn"], 64);
 }
-
 // ─── /config: lease timing constraint (R19) ───
 
 /// DCS stub that only stores the /config value.
 struct ConfigDcs {
     config: std::sync::Mutex<Option<String>>,
+    history: std::sync::Mutex<Vec<pg_ha_core::history::HistoryEntry>>,
 }
 
 #[async_trait::async_trait]
@@ -528,6 +526,18 @@ impl pg_ha_core::dcs::DcsAdapter for ConfigDcs {
     ) -> pg_ha_core::Result<bool> {
         Ok(true)
     }
+    async fn read_history(
+        &self,
+    ) -> pg_ha_core::Result<(Vec<pg_ha_core::history::HistoryEntry>, Option<u64>)> {
+        Ok((self.history.lock().unwrap().clone(), Some(1)))
+    }
+    async fn write_history(
+        &self,
+        _: &[pg_ha_core::history::HistoryEntry],
+        _: Option<u64>,
+    ) -> pg_ha_core::Result<bool> {
+        Ok(true)
+    }
     fn ttl(&self) -> u64 {
         15
     }
@@ -540,6 +550,7 @@ impl pg_ha_core::dcs::DcsAdapter for ConfigDcs {
 fn config_state(stored: &str) -> (AppState, std::sync::Arc<ConfigDcs>) {
     let dcs = std::sync::Arc::new(ConfigDcs {
         config: std::sync::Mutex::new(Some(stored.to_string())),
+        history: std::sync::Mutex::new(Vec::new()),
     });
     let state = AppState::with_dcs(
         "node1".into(),

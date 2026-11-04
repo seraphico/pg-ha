@@ -6,7 +6,6 @@ use pg_ha_core::ApiSnapshot;
 use pg_ha_core::cluster::{MemberRole, MemberState};
 use pg_ha_core::config::LeaseTiming;
 use pg_ha_core::dcs::DcsAdapter;
-use pg_ha_core::history::History;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -19,7 +18,6 @@ pub struct AppState {
     /// This node's static lease timing; PATCH / PUT /config checks dynamic
     /// `ttl` / `loop_wait` / `retry_timeout` changes against it
     lease_timing: Option<LeaseTiming>,
-    history: Arc<RwLock<History>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -27,7 +25,6 @@ impl std::fmt::Debug for AppState {
         f.debug_struct("AppState")
             .field("inner", &"<RwLock<NodeState>>")
             .field("dcs", &self.dcs.as_ref().map(|_| "<DcsAdapter>"))
-            .field("history", &"<RwLock<History>>")
             .finish()
     }
 }
@@ -95,7 +92,6 @@ impl AppState {
             })),
             dcs: None,
             lease_timing: None,
-            history: Arc::new(RwLock::new(History::new())),
         }
     }
 
@@ -132,7 +128,6 @@ impl AppState {
             })),
             dcs: Some(dcs),
             lease_timing: Some(lease_timing),
-            history: Arc::new(RwLock::new(History::new())),
         }
     }
 
@@ -156,11 +151,6 @@ impl AppState {
     /// This node's static lease timing (set together with the DCS adapter)
     pub fn lease_timing(&self) -> Option<LeaseTiming> {
         self.lease_timing
-    }
-
-    /// Get a reference to the shared history
-    pub fn history(&self) -> &Arc<RwLock<History>> {
-        &self.history
     }
 }
 
