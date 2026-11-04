@@ -55,8 +55,18 @@ pg_ha_is_paused {is_paused}
     )
 }
 
-/// GET /history — JSON array of cluster history events
+/// GET /history — JSON array of cluster history events (oldest first), read
+/// from the DCS `/history` key. `[]` without a DCS handle.
 pub(crate) async fn get_history(State(state): State<RouterState>) -> impl IntoResponse {
-    let history = state.app.history().read().await;
-    Json(json!(history.entries()))
+    let Some(dcs) = state.app.dcs() else {
+        return Json(json!([])).into_response();
+    };
+    match dcs.read_history().await {
+        Ok((entries, _version)) => Json(json!(entries)).into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("failed to read /history from the DCS: {e}")})),
+        )
+            .into_response(),
+    }
 }

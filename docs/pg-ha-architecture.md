@@ -239,7 +239,7 @@ flowchart LR
 ├── config          → {loop_wait, ttl, synchronous_mode, postgresql: {...}}
 ├── failover        → {leader, candidate}  (switchover 请求)
 ├── sync            → {leader, sync_standby, quorum}
-└── history         → [{timestamp, event_type, old_leader, new_leader}]
+└── history         → [{timestamp, event_type, old_leader, new_leader, reason, timeline?, lsn?}]  (无 TTL, CAS, 最多 100 条, 持锁主库在 promote 后的 Hold 周期追加)
 ```
 
 ## 同步复制数据流

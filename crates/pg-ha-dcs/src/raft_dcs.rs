@@ -18,6 +18,7 @@ use pg_ha_core::cluster::{
 };
 use pg_ha_core::dcs::DcsAdapter;
 use pg_ha_core::error::{Error, Result};
+use pg_ha_core::history::{History, HistoryEntry};
 
 use crate::network::NetworkFactory;
 use crate::state_machine::{Request, Response, current_millis, stamp_leader_time};
@@ -308,6 +309,11 @@ impl RaftDcs {
     }
 
     /// Persistent cluster timeline (D6): no TTL, never lowered.
+    /// Persistent cluster history (no TTL, capped by `History`).
+    fn history_path(&self) -> String {
+        format!("{}history", self.base_path)
+    }
+
     fn timeline_path(&self) -> String {
         format!("{}timeline", self.base_path)
     }
@@ -482,6 +488,12 @@ impl DcsAdapter for RaftDcs {
                 ClusterTimeline::parse(&e.value, e.version)
             });
 
+        let history = self
+            .store
+            .get(&self.history_path())
+            .await
+            .map(|e| History::from_json(&e.value).into_entries())
+            .unwrap_or_default();
         // Raft voters = pg-ha nodes (all members are voters, see
         // bootstrap_cluster).
         let dcs_voters = Some(
@@ -501,7 +513,7 @@ impl DcsAdapter for RaftDcs {
             config,
             sync_state,
             failover,
-            history: Vec::new(),
+            history,
             timeline,
             dcs_voters,
         })
@@ -697,6 +709,26 @@ impl DcsAdapter for RaftDcs {
         }
     }
 
+    async fn read_history(&self) -> Result<(Vec<HistoryEntry>, Option<u64>)> {
+        Ok(self
+            .store
+            .get(&self.history_path())
+            .await
+            .map_or((Vec::new(), None), |e| {
+                (History::from_json(&e.value).into_entries(), Some(e.version))
+            }))
+    }
+    async fn write_history(&self, entries: &[HistoryEntry], expected: Option<u64>) -> Result<bool> {
+        let request =
+            history_write_request(self.history_path(), entries, expected, current_millis())?;
+        match self.propose(request).await? {
+            Response::Ok { .. } => Ok(true),
+            Response::NotChanged => {
+                debug!(?expected, "/history CAS not applied: changed since read");
+                Ok(false)
+            }
+        }
+    }
     fn ttl(&self) -> u64 {
         self.lock_ttl()
     }
@@ -762,10 +794,32 @@ fn timeline_write_request(
     })
 }
 
+/// CAS request that writes the `/history` array (no TTL) only if the key
+/// still has version `expected`, or does not exist when `expected` is None.
+fn history_write_request(
+    key: String,
+    entries: &[HistoryEntry],
+    expected: Option<u64>,
+    now: u64,
+) -> Result<Request> {
+    let value = serde_json::to_string(entries)
+        .map_err(|e| Error::Dcs(format!("Serialize /history: {e}")))?;
+    Ok(Request::Set {
+        key,
+        value,
+        ttl: None,
+        prev_exist: expected.is_none().then_some(false),
+        prev_value: None,
+        prev_version: expected,
+        now,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state_machine::KvStateMachine;
+    use pg_ha_core::history::HistoryEventType;
 
     const KEY: &str = "/service/test/timeline";
 
@@ -793,6 +847,34 @@ mod tests {
         sm.get(KEY).map_or(ClusterTimeline::Absent, |e| {
             ClusterTimeline::parse(&e.value, e.version)
         })
+    }
+
+    #[test]
+    fn history_write_is_a_cas_without_ttl() {
+        let hkey = "/service/test/history";
+        let entry = HistoryEntry {
+            timestamp: 1,
+            event_type: HistoryEventType::Failover,
+            old_leader: None,
+            new_leader: Some("node2".into()),
+            reason: "r".into(),
+            timeline: Some(2),
+            lsn: Some(32),
+        };
+        let mut sm = KvStateMachine::new();
+        let create = history_write_request(hkey.into(), &[entry.clone()], None, 1_000).unwrap();
+        assert!(matches!(sm.apply(&create, 3), Response::Ok { .. }));
+        let stored = sm.get(hkey).unwrap();
+        assert_eq!(stored.expire_at, None, "the key has no TTL");
+        assert_eq!(History::from_json(&stored.value).entries().len(), 1);
+        // A writer that read the key before it existed loses.
+        let again = history_write_request(hkey.into(), &[entry.clone()], None, 1_000).unwrap();
+        assert!(matches!(sm.apply(&again, 4), Response::NotChanged));
+        // A writer with the current version wins; a stale one does not.
+        let ok = history_write_request(hkey.into(), &[entry.clone()], Some(3), 1_000).unwrap();
+        assert!(matches!(sm.apply(&ok, 5), Response::Ok { .. }));
+        let stale = history_write_request(hkey.into(), &[entry], Some(3), 1_000).unwrap();
+        assert!(matches!(sm.apply(&stale, 6), Response::NotChanged));
     }
 
     #[test]

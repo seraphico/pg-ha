@@ -235,6 +235,9 @@ impl Ha {
                 Ok(true) => {
                     self.is_leader = true;
                     self.extend_leader_lease(anchor);
+                    // Memory only: what this election was, before the
+                    // failover key is cleared. A Hold cycle appends it.
+                    self.note_pending_history();
                     // Clear the failover key after successful acquisition
                     let _ = self.dcs.set_failover_value("").await;
                     self.enforce_primary_role().await

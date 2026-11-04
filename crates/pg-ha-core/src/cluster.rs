@@ -3,6 +3,7 @@
 //! These types are deserialized from DCS keys and used by the HA engine
 //! to make decisions about failover, promotion, and replication topology.
 
+use crate::history::HistoryEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -27,7 +28,7 @@ pub struct Cluster {
     /// Pending failover/switchover request from DCS /failover key
     pub failover: Option<Failover>,
 
-    /// Cluster history (timeline changes)
+    /// Cluster history (failovers and switchovers), oldest first; the DCS `/history` key
     pub history: Vec<HistoryEntry>,
 
     /// The DCS `/timeline` key (D6): identity of the latest confirmed
@@ -452,16 +453,6 @@ impl Failover {
     pub fn is_switchover(&self) -> bool {
         self.leader.is_some()
     }
-}
-
-/// A cluster history entry (timeline change record)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HistoryEntry {
-    pub timeline: u64,
-    pub lsn: u64,
-    pub reason: String,
-    #[serde(default)]
-    pub timestamp: Option<String>,
 }
 
 #[cfg(test)]

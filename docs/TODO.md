@@ -29,7 +29,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 - 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
 - Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
 
-**还没接到运行路径上的接口**：`GET /history` 有路由，HA 循环不调用 `History::record_event`，运行中通常是空数组。（Raft 快照落盘已由 SB-06 闭合——快照持久化到 `snapshot.json`、重启读回，见下文 #14；`/failover` 无 TTL 已由 SB-05 闭合——非空意图带集群 `ttl` 自过期，见下文 #13；成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS；Failsafe 已由 SB-04 裁定为 NO-GO 并移除表面代码，见下文 #4）。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
+**还没接到运行路径上的接口**：（`GET /history` 已由 SB-09 接通——DCS `/history` key，failover / switchover 在 promote 后的 Hold 周期尽力追加；）（Raft 快照落盘已由 SB-06 闭合——快照持久化到 `snapshot.json`、重启读回，见下文 #14；`/failover` 无 TTL 已由 SB-05 闭合——非空意图带集群 `ttl` 自过期，见下文 #13；成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS；Failsafe 已由 SB-04 裁定为 NO-GO 并移除表面代码，见下文 #4）。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
 
 ---
 
