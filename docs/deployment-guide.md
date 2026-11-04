@@ -45,6 +45,10 @@ curl -s http://localhost:8008/cluster | jq .
 # 查看本节点详情（角色、状态、timeline、lag）
 curl -s http://localhost:8008/patroni | jq .
 
+# REST_TLS=tls：改用 HTTPS 并信任开发 CA；REST_TLS=mtls 再带客户端证书
+curl -s --cacert docker/tls/ca.crt https://localhost:8008/cluster | jq .
+curl -s --cacert docker/tls/ca.crt --cert docker/tls/client.crt --key docker/tls/client.key https://localhost:8008/cluster | jq .
+
 # 连接 PostgreSQL（通过 Proxy RW 端口）
 psql -h localhost -p 6432 -U postgres -d postgres
 # 密码: secret
@@ -484,6 +488,13 @@ REST 管理 API 也支持内建 HTTPS，配置形状与 `raft.tls` 的服务端�
 
 代理对 `/primary`、`/replica` 的探活使用同一套 `restapi.tls`。未配置时走明文 `http://`。配置了 `cert` + `key` 后探活改为 `https://`，并用 `ca_cert` 校验服务器证书。`require_client_cert: true` 时，探活出示本节点自己的 REST 服务端证书。
 
+**所有节点的 REST TLS 模式必须一致**：要么全部明文，要么全部 HTTPS（server-auth），要么全部 mTLS。不支持混合集群。每个节点的代理都用自己的 `restapi.tls` 去探测所有成员，并把成员发布的 `api_url` 协议改写成本节点的协议；如果某个成员发布的协议与本节点不一致，日志里会对该成员告警一次（`All nodes must use the same restapi.tls mode`），但行为仍按本节点的协议继续，不会让混合集群真正可用。
+
+**代理探活的证书要求**：
+- `ca_cert` 同时也是代理探活用来信任服务器证书的 CA。只配 `cert` + `key`（server-auth TLS）而不配 `ca_cert` 时，探活只信任系统根证书；证书由私有 CA 签发时，所有后端会被标记为 DOWN，代理拒绝 6432/6433 的全部连接，而选主不受影响。启动时会有一条 `restapi.tls is set without ca_cert` 警告，探活失败的原因（URL 与 reqwest 错误链）也会以 `Health probe failed` 记录（同一后端持续失败时每 60 秒最多一条）。公共 CA 签发的证书不受此影响。
+- 服务器证书的 SAN 必须覆盖 `raft.self_addr` 里使用的主机名（探活用成员发布的主机名访问，主机名不在 SAN 里会校验失败）。
+- mTLS 探活出示本节点的 REST 服务端证书作为客户端证书，所以该证书的 Extended Key Usage 必须同时允许 `clientAuth`（只签发 `serverAuth` 的 CA 会让探活握手失败）。
+
 `raft.tls` 不影响 REST API，`restapi.tls` 也不影响 Raft RPC（2380），二者各自独立配置。
 
 ---
@@ -545,6 +556,10 @@ services:
     networks:
       - pg-ha-net
     healthcheck:
+      # 明文 REST（本示例未设置 PG_HA_RESTAPI_TLS_CERT）。启用 restapi.tls 后必须改成 HTTPS，
+      # 否则健康检查永远失败：
+      #   server-auth TLS: ["CMD", "curl", "-sf", "--cacert", "/etc/pg-ha/tls/ca.crt", "https://localhost:8008/liveness"]
+      #   mTLS 另加:      "--cert", "/etc/pg-ha/tls/client.crt", "--key", "/etc/pg-ha/tls/client.key"
       test: ["CMD", "curl", "-sf", "http://localhost:8008/liveness"]
       interval: 5s
       timeout: 3s
@@ -582,6 +597,10 @@ services:
     networks:
       - pg-ha-net
     healthcheck:
+      # 明文 REST（本示例未设置 PG_HA_RESTAPI_TLS_CERT）。启用 restapi.tls 后必须改成 HTTPS，
+      # 否则健康检查永远失败：
+      #   server-auth TLS: ["CMD", "curl", "-sf", "--cacert", "/etc/pg-ha/tls/ca.crt", "https://localhost:8008/liveness"]
+      #   mTLS 另加:      "--cert", "/etc/pg-ha/tls/client.crt", "--key", "/etc/pg-ha/tls/client.key"
       test: ["CMD", "curl", "-sf", "http://localhost:8008/liveness"]
       interval: 5s
       timeout: 3s
@@ -619,6 +638,10 @@ services:
     networks:
       - pg-ha-net
     healthcheck:
+      # 明文 REST（本示例未设置 PG_HA_RESTAPI_TLS_CERT）。启用 restapi.tls 后必须改成 HTTPS，
+      # 否则健康检查永远失败：
+      #   server-auth TLS: ["CMD", "curl", "-sf", "--cacert", "/etc/pg-ha/tls/ca.crt", "https://localhost:8008/liveness"]
+      #   mTLS 另加:      "--cert", "/etc/pg-ha/tls/client.crt", "--key", "/etc/pg-ha/tls/client.key"
       test: ["CMD", "curl", "-sf", "http://localhost:8008/liveness"]
       interval: 5s
       timeout: 3s
@@ -646,6 +669,9 @@ make build
 docker compose -f docker-compose.prod.yml build
 docker compose -f docker-compose.prod.yml up -d
 curl -s http://localhost:8008/cluster | jq .
+# 若启用了 restapi.tls，改用：
+# curl -s --cacert docker/tls/ca.crt https://localhost:8008/cluster | jq .
+# （mTLS 再加 --cert docker/tls/client.crt --key docker/tls/client.key）
 ```
 
 开发集群直接 `make up`，不要套这份示例。`make down` 会删掉 Raft 和 PGDATA 卷。

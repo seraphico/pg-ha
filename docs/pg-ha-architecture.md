@@ -413,6 +413,8 @@ curl -X POST http://localhost:8008/failover
 # → {"error": "Unauthorized"}
 ```
 
+> 以上示例是明文 HTTP（未配置 `restapi.tls`）。启用 `restapi.tls` 后改用 `https://`，并用 `--cacert` 信任服务器证书的 CA（mTLS 另加 `--cert` / `--key`）。所有节点的 REST TLS 模式必须一致，不支持混合集群。
+
 ## 优雅关停流程
 
 pg-ha 收到第一个 `SIGTERM` 或 `SIGINT` 后调用 `Ha::graceful_shutdown`（`crates/pg-ha-core/src/ha/shutdown.rs`，`src/main.rs` 只调用它）。规则：drain 期间续锁；CHECKPOINT + 停库受 leader 租约限制；停库之后才释放锁；PostgreSQL 还可能可写时绝不带着锁退出。
