@@ -32,6 +32,34 @@ pub(crate) fn replication_lag_bytes(
     }
 }
 
+/// SB-11: does a failover candidate lag the cluster's max published WAL by
+/// more than the configured ceiling?
+///
+/// Role-agnostic on purpose: during an election `cluster.leader` is usually
+/// `None`, so the reference is `max_wal` (the highest `wal_position` over the
+/// still-eligible candidates), not the leader's position. This is a pure byte
+/// comparison, independent of the `MemberRole` branching in
+/// [`replication_lag_bytes`].
+///
+/// - `threshold` is `None`  -> `false` (feature off, the default).
+/// - `own_wal` is `None`    -> `true`  (an unknown position cannot be proven
+///   non-lagging, so the candidate is conservatively excluded).
+/// - otherwise              -> `max_wal.saturating_sub(own) > t` (a candidate
+///   exactly at the threshold is NOT excluded).
+pub(crate) fn exceeds_failover_lag(
+    own_wal: Option<u64>,
+    max_wal: u64,
+    threshold: Option<u64>,
+) -> bool {
+    let Some(t) = threshold else {
+        return false;
+    };
+    let Some(own) = own_wal else {
+        return true;
+    };
+    max_wal.saturating_sub(own) > t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +106,34 @@ mod tests {
             replication_lag_bytes(&MemberRole::Primary, None, None),
             None
         );
+    }
+
+    #[test]
+    fn exceeds_failover_lag_threshold_none_is_off() {
+        // Feature off: never excludes, even with an unknown position.
+        assert!(!exceeds_failover_lag(Some(0), 1_000_000, None));
+        assert!(!exceeds_failover_lag(None, 1_000_000, None));
+    }
+
+    #[test]
+    fn exceeds_failover_lag_unknown_own_is_excluded() {
+        assert!(exceeds_failover_lag(None, 1000, Some(500)));
+    }
+
+    #[test]
+    fn exceeds_failover_lag_exactly_at_threshold_not_excluded() {
+        // max - own == t is NOT excluded (strict greater-than).
+        assert!(!exceeds_failover_lag(Some(500), 1000, Some(500)));
+    }
+
+    #[test]
+    fn exceeds_failover_lag_over_threshold_excluded() {
+        assert!(exceeds_failover_lag(Some(499), 1000, Some(500)));
+    }
+
+    #[test]
+    fn exceeds_failover_lag_ahead_of_max_saturates_to_zero() {
+        // own ahead of max_wal -> saturating_sub gives 0, not excluded.
+        assert!(!exceeds_failover_lag(Some(2000), 1000, Some(0)));
     }
 }

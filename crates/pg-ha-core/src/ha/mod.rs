@@ -2183,6 +2183,146 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    // SB-11: maximum_lag_on_failover candidate filtering.
+
+    #[tokio::test]
+    async fn test_max_lag_rejects_lagging_self() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "maxlag-self");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            maximum_lag_on_failover: Some(500),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            timeline: rec(1),
+            leader: None,
+            members: vec![
+                running_member("node2", 1000), // self, lags max by 1000 > 500
+                running_member("node3", 2000), // reference max
+            ],
+            ..Default::default()
+        };
+
+        // Self lags the candidate max past the ceiling → not healthiest.
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_max_lag_skips_lagging_peer_so_self_wins() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "maxlag-peer");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            maximum_lag_on_failover: Some(500),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            timeline: rec(1),
+            leader: None,
+            members: vec![
+                running_member("node2", 2000), // self, the reference max
+                running_member("node3", 1000), // peer lags by 1000 > 500
+            ],
+            ..Default::default()
+        };
+
+        // The lagging peer is skipped and cannot force self to yield.
+        assert!(ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_max_lag_single_eligible_node_still_healthiest() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "maxlag-single");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            maximum_lag_on_failover: Some(500),
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            timeline: rec(1),
+            leader: None,
+            members: vec![running_member("node2", 1000)],
+            ..Default::default()
+        };
+
+        // A lone eligible node with a known position lags itself by 0, so the
+        // feature must not wedge it even with a threshold set.
+        assert!(ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_max_lag_unknown_own_wal_excludes_self() {
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "maxlag-unknown-own");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            maximum_lag_on_failover: Some(500),
+            ..Default::default()
+        });
+        let mut me = running_member("node2", 0);
+        me.wal_position = None; // own position unknown
+        ha.cluster = Cluster {
+            timeline: rec(1),
+            leader: None,
+            members: vec![me, running_member("node3", 1000)],
+            ..Default::default()
+        };
+
+        // Unknown own position cannot be proven non-lagging → excluded.
+        assert!(!ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn test_max_lag_none_is_todays_behaviour() {
+        // With the feature off, a node that lags a higher-WAL peer still loses
+        // on the plain WAL comparison — byte-for-byte the pre-SB-11 path.
+        let config = test_config("node2");
+        let dcs = Arc::new(MockDcs::new());
+        let (pg, data_dir) = with_fake_running_pg(&config, "maxlag-off");
+        let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
+
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            maximum_lag_on_failover: None,
+            ..Default::default()
+        });
+        ha.cluster = Cluster {
+            timeline: rec(1),
+            leader: None,
+            members: vec![
+                running_member("node2", 1000), // self
+                running_member("node3", 2000), // higher WAL peer
+            ],
+            ..Default::default()
+        };
+
+        // Higher-WAL peer wins exactly as before.
+        assert!(!ha.is_healthiest_node());
+
+        // And a lone node is healthiest with the feature off, as today.
+        ha.cluster = Cluster {
+            timeline: rec(1),
+            leader: None,
+            members: vec![running_member("node2", 1000)],
+            ..Default::default()
+        };
+        assert!(ha.is_healthiest_node());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
     #[tokio::test]
     async fn test_sync_mode_designated_candidate_not_sync_eligible() {
         let mut config = test_config("node3");

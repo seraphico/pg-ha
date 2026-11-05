@@ -359,7 +359,7 @@
 | TTL 过期仍受 Raft leader 墙钟影响 | L5 | 写入日志前由 Raft leader 用自己的时钟覆盖 `now`（`stamp_leader_time`），发起节点的时钟不再决定锁是否过期。本地读取仍用读取节点的墙钟，所以时钟快的节点可能在本地视图里认为锁已过期，但抢锁要经过 leader 的 `now`，在 leader 认为锁还在时会失败。Raft leader 的时钟比锁持有者快超过 `safety_margin`（减去约 0.1 秒）时，新主仍可能在旧主围栏前出现 |
 | 停库一直失败时锁一直被占（switchover 与优雅关停） | L5 / S1 | 用可用性换安全：持锁节点每轮续锁、重试停库，集群不换主，没有可写主对外（`/primary` 503）。运维处理见运维指南「关停卡住」「switchover 卡住」 |
 | 主库正常关停期间写不可用 | H4 / S1 | drain（默认 30 秒，只等待，不看连接是否清零）+ CHECKPOINT + 停库期间 `/primary` 503 且锁被续着，别的节点不接管。先 switchover 再停主库，或把主库的 `drain_timeout_secs` 调短 |
-| `maximum_lag_on_failover` 未接入选举（SB-11） | S5 / S2 | 动态配置能写入 `maximum_lag_on_failover`，但选举侧不读取它，lag 不参与候选过滤。与同步侧的 `maximum_lag_on_syncnode`（已接入）不同 |
+| `maximum_lag_on_failover` 已接入选举（SB-11，已接入） | S5 / S2 | `is_healthiest_node` 读取该阈值：参照是当轮已通过资格/running/sync 闸门的候选集合（含自身）里最大的 `wal_position`，落后该最大值超过阈值的候选（含自身）不参选；`wal_position` 未知的候选保守排除；阈值为 `None`（默认）时功能关闭、行为与接入前一致。与同步侧的 `maximum_lag_on_syncnode` 一致，也用 `None` 作唯一 off-state |
 | `replication_lag` 是相对 leader 上次发布位置的近似值（SB-10） | H2 | lag 按 leader 最后发布的 `wal_position` 计算，写入很重时偏小，最多约少一个 `loop_wait` 的 WAL；衡量的是已收到（`max(receive, replay)`）而非已应用；没有 leader 记录或位置缺失时为未知（`null` / 指标省略），`/replica?lag=` 对未知 fail-open |
 
 ---
@@ -368,6 +368,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-11-05 | SB-11：`maximum_lag_on_failover` 接入 `is_healthiest_node`。参照取已通过其它闸门的候选集合（含自身）里最大的 `wal_position`，落后超阈值的候选（含自身）不参选；未知 `wal_position` 保守排除；阈值 `None`（默认）功能关闭，与接入前逐字节等价。第 9 节该条从「未接入」改为「已接入」 |
 | 2026-11-02 | SB-01：S5 重写为「DCS `/sync` 始终是 PG `synchronous_standby_names` 的子集」，写明对称的两阶段 add/remove 顺序、追上确认（`maximum_lag_on_syncnode` + 实际在 `pg_stat_replication` 流复制）、过渡窗口期间无节点可晋升，并澄清 strict 用不可满足的占位名单（不是 `*`）、仅 Priority 模式接入。第 9 节登记 SB-11（`maximum_lag_on_failover` 未接入选举）、SB-10（REST `replication_lag` 从不填充） |
 | 2026-11-01 | W2 实测（colima Ubuntu 虚拟机 + `softdog soft_noboot=1`）发现并修正两处：switchover 后旧主停库、以备库重启，观测被清空，按「可能可写」保持装填，10 秒后触发（生产上会重启一台健康的机器）；设备未用 `O_CLOEXEC` 打开，之后启动的 postmaster 继承了它，解除后设备仍被占用、计时继续并触发，之后再装填报 EBUSY。现在 reconcile 先实时观测，停库确认后立即解除，设备以 `O_CLOEXEC` 打开 |
 | 2026-11-01 | W2 修正：`required` 且不可用的 watchdog 不再导致「当选 → promote → 围栏」循环：不竞选初始化、不参选、发布 `watchdog_failed`，peer 不让位、API 拒绝其作为 candidate；promote 前（写 pending 前）装填，失败则以备库身份释放锁。PostgreSQL 可能仍可写时不再解除 watchdog（降级、租约围栏、`stop_pending`、关停开始、`Drop`）；统一由 `reconcile_watchdog` 决定喂狗 / 保持 / 解除。第 9 节登记超时起算点问题 |
