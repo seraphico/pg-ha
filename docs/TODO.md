@@ -29,7 +29,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 - 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
 - Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
 
-**还没接到运行路径上的接口**：（`GET /history` 已由 SB-09 接通——DCS `/history` key，failover / switchover 在 promote 后的 Hold 周期尽力追加；）（Raft 快照落盘已由 SB-06 闭合——快照持久化到 `snapshot.json`、重启读回，见下文 #14；`/failover` 无 TTL 已由 SB-05 闭合——非空意图带集群 `ttl` 自过期，见下文 #13；成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS；Failsafe 已由 SB-04 裁定为 NO-GO 并移除表面代码，见下文 #4）。同步侧的 `maximum_lag_on_syncnode` 已接入；仍开放的是选举侧的 `maximum_lag_on_failover` 和 REST `replication_lag` 填充。
+**还没接到运行路径上的接口**：（`GET /history` 已由 SB-09 接通——DCS `/history` key，failover / switchover 在 promote 后的 Hold 周期尽力追加；）（Raft 快照落盘已由 SB-06 闭合——快照持久化到 `snapshot.json`、重启读回，见下文 #14；`/failover` 无 TTL 已由 SB-05 闭合——非空意图带集群 `ttl` 自过期，见下文 #13；成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS；Failsafe 已由 SB-04 裁定为 NO-GO 并移除表面代码，见下文 #4）。同步侧的 `maximum_lag_on_syncnode` 已接入；选举侧的 `maximum_lag_on_failover`（SB-11）和 REST `replication_lag`（SB-10）均已接入。
 
 ---
 
@@ -93,7 +93,7 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 **仍开放**：
 
 - Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但 `enforce_synchronous_replication` 固定使用 `SyncMode::Priority`，动态配置没有模式开关（仅 Priority / `FIRST N` 可用）
-- **SB-11**：`maximum_lag_on_failover` 仍不被选举读取——动态配置能写入该值，但 `ha/election.rs` 侧不用它过滤候选（与已接入的 `maximum_lag_on_syncnode` 不同）
+- ~~**SB-11**~~ ✅ 已完成：`maximum_lag_on_failover` 已接入 `is_healthiest_node`——参照是当轮已通过资格/running/sync 闸门的候选集合（含自身）里最大的 `wal_position`，落后超阈值的候选（含自身）不参选，`wal_position` 未知者保守排除；阈值 `None`（默认）功能关闭、与接入前逐字节等价（与同步侧的 `maximum_lag_on_syncnode` 一致）
 - ~~**SB-10**~~ ✅ 已完成：`/patroni`、`/primary`、`/replica` 和 `/metrics` 的 `timeline`、`wal_position`、`replication_lag` 由 HA 循环经 `ApiSnapshot` 填充（复用 `touch_member` 的 `wal_status`，不多一次查询）。lag = leader 最后发布的位置减本节点位置（字节，最小 0，近似：写入重时最多少约一个 `loop_wait`，衡量已收到而非已应用）；主库为 0，未知为 `null` / 指标省略；`/replica?lag=` 对未知 fail-open
 
 **相关文件**：
@@ -217,7 +217,7 @@ pg-ha 明确不支持外部 DCS，保留 failsafe 只会误导，故移除。
 | ~~`crates/pg-ha-dcs/src/raft_dcs.rs`（`set_failover_value`）~~ | ~~`ttl: None`~~ → 非空意图带集群 `ttl`（#13，SB-05） | #13 ✅ |
 | ~~`crates/pg-ha-dcs/src/store.rs`（`build_snapshot` / `new_persistent`）~~ | ~~快照只在内存，重启不加载~~ → 落盘到 `snapshot.json`、重启读回（#14，SB-06） | #14 ✅ |
 | ~~`crates/pg-ha-core/src/ha/helpers.rs`（组装 `conn_url`）~~ | ~~`password=` 进入 Raft 日志~~ → 已移除（#15，SB-07） | #15 ✅ |
-| `crates/pg-ha-core/src/ha/election.rs` | `maximum_lag_on_failover` 未参与候选过滤 | #2 剩余 |
+| ~~`crates/pg-ha-core/src/ha/election.rs`~~ | ~~`maximum_lag_on_failover` 未参与候选过滤~~ → 已接入 `is_healthiest_node`（SB-11） | #2 ✅ |
 | ~~REST `/patroni` `replication_lag`~~ | ~~字段始终为 0，未计算填充~~ → 已由 HA 循环填充（SB-10） | #2 ✅ |
 
 ---

@@ -200,7 +200,7 @@ bootstrap:
   dcs:
     loop_wait: 10
     ttl: 30
-    maximum_lag_on_failover: 1048576
+    maximum_lag_on_failover: 1048576   # 选举拒绝落后集群最大 wal_position 超过 N 字节的候选；None/缺省=关闭
   post_bootstrap_sql:
     - "CREATE USER replicator WITH REPLICATION PASSWORD 'CHANGE_ME_replication_password'"
 ```
@@ -369,7 +369,7 @@ bootstrap:
   dcs:                             # 初始动态配置 (写入 DCS /config)
     loop_wait: <u64>
     ttl: <u64>
-    maximum_lag_on_failover: <u64>
+    maximum_lag_on_failover: <u64>   # 选举拒绝落后集群最大 wal_position 超过 N 字节的候选；None/缺省=关闭
     synchronous_mode: <bool>       # 同步复制开关 (默认: false)
     synchronous_mode_strict: <bool># 无同步备库时是否阻塞写 (默认: false)
     synchronous_node_count: <u32>  # 同步备库数量 (默认: 1)
