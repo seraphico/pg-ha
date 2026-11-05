@@ -94,7 +94,7 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 
 - Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但 `enforce_synchronous_replication` 固定使用 `SyncMode::Priority`，动态配置没有模式开关（仅 Priority / `FIRST N` 可用）
 - **SB-11**：`maximum_lag_on_failover` 仍不被选举读取——动态配置能写入该值，但 `ha/election.rs` 侧不用它过滤候选（与已接入的 `maximum_lag_on_syncnode` 不同）
-- **SB-10**：REST `/patroni` 的 `replication_lag` 字段从不被填充，始终为 `0`，没有代码计算并写入它
+- ~~**SB-10**~~ ✅ 已完成：`/patroni`、`/primary`、`/replica` 和 `/metrics` 的 `timeline`、`wal_position`、`replication_lag` 由 HA 循环经 `ApiSnapshot` 填充（复用 `touch_member` 的 `wal_status`，不多一次查询）。lag = leader 最后发布的位置减本节点位置（字节，最小 0，近似：写入重时最多少约一个 `loop_wait`，衡量已收到而非已应用）；主库为 0，未知为 `null` / 指标省略；`/replica?lag=` 对未知 fail-open
 
 **相关文件**：
 
@@ -218,7 +218,7 @@ pg-ha 明确不支持外部 DCS，保留 failsafe 只会误导，故移除。
 | ~~`crates/pg-ha-dcs/src/store.rs`（`build_snapshot` / `new_persistent`）~~ | ~~快照只在内存，重启不加载~~ → 落盘到 `snapshot.json`、重启读回（#14，SB-06） | #14 ✅ |
 | ~~`crates/pg-ha-core/src/ha/helpers.rs`（组装 `conn_url`）~~ | ~~`password=` 进入 Raft 日志~~ → 已移除（#15，SB-07） | #15 ✅ |
 | `crates/pg-ha-core/src/ha/election.rs` | `maximum_lag_on_failover` 未参与候选过滤 | #2 剩余 |
-| REST `/patroni` `replication_lag` | 字段始终为 0，未计算填充 | #2 剩余 |
+| ~~REST `/patroni` `replication_lag`~~ | ~~字段始终为 0，未计算填充~~ → 已由 HA 循环填充（SB-10） | #2 ✅ |
 
 ---
 
