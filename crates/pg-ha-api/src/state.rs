@@ -167,6 +167,9 @@ impl NodeState {
         self.pending_restart = snapshot.pending_restart;
         self.shutting_down = snapshot.shutting_down;
         self.rewind_check = snapshot.rewind_check;
+        self.timeline = snapshot.timeline;
+        self.wal_position = snapshot.wal_position;
+        self.replication_lag = snapshot.replication_lag;
     }
 
     /// H1: `/primary` is 200 exactly when this node holds the leader lock,
@@ -213,5 +216,50 @@ impl NodeState {
             .get("noloadbalance")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot() -> ApiSnapshot {
+        ApiSnapshot {
+            role: MemberRole::Replica,
+            state: MemberState::Running,
+            pg_running: true,
+            pg_in_recovery: Some(true),
+            is_leader: false,
+            is_paused: false,
+            pending_restart: false,
+            shutting_down: false,
+            rewind_check: false,
+            timeline: Some(4),
+            wal_position: Some(2000),
+            replication_lag: Some(500),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_ha_snapshot_copies_wal_fields_and_clears_unknown() {
+        let state = AppState::new("n".into(), "s".into(), 30);
+        state.update(|s| s.apply_ha_snapshot(&snapshot())).await;
+        {
+            let s = state.read().await;
+            assert_eq!(
+                (s.timeline, s.wal_position, s.replication_lag),
+                (Some(4), Some(2000), Some(500))
+            );
+        }
+        let mut unknown = snapshot();
+        unknown.timeline = None;
+        unknown.wal_position = None;
+        unknown.replication_lag = None;
+        state.update(|s| s.apply_ha_snapshot(&unknown)).await;
+        let s = state.read().await;
+        assert_eq!(
+            (s.timeline, s.wal_position, s.replication_lag),
+            (None, None, None)
+        );
     }
 }

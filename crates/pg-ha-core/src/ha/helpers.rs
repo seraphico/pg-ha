@@ -187,6 +187,10 @@ impl Ha {
             snapshot.role = MemberRole::Replica;
         }
         snapshot.pg_in_recovery = None;
+        // SB-10: a demoted primary's lag against the new leader is unknown
+        // (the Primary-derived 0 no longer holds); position and timeline are
+        // still the last sample and stay.
+        snapshot.replication_lag = None;
         publish(snapshot).await;
     }
 
@@ -818,6 +822,12 @@ impl Ha {
         } else {
             (None, None)
         };
+        // SB-10: keep the sample for api_snapshot (no second query).
+        *self
+            .wal_sample
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            wal_position.map(|position| super::lag::WalSample { position, timeline });
         let lineage = self.local_lineage(timeline);
 
         let mut data = serde_json::json!({

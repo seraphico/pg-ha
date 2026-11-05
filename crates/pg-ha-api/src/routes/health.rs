@@ -63,7 +63,9 @@ pub(crate) async fn health_replica(
         );
     }
 
-    // Check lag threshold if specified
+    // Check lag threshold if specified. Fail-open (SB-10): an unknown lag (no
+    // leader record, missing position) never rejects; only a known lag above
+    // the limit does.
     if let Some(max_lag) = params.lag
         && let Some(lag) = s.replication_lag
         && lag > max_lag

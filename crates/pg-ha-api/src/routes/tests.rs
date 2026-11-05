@@ -641,3 +641,76 @@ async fn test_config_accepts_timing_that_meets_lease_requirement() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(stored_config(&dcs)["pause"], true);
 }
+
+async fn body_text(state: AppState, uri: &str) -> (StatusCode, String) {
+    let resp = build_router(state)
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+/// SB-10: an unknown lag fails open: 200 with `"lag": null`, never 503.
+#[tokio::test]
+async fn test_replica_lag_unknown_fails_open() {
+    let state = test_state();
+    set_replica(&state).await;
+    state.update(|s| s.replication_lag = None).await;
+    let (status, body) = body_text(state, "/replica?lag=10").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(json["lag"].is_null());
+}
+
+/// SB-10: the limit is exclusive of equality: lag == max passes, max+1 fails.
+#[tokio::test]
+async fn test_replica_lag_known_boundary() {
+    let state = test_state();
+    set_replica(&state).await;
+    assert_eq!(
+        status_of(state.clone(), "/replica?lag=45").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status_of(state, "/replica?lag=44").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+/// SB-10: unknown timeline / lag omit the sample line (HELP/TYPE stay).
+#[tokio::test]
+async fn test_metrics_omit_unknown_samples() {
+    let state = test_state();
+    set_replica(&state).await;
+    state
+        .update(|s| {
+            s.timeline = None;
+            s.replication_lag = None;
+        })
+        .await;
+    let (_, text) = body_text(state, "/metrics").await;
+    assert!(text.contains("# TYPE pg_ha_replication_lag_bytes gauge"));
+    assert!(text.contains("# TYPE pg_ha_timeline gauge"));
+    assert!(!text.contains("\npg_ha_replication_lag_bytes "));
+    assert!(!text.contains("\npg_ha_timeline "));
+}
+
+/// SB-10: /primary and /patroni expose the three fields.
+#[tokio::test]
+async fn test_primary_and_patroni_show_fields() {
+    let state = test_state();
+    set_primary(&state).await;
+    state.update(|s| s.replication_lag = Some(0)).await;
+    let (status, body) = body_text(state.clone(), "/primary").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["timeline"], 1);
+    assert_eq!(json["wal_position"], 12345);
+    let (_, body) = body_text(state, "/patroni").await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["timeline"], 1);
+    assert_eq!(json["wal_position"], 12345);
+    assert_eq!(json["replication_lag"], 0);
+}

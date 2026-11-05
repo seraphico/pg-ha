@@ -29,6 +29,7 @@ mod follow;
 mod helpers;
 mod history_log;
 pub(crate) mod identity;
+mod lag;
 mod lease;
 mod lineage;
 mod shutdown;
@@ -74,6 +75,15 @@ pub struct ApiSnapshot {
     pub shutting_down: bool,
     /// `pg-ha.rewind_check` present: may hold forked WAL; `/replica` is 503 (H2).
     pub rewind_check: bool,
+    /// SB-10: PostgreSQL timeline from this cycle's `wal_status`. None while
+    /// PostgreSQL is not running or the query failed (unknown, not 0).
+    pub timeline: Option<u64>,
+    /// SB-10: this node's WAL position, the value `touch_member` publishes
+    /// (primary: current write LSN; replica: max(receive, replay)). None when unknown.
+    pub wal_position: Option<u64>,
+    /// SB-10: bytes behind the leader's last published position (see
+    /// `lag::replication_lag_bytes`). 0 on a primary, None when unknown.
+    pub replication_lag: Option<u64>,
 }
 
 /// Hook that writes an [`ApiSnapshot`] into the REST API state. The HA engine
@@ -166,6 +176,11 @@ pub struct Ha {
     /// Hardware watchdog (W2): armed only while this node is a writable
     /// primary under a valid leader lease.
     watchdog: crate::watchdog::Watchdog,
+
+    /// SB-10: the `wal_status` sample `touch_member` took last (position,
+    /// timeline). `api_snapshot` reads it, so the API values cost no extra
+    /// PostgreSQL query. None: PostgreSQL not running or the query failed.
+    wal_sample: std::sync::Mutex<Option<lag::WalSample>>,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -207,6 +222,7 @@ impl Ha {
             state_publisher: None,
             shutting_down: false,
             watchdog,
+            wal_sample: std::sync::Mutex::new(None),
         };
         (ha, cmd_tx)
     }
@@ -219,10 +235,36 @@ impl Ha {
 
     /// The REST API state derived from the current HA state.
     pub fn api_snapshot(&self) -> ApiSnapshot {
+        let pg_running = self.postgresql.is_running();
+        let role = self.postgresql.role().clone();
+        // A sample from before PostgreSQL stopped is not served.
+        let sample = if pg_running {
+            *self
+                .wal_sample
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        } else {
+            None
+        };
+        let wal_position = sample.map(|s| s.position);
+        // The leader's own record is no reference for a node that holds the lock.
+        let leader_wal = if self.is_lock_owner() {
+            None
+        } else {
+            self.cluster
+                .leader
+                .as_ref()
+                .and_then(|l| self.cluster.get_member(&l.name))
+                .and_then(|m| m.wal_position)
+        };
+        let replication_lag = lag::replication_lag_bytes(&role, leader_wal, wal_position);
         ApiSnapshot {
-            role: self.postgresql.role().clone(),
+            timeline: sample.and_then(|s| s.timeline),
+            wal_position,
+            replication_lag,
+            role,
             state: self.advertised_state(),
-            pg_running: self.postgresql.is_running(),
+            pg_running,
             pg_in_recovery: self.postgresql.observed_in_recovery(),
             is_leader: self.is_leader,
             is_paused: self.is_paused,
