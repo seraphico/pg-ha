@@ -376,10 +376,56 @@ impl Ha {
             return false;
         }
 
+        // SB-11: `maximum_lag_on_failover` ceiling (same accessor used for
+        // `synchronous_mode` above). `None` is the off-state and must leave
+        // every path below byte-for-byte identical to the pre-SB-11 behaviour.
+        let max_lag = self
+            .dynamic_config_state
+            .last_config
+            .maximum_lag_on_failover;
+
         let my_name = &self.config.name;
         let my_member = self.cluster.get_member(my_name);
-        let my_wal = my_member.and_then(|m| m.wal_position).unwrap_or(0);
+        let my_wal_opt = my_member.and_then(|m| m.wal_position);
+        let my_wal = my_wal_opt.unwrap_or(0);
         let my_priority = self.config.tags.failover_priority;
+
+        // SB-11: a peer that has passed every other gate (eligibility /
+        // running / sync / not-nofailover / failover_priority != 0) is a
+        // candidate whose `wal_position` counts toward the reference max.
+        let peer_passes_gates = |member: &crate::cluster::Member| {
+            member.name != *my_name
+                && excluded_leader.as_deref() != Some(member.name.as_str())
+                && !member.is_nofailover()
+                && member.failover_priority() != 0
+                && member.state == crate::cluster::MemberState::Running
+                && sync_failover_allowed(&member.name, sync_mode, self.cluster.sync_state.as_ref())
+                && self.member_eligibility(member).is_ok()
+        };
+
+        // SB-11: reference = max(wal_position) over the still-eligible
+        // candidates, including self. When no candidate has a known position
+        // this is 0; combined with the unknown-own rule in
+        // `exceeds_failover_lag`, a lone eligible node with a known position
+        // still wins (its lag past itself is 0). Only computed when the
+        // feature is on so the `None` path is unchanged.
+        let max_wal = if max_lag.is_some() {
+            self.cluster
+                .members
+                .iter()
+                .filter(|member| member.name == *my_name || peer_passes_gates(member))
+                .filter_map(|member| member.wal_position)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // SB-11 self-gate: if this node lags the candidate max by more than
+        // the ceiling, it does not campaign this cycle.
+        if super::lag::exceeds_failover_lag(my_wal_opt, max_wal, max_lag) {
+            return false;
+        }
 
         // Compare against all other members
         for member in &self.cluster.members {
@@ -403,6 +449,11 @@ impl Ha {
             // A18 / I3: do not defer to a peer that may not campaign (the
             // same rule it applies to itself).
             if self.member_eligibility(member).is_err() {
+                continue;
+            }
+            // SB-11: a peer lagging the candidate max by more than the ceiling
+            // is not a valid candidate, so it cannot force this node to yield.
+            if super::lag::exceeds_failover_lag(member.wal_position, max_wal, max_lag) {
                 continue;
             }
 
