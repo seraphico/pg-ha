@@ -205,7 +205,7 @@
 | ID | 陈述 | 状态 |
 |----|------|------|
 | H1 | `GET /primary` 返回 200 ⟺ 本节点持有 leader lock，且 PG 为健康 Primary，且不在优雅关停中。 | 持有 |
-| H2 | `GET /replica` 返回 200 ⟺ 本节点为健康 Replica（可选 `lag` 阈值满足时），且**无** `pg-ha.rewind_check` 标记。 | 持有 |
+| H2 | `GET /replica` 返回 200 ⟺ 本节点为健康 Replica（可选 `lag` 阈值满足时；lag 未知时按通过处理，fail-open），且**无** `pg-ha.rewind_check` 标记。 | 持有 |
 | H3 | 同一时刻，集群中至多一个节点对 `/primary` 返回 200。 | 持有 |
 | H4 | TCP Proxy：RW 端口健康探测依赖 `/primary`；RO 依赖 `/replica`（及文档规定的 fallback）。 | 持有 |
 | H5 | 当 `synchronous_mode` 为 false，或 DCS `/sync` 为空（等价未启用同步名单）时：所有健康 Replica 对 `/async` 为 200、对 `/sync` 为 503；Primary 对二者均为 503。 | 持有 |
@@ -216,8 +216,9 @@
 
 - `/primary` 200 ⟺ 持有 leader lock ∧ `state = running` ∧ `role = primary` ∧ 观测不在 recovery ∧ 不在优雅关停中。观测缺失时为 503。
 - 优雅关停：收到 SIGTERM / SIGINT 起 `/primary` 一律 503（`shutting_down`），其他节点的 Proxy 不再把新写路由到本节点（与旧版关停时 REST 已停的路由效果相同）；REST API 在整个关停期间继续服务，`/patroni`、`/cluster` 照实报告角色和锁。`/liveness` 在 drain 期间（没有 HA 周期）会变 503。
-- `/replica` 200 ⟺ `state = running` ∧ `role = replica` ∧ 观测在 recovery ∧ 无 rewind 检查标记（再叠加 `lag` 阈值）。观测为不在 recovery 的节点，不论记录的 role 是什么，都不作为副本对外服务。带 `pg-ha.rewind_check` 的节点返回 503，避免 RO 客户端读到分叉历史上的数据。
+- `/replica` 200 ⟺ `state = running` ∧ `role = replica` ∧ 观测在 recovery ∧ 无 rewind 检查标记（再叠加 `lag` 阈值：只有 lag **已知**且大于阈值才返回 503；lag 未知时仍返回 200，响应里 `"lag": null`。原因：failover 期间没有 leader，所有副本的 lag 都未知，fail-closed 会在这时把所有副本同时摘出读池）。观测为不在 recovery 的节点，不论记录的 role 是什么，都不作为副本对外服务。带 `pg-ha.rewind_check` 的节点返回 503，避免 RO 客户端读到分叉历史上的数据。
 - `/health` 只反映 PG 进程是否运行，与 HA 身份无关。
+- `replication_lag` = leader 成员记录里最后发布的 `wal_position` 减本节点自己的 `wal_position`（字节，最小为 0；`ha::lag::replication_lag_bytes`，纯函数）。本节点的位置就是 `touch_member` 发布到 DCS 的同一个值（主库 `pg_current_wal_lsn`，副本 `max(receive, replay)`，R2），复用同一次 `wal_status`，不多一次 PostgreSQL 查询。注意：(1) leader 的位置每个 `loop_wait` 才刷新一次，写入很重时 lag 会偏小，最多约少一个 `loop_wait` 的 WAL；(2) 它衡量副本**已收到**的 WAL（receive 与 replay 取大），不是已应用的，所以用于读新鲜度判断时可能偏乐观；(3) 主库报告 0；副本没有 leader 记录、或任一侧位置缺失（含 PostgreSQL 未运行）时为**未知**：JSON 为 `null`，`/metrics` 省略 `pg_ha_replication_lag_bytes` 这一行（HELP/TYPE 保留），不会当成 0。降级 / 围栏路径（`publish_not_primary`）发布的快照把 `replication_lag` 置为未知（刚降级的主库相对新 leader 的 lag 不是 0），`timeline` / `wal_position` 保持最后一次采样。
 - 降级 / 围栏不等本轮 cycle 结束：`stop_after_demotion_write` 在停库前、停库后（停库后的 `touch_member` 之前）各发布一次 API 状态（不持锁、role 非 primary、观测缺失），所以 `/primary` 不晚于 PG 不可写变成 503。停库后的 DCS 写在少数派上可能等满 `retry_timeout`，不影响这一点（`Ha::set_state_publisher`，测试 `test_demotion_publishes_non_primary_before_stop_and_touch_member`）。
 
 **稳态检查**：运维指南中 Primary / Replica / sync / async 的 curl 示例；三节点交叉探测 H3；`GET /patroni` 的 `pg_in_recovery` 字段即本节点最近一次观测。
@@ -359,7 +360,7 @@
 | 停库一直失败时锁一直被占（switchover 与优雅关停） | L5 / S1 | 用可用性换安全：持锁节点每轮续锁、重试停库，集群不换主，没有可写主对外（`/primary` 503）。运维处理见运维指南「关停卡住」「switchover 卡住」 |
 | 主库正常关停期间写不可用 | H4 / S1 | drain（默认 30 秒，只等待，不看连接是否清零）+ CHECKPOINT + 停库期间 `/primary` 503 且锁被续着，别的节点不接管。先 switchover 再停主库，或把主库的 `drain_timeout_secs` 调短 |
 | `maximum_lag_on_failover` 未接入选举（SB-11） | S5 / S2 | 动态配置能写入 `maximum_lag_on_failover`，但选举侧不读取它，lag 不参与候选过滤。与同步侧的 `maximum_lag_on_syncnode`（已接入）不同 |
-| REST `replication_lag` 从不填充（SB-10） | H2 | `/patroni` 的 `replication_lag` 字段始终为 0，没有代码计算并写入它；不要据此告警或做 lag 阈值判断 |
+| `replication_lag` 是相对 leader 上次发布位置的近似值（SB-10） | H2 | lag 按 leader 最后发布的 `wal_position` 计算，写入很重时偏小，最多约少一个 `loop_wait` 的 WAL；衡量的是已收到（`max(receive, replay)`）而非已应用；没有 leader 记录或位置缺失时为未知（`null` / 指标省略），`/replica?lag=` 对未知 fail-open |
 
 ---
 

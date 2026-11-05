@@ -43,6 +43,8 @@ curl -s http://localhost:8008/patroni | jq .
 }
 ```
 
+`timeline`、`wal_position`、`replication_lag` 由 HA 循环每个 cycle 更新。`replication_lag`（字节）= leader 最后发布的 `wal_position` 减本节点的 `wal_position`，最小为 0；主库为 0。副本没有 leader 记录、任一侧位置缺失、或 PostgreSQL 未运行时为 `null`（未知，不是 0），`timeline` 在 PostgreSQL 未运行时同样为 `null`。注意：leader 的位置每个 `loop_wait` 才刷新一次，写入很重时 lag 偏小，最多约少一个 `loop_wait` 的 WAL；它衡量副本已**收到**的 WAL（`max(receive, replay)`），不是已应用的。
+
 `/patroni` 的 `role` / `state` 是 Rust Debug 写法（`Primary`、`Replica`、`Running`），和 `/cluster` 的小写角色不是同一套字符串。
 
 健康检查（`/primary`、`/replica`、`/health`、`/liveness`、`/sync`、`/async`、`/cluster`、`/patroni`、`/metrics`、`/history`）不要求认证。`/switchover`、`/failover`、`/restart`、`/reinitialize`、`/config` 在 YAML 里设置了 `restapi.username` 时要求 HTTP Basic Auth。Docker 入口默认用户名 `admin`、密码 `secret`。
@@ -69,7 +71,8 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:8008/replica
 
 # 带 lag 阈值检查（单位：字节）
 curl -s http://localhost:8008/replica?lag=1048576 | jq .
-# lag 超过 1MB 时返回 503
+# 已知 lag 超过 1MB 时返回 503
+# lag 未知（没有 leader 记录或位置缺失，如 failover 期间）时仍返回 200，响应里 "lag": null（fail-open）
 ```
 
 ### 同步 / 异步备库检查
@@ -107,7 +110,7 @@ curl -s http://localhost:8008/patroni | jq .
 curl -s http://localhost:8008/metrics
 ```
 
-输出：
+输出（`pg_ha_replication_lag_bytes` 和 `pg_ha_timeline` 的值未知时，对应样本行不输出，只保留 HELP/TYPE 行：PostgreSQL 未运行时没有 timeline，副本没有 leader 记录或位置缺失时没有 lag）：
 
 ```
 # HELP pg_ha_node_role Current role of this node
@@ -613,7 +616,6 @@ bootstrap:
 - 尚未实现（登记在 [TODO.md](TODO.md)）：
   - Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但运行路径没有配置项把它选中（仅 Priority 可用）
   - `maximum_lag_on_failover`：选举侧仍不读取这个阈值（SB-11）
-  - REST `/patroni` 的 `replication_lag` 字段从不被填充，始终为 0（SB-10）
 
 ---
 

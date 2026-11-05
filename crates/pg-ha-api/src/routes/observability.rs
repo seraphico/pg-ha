@@ -13,8 +13,15 @@ pub(crate) async fn get_metrics(State(state): State<RouterState>) -> impl IntoRe
 
     let role_str = format!("{:?}", s.role).to_lowercase();
     let state_str = format!("{:?}", s.state).to_lowercase();
-    let timeline = s.timeline.unwrap_or(0);
-    let replication_lag = s.replication_lag.unwrap_or(0);
+    // SB-10: unknown is not 0. HELP/TYPE stay, the sample line is omitted.
+    let timeline_sample = s
+        .timeline
+        .map(|v| format!("pg_ha_timeline {v}\n"))
+        .unwrap_or_default();
+    let lag_sample = s
+        .replication_lag
+        .map(|v| format!("pg_ha_replication_lag_bytes {v}\n"))
+        .unwrap_or_default();
     let pending_restart: u8 = if s.pending_restart { 1 } else { 0 };
     let is_paused: u8 = if s.is_paused { 1 } else { 0 };
 
@@ -32,11 +39,9 @@ pg_ha_node_role{{role="{role_str}"}} 1
 pg_ha_pg_state{{state="{state_str}"}} 1
 # HELP pg_ha_replication_lag_bytes Replication lag in bytes
 # TYPE pg_ha_replication_lag_bytes gauge
-pg_ha_replication_lag_bytes {replication_lag}
-# HELP pg_ha_timeline Current PostgreSQL timeline
+{lag_sample}# HELP pg_ha_timeline Current PostgreSQL timeline
 # TYPE pg_ha_timeline gauge
-pg_ha_timeline {timeline}
-# HELP pg_ha_dcs_last_seen_seconds Seconds since last successful DCS communication
+{timeline_sample}# HELP pg_ha_dcs_last_seen_seconds Seconds since last successful DCS communication
 # TYPE pg_ha_dcs_last_seen_seconds gauge
 pg_ha_dcs_last_seen_seconds {dcs_last_seen_seconds}
 # HELP pg_ha_pending_restart Whether a PostgreSQL restart is pending (1 = pending)
