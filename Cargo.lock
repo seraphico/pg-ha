@@ -1338,7 +1338,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pg-ha"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "axum",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "pg-ha-api"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "pg-ha-core"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "pg-ha-ctl"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "clap",
  "reqwest",
@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "pg-ha-dcs"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "pg-ha-proxy"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "futures",
