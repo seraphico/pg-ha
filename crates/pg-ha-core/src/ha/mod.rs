@@ -1925,18 +1925,9 @@ mod tests {
             ..Default::default()
         });
 
-        // Create a fake data dir with postmaster.pid containing our PID
-        let data_dir = std::env::temp_dir().join("pg-ha-test-healthiest");
-        let _ = std::fs::create_dir_all(&data_dir);
-        std::fs::write(
-            data_dir.join("postmaster.pid"),
-            format!("{}\n", std::process::id()),
-        )
-        .unwrap();
-
-        let mut pg_config = config.postgresql.clone();
-        pg_config.data_dir = data_dir.clone();
-        let pg = Postgresql::new(pg_config);
+        // Create a fake running PG via the shared fixture (per-pid unique dir,
+        // test seam marks it running on every platform).
+        let (pg, data_dir) = with_fake_running_pg(&config, "healthiest");
         let (mut ha, _cmd_tx) = Ha::new(config, dcs.clone(), pg);
         ha.cluster = dcs.cluster.lock().unwrap().clone();
 
@@ -2043,7 +2034,14 @@ mod tests {
         std::fs::write(data_dir.join("pg_wal").join("000000010000000000000001"), "").unwrap();
         let mut pg_config = config.postgresql.clone();
         pg_config.data_dir = data_dir.clone();
-        (Postgresql::new(pg_config), data_dir)
+        let mut pg = Postgresql::new(pg_config);
+        // Test seam: accept the fixture's own PID as a running PostgreSQL on
+        // every platform. The PID written above is alive (passes `kill(pid,0)`)
+        // but is not a "postgres" process, so the Linux `/proc` identity check
+        // would otherwise reject it and collapse the tests. is_running() still
+        // honours postmaster.pid, so tests that delete it read as not-running.
+        pg.set_fake_running(true);
+        (pg, data_dir)
     }
 
     #[tokio::test]
@@ -4346,7 +4344,13 @@ mod tests {
         std::fs::write(data_dir.join("PG_VERSION"), "16\n").unwrap();
         // Set before both Postgresql::new and Ha::new (Ha keeps its own copy).
         config.postgresql.data_dir = data_dir.clone();
-        let pg = Postgresql::new(config.postgresql.clone());
+        let mut pg = Postgresql::new(config.postgresql.clone());
+        // Test seam: when a fake pg_ctl/pg_rewind later writes a postmaster.pid
+        // with the (alive) test PID, is_running() must read it as a running
+        // PostgreSQL on every platform — the Linux `/proc` identity check would
+        // otherwise reject it. No pid file exists yet, so is_running() is still
+        // false here; the seam only bypasses the identity check.
+        pg.set_fake_running(true);
         let (ha, cmd_tx) = Ha::new(config, dcs, pg);
         assert!(!ha.postgresql().is_running());
         (ha, data_dir, cmd_tx)
