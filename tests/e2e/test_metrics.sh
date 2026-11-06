@@ -51,15 +51,18 @@ test_expected_metrics_present() {
     local metrics
     metrics=$(http_get "$primary_url/metrics")
 
-    # Core metrics we expect from the pg-ha system
+    # Core metrics the pg-ha /metrics endpoint actually emits (see
+    # crates/pg-ha-api/src/routes/observability.rs). Role and PG state are
+    # labelled gauges (pg_ha_node_role{role=...}, pg_ha_pg_state{state=...}),
+    # not boolean is_primary/is_replica/postgres_running gauges.
     local expected_metrics=(
-        "pg_ha_node_is_primary"
-        "pg_ha_node_is_replica"
-        "pg_ha_postgres_running"
+        "pg_ha_node_role"
+        "pg_ha_pg_state"
         "pg_ha_replication_lag_bytes"
         "pg_ha_timeline"
         "pg_ha_dcs_last_seen_seconds"
-        "pg_ha_loop_duration_seconds"
+        "pg_ha_pending_restart"
+        "pg_ha_is_paused"
     )
 
     for metric_name in "${expected_metrics[@]}"; do
@@ -74,9 +77,9 @@ test_expected_metrics_present() {
     done
 }
 
-# --- Test: Primary node reports is_primary=1 ---
+# --- Test: Primary node reports role=primary and pg_state=running ---
 test_primary_metric_value() {
-    log_info "Checking primary reports is_primary=1..."
+    log_info "Checking primary reports pg_ha_node_role{role=\"primary\"}=1..."
 
     local primary_url
     primary_url=$(get_primary)
@@ -84,18 +87,27 @@ test_primary_metric_value() {
     metrics=$(http_get "$primary_url/metrics")
 
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$metrics" | grep -q 'pg_ha_node_is_primary.*1'; then
+    if echo "$metrics" | grep -q 'pg_ha_node_role{role="primary"} 1'; then
         TESTS_PASSED=$((TESTS_PASSED + 1))
-        log_pass "Primary node reports pg_ha_node_is_primary=1"
+        log_pass "Primary node reports pg_ha_node_role{role=\"primary\"}=1"
     else
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        log_fail "Primary node does not report pg_ha_node_is_primary=1"
+        log_fail "Primary node does not report pg_ha_node_role{role=\"primary\"}=1"
+    fi
+
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if echo "$metrics" | grep -q 'pg_ha_pg_state{state="running"} 1'; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        log_pass "Primary node reports pg_ha_pg_state{state=\"running\"}=1"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        log_fail "Primary node does not report pg_ha_pg_state{state=\"running\"}=1"
     fi
 }
 
-# --- Test: Replica reports is_replica=1 ---
+# --- Test: Replica reports role=replica ---
 test_replica_metric_value() {
-    log_info "Checking replica reports is_replica=1..."
+    log_info "Checking replica reports pg_ha_node_role{role=\"replica\"}=1..."
 
     local replica_url
     replica_url=$(get_replicas | head -n 1)
@@ -108,12 +120,12 @@ test_replica_metric_value() {
     metrics=$(http_get "$replica_url/metrics")
 
     TESTS_RUN=$((TESTS_RUN + 1))
-    if echo "$metrics" | grep -q 'pg_ha_node_is_replica.*1'; then
+    if echo "$metrics" | grep -q 'pg_ha_node_role{role="replica"} 1'; then
         TESTS_PASSED=$((TESTS_PASSED + 1))
-        log_pass "Replica node reports pg_ha_node_is_replica=1"
+        log_pass "Replica node reports pg_ha_node_role{role=\"replica\"}=1"
     else
         TESTS_FAILED=$((TESTS_FAILED + 1))
-        log_fail "Replica node does not report pg_ha_node_is_replica=1"
+        log_fail "Replica node does not report pg_ha_node_role{role=\"replica\"}=1"
     fi
 }
 

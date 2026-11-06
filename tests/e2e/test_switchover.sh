@@ -79,12 +79,20 @@ test_old_leader_demotes() {
 test_cluster_healthy_after_switchover() {
     log_info "Checking cluster health after switchover..."
 
-    # All nodes should be running
+    # A switchover demotes the old leader and the other nodes re-point their
+    # replication, so a node can briefly report a non-Running state right after.
+    # Poll each node until it settles on Running (bounded) before asserting,
+    # instead of reading the state once during the transition.
     for node in "${ALL_NODES[@]}"; do
-        local state
-        state=$(get_node_state "$node")
         local container
         container=$(node_url_to_container "$node")
+        local state=""
+        local start=$SECONDS
+        while [ "$((SECONDS - start))" -lt 60 ]; do
+            state=$(get_node_state "$node")
+            [ "$state" = "running" ] && break
+            sleep 2
+        done
         assert_eq "running" "$state" "$container is running after switchover"
     done
 

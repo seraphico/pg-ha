@@ -115,12 +115,15 @@ echo "  Old primary sees 'after_failover': $AFTER_VAL"
 echo ""
 
 echo "═══════════════════════════════════════════════"
+FAIL=0
 if [ "$OLD_COUNT" = "$NEW_COUNT" ] && [ "$AFTER_VAL" = "after_failover" ]; then
   echo " ✅ PASS: 旧 Primary 成功重新加入并同步了所有数据"
 elif [ "$REJOINED" = "true" ]; then
   echo " ⚠️  PARTIAL: 重新加入了但数据不一致 (old=$OLD_COUNT, new=$NEW_COUNT)"
+  FAIL=1
 else
   echo " ❌ FAIL: 旧 Primary 未能重新加入为 Replica"
+  FAIL=1
 fi
 echo "═══════════════════════════════════════════════"
 
@@ -130,3 +133,6 @@ for port in 8008 8009 8010; do
   STATUS=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$port/patroni 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['name']}: {d['role']} ({d['state']})\")" 2>/dev/null || echo "not responding")
   echo "  :$port -> $STATUS"
 done
+
+# Propagate the real result so run_tests.sh / CI can gate on it.
+exit "$FAIL"
