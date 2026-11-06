@@ -75,6 +75,18 @@ pub struct Postgresql {
     /// Receiver pair from the last cycle it was streaming (see
     /// [`ReceivedWal`]). A Mutex because `wal_status` takes `&self`.
     last_received_wal: std::sync::Mutex<Option<ReceivedWal>>,
+    /// Test-only seam: when set, [`Postgresql::is_running`] skips the `/proc`
+    /// process-identity check (the only platform-forking step) and treats the
+    /// live PID as a PostgreSQL process. It lets unit-test fixtures fake a
+    /// running PostgreSQL on every platform — on Linux the test binary's
+    /// `/proc/self/cmdline` has no "postgres", so the real identity check would
+    /// otherwise reject a fixture that writes its own PID. The `postmaster.pid`
+    /// existence and live-PID (`kill(pid, 0)`) checks still run, so fixtures
+    /// that delete the pid file still read as not-running. Compiled out of
+    /// non-test builds, so production `is_running()` behavior is byte-for-byte
+    /// unchanged.
+    #[cfg(test)]
+    fake_running: bool,
 }
 
 /// Internal PostgreSQL process state
@@ -292,7 +304,19 @@ impl Postgresql {
             in_recovery: None,
             starts_blocked: false,
             last_received_wal: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fake_running: false,
         }
+    }
+
+    /// Test-only seam: when `running` is true, [`Postgresql::is_running`] skips
+    /// the `/proc` process-identity check so a fixture that writes its own PID
+    /// into `postmaster.pid` reads as a running PostgreSQL on every platform.
+    /// The pid-file and live-PID checks still apply. Never compiled into
+    /// production builds.
+    #[cfg(test)]
+    pub(crate) fn set_fake_running(&mut self, running: bool) {
+        self.fake_running = running;
     }
 
     /// Graceful shutdown began: from now on `start()` fails without doing
@@ -367,6 +391,20 @@ impl Postgresql {
                     // Check if process is alive (signal 0 doesn't send a signal, just checks)
                     if unsafe { libc::kill(pid, 0) != 0 } {
                         return false;
+                    }
+                    // Test-only seam: fixtures write their own PID (alive, so
+                    // the `kill(pid, 0)` check above passes) but cannot be a
+                    // real "postgres" process, so the `/proc` identity check
+                    // below rejects them on Linux. When the flag is set, accept
+                    // the identity so the pid-file-driven running state still
+                    // tracks correctly on every platform. The pid-file and
+                    // live-PID checks above are unchanged, so deleting the pid
+                    // file still flips `is_running()` to false. Compiled out of
+                    // non-test builds, so production behavior is byte-for-byte
+                    // unchanged.
+                    #[cfg(test)]
+                    if self.fake_running {
+                        return true;
                     }
                     // PID exists — verify it's actually a postgres process
                     return Self::is_postgres_process(pid);
@@ -1829,8 +1867,14 @@ mod tests {
     fn test_timeout_wraps_connection_not_query() {
         let source = include_str!("postgresql.rs");
 
-        // Only check the production code (before #[cfg(test)] mod tests)
-        let prod_code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        // Only check the production code (before the `#[cfg(test)] mod tests`
+        // block). Split on the module marker, not a bare `#[cfg(test)]`, so
+        // test-only `#[cfg(test)]` items earlier in the file are still counted
+        // as production code here.
+        let prod_code = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(source);
 
         // The timeout pattern wraps `connection`, not `client`
         let timeout_wraps_connection = "tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection)";
@@ -2089,8 +2133,14 @@ mod tests {
     fn test_all_methods_follow_same_preservation_pattern() {
         let source = include_str!("postgresql.rs");
 
-        // Only check the production code (before #[cfg(test)] mod tests)
-        let prod_code = source.split("#[cfg(test)]").next().unwrap_or(source);
+        // Only check the production code (before the `#[cfg(test)] mod tests`
+        // block). Split on the module marker, not a bare `#[cfg(test)]`, so
+        // test-only `#[cfg(test)]` items earlier in the file are still counted
+        // as production code here.
+        let prod_code = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(source);
 
         // Each method should have exactly this structure:
         // 1. tokio_postgres::connect(...) → (client, connection)
