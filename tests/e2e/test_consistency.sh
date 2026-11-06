@@ -1,6 +1,10 @@
 #!/bin/bash
 # 全面自洽性验证：验证 PG 层、HA 层、DCS 层、代理层在各场景下状态一致
-set -euo pipefail
+# errexit/pipefail OFF so a single failing check (or a transient 503 during a
+# scenario transition) accumulates into FAIL and the script still reaches its
+# summary and `exit $FAIL`, rather than aborting mid-scenario.
+set +e +o pipefail
+set -u
 
 source "$(dirname "${BASH_SOURCE[0]}")/rest_env.sh"
 PASS=0; FAIL=0
@@ -13,6 +17,57 @@ psql_node() {
   docker exec "$1" bash -c "PGPASSWORD=secret psql -h localhost -U postgres -d postgres -t -A -c \"$2\"" 2>/dev/null | tr -d '[:space:]'
 }
 
+# Wait for all three API endpoints to answer and for a primary to exist, so we
+# never assert against a just-bootstrapped replica that still answers /replica
+# with 503. Polls instead of a fixed sleep.
+wait_cluster_ready() {
+  local timeout="${1:-120}"
+  local start=$SECONDS
+  echo "  Waiting for cluster to be ready (timeout ${timeout}s)..."
+  while true; do
+    local ready=0 primary=0
+    for port in 8008 8009 8010; do
+      [ "$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$port/patroni 2>/dev/null)" = "200" ] && ready=$((ready+1))
+      [ "$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$port/primary 2>/dev/null)" = "200" ] && primary=1
+    done
+    if [ "$ready" -eq 3 ] && [ "$primary" -eq 1 ]; then
+      echo "  Cluster ready in $((SECONDS - start))s"
+      return 0
+    fi
+    if [ "$((SECONDS - start))" -ge "$timeout" ]; then
+      echo "  ⚠️  Cluster not ready after ${timeout}s (${ready}/3 responding)"
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+# Poll until a node's /replica reports 200 (caught-up replica) or timeout.
+wait_replica_ready() {
+  local port="$1"; local timeout="${2:-60}"; local start=$SECONDS
+  while [ "$((SECONDS - start))" -lt "$timeout" ]; do
+    [ "$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$port/replica 2>/dev/null)" = "200" ] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# Poll until some node (other than $1) becomes primary; echo its container name.
+wait_new_primary() {
+  local old="$1"; local timeout="${2:-60}"; local start=$SECONDS
+  while [ "$((SECONDS - start))" -lt "$timeout" ]; do
+    for port in 8008 8009 8010; do
+      if [ "$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$port/primary 2>/dev/null)" = "200" ]; then
+        local ctr
+        case $port in 8008) ctr=pg-ha-node1;; 8009) ctr=pg-ha-node2;; 8010) ctr=pg-ha-node3;; esac
+        if [ "$ctr" != "$old" ]; then echo "$ctr"; return 0; fi
+      fi
+    done
+    sleep 2
+  done
+  return 1
+}
+
 echo "═══════════════════════════════════════════════════"
 echo "  pg-ha 全面自洽性验证"
 echo "═══════════════════════════════════════════════════"
@@ -21,6 +76,9 @@ echo ""
 # ─── 场景 1: 稳态集群 ───
 echo "═══ 场景 1: 稳态集群 — 各层状态对齐 ═══"
 echo ""
+
+# 先等集群就绪，避免对刚 bootstrap 未就绪的 replica 断言
+wait_cluster_ready 120 || true
 
 # 找到 Primary
 PRIMARY=""
@@ -84,15 +142,9 @@ echo ""
 # 停止 Primary
 echo "  停止 Primary ($PRIMARY)..."
 docker stop "$PRIMARY" > /dev/null 2>&1
-sleep 20
 
-# 找到新 Primary
-NEW_PRIMARY=""
-for node in pg-ha-node1 pg-ha-node2 pg-ha-node3; do
-  if [ "$node" = "$PRIMARY" ]; then continue; fi
-  RECOVERY=$(psql_node "$node" "SELECT pg_is_in_recovery()")
-  if [ "$RECOVERY" = "f" ]; then NEW_PRIMARY=$node; fi
-done
+# 轮询等待新 Primary 选出（替代固定 sleep）
+NEW_PRIMARY=$(wait_new_primary "$PRIMARY" 60 || true)
 echo "  新 PG 层 Primary: ${NEW_PRIMARY:-NONE}"
 check "${NEW_PRIMARY:-NONE}" "${NEW_PRIMARY:-NONE}" "Failover: 新 Primary 选出"
 
@@ -123,9 +175,13 @@ if [ -n "$NEW_PRIMARY" ]; then
     R_HA_ROLE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$R_PORT/patroni | jq -r '.role')
     check "$R_RECOVERY" "t" "$node: PG in-recovery"
     check "$R_HA_ROLE" "Replica" "$node: HA role = Replica"
-    # 数据复制到了存活 Replica
-    sleep 2
-    R_VAL=$(psql_node "$node" "SELECT val FROM consistency_test WHERE val='after_failover' LIMIT 1")
+    # 数据复制到了存活 Replica：轮询等待复制追上（替代固定 sleep 2）
+    R_VAL=""
+    for _ in $(seq 1 15); do
+      R_VAL=$(psql_node "$node" "SELECT val FROM consistency_test WHERE val='after_failover' LIMIT 1")
+      [ "$R_VAL" = "after_failover" ] && break
+      sleep 2
+    done
     check "$R_VAL" "after_failover" "$node: 复制了 after_failover 数据"
   done
 fi
@@ -136,11 +192,14 @@ echo ""
 
 echo "  重启旧 Primary ($PRIMARY)..."
 docker start "$PRIMARY" > /dev/null 2>&1
-sleep 40
 
 case "$PRIMARY" in
   pg-ha-node1) OLD_PORT=8008 ;; pg-ha-node2) OLD_PORT=8009 ;; pg-ha-node3) OLD_PORT=8010 ;;
 esac
+
+# 轮询等待旧 Primary rejoin 为 replica（替代固定 sleep 40）
+echo "  等待旧 Primary rejoin 为 replica (max 120s)..."
+wait_replica_ready "$OLD_PORT" 120 || echo "  ⚠️  旧 Primary 未在 120s 内变为 replica"
 
 OLD_RECOVERY=$(psql_node "$PRIMARY" "SELECT pg_is_in_recovery()")
 OLD_HA_ROLE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$OLD_PORT/patroni | jq -r '.role')
@@ -152,9 +211,13 @@ check "$OLD_HA_ROLE" "Replica" "旧 Primary rejoin: HA role = Replica"
 check "$OLD_PRIMARY_CODE" "503" "旧 Primary rejoin: /primary → 503"
 check "$OLD_REPLICA_CODE" "200" "旧 Primary rejoin: /replica → 200"
 
-# 数据完整性：旧 Primary 能读到 failover 后写入的数据
-sleep 3
-OLD_VAL=$(psql_node "$PRIMARY" "SELECT val FROM consistency_test WHERE val='after_failover' LIMIT 1")
+# 数据完整性：旧 Primary 能读到 failover 后写入的数据（轮询等待复制追上）
+OLD_VAL=""
+for _ in $(seq 1 15); do
+  OLD_VAL=$(psql_node "$PRIMARY" "SELECT val FROM consistency_test WHERE val='after_failover' LIMIT 1")
+  [ "$OLD_VAL" = "after_failover" ] && break
+  sleep 2
+done
 check "$OLD_VAL" "after_failover" "旧 Primary rejoin: 读到 failover 后数据"
 
 echo ""

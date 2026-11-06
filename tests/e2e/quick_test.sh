@@ -98,3 +98,6 @@ echo ""
 echo "═══════════════════════════════════════"
 echo " Results: $PASS passed, $FAIL failed"
 echo "═══════════════════════════════════════"
+
+# Propagate the real result so run_tests.sh / CI can gate on it.
+exit "$FAIL"

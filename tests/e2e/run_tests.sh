@@ -15,6 +15,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 source "$SCRIPT_DIR/lib.sh"
+# lib.sh relaxes errexit/pipefail for the per-test assertion model. The runner
+# itself wants fail-fast for its build/setup steps (test files run in their own
+# `bash` subshell, so they keep lib.sh's relaxed mode regardless). Restore it.
+set -euo pipefail
 
 # --- Configuration ---
 BUILD=${BUILD:-true}
@@ -47,13 +51,19 @@ while [[ $# -gt 0 ]]; do
             echo "  --no-teardown   Don't stop cluster after tests"
             echo ""
             echo "Test names:"
+            echo "  smoke            Quick smoke test (quick_test.sh)"
             echo "  bootstrap        Cluster bootstrap tests"
             echo "  failover         Auto failover tests"
+            echo "  failover_ttl     /failover key TTL (SB-05) tests"
             echo "  switchover       Manual switchover tests"
             echo "  partition        Network partition tests"
             echo "  pause            Pause mode tests"
             echo "  config           Dynamic configuration tests"
             echo "  metrics          Prometheus metrics tests"
+            echo "  connections      Database connection tests"
+            echo "  rejoin           Old primary rejoin tests"
+            echo "  consistency      Cross-layer consistency tests"
+            echo "  ha_full          Full HA lifecycle tests"
             echo ""
             echo "If no test name is given, all tests run in order."
             exit 0
@@ -195,20 +205,41 @@ run_test_file() {
 run_all_tests() {
     local overall_failures=0
 
-    # Order matters: bootstrap first (non-destructive), then destructive tests
+    # Order matters: non-destructive smoke/inspection first, then the
+    # destructive HA scenarios. Every one of these scripts now propagates its
+    # real failure count as its exit code, so run_test_file's non-zero branch
+    # is trustworthy and overall_failures is an honest gate signal.
+    #
+    # quick_test.sh is a fast smoke test (bootstrap + metrics + config +
+    # switchover) listed first so an obviously-broken cluster fails early.
+    # The remaining entries are the full suite, including the five scripts the
+    # old runner never registered (ha_full, consistency, db_connections,
+    # rejoin, failover_ttl).
     local tests=(
+        "quick_test.sh:Smoke (quick_test)"
         "test_bootstrap.sh:Bootstrap"
         "test_metrics.sh:Metrics"
         "test_dynamic_config.sh:Dynamic Configuration"
+        "test_db_connections.sh:Database Connections"
         "test_switchover.sh:Manual Switchover"
         "test_failover.sh:Auto Failover"
+        "test_failover_ttl.sh:Failover Key TTL"
         "test_network_partition.sh:Network Partition"
         "test_pause_mode.sh:Pause Mode"
+        "test_rejoin.sh:Old Primary Rejoin"
+        "test_consistency.sh:Cross-layer Consistency"
+        "test_ha_full.sh:Full HA Lifecycle"
     )
 
     for entry in "${tests[@]}"; do
         local file="${entry%%:*}"
         local name="${entry##*:}"
+
+        # Every suite (including the first) starts from a known-ready cluster.
+        # The destructive scripts kill/stop/pause nodes, so force a readiness
+        # barrier between suites rather than a blind fixed sleep.
+        log_info "Ensuring cluster is ready before: $name"
+        wait_for_cluster_ready 120 || log_warn "Cluster not fully ready before '$name', continuing..."
 
         # Reset counters for each test file
         TESTS_RUN=0
@@ -218,11 +249,6 @@ run_all_tests() {
         if ! run_test_file "$SCRIPT_DIR/$file" "$name"; then
             overall_failures=$((overall_failures + 1))
         fi
-
-        # Wait between destructive tests for cluster to stabilize
-        log_info "Waiting for cluster to stabilize..."
-        sleep 5
-        wait_for_cluster_ready 60 || log_warn "Cluster not fully ready, continuing..."
     done
 
     return $overall_failures
@@ -233,16 +259,22 @@ run_specific_test() {
     local file=""
 
     case "$test_name" in
+        smoke|quick) file="quick_test.sh" ;;
         bootstrap)  file="test_bootstrap.sh" ;;
         failover)   file="test_failover.sh" ;;
+        failover_ttl|ttl) file="test_failover_ttl.sh" ;;
         switchover) file="test_switchover.sh" ;;
         partition)  file="test_network_partition.sh" ;;
         pause)      file="test_pause_mode.sh" ;;
         config)     file="test_dynamic_config.sh" ;;
         metrics)    file="test_metrics.sh" ;;
+        connections|db) file="test_db_connections.sh" ;;
+        rejoin)     file="test_rejoin.sh" ;;
+        consistency) file="test_consistency.sh" ;;
+        ha_full|full) file="test_ha_full.sh" ;;
         *)
             log_fail "Unknown test: $test_name"
-            echo "Valid tests: bootstrap, failover, switchover, partition, pause, config, metrics"
+            echo "Valid tests: smoke, bootstrap, failover, failover_ttl, switchover, partition, pause, config, metrics, connections, rejoin, consistency, ha_full"
             exit 1
             ;;
     esac

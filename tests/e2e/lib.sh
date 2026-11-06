@@ -1,7 +1,14 @@
 #!/bin/bash
 # tests/e2e/lib.sh — Shared helpers for pg-ha end-to-end tests
 
-set -euo pipefail
+# Keep undefined-variable detection, but turn OFF errexit and pipefail. The
+# test scripts rely on assertions ACCUMULATING into TESTS_FAILED and the script
+# running all the way to print_results (which exits with the failure count). A
+# bare failing assertion or a SIGPIPE from `producer | head` must NOT abort the
+# script before the summary — that was the old bug (scripts died at the first
+# failure with exit 1 or 141 instead of reporting the real failure count).
+set +e +o pipefail
+set -u
 
 # --- Color output ---
 RED='\033[0;31m'
@@ -123,14 +130,17 @@ assert_http_status() {
 }
 
 # --- HTTP helpers ---
+# GETs carry REST_AUTH too: health endpoints are open, but GET /config requires
+# Basic Auth (returns 401 without it). Sending credentials on every GET is
+# harmless for the open endpoints and fixes the /config reads.
 http_get() {
     local url="$1"
-    curl "${CURL_OPTS[@]}" --max-time 5 "$url" 2>/dev/null || echo ""
+    curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 5 "$url" 2>/dev/null || echo ""
 }
 
 http_get_status() {
     local url="$1"
-    curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null || echo "000"
+    curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null || echo "000"
 }
 
 http_post() {
@@ -193,17 +203,21 @@ get_replicas() {
 }
 
 get_node_role() {
+    # /patroni returns the role in Debug form (uppercase "Primary"/"Replica").
+    # Lowercase it so callers can compare against "primary"/"replica".
     local node_url="$1"
     local resp
     resp=$(http_get "$node_url/patroni")
-    echo "$resp" | jq -r '.role // empty' 2>/dev/null || echo ""
+    echo "$resp" | jq -r '.role // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo ""
 }
 
 get_node_state() {
+    # /patroni returns the state in Debug form (uppercase "Running"); lowercase
+    # it to match the expectations in the test scripts.
     local node_url="$1"
     local resp
     resp=$(http_get "$node_url/patroni")
-    echo "$resp" | jq -r '.state // empty' 2>/dev/null || echo ""
+    echo "$resp" | jq -r '.state // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo ""
 }
 
 get_node_name() {
@@ -250,12 +264,23 @@ wait_for_cluster_ready() {
         done
 
         if [ "$ready" -eq 3 ]; then
-            # Also check that we have exactly one primary
-            local primary
+            # A primary is not enough: right after bootstrap/failover the two
+            # replicas can still be Uninitialized/catching up while a primary
+            # already answers. Require a settled cluster — exactly one primary
+            # AND two replicas answering /replica=200 — so suites that run after
+            # this barrier (quick_test's "2 replicas", failover_ttl's
+            # get_replicas, ha_full's replicated reads) don't assert too early.
+            local primary replica_count=0
             primary=$(get_primary)
-            if [ -n "$primary" ]; then
+            local rnode
+            for rnode in "${ALL_NODES[@]}"; do
+                if [ "$(http_get_status "$rnode/replica")" = "200" ]; then
+                    replica_count=$((replica_count + 1))
+                fi
+            done
+            if [ -n "$primary" ] && [ "$replica_count" -eq 2 ]; then
                 local elapsed=$((SECONDS - start))
-                log_info "Cluster ready in ${elapsed}s (primary: $primary)"
+                log_info "Cluster ready in ${elapsed}s (primary: $primary, replicas: $replica_count)"
                 return 0
             fi
         fi
@@ -271,17 +296,27 @@ wait_for_cluster_ready() {
 }
 
 wait_for_role() {
+    # Judge role by the case-free health endpoints (/primary → 200 when primary,
+    # /replica → 200 when replica) rather than the role string, which the
+    # product returns capitalised. expected_role is "primary" or "replica".
     local node_url="$1"
     local expected_role="$2"
     local timeout="${3:-60}"
     local start=$SECONDS
 
+    local probe
+    case "$expected_role" in
+        primary|master) probe="$node_url/primary" ;;
+        replica)        probe="$node_url/replica" ;;
+        *)              probe="$node_url/$expected_role" ;;
+    esac
+
     log_info "Waiting for $(node_url_to_container "$node_url") to become '$expected_role' (timeout: ${timeout}s)..."
 
     while true; do
-        local role
-        role=$(get_node_role "$node_url")
-        if [ "$role" = "$expected_role" ]; then
+        local status
+        status=$(http_get_status "$probe")
+        if [ "$status" = "200" ]; then
             local elapsed=$((SECONDS - start))
             log_info "Node became '$expected_role' in ${elapsed}s"
             return 0
@@ -289,7 +324,9 @@ wait_for_role() {
 
         local elapsed=$((SECONDS - start))
         if [ "$elapsed" -ge "$timeout" ]; then
-            log_fail "Node did not become '$expected_role' after ${timeout}s (current: '$role')"
+            local role
+            role=$(get_node_role "$node_url")
+            log_fail "Node did not become '$expected_role' after ${timeout}s (current role: '$role')"
             return 1
         fi
 
@@ -447,6 +484,12 @@ measure_failover_time() {
     # Wait for new primary
     local new_primary
     new_primary=$(wait_for_new_primary "$primary_url" 60)
+
+    # Always restart the node we killed so the cluster is left whole. Otherwise
+    # this measurement permanently removes a node, and every suite that runs
+    # after it in run_tests.sh fails on "2/3 nodes responding".
+    docker start "$container" > /dev/null 2>&1 || true
+
     if [ -z "$new_primary" ]; then
         echo "-1"
         return 1

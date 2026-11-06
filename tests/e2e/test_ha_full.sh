@@ -139,17 +139,56 @@ for node in pg-ha-node1 pg-ha-node2 pg-ha-node3; do
     break
   fi
 done
+CANDIDATE_CTR="pg-ha-$CANDIDATE"
+CANDIDATE_PORT=$(port_of "$CANDIDATE_CTR")
 echo "  switchover: $CURRENT_PRIMARY → $CANDIDATE"
-curl "${CURL_OPTS[@]}" -u admin:secret -X POST $SCHEME://localhost:$CURRENT_PORT/switchover \
-  -H "Content-Type: application/json" \
-  -d "{\"candidate\":\"$CANDIDATE\"}" > /dev/null
 
-sleep 20
-SWITCHED_PRIMARY=$(find_primary)
+# Precondition: the candidate must be a Running replica that has caught up
+# before we switch to it (the cluster may still be stabilising right after the
+# previous rejoin). Poll /replica=200 and a Running state rather than switching
+# blind after a fixed sleep.
+echo "  Waiting for candidate $CANDIDATE_CTR to be a caught-up replica..."
+CANDIDATE_READY=false
+for i in $(seq 1 60); do
+  RCODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" $SCHEME://localhost:$CANDIDATE_PORT/replica 2>/dev/null)
+  CSTATE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$CANDIDATE_PORT/patroni 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])" 2>/dev/null || echo "")
+  if [ "$RCODE" = "200" ] && [ "$CSTATE" = "Running" ]; then
+    CANDIDATE_READY=true
+    break
+  fi
+  sleep 2
+done
+if [ "$CANDIDATE_READY" != "true" ]; then
+  echo "  ⚠️  Candidate not confirmed caught-up; proceeding anyway"
+fi
+
+# Issue the switchover. The primary validates the candidate against its own
+# cluster view (refreshed on its HA cycle), so a just-rejoined candidate can be
+# briefly rejected with "not running" — retry until accepted. Then POLL for the
+# new primary (the synchronous switchover has a brief leaderless gap).
+for i in $(seq 1 10); do
+  RESP=$(curl "${CURL_OPTS[@]}" -u admin:secret -X POST $SCHEME://localhost:$CURRENT_PORT/switchover \
+    -H "Content-Type: application/json" \
+    -d "{\"candidate\":\"$CANDIDATE\"}" 2>/dev/null)
+  case "$RESP" in
+    *"not running"*) sleep 3 ;;  # candidate not yet in the primary's view
+    *) break ;;
+  esac
+done
+
+SWITCHED_PRIMARY=""
+for i in $(seq 1 45); do
+  sleep 2
+  SWITCHED_PRIMARY=$(find_primary)
+  if [ -n "$SWITCHED_PRIMARY" ] && [ "$SWITCHED_PRIMARY" != "$CURRENT_PRIMARY" ]; then
+    break
+  fi
+  SWITCHED_PRIMARY=""
+done
 if [ -n "$SWITCHED_PRIMARY" ] && [ "$SWITCHED_PRIMARY" != "$CURRENT_PRIMARY" ]; then
   echo "  ✅ Switchover成功: 新Primary=$SWITCHED_PRIMARY"; PASS=$((PASS+1))
 else
-  echo "  ❌ Switchover失败 (primary=$SWITCHED_PRIMARY)"; FAIL=$((FAIL+1))
+  echo "  ❌ Switchover失败 (primary=${SWITCHED_PRIMARY:-none})"; FAIL=$((FAIL+1))
 fi
 echo ""
 
@@ -157,9 +196,14 @@ echo ""
 echo "── Step 8: 最终验证 ──"
 FINAL_PRIMARY=$(find_primary)
 psql_node "$FINAL_PRIMARY" "INSERT INTO ha_test(val) VALUES('final_write')" > /dev/null 2>&1
-sleep 3
 for node in pg-ha-node1 pg-ha-node2 pg-ha-node3; do
-  FINAL_VAL=$(psql_node "$node" "SELECT val FROM ha_test WHERE val='final_write'")
+  # Poll for the replicated row instead of a single read after a fixed sleep.
+  FINAL_VAL=""
+  for _ in $(seq 1 15); do
+    FINAL_VAL=$(psql_node "$node" "SELECT val FROM ha_test WHERE val='final_write'")
+    [ "$FINAL_VAL" = "final_write" ] && break
+    sleep 2
+  done
   check "$FINAL_VAL" "final_write" "$node sees final_write"
 done
 echo ""

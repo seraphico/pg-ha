@@ -82,7 +82,7 @@ COMPOSE_DEV   := $(COMPOSE) -f docker-compose.yml
 
 BIN_DIR := target/$(RUST_TARGET)/release
 
-.PHONY: all build docker-build up up-tls up-mtls down stop restart status logs help clean print-env fmt check lint test
+.PHONY: all build docker-build up up-tls up-mtls down stop restart status logs help clean print-env fmt check lint test e2e
 
 ## fmt: format all Rust source code
 fmt:
@@ -99,6 +99,22 @@ lint:
 ## test: run all workspace tests
 test:
 	cargo test --workspace
+
+## e2e: bring up the dev cluster, run the end-to-end shell suite, tear it down
+##      (headless gate for CI). REST_TLS is passed through (default off).
+##      Exits non-zero if any suite fails. The suite manages nodes destructively,
+##      so one cluster at a time; `make down` always runs, even on failure.
+e2e:
+	@echo "==> e2e: starting cluster (REST_TLS=$(REST_TLS))"
+	$(MAKE) up REST_TLS=$(REST_TLS)
+	@echo "==> e2e: running end-to-end suite"
+	@set -e; \
+	  status=0; \
+	  REST_TLS=$(REST_TLS) ./tests/e2e/run_tests.sh --no-setup --no-teardown || status=$$?; \
+	  echo "==> e2e: tearing down cluster"; \
+	  $(MAKE) down REST_TLS=$(REST_TLS); \
+	  echo "==> e2e: suite exit status=$$status"; \
+	  exit $$status
 
 ## all: compile Linux binaries and start the Docker development cluster
 all: up

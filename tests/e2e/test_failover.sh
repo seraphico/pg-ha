@@ -16,9 +16,16 @@ log_section "TEST: Auto Failover"
 # --- Test: Primary failure triggers failover ---
 test_failover_on_kill() {
     log_info "Identifying current primary..."
+    # Use the retrying wait rather than a single get_primary probe: a transient
+    # non-response at the exact moment of the probe would otherwise leave
+    # old_primary empty and corrupt the rest of the test (killing the wrong /
+    # no container).
     local old_primary
-    old_primary=$(get_primary)
+    old_primary=$(wait_for_primary 60) || true
     assert_not_empty "$old_primary" "Primary exists before test"
+    if [ -z "$old_primary" ]; then
+        return
+    fi
 
     local old_container
     old_container=$(node_url_to_container "$old_primary")

@@ -94,7 +94,7 @@ test_dead_candidate_intent_expires() {
     # "candidate is not running").
     log_info "Waiting for $candidate_name to report a Running state..."
     for _ in $(seq 1 30); do
-        [ "$(get_node_state "$candidate_url")" = "Running" ] && break
+        [ "$(get_node_state "$candidate_url")" = "running" ] && break
         sleep 2
     done
 
@@ -251,7 +251,37 @@ test_normal_switchover_still_works() {
     fi
 }
 
+# The dev cluster's entrypoint default is ttl=15, and there is no
+# docker-compose.override.yml bumping it to 60. Align the running cluster's ttl
+# to TTL up-front so the observable expiry window matches what this test
+# measures. The update must satisfy ttl >= loop_wait + retry_timeout +
+# safety_margin; TTL=60 with the dev loop_wait=5 is comfortably valid.
+set_cluster_ttl() {
+    local ttl="$1"
+    wait_for_cluster_ready 120 || true
+    local primary_url
+    primary_url=$(get_primary)
+    if [ -z "$primary_url" ]; then
+        log_warn "No primary to set ttl=$ttl; leaving cluster ttl as-is"
+        return
+    fi
+    log_info "Aligning cluster ttl to ${ttl}s via PATCH /config..."
+    local resp
+    resp=$(http_patch "$primary_url/config" "{\"ttl\": $ttl}")
+    log_info "PATCH /config ttl response: $resp"
+    # Give the change a couple of HA cycles to propagate before testing.
+    sleep 5
+}
+
+set_cluster_ttl "$TTL"
+
 test_dead_candidate_intent_expires
 test_normal_switchover_still_works
+
+# Restore the cluster's default ttl so later suites see a stock cluster.
+restore_url=$(get_primary || true)
+if [ -n "${restore_url:-}" ]; then
+    http_patch "$restore_url/config" '{"ttl": 15}' > /dev/null
+fi
 
 print_results
