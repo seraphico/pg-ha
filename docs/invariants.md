@@ -1,5 +1,7 @@
 # pg-ha 闭环不变量
 
+[English](en/invariants.md)
+
 > **定位**：本文件是控制面语义的**契约源**。实现与文档冲突时，先裁定本文件（或同步修订本文件），再改代码。  
 > **配套**：状态机与数据流见 [pg-ha-architecture.md](pg-ha-architecture.md)；稳态如何手工验证见 [operations-guide.md](operations-guide.md)。
 

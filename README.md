@@ -1,10 +1,12 @@
 # pg-ha
 
+[中文](README.zh.md)
+
 PostgreSQL High Availability with built-in Raft consensus and load balancing.
 
 ## Overview
 
-pg-ha is a Rust-based PostgreSQL HA solution providing complete feature parity with [Patroni](https://github.com/patroni/patroni) while eliminating external dependencies:
+pg-ha is a Rust-based PostgreSQL HA solution aimed at the same job as [Patroni](https://github.com/patroni/patroni): automatic failover and synchronous replication, without etcd, ZooKeeper, Consul, or HAProxy. It does not implement every Patroni switch. Open gaps are listed in the TODO.
 
 - **No etcd/ZooKeeper/Consul** — embedded Raft consensus via [openraft](https://github.com/databendlabs/openraft)
 - **No HAProxy** — built-in TCP proxy with active health checking
@@ -14,12 +16,13 @@ pg-ha is a Rust-based PostgreSQL HA solution providing complete feature parity w
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Architecture](docs/pg-ha-architecture.md) | System design, HA decision loop, Raft consensus, TLS, auth, graceful shutdown |
-| [Deployment Guide](docs/deployment-guide.md) | Quick start, production setup, config reference, TLS certificates, Docker/systemd |
-| [Operations Guide](docs/operations-guide.md) | Cluster management, switchover/failover, disaster recovery, debugging, monitoring |
-| [TODO](docs/TODO.md) | Production-readiness gaps tracked against the current code |
+| Document | 中文 | English |
+|----------|------|---------|
+| Architecture | [架构](docs/pg-ha-architecture.md) | [Architecture](docs/en/pg-ha-architecture.md) |
+| Deployment | [部署指南](docs/deployment-guide.md) | [Deployment Guide](docs/en/deployment-guide.md) |
+| Operations | [运维指南](docs/operations-guide.md) | [Operations Guide](docs/en/operations-guide.md) |
+| Invariants | [不变量](docs/invariants.md) | [Invariants](docs/en/invariants.md) |
+| TODO | [待办](docs/TODO.md) | [TODO](docs/en/TODO.md) |
 
 ## Architecture
 
