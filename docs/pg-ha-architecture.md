@@ -1,5 +1,7 @@
 # pg-ha 系统架构图
 
+[English](en/pg-ha-architecture.md)
+
 ## 整体架构
 
 ```mermaid
@@ -91,7 +93,7 @@ sequenceDiagram
     Note over P: Primary 宕机
     P->>P: 进程终止
 
-    Note over DCS: Leader lock TTL 过期 (15s)
+    Note over DCS: Leader lock TTL 过期（默认 30s，开发集群 Docker 为 15s）
     R1->>DCS: get_cluster() → unlocked
     R1->>R1: is_healthiest_node() = true
     R1->>DCS: attempt_to_acquire_leader()
@@ -229,7 +231,7 @@ flowchart LR
 
 ```
 /service/{scope}/
-├── leader          → "node1"              (TTL=15s, CAS 原子操作)
+├── leader          → "node1"              (TTL 默认 30s，开发集群 Docker 为 15s, CAS 原子操作)
 ├── members/
 │   ├── node1       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
 │   ├── node2       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
@@ -365,6 +367,12 @@ flowchart LR
         GET_LIVENESS["GET /liveness"]
         GET_CLUSTER["GET /cluster"]
         GET_METRICS["GET /metrics"]
+        GET_PATRONI["GET /patroni"]
+        GET_HISTORY["GET /history"]
+        GET_STANDBY["GET /standby-leader"]
+        GET_ROOT["GET / 与 /read-write"]
+        GET_SYNC_ALIAS["GET /synchronous"]
+        GET_ASYNC_ALIAS["GET /asynchronous"]
     end
 
     subgraph ProtectedEndpoints["管理操作 - Basic Auth"]

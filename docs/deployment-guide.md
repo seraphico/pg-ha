@@ -1,5 +1,7 @@
 # pg-ha 部署指南
 
+[English](en/deployment-guide.md)
+
 ## 系统要求
 
 | 组件 | 最低版本 | 说明 |
@@ -355,7 +357,7 @@ tags:
   noloadbalance: <bool>            # 从 RO Proxy 排除本节点 (默认: false)
   noclone: <bool>                  # 禁止作为 clone 源 (默认: false)
   nosync: <bool>                   # 不参与同步复制 (默认: false)
-  nostream: <bool>                 # 使用 WAL 文件恢复代替 streaming (默认: false)
+  nostream: <bool>                 # 只解析，默认 false。HA 运行路径不读这个字段
   clonefrom: <bool>                # 优先作为 clone 源 (默认: false)
   replicatefrom: <string>          # 从指定节点复制 (级联复制, 可选)
   failover_priority: <u32>         # 故障转移优先级 (默认: 1, 0=等同 nofailover)

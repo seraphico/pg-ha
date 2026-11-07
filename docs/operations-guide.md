@@ -1,5 +1,7 @@
 # pg-ha 运维指南
 
+[English](en/operations-guide.md)
+
 ## 集群状态检查
 
 ### 集群总览
@@ -441,9 +443,11 @@ PostgreSQL 的异步复制中，Primary COMMIT 后立即返回客户端成功，
 pg-ha 通过 PostgreSQL 的 `synchronous_standby_names` 参数控制哪些节点是同步备库。这个参数的值有两种形式：
 
 ```
-FIRST 1 (node2,node3)    -- Priority 模式：列表中第一个可用节点确认即可
-ANY 2 (node1,node2,node3) -- Quorum 模式：任意 2 个节点确认即可
+FIRST 1 ("node2")              -- Priority：N 既是需要确认的个数，也是名单长度。运行路径只发这种
+ANY 2 ("node1","node2","node3") -- Quorum：任意 2 个确认。代码能生成，运行路径没有开关选中它
 ```
+
+名字一律加双引号。`synchronous_node_count = 1` 时名单里只有一个名字，不会写成 `FIRST 1 (node2,node3)`。
 
 ### 工作流程
 
@@ -481,7 +485,7 @@ DCS `/sync` 名单与 PG 的 `synchronous_standby_names` 不是一次写完，�
 
 ```
 Primary: node1
-synchronous_standby_names = 'FIRST 1 (node2,node3)'
+synchronous_standby_names = 'FIRST 1 ("node2")'
 pg_stat_replication:
   node2 → sync    (第一优先，确认后 Primary 才返回 COMMIT)
   node3 → async   (备选)
@@ -489,7 +493,7 @@ pg_stat_replication:
 
 #### Sync standby 断开（node2 网络断开）
 
-pg-ha 检测到 node2 非 Running → 重新计算 → `'FIRST 1 (node3)'`
+pg-ha 检测到 node2 非 Running → 重新计算 → `'FIRST 1 ("node3")'`
 PG 自动将 node3 提升为 sync。写入不中断。
 
 #### 所有 Replica 都挂了
@@ -502,13 +506,13 @@ PG 自动将 node3 提升为 sync。写入不中断。
 #### 节点重新加入
 
 node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
-`'FIRST 1 (node2,node3)'`（node2 被自动加回列表）
+`'FIRST 1 ("node2")'`（`sync_node_count` 仍是 1，名单里只有优先级更高的那一个）
 
 #### 手动 Switchover（Primary 从 node1 切到 node2）
 
 1. node1 demote 为 Replica → 不再调用 `enforce_synchronous_replication`
 2. node2 promote 为 Primary → 首个 cycle 计算新的 sync 列表
-3. 结果：`'FIRST 1 (node1,node3)'`（node1 现在是 Replica 候选）
+3. 结果：`'FIRST 1 ("node1")'` 或 `'FIRST 1 ("node3")'`，取优先级更高的那一个。`sync_node_count = 1` 时不会把两个名字都写进去
 
 **无残留**：降级不再覆盖 `postgresql.auto.conf`（只替换 `primary_conninfo` / `recovery_target_timeline`），`synchronous_standby_names` 留在副本上，被 PG 忽略（仅 Primary 读取此参数）；它下次成为主库时，pg-ha 在第一个 cycle 重新写入当前的期望值。
 
@@ -516,7 +520,7 @@ node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
 
 1. Leader lock 超时，新选举产生 node2 为 Primary
 2. node2 promote 后首个 cycle 计算 sync 列表
-3. node1（已崩溃）被过滤掉 → `'FIRST 1 (node3)'`
+3. node1（已崩溃）被过滤掉 → `'FIRST 1 ("node3")'`
 
 ### 配置参数
 
@@ -577,7 +581,7 @@ curl -u admin:secret -X PATCH http://localhost:8008/config \
 # 2. 等待一个 HA cycle（默认 loop_wait 秒）后检查 Primary
 docker exec <primary-container> \
   psql -U postgres -Atc "SHOW synchronous_standby_names;"
-# 示例: FIRST 1 (node2,node3)
+# 示例: FIRST 1 ("node2")
 
 # 3. 确认实际复制状态
 docker exec <primary-container> \
@@ -615,7 +619,7 @@ bootstrap:
 - 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（HA 循环固定用 Priority / `FIRST N`）、节点变动时自动更新、两阶段写入（DCS `/sync` 始终是 PG 名单的子集）、`maximum_lag_on_syncnode` lag 门槛、「实际正在流复制」筛选（必须出现在 `pg_stat_replication`）、strict 用不可满足的占位名单真正阻塞写入（不是 `'*'`）、发布 DCS `/sync`、`/sync` `/async` 健康检查、Failover / Switchover 时强制 `/sync` 成员资格
 - 尚未实现（登记在 [TODO.md](TODO.md)）：
   - Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但运行路径没有配置项把它选中（仅 Priority 可用）
-  - `maximum_lag_on_failover`：选举侧仍不读取这个阈值（SB-11）
+  - `maximum_lag_on_failover`：选举会读（SB-11）。落后当轮合格候选里最大 `wal_position` 超过该字节数的节点不参选；`null` 或省略表示关闭
 
 ---
 

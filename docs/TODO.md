@@ -1,6 +1,8 @@
 # pg-ha TODO — 生产就绪路线图
 
-本文对照当前代码（2026-11，标签 `v0.1.22`）。已落地的项标为完成；仍开放的项按代码里的实际缺口描述，不沿用过时现状。
+[English](en/TODO.md)
+
+本文对照当前代码（2026-11，标签 `v0.1.23`）。已落地的项标为完成；仍开放的项按代码里的实际缺口描述，不沿用过时现状。
 
 ## 项目概述
 
@@ -13,7 +15,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 - **REST API** — axum 实现的健康检查和管理端点（默认端口 8008，默认明文 HTTP；配置 `restapi.tls` 后为 HTTPS，可选 mTLS）
 - **TCP Proxy** — 读写分离代理（RW:6432, RO:6433），带主动健康检查、fall/rise 和每后端 `maxconn`。REST 为明文时探活走 `http://`；配置 `restapi.tls` 后走 `https://`，mTLS 时出示本节点服务端证书。
 
-**当前版本**：0.1.22（与 git tag `v0.1.22` 一致）  
+**当前版本**：0.1.23（与 git tag `v0.1.23` 一致）  
 **代码结构**：Cargo workspace，`edition = "2024"`。核心 crate：`pg-ha-core`（HA 逻辑）、`pg-ha-dcs`（Raft）、`pg-ha-proxy`（代理）、`pg-ha-api`（REST）、`pg-ha-ctl`（CLI）
 
 **已实现的关键能力**：
@@ -158,12 +160,12 @@ pg-ha 明确不支持外部 DCS，保留 failsafe 只会误导，故移除。
 
 ### 6. CI 中的测试
 
-**现状**：`.github/workflows/release.yml` 只在 `v*` tag 上做四平台 release 构建，不跑测试。本地有 `make test`（`cargo test --workspace`）。E2E 入口是 `tests/e2e/run_tests.sh`，默认 7 个套件：bootstrap、metrics、dynamic config、switchover、failover、network partition、pause。仓库里还有 `test_rejoin.sh`、`test_consistency.sh`、`test_ha_full.sh`、`test_db_connections.sh`、`quick_test.sh`，没有注册进 runner。Makefile 没有 `e2e` 目标。  
-**目标**：
+**现状**：`.github/workflows/ci.yml` 在每次 push 和 PR 上跑 `cargo fmt --check` 与 `cargo test --workspace`。`.github/workflows/release.yml` 仍只在 `v*` tag 上做发布构建。`make e2e` 跑 `tests/e2e/`，不进 CI（慢、容易抖，留作发布前手工门）。  
+**还没做**：
 
-- CI 中运行 `cargo test`（含 proptest）
-- CI 中启动 compose 并运行 `tests/e2e/run_tests.sh`
-- 增加 Raft TLS 路径的集成测试
+- CI 里的 clippy（`-D warnings`）
+- CI 里启动 compose 跑 e2e
+- Raft TLS 路径的集成测试
 
 ---
 
@@ -235,7 +237,7 @@ pg-ha 明确不支持外部 DCS，保留 failsafe 只会误导，故移除。
    - `cargo build` / `make build` — 本机或面向 Linux 容器的发布二进制（Mac 上走 `cargo-zigbuild`、`cross` 或 `docker-compose.build.yml`）
    - `make test` — `cargo test --workspace`
    - `make up` — 编译并启动 3 节点 Docker 集群（默认 PostgreSQL 16；`PG_VERSION` 传给官方 `postgres` 镜像）
-   - `./tests/e2e/run_tests.sh` — E2E（不是 `make e2e`）
+   - `make e2e` — 端到端脚本（不在 CI 里）
 4. **工具链**：
    - Rust **1.99.1**（`rust-toolchain.toml`、Docker 构建镜像 `rust:1.99.1-bookworm`、CI release 使用 `dtolnay/rust-toolchain@1.99.1`）。`edition = "2024"`，代码使用已稳定的 if-let chains。不跟浮动的 `stable`
    - openraft 0.9
