@@ -207,7 +207,7 @@ When no candidate is specified, and aside from this node there is no member that
 sequenceDiagram
     participant Admin as Operator
     participant API as REST API
-    participant HA as HA Loop (current primary)
+    participant HA as HA Loop, current primary
     participant DCS as Raft DCS
     participant New as Candidate node
 
@@ -216,17 +216,17 @@ sequenceDiagram
     Note over HA: When sync is on, the candidate must belong to /sync<br/>otherwise 409: no key is written and there is no demote
     HA->>DCS: Write /failover
     HA->>DCS: Renew the lock once
-    HA->>HA: Write standby.signal (+ primary_conninfo), then pg_ctl stop -m fast
+    HA->>HA: Write standby.signal and primary_conninfo, then pg_ctl stop -m fast
     HA->>DCS: After PostgreSQL stops successfully, delete the leader lock
     API-->>Admin: 200 accepted, leader lock released
     New->>DCS: Sees the lock is not held, plus the failover key
     Note over New: Acquire the lock only after re-checking its own sync eligibility
-    New->>DCS: attempt_to_acquire_leader()
-    New->>DCS: Write pending to /timeline (before promote, CAS)
+    New->>DCS: attempt_to_acquire_leader
+    New->>DCS: Write pending to /timeline before promote, CAS
     New->>New: pg_ctl promote
-    HA->>HA: Start as a standby (pg_controldata is shut down → write a rewind-check marker)
-    HA->>New: SELECT pg_is_in_recovery() = f (live confirmation that the new primary is ready)
-    HA->>HA: Stop → pg_rewind (no rewind required) → remove the marker → start and follow
+    HA->>HA: Start as a standby. pg_controldata is shut down, so write a rewind-check marker
+    HA->>New: SELECT pg_is_in_recovery = f, live confirmation that the new primary is ready
+    HA->>HA: Stop, then pg_rewind reports no rewind required, remove the marker, start and follow
 ```
 
 **Rewind check of the old primary after a switchover**: After the old primary's `pg_ctl stop -m fast`, `pg_controldata` reports `shut down`. On the next start, a rewind-check marker is written according to the startup rules. Logs:

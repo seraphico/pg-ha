@@ -36,7 +36,7 @@ flowchart TD
     DYNCONF --> DATADIR{data directory empty?}
     DATADIR -->|yes| BOOTSTRAP[Bootstrap initdb/clone]
     DATADIR -->|no| PGRUN{PG running?}
-    PGRUN -->|no| PGSTART[rewind hold file present: do not start<br/>otherwise write standby.signal and the marker from pg_controldata<br/>start as standby; do not start if the write fails<br/>start as primary only while holding the lock]
+    PGRUN -->|no| PGSTART[rewind hold file present: do not start<br/>otherwise write standby.signal and the marker from pg_controldata<br/>start as standby. Do not start if the write fails<br/>start as primary only while holding the lock]
     PGRUN -->|yes| OBSERVE[observe pg_is_in_recovery<br/>and derive identity]
     OBSERVE --> LOCKED{cluster has a leader?}
     LOCKED -->|unlocked| ELECTION[election flow]
@@ -66,7 +66,7 @@ flowchart TD
     IDENT -->|Primary / ManagedStandby| GEN{data belongs to an old history generation?}
     GEN -->|yes| HOLDGEN[stop the database, sit out, do not follow<br/>wait for operations to reinitialize]
     GEN -->|no| MARK{on the latest timeline?<br/>D6, the same with or without the marker}
-    MARK -->|no| ASIDE2[sit out; if running as primary, stop first<br/>follow after a leader appears]
+    MARK -->|no| ASIDE2[sit out. If running as primary, stop first<br/>follow after a leader appears]
     MARK -->|yes| STALE{observed as primary and not the healthiest?}
     STALE -->|yes| STOPSTALE[stop the database, next start as standby]
     STALE -->|no| FAILOVER{failover key names a candidate?}
@@ -85,42 +85,42 @@ Eligibility to run, the format and write timing of `/timeline`, history generati
 
 ```mermaid
 sequenceDiagram
-    participant P as Primary (node1)
-    participant R1 as Replica (node2)
-    participant R2 as Replica (node3)
+    participant P as Primary, node1
+    participant R1 as Replica, node2
+    participant R2 as Replica, node3
     participant DCS as Raft DCS
 
     Note over P: Primary is down
     P->>P: process terminated
 
-    Note over DCS: Leader lock TTL expires (default 30s; Docker dev cluster is 15s)
-    R1->>DCS: get_cluster() → unlocked
-    R1->>R1: is_healthiest_node() = true
-    R1->>DCS: attempt_to_acquire_leader()
-    DCS-->>R1: OK (acquired)
-    R1->>DCS: write /timeline pending (CAS before promote; do not promote if the write fails)
+    Note over DCS: Leader lock TTL expires. Default 30s. Docker dev cluster is 15s
+    R1->>DCS: get_cluster, unlocked
+    R1->>R1: is_healthiest_node = true
+    R1->>DCS: attempt_to_acquire_leader
+    DCS-->>R1: OK, acquired
+    R1->>DCS: write /timeline pending. CAS before promote. Do not promote if the write fails
     R1->>R1: pg_ctl promote
-    R1->>R1: re-observe pg_is_in_recovery() = f
-    R1->>DCS: /timeline = actual identity {timeline, begin} (CAS, clear pending)
+    R1->>R1: re-observe pg_is_in_recovery = f
+    R1->>DCS: /timeline = actual identity, timeline and begin. CAS, clear pending
     Note over R1: becomes the new Primary
 
-    R2->>DCS: get_cluster() → leader=node2
-    R2->>R2: follow_upstream(node2)
+    R2->>DCS: get_cluster, leader=node2
+    R2->>R2: follow_upstream node2
     R2->>R2: detect primary_conninfo change
-    R2->>R2: reconfigure → restart PG to point at node2
+    R2->>R2: reconfigure, restart PG to point at node2
 
     Note over P: old Primary restarts
-    P->>DCS: get_cluster() → leader=node2
-    P->>P: not holding the lock: write standby.signal<br/>pg_controldata = in production → write the rewind-check marker
-    P->>P: pg_ctl start (standby mode)
+    P->>DCS: get_cluster, leader=node2
+    P->>P: not holding the lock, write standby.signal<br/>pg_controldata = in production, write the rewind-check marker
+    P->>P: pg_ctl start, standby mode
     P->>DCS: node2 holds the lock and is running/primary
-    P->>R1: SELECT pg_is_in_recovery() → f (confirm live)
+    P->>R1: SELECT pg_is_in_recovery = f, confirm live
     P->>P: pg_ctl stop
-    P->>R1: SELECT pg_is_in_recovery() → f (confirm again after stop)
-    P->>P: pg_rewind (from node2)
+    P->>R1: SELECT pg_is_in_recovery = f, confirm again after stop
+    P->>P: pg_rewind from node2
     alt pg_rewind succeeds
         P->>P: delete the marker, write standby.signal + primary_conninfo
-        P->>P: pg_ctl start (standby mode)
+        P->>P: pg_ctl start, standby mode
         Note over P: automatic streaming catches up
     else pg_rewind fails
         P->>P: stop the database, keep the data directory, write pg-ha.rewind_failed
@@ -436,42 +436,42 @@ sequenceDiagram
     participant OTHER as Other nodes
 
     OS->>PGHA: SIGTERM / SIGINT
-    PGHA->>PGHA: HA loop stops; REST API and Proxy keep serving
-    Note over PGHA: /primary is always 503, PG is not started, management commands are rejected
+    PGHA->>PGHA: HA loop stops. REST API and Proxy keep serving
+    Note over PGHA: /primary is always 503. PG is not started. Management commands are rejected
     alt holding the lock but the lease has expired
         PGHA->>PG: standby.signal + marker, pg_ctl stop -m immediate
         Note over PGHA: no drain, no CHECKPOINT, do not release the lock
     else lease still valid
-        loop drain (drain_timeout_secs), every loop_wait
-            PGHA->>DCS: update_leader (renew the lock)
-            Note over PGHA: renewal fails: immediate fence, do not release the lock (WARN only under pause)
+        loop drain for drain_timeout_secs, every loop_wait
+            PGHA->>DCS: update_leader, renew the lock
+            Note over PGHA: renewal fails. Immediate fence. Do not release the lock. WARN only under pause
         end
         par race the lease from the last renewal
-            PGHA->>PG: CHECKPOINT (while holding the lock)
+            PGHA->>PG: CHECKPOINT, while holding the lock
             PGHA->>PG: standby.signal + marker, pg_ctl stop -m fast
             PGHA->>PG: on failure, try pg_ctl stop -m immediate once more
         end
         alt PG has stopped
-            PGHA->>DCS: delete_leader (CAS, wait at most retry_timeout)
-            PGHA->>OS: exit(0)
+            PGHA->>DCS: delete_leader, CAS, wait at most retry_timeout
+            PGHA->>OS: exit 0
         else lease expires first
             PGHA->>PG: standby.signal + marker, pg_ctl stop -m immediate
-            Note over PGHA: do not release the lock; the lock expires by TTL
-            PGHA->>OS: exit(0)
+            Note over PGHA: do not release the lock. The lock expires by TTL
+            PGHA->>OS: exit 0
         else PG may be writable and will not stop
-            loop every loop_wait: normal HA loop
-                PGHA->>DCS: renew the lock (while holding it)
-                PGHA->>PG: retry pg_ctl stop (holding the lock: -m fast; not holding it: -m immediate)
-                Note over PGHA: ERROR: give the manual stop command; a further signal only makes the next round run immediately
+            loop every loop_wait, normal HA loop
+                PGHA->>DCS: renew the lock while holding it
+                PGHA->>PG: retry pg_ctl stop. Holding the lock uses -m fast. Not holding it uses -m immediate
+                Note over PGHA: ERROR, give the manual stop command. A further signal only makes the next round run immediately
             end
             Note over PG: operations stops the database by hand
             PGHA->>DCS: delete_leader
-            PGHA->>OS: exit(0)
+            PGHA->>OS: exit 0
         end
     end
 
     Note over OTHER: after the lock is released or expires
-    OTHER->>DCS: attempt_to_acquire_leader()
+    OTHER->>DCS: attempt_to_acquire_leader
     OTHER->>OTHER: pg_ctl promote
 ```
 
