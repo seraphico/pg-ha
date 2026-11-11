@@ -21,6 +21,7 @@ use pg_ha_api::{AppState, AuthConfig};
 use pg_ha_core::cluster::{Member, MemberRole, MemberState};
 use pg_ha_core::config::Config;
 use pg_ha_core::ha::{Ha, ShutdownOutcome};
+use pg_ha_core::peer_http::align_api_scheme;
 use pg_ha_core::postgresql::Postgresql;
 use pg_ha_dcs::RaftDcs;
 use pg_ha_proxy::{PgBackend, PgProxy};
@@ -227,7 +228,11 @@ async fn main() -> anyhow::Result<()> {
     let postgresql = Postgresql::new(config.postgresql.clone());
 
     // ─── Initialize HA engine ───
+    let wal_probe = Arc::new(postgresql.live_wal_probe());
     let (mut ha, cmd_tx) = Ha::new(config.clone(), dcs.clone(), postgresql);
+    ha.set_peer_probe(Arc::new(pg_ha_core::peer_http::ReqwestPeerWalProbe::new(
+        config.restapi.tls.as_ref(),
+    )?));
 
     // ─── Initialize REST API ───
     let app_state = AppState::with_dcs(
@@ -236,7 +241,8 @@ async fn main() -> anyhow::Result<()> {
         config.ttl,
         dcs.clone(),
         config.lease_timing(),
-    );
+    )
+    .with_wal_probe(wal_probe);
     app_state.update(|s| s.set_own_tags(&config.tags)).await;
     let auth_config = AuthConfig {
         username: config.restapi.username.clone(),
@@ -651,17 +657,6 @@ impl SchemeMismatchWarned {
         self.0
             .retain(|name| members.iter().any(|m| &m.name == name));
     }
-}
-
-/// Published member URLs may still say `http://` after REST TLS is turned on.
-/// The probe has to use the scheme this node is actually listening with.
-fn align_api_scheme(url: &str, https: bool) -> String {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    let scheme = if https { "https" } else { "http" };
-    format!("{scheme}://{rest}")
 }
 
 /// Resolve a host:port string to a SocketAddr (supports DNS names)

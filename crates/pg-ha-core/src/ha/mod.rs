@@ -19,7 +19,9 @@ use crate::commands::{CommandResponse, ManagementCommand};
 use crate::config::Config;
 use crate::dcs::DcsAdapter;
 use crate::dynamic_config::{DynamicConfigState, GlobalConfig};
+use crate::live_wal::LiveWalProbe;
 use crate::postgresql::Postgresql;
+use crate::quorum::round::PeerWalProbe;
 use crate::standby_cluster::StandbyCluster;
 use crate::sync::{SyncManager, SyncMode};
 
@@ -33,6 +35,7 @@ mod lag;
 mod lease;
 mod lineage;
 mod shutdown;
+mod vote;
 
 use identity::{LeaderAction, PgIdentity};
 use lease::{LeaderLease, LeaseAnchor};
@@ -181,6 +184,11 @@ pub struct Ha {
     /// timeline). `api_snapshot` reads it, so the API values cost no extra
     /// PostgreSQL query. None: PostgreSQL not running or the query failed.
     wal_sample: std::sync::Mutex<Option<lag::WalSample>>,
+    /// SB-13: reads a voter's live WAL position over the network. None until
+    /// installed; a quorum-sync election then refuses (no vote).
+    peer_probe: Option<Arc<dyn PeerWalProbe>>,
+    /// SB-13: this node's own live WAL reading for the vote.
+    local_wal: Arc<dyn LiveWalProbe>,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -197,6 +205,7 @@ impl Ha {
     ) -> (Self, CommandSender) {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let watchdog = crate::watchdog::Watchdog::new(config.watchdog.clone());
+        let local_wal: Arc<dyn LiveWalProbe> = Arc::new(postgresql.live_wal_probe());
         let ha = Self {
             config,
             dcs,
@@ -223,6 +232,8 @@ impl Ha {
             shutting_down: false,
             watchdog,
             wal_sample: std::sync::Mutex::new(None),
+            peer_probe: None,
+            local_wal,
         };
         (ha, cmd_tx)
     }
@@ -231,6 +242,12 @@ impl Ha {
     /// cycle (see [`StatePublisher`]).
     pub fn set_state_publisher(&mut self, publisher: StatePublisher) {
         self.state_publisher = Some(publisher);
+    }
+
+    /// Install the network probe the quorum vote uses to read the voters'
+    /// live WAL positions.
+    pub fn set_peer_probe(&mut self, probe: Arc<dyn PeerWalProbe>) {
+        self.peer_probe = Some(probe);
     }
 
     /// The REST API state derived from the current HA state.
@@ -849,6 +866,8 @@ impl Ha {
             leader: self.config.name.clone(),
             sync_standby,
             quorum: if enabled { count as u32 } else { 0 },
+            // SB-13 PR1: not wired. Priority is the only kind ever written.
+            kind: crate::cluster::SyncKind::Priority,
         };
         match serde_json::to_string(&state) {
             Ok(json) => {
@@ -2086,6 +2105,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("*".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -2116,6 +2136,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -2146,6 +2167,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -2345,6 +2367,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             failover: Some(Failover {
                 leader: Some("node1".into()),
@@ -2945,6 +2968,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -2990,6 +3014,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -3032,6 +3057,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -3124,6 +3150,7 @@ mod tests {
             leader: "test_node".into(),
             sync_standby: Some("node2".into()),
             quorum: 1,
+            kind: Default::default(),
         });
         ha.is_leader = true;
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
@@ -8833,6 +8860,860 @@ mod tests {
                  stop_after_demotion_write, or add it to the audited table in plan \
                  section 2.2b with a reason"
             );
+        }
+    }
+
+    // ─────────────────── SB-13: quorum vote step ───────────────────
+    mod quorum_vote_tests {
+        use super::*;
+        use crate::cluster::SyncKind;
+        use crate::ha::vote::VoteGate;
+        use crate::live_wal::LiveWalProbe;
+        use crate::postgresql::WalStatus;
+        use crate::quorum::WalPosition;
+        use crate::quorum::round::{PeerProbeError, PeerTarget, PeerWalProbe};
+        use std::time::Duration;
+
+        /// The candidate's own live reading.
+        struct FakeLocal(std::result::Result<WalStatus, String>);
+
+        #[async_trait::async_trait]
+        impl LiveWalProbe for FakeLocal {
+            async fn probe(&self) -> Result<WalStatus> {
+                self.0.clone().map_err(crate::error::Error::Postgres)
+            }
+        }
+
+        /// The candidate's own live reading, after a delay.
+        struct SlowLocal(Duration, std::result::Result<WalStatus, String>);
+
+        #[async_trait::async_trait]
+        impl LiveWalProbe for SlowLocal {
+            async fn probe(&self) -> Result<WalStatus> {
+                tokio::time::sleep(self.0).await;
+                self.1.clone().map_err(crate::error::Error::Postgres)
+            }
+        }
+
+        fn slow_local(delay: Duration, lsn: u64) -> Arc<dyn LiveWalProbe> {
+            Arc::new(SlowLocal(
+                delay,
+                Ok(WalStatus {
+                    timeline: Some(1),
+                    wal_position: lsn,
+                    in_recovery: true,
+                }),
+            ))
+        }
+
+        /// Panics if the election touches the own-WAL probe.
+        struct PanicLocal;
+
+        #[async_trait::async_trait]
+        impl LiveWalProbe for PanicLocal {
+            async fn probe(&self) -> Result<WalStatus> {
+                panic!("local WAL probe must not be called");
+            }
+        }
+
+        fn local(timeline: Option<u64>, lsn: u64) -> Arc<dyn LiveWalProbe> {
+            Arc::new(FakeLocal(Ok(WalStatus {
+                timeline,
+                wal_position: lsn,
+                in_recovery: true,
+            })))
+        }
+
+        /// Scripted peers. Records every call (name and URL) and whether the
+        /// leader lock was already held when the call happened.
+        struct FakePeers {
+            answers: HashMap<String, std::result::Result<WalPosition, PeerProbeError>>,
+            delay: Duration,
+            calls: Mutex<Vec<(String, String)>>,
+            lock_held_at_call: Mutex<Vec<bool>>,
+            dcs: Option<Arc<MockDcs>>,
+        }
+
+        impl FakePeers {
+            fn new() -> Self {
+                Self {
+                    answers: HashMap::new(),
+                    delay: Duration::ZERO,
+                    calls: Mutex::new(Vec::new()),
+                    lock_held_at_call: Mutex::new(Vec::new()),
+                    dcs: None,
+                }
+            }
+            fn ok(mut self, name: &str, timeline: u64, lsn: u64) -> Self {
+                self.answers
+                    .insert(name.into(), Ok(peer_pos(name, timeline, lsn, true)));
+                self
+            }
+            fn primary(mut self, name: &str, timeline: u64, lsn: u64) -> Self {
+                self.answers
+                    .insert(name.into(), Ok(peer_pos(name, timeline, lsn, false)));
+                self
+            }
+            fn err(mut self, name: &str, e: PeerProbeError) -> Self {
+                self.answers.insert(name.into(), Err(e));
+                self
+            }
+            fn delay(mut self, d: Duration) -> Self {
+                self.delay = d;
+                self
+            }
+            fn watching(mut self, dcs: &Arc<MockDcs>) -> Self {
+                self.dcs = Some(dcs.clone());
+                self
+            }
+            fn call_count(&self) -> usize {
+                self.calls.lock().unwrap().len()
+            }
+        }
+
+        fn peer_pos(name: &str, timeline: u64, lsn: u64, in_recovery: bool) -> WalPosition {
+            WalPosition {
+                name: name.into(),
+                in_recovery,
+                timeline,
+                lsn,
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl PeerWalProbe for FakePeers {
+            async fn read(
+                &self,
+                target: &PeerTarget,
+            ) -> std::result::Result<WalPosition, PeerProbeError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((target.name.clone(), target.api_url.clone()));
+                if let Some(dcs) = &self.dcs {
+                    self.lock_held_at_call
+                        .lock()
+                        .unwrap()
+                        .push(lock_held_by(dcs).is_some());
+                }
+                if !self.delay.is_zero() {
+                    tokio::time::sleep(self.delay).await;
+                }
+                self.answers
+                    .get(&target.name)
+                    .cloned()
+                    .unwrap_or(Err(PeerProbeError::Timeout))
+            }
+        }
+
+        /// Panics on any call.
+        struct PanicPeers;
+
+        #[async_trait::async_trait]
+        impl PeerWalProbe for PanicPeers {
+            async fn read(
+                &self,
+                _target: &PeerTarget,
+            ) -> std::result::Result<WalPosition, PeerProbeError> {
+                panic!("peer probe must not be called");
+            }
+        }
+
+        fn member_at(name: &str, wal: u64) -> Member {
+            Member {
+                api_url: format!("http://{name}:8008"),
+                ..running_member(name, wal)
+            }
+        }
+
+        struct Setup {
+            kind: SyncKind,
+            sync_on: bool,
+            designated: bool,
+            members: Vec<Member>,
+            quorum: u32,
+            max_lag: Option<u64>,
+        }
+
+        impl Setup {
+            /// Voters test_node, node2, node3; this node is test_node.
+            fn quorum() -> Self {
+                Self {
+                    kind: SyncKind::Quorum,
+                    sync_on: true,
+                    designated: false,
+                    members: vec![
+                        member_at("test_node", 100),
+                        member_at("node2", 50),
+                        member_at("node3", 50),
+                    ],
+                    quorum: 1,
+                    max_lag: None,
+                }
+            }
+        }
+
+        fn build(
+            label: &str,
+            setup: Setup,
+            dcs: &Arc<MockDcs>,
+            local_probe: Arc<dyn LiveWalProbe>,
+            peers: Option<Arc<dyn PeerWalProbe>>,
+        ) -> (Ha, PathBuf) {
+            let (mut ha, dir) = identity_test_ha("test_node", label, dcs.clone(), Some(true), true);
+            ha.set_local_wal_probe(local_probe);
+            if let Some(p) = peers {
+                ha.set_peer_probe(p);
+            }
+            ha.dynamic_config_state.apply_new_config(GlobalConfig {
+                synchronous_mode: Some(setup.sync_on),
+                maximum_lag_on_failover: setup.max_lag,
+                ..Default::default()
+            });
+            ha.cluster = Cluster {
+                timeline: rec(1),
+                leader: None,
+                members: setup.members,
+                sync_state: Some(SyncState {
+                    leader: "old".into(),
+                    sync_standby: Some("test_node,node2,node3".into()),
+                    quorum: setup.quorum,
+                    kind: setup.kind,
+                }),
+                failover: setup.designated.then(|| Failover {
+                    leader: Some("old".into()),
+                    candidate: Some("test_node".into()),
+                    scheduled_at: None,
+                }),
+                ..Default::default()
+            };
+            (ha, dir)
+        }
+
+        fn refused(result: &CycleResult) -> &str {
+            match result {
+                CycleResult::Follower(m) if m.starts_with("quorum vote refused") => m,
+                other => panic!("expected a quorum vote refusal, got: {other}"),
+            }
+        }
+
+        // (a) Priority / sync off: no I/O, the vote never runs.
+        #[tokio::test]
+        async fn priority_kind_never_calls_a_probe() {
+            for designated in [false, true] {
+                let dcs = Arc::new(MockDcs::new());
+                let setup = Setup {
+                    kind: SyncKind::Priority,
+                    designated,
+                    ..Setup::quorum()
+                };
+                let (mut ha, dir) = build(
+                    &format!("vote-priority-{designated}"),
+                    setup,
+                    &dcs,
+                    Arc::new(PanicLocal),
+                    Some(Arc::new(PanicPeers)),
+                );
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(
+                    !matches!(&result, CycleResult::Follower(m) if m.contains("quorum vote")),
+                    "got: {result}"
+                );
+                assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+                assert_eq!(ha.quorum_vote().await, VoteGate::NotApplicable);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        #[tokio::test]
+        async fn sync_mode_off_never_calls_a_probe() {
+            for designated in [false, true] {
+                let dcs = Arc::new(MockDcs::new());
+                let setup = Setup {
+                    sync_on: false,
+                    designated,
+                    ..Setup::quorum()
+                };
+                let (mut ha, dir) = build(
+                    &format!("vote-syncoff-{designated}"),
+                    setup,
+                    &dcs,
+                    Arc::new(PanicLocal),
+                    Some(Arc::new(PanicPeers)),
+                );
+                assert_eq!(ha.quorum_vote().await, VoteGate::NotApplicable);
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(
+                    !matches!(&result, CycleResult::Follower(m) if m.contains("quorum vote")),
+                    "got: {result}"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        // (b) granted, and (g) the designated candidate takes the same gate.
+        #[tokio::test]
+        async fn granted_vote_acquires_the_lock_on_both_branches() {
+            for designated in [false, true] {
+                let dcs = Arc::new(MockDcs::new());
+                let peers = Arc::new(FakePeers::new().ok("node2", 1, 100).ok("node3", 1, 90));
+                let setup = Setup {
+                    designated,
+                    ..Setup::quorum()
+                };
+                let (mut ha, dir) = build(
+                    &format!("vote-granted-{designated}"),
+                    setup,
+                    &dcs,
+                    local(Some(1), 100),
+                    Some(peers.clone()),
+                );
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(
+                    !matches!(&result, CycleResult::Follower(m) if m.contains("quorum vote")),
+                    "got: {result}"
+                );
+                assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+                assert_eq!(peers.call_count(), 2, "designated={designated}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        // (c) each refusal leaves the lock alone.
+        async fn refusal_case(
+            label: &str,
+            setup: Setup,
+            local_probe: Arc<dyn LiveWalProbe>,
+            peers: FakePeers,
+            needle: &str,
+        ) {
+            for designated in [false, true] {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = build(
+                    &format!("{label}-{designated}"),
+                    Setup {
+                        designated,
+                        kind: setup.kind,
+                        sync_on: setup.sync_on,
+                        members: setup.members.clone(),
+                        quorum: setup.quorum,
+                        max_lag: setup.max_lag,
+                    },
+                    &dcs,
+                    local_probe.clone(),
+                    Some(Arc::new(FakePeersView(peers.clone_script()))),
+                );
+                let result = ha.process_unhealthy_cluster().await;
+                let msg = refused(&result);
+                assert!(msg.contains(needle), "wanted {needle}, got: {msg}");
+                assert_eq!(lock_held_by(&dcs), None, "lock must not be taken");
+                assert!(!ha.is_leader());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        impl FakePeers {
+            fn clone_script(&self) -> Self {
+                Self {
+                    answers: self.answers.clone(),
+                    delay: self.delay,
+                    calls: Mutex::new(Vec::new()),
+                    lock_held_at_call: Mutex::new(Vec::new()),
+                    dcs: None,
+                }
+            }
+        }
+
+        /// Owned copy of a script, usable as `Arc<dyn PeerWalProbe>`.
+        struct FakePeersView(FakePeers);
+
+        #[async_trait::async_trait]
+        impl PeerWalProbe for FakePeersView {
+            async fn read(
+                &self,
+                target: &PeerTarget,
+            ) -> std::result::Result<WalPosition, PeerProbeError> {
+                self.0.read(target).await
+            }
+        }
+
+        #[tokio::test]
+        async fn refused_when_a_voter_is_ahead() {
+            refusal_case(
+                "vote-behind",
+                Setup::quorum(),
+                local(Some(1), 100),
+                FakePeers::new().ok("node2", 1, 101).ok("node3", 1, 90),
+                "BehindPeer",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn refused_when_a_voter_is_on_a_higher_timeline() {
+            refusal_case(
+                "vote-hightl",
+                Setup::quorum(),
+                local(Some(1), 100),
+                FakePeers::new().ok("node2", 2, 1).ok("node3", 1, 90),
+                "HigherTimeline",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn refused_when_a_primary_is_alive() {
+            refusal_case(
+                "vote-primary",
+                Setup::quorum(),
+                local(Some(1), 100),
+                FakePeers::new().primary("node2", 1, 100).ok("node3", 1, 90),
+                "PrimaryAlive",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn refused_with_insufficient_votes() {
+            refusal_case(
+                "vote-insufficient",
+                Setup {
+                    quorum: 2,
+                    ..Setup::quorum()
+                },
+                local(Some(1), 100),
+                FakePeers::new().ok("node2", 1, 90),
+                "InsufficientVotes",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn refused_when_candidate_is_not_a_voter() {
+            let mut ha_setup = Setup::quorum();
+            ha_setup.designated = false;
+            let dcs = Arc::new(MockDcs::new());
+            let (mut ha, dir) = build(
+                "vote-notvoter",
+                ha_setup,
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 90),
+                )),
+            );
+            // Voter set without this node.
+            ha.cluster.sync_state.as_mut().unwrap().sync_standby = Some("node2,node3".into());
+            match ha.quorum_vote().await {
+                VoteGate::Refuse(m) => assert!(m.contains("NotVoter"), "{m}"),
+                other => panic!("got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // (d) every kind of missing or failed answer is "no vote", never an Error.
+        #[tokio::test]
+        async fn unusable_voters_are_no_vote_not_errors() {
+            let cases: Vec<(&str, FakePeers, Vec<Member>)> = vec![
+                (
+                    "missing-record",
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 90),
+                    vec![member_at("test_node", 100), member_at("node2", 50)],
+                ),
+                (
+                    "empty-api-url",
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 90),
+                    vec![
+                        member_at("test_node", 100),
+                        member_at("node2", 50),
+                        Member {
+                            api_url: String::new(),
+                            ..member_at("node3", 50)
+                        },
+                    ],
+                ),
+                (
+                    "not-running",
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 90),
+                    vec![
+                        member_at("test_node", 100),
+                        member_at("node2", 50),
+                        Member {
+                            state: MemberState::Stopped,
+                            ..member_at("node3", 50)
+                        },
+                    ],
+                ),
+            ];
+            for (label, peers, members) in cases {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = build(
+                    &format!("vote-nov-{label}"),
+                    Setup {
+                        quorum: 2,
+                        members,
+                        ..Setup::quorum()
+                    },
+                    &dcs,
+                    local(Some(1), 100),
+                    Some(Arc::new(peers)),
+                );
+                let result = ha.process_unhealthy_cluster().await;
+                refused(&result);
+                assert_eq!(lock_held_by(&dcs), None, "{label}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        #[tokio::test]
+        async fn failing_answers_are_no_vote_not_errors() {
+            let failures = [
+                PeerProbeError::Timeout,
+                PeerProbeError::Status(503),
+                PeerProbeError::Transport("refused".into()),
+                PeerProbeError::BadBody("x".into()),
+                PeerProbeError::Mismatch,
+            ];
+            for (i, failure) in failures.into_iter().enumerate() {
+                let dcs = Arc::new(MockDcs::new());
+                let peers = FakePeers::new()
+                    .ok("node2", 1, 90)
+                    .err("node3", failure.clone());
+                let (mut ha, dir) = build(
+                    &format!("vote-fail-{i}"),
+                    Setup {
+                        quorum: 2,
+                        ..Setup::quorum()
+                    },
+                    &dcs,
+                    local(Some(1), 100),
+                    Some(Arc::new(peers)),
+                );
+                let result = ha.process_unhealthy_cluster().await;
+                let msg = refused(&result);
+                assert!(msg.contains("InsufficientVotes"), "{failure}: {msg}");
+                assert_eq!(lock_held_by(&dcs), None);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// A voter whose PostgreSQL is down answers 503: no vote.
+        #[tokio::test]
+        async fn pg_down_peer_answer_is_no_vote() {
+            let dcs = Arc::new(MockDcs::new());
+            let peers = FakePeers::new()
+                .ok("node2", 1, 90)
+                .err("node3", PeerProbeError::Status(503));
+            let (mut ha, dir) = build(
+                "vote-pgdown",
+                Setup {
+                    quorum: 2,
+                    ..Setup::quorum()
+                },
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(peers)),
+            );
+            assert!(matches!(ha.quorum_vote().await, VoteGate::Refuse(_)));
+            // With quorum 1 the same answers win.
+            ha.cluster.sync_state.as_mut().unwrap().quorum = 1;
+            assert_eq!(ha.quorum_vote().await, VoteGate::Pass);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // (e) every voter unreachable.
+        #[tokio::test]
+        async fn all_voters_unreachable_is_refused() {
+            let dcs = Arc::new(MockDcs::new());
+            let peers = FakePeers::new()
+                .err("node2", PeerProbeError::Transport("tls handshake".into()))
+                .err("node3", PeerProbeError::Transport("tls handshake".into()));
+            let (mut ha, dir) = build(
+                "vote-unreachable",
+                Setup::quorum(),
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(peers)),
+            );
+            let result = ha.process_unhealthy_cluster().await;
+            let msg = refused(&result);
+            assert!(msg.contains("InsufficientVotes"), "{msg}");
+            assert_eq!(lock_held_by(&dcs), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // (f) no peer probe installed.
+        #[tokio::test]
+        async fn missing_peer_probe_is_refused() {
+            let dcs = Arc::new(MockDcs::new());
+            let (mut ha, dir) = build(
+                "vote-noprobe",
+                Setup::quorum(),
+                &dcs,
+                local(Some(1), 100),
+                None,
+            );
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(refused(&result).contains("no peer probe"));
+            assert_eq!(lock_held_by(&dcs), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn unreadable_own_wal_is_refused() {
+            let dcs = Arc::new(MockDcs::new());
+            let bad: Arc<dyn LiveWalProbe> = Arc::new(FakeLocal(Err("pg down".into())));
+            let (mut ha, dir) = build(
+                "vote-ownerr",
+                Setup::quorum(),
+                &dcs,
+                bad,
+                Some(Arc::new(PanicPeers)),
+            );
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(refused(&result).contains("own WAL unreadable"));
+            assert_eq!(lock_held_by(&dcs), None);
+
+            // A reading without a timeline is no proof either.
+            ha.set_local_wal_probe(local(None, 100));
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(refused(&result).contains("timeline unknown"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // The scheme follows this node's own REST TLS mode.
+        #[tokio::test]
+        async fn peer_urls_use_the_local_scheme() {
+            let dcs = Arc::new(MockDcs::new());
+            let peers = Arc::new(FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 90));
+            let (ha, dir) = build(
+                "vote-scheme",
+                Setup::quorum(),
+                &dcs,
+                local(Some(1), 100),
+                Some(peers.clone()),
+            );
+            assert_eq!(ha.quorum_vote().await, VoteGate::Pass);
+            let urls: Vec<String> = peers
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| c.1.clone())
+                .collect();
+            assert!(urls.iter().all(|u| u.starts_with("http://")), "{urls:?}");
+            assert!(
+                !peers
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.0 == "test_node")
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // (h) the SB-11 ceiling is decided with live values only.
+        #[tokio::test]
+        async fn lag_ceiling_uses_live_values_not_published_ones() {
+            // Published values say this node is 10000 bytes behind node2
+            // (over the 500 ceiling), but the live readings are level: the
+            // designated candidate passes the vote.
+            let dcs = Arc::new(MockDcs::new());
+            let setup = Setup {
+                designated: true,
+                max_lag: Some(500),
+                members: vec![
+                    member_at("test_node", 100),
+                    member_at("node2", 10_100),
+                    member_at("node3", 50),
+                ],
+                ..Setup::quorum()
+            };
+            let (mut ha, dir) = build(
+                "vote-lag-stale",
+                setup,
+                &dcs,
+                local(Some(1), 5000),
+                Some(Arc::new(
+                    FakePeers::new().ok("node2", 1, 5000).ok("node3", 1, 4900),
+                )),
+            );
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(
+                !matches!(&result, CycleResult::Follower(m) if m.contains("quorum vote")),
+                "got: {result}"
+            );
+            assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+            let _ = std::fs::remove_dir_all(&dir);
+
+            // The converse: published values look level, a live reading is
+            // ahead: refused.
+            let dcs = Arc::new(MockDcs::new());
+            let setup = Setup {
+                designated: true,
+                max_lag: Some(500),
+                members: vec![
+                    member_at("test_node", 100),
+                    member_at("node2", 100),
+                    member_at("node3", 100),
+                ],
+                ..Setup::quorum()
+            };
+            let (mut ha, dir) = build(
+                "vote-lag-live",
+                setup,
+                &dcs,
+                local(Some(1), 5000),
+                Some(Arc::new(
+                    FakePeers::new().ok("node2", 1, 9000).ok("node3", 1, 4900),
+                )),
+            );
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(refused(&result).contains("BehindPeer"));
+            assert_eq!(lock_held_by(&dcs), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // (i) a slow vote runs before the acquire and never shortens the lease.
+        #[tokio::test(start_paused = true)]
+        async fn slow_vote_happens_before_acquire_and_does_not_shorten_the_lease() {
+            let dcs = Arc::new(MockDcs::new());
+            let peers = Arc::new(
+                FakePeers::new()
+                    .ok("node2", 1, 90)
+                    .ok("node3", 1, 90)
+                    .delay(Duration::from_millis(1900))
+                    .watching(&dcs),
+            );
+            let (mut ha, dir) = build(
+                "vote-ordering",
+                Setup::quorum(),
+                &dcs,
+                local(Some(1), 100),
+                Some(peers.clone()),
+            );
+            let start = tokio::time::Instant::now();
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(
+                !matches!(&result, CycleResult::Follower(m) if m.contains("quorum vote")),
+                "got: {result}"
+            );
+            assert!(start.elapsed() >= Duration::from_millis(1900));
+            assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+            // Every probe call happened while the lock was still free.
+            assert_eq!(*peers.lock_held_at_call.lock().unwrap(), vec![false, false]);
+            // The lease is anchored after the vote: nearly the whole
+            // ttl - safety_margin is left, not that minus the vote delay.
+            let lease = ha.leader_lease.expect("lease taken");
+            let valid =
+                Duration::from_secs(dcs.ttl().saturating_sub(ha.config.watchdog.safety_margin));
+            assert!(
+                lease.remaining() > valid - Duration::from_millis(500),
+                "remaining {:?} of {:?}",
+                lease.remaining(),
+                valid
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // The peer round is bounded: peers that never answer cost 3 s at most.
+        #[tokio::test(start_paused = true)]
+        async fn hanging_voters_are_cut_off_within_the_round_budget() {
+            let dcs = Arc::new(MockDcs::new());
+            let peers = Arc::new(
+                FakePeers::new()
+                    .ok("node2", 1, 90)
+                    .ok("node3", 1, 90)
+                    .delay(Duration::from_secs(3600)),
+            );
+            let (ha, dir) = build(
+                "vote-hang",
+                Setup::quorum(),
+                &dcs,
+                local(Some(1), 100),
+                Some(peers),
+            );
+            let start = tokio::time::Instant::now();
+            assert!(matches!(ha.quorum_vote().await, VoteGate::Refuse(_)));
+            assert!(start.elapsed() <= Duration::from_secs(3));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // The own live read (1.5 s) runs concurrently with the peer round: the
+        // whole vote is bounded by max(1.5 s, 3 s), not their 4.5 s sum.
+        #[tokio::test(start_paused = true)]
+        async fn slow_own_read_and_hanging_peers_stay_within_the_round_budget() {
+            let dcs = Arc::new(MockDcs::new());
+            let peers = Arc::new(
+                FakePeers::new()
+                    .ok("node2", 1, 90)
+                    .ok("node3", 1, 90)
+                    .delay(Duration::from_secs(3600)),
+            );
+            let (ha, dir) = build(
+                "vote-slow-own-hang",
+                Setup::quorum(),
+                &dcs,
+                slow_local(crate::live_wal::LIVE_WAL_READ_TIMEOUT, 100),
+                Some(peers),
+            );
+            let start = tokio::time::Instant::now();
+            assert!(matches!(ha.quorum_vote().await, VoteGate::Refuse(_)));
+            assert!(
+                start.elapsed() <= Duration::from_secs(3),
+                "vote took {:?}",
+                start.elapsed()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A failing own read is refused with the usual reason while the peers
+        // answer; no panic, and the peers' answers are not used.
+        #[tokio::test(start_paused = true)]
+        async fn failing_own_read_is_refused_while_peers_answer() {
+            let dcs = Arc::new(MockDcs::new());
+            let bad: Arc<dyn LiveWalProbe> =
+                Arc::new(SlowLocal(Duration::from_millis(10), Err("pg down".into())));
+            let (ha, dir) = build(
+                "vote-ownerr-peers-ok",
+                Setup::quorum(),
+                &dcs,
+                bad,
+                Some(Arc::new(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 90),
+                )),
+            );
+            match ha.quorum_vote().await {
+                VoteGate::Refuse(m) => {
+                    assert_eq!(
+                        m,
+                        "quorum vote refused: own WAL unreadable: PostgreSQL error: pg down"
+                    )
+                }
+                other => panic!("expected refusal, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A slow own read with immediate peers still grants, and the grant is
+        // not delayed beyond the own read.
+        #[tokio::test(start_paused = true)]
+        async fn slow_own_read_with_fast_peers_is_granted_without_extra_delay() {
+            let dcs = Arc::new(MockDcs::new());
+            let (ha, dir) = build(
+                "vote-slow-own-fast-peers",
+                Setup::quorum(),
+                &dcs,
+                slow_local(crate::live_wal::LIVE_WAL_READ_TIMEOUT, 100),
+                Some(Arc::new(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 90),
+                )),
+            );
+            let start = tokio::time::Instant::now();
+            assert_eq!(ha.quorum_vote().await, VoteGate::Pass);
+            assert_eq!(start.elapsed(), crate::live_wal::LIVE_WAL_READ_TIMEOUT);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

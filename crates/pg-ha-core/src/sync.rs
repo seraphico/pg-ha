@@ -76,6 +76,31 @@ impl SyncManager {
         threshold: Option<u64>,
         current_voters: &[String],
     ) -> Option<String> {
+        let selection =
+            self.select_sync_standbys(members, my_name, snapshot, threshold, current_voters)?;
+        self.format_sync_standby_names(&selection)
+    }
+
+    /// Selection half of [`Self::compute_sync_standby_names`]: decide WHICH
+    /// standbys are listed and with what `count`, without formatting.
+    ///
+    /// Eligibility, lag filtering and ordering are identical for every mode.
+    /// The modes differ only in how the ordered candidates become a list:
+    /// - `Priority`: the first `count` candidates (`FIRST count (...)`).
+    /// - `Quorum`: ALL eligible candidates, sorted by name, with `count` as the
+    ///   `ANY n` confirmation number (`ANY n (V)`, `quorum = |V| - n`).
+    ///   `count` is never used to truncate the list (SB-13: truncating made
+    ///   every listed name mandatory, which is not a quorum).
+    ///
+    /// Returns `None` if sync mode is Off.
+    pub fn select_sync_standbys(
+        &self,
+        members: &[Member],
+        my_name: &str,
+        snapshot: &ReplicationSnapshot,
+        threshold: Option<u64>,
+        current_voters: &[String],
+    ) -> Option<SyncSelection> {
         if self.mode == SyncMode::Off {
             return None;
         }
@@ -135,14 +160,9 @@ impl SyncManager {
         });
 
         if candidates.is_empty() {
-            if self.strict_mode {
-                // No eligible standby: emit a quoted placeholder matching no
-                // real member so every commit WAITs. Not '*' — '*' means "any
-                // connected standby" and does not block.
-                return Some(STRICT_NO_ELIGIBLE_PLACEHOLDER.to_string());
-            }
-            // Non-strict: degrade to async (failover still forbidden).
-            return Some(String::new());
+            return Some(SyncSelection::NoEligible {
+                strict: self.strict_mode,
+            });
         }
 
         let eligible_len = candidates.len();
@@ -155,20 +175,99 @@ impl SyncManager {
             self.sync_node_count.min(eligible_len)
         };
 
-        // Double-quote each member name so special characters cannot break
-        // ALTER SYSTEM (decision 11).
-        let name_list = candidates
-            .iter()
-            .take(count)
-            .map(|c| quote_ident(&c.member.name))
-            .collect::<Vec<_>>()
-            .join(",");
+        let names = match self.mode {
+            SyncMode::Priority => candidates
+                .iter()
+                .take(count)
+                .map(|c| c.member.name.clone())
+                .collect(),
+            SyncMode::Quorum => {
+                // All eligible voters; order carries no meaning for `ANY`, so
+                // sort by name (case-folded) to keep the string stable.
+                let mut names: Vec<String> =
+                    candidates.iter().map(|c| c.member.name.clone()).collect();
+                names.sort_by(|a, b| {
+                    a.to_ascii_lowercase()
+                        .cmp(&b.to_ascii_lowercase())
+                        .then_with(|| a.cmp(b))
+                });
+                names
+            }
+            SyncMode::Off => return None,
+        };
+        Some(SyncSelection::Voters { names, count })
+    }
 
-        match self.mode {
-            SyncMode::Priority => Some(format!("FIRST {count} ({name_list})")),
-            SyncMode::Quorum => Some(format!("ANY {count} ({name_list})")),
-            SyncMode::Off => None,
+    /// Formatting half of [`Self::compute_sync_standby_names`]: render a
+    /// selection as a `synchronous_standby_names` value.
+    ///
+    /// Returns `None` if sync mode is Off. `NoEligible` renders as the
+    /// unsatisfiable placeholder in strict mode (every commit WAITs, not
+    /// `'*'`, which does not block) and as the empty string otherwise (async).
+    pub fn format_sync_standby_names(&self, selection: &SyncSelection) -> Option<String> {
+        if self.mode == SyncMode::Off {
+            return None;
         }
+        match selection {
+            SyncSelection::NoEligible { strict: true } => {
+                Some(STRICT_NO_ELIGIBLE_PLACEHOLDER.to_string())
+            }
+            SyncSelection::NoEligible { strict: false } => Some(String::new()),
+            SyncSelection::Voters { names, count } => {
+                // Double-quote each member name so special characters cannot
+                // break ALTER SYSTEM (decision 11).
+                let name_list = names
+                    .iter()
+                    .map(|n| quote_ident(n))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                match self.mode {
+                    SyncMode::Priority => Some(format!("FIRST {count} ({name_list})")),
+                    SyncMode::Quorum => Some(format!("ANY {count} ({name_list})")),
+                    SyncMode::Off => None,
+                }
+            }
+        }
+    }
+}
+
+/// Result of standby selection, before formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncSelection {
+    /// Nobody is eligible. `strict` records which fallback applies when
+    /// formatting (placeholder that blocks writes vs. empty = async).
+    NoEligible { strict: bool },
+    /// The listed standbys (raw, unquoted member names) and the `FIRST`/`ANY`
+    /// number. For `Priority` `names.len() <= count` after non-strict
+    /// downscaling; for `Quorum` `names` is every eligible voter.
+    Voters { names: Vec<String>, count: usize },
+}
+
+impl SyncSelection {
+    /// Voter names (empty for `NoEligible`).
+    pub fn voters(&self) -> &[String] {
+        match self {
+            SyncSelection::NoEligible { .. } => &[],
+            SyncSelection::Voters { names, .. } => names,
+        }
+    }
+
+    /// The `n` of `ANY n (...)` / `FIRST n (...)` (0 for `NoEligible`).
+    pub fn confirmations(&self) -> usize {
+        match self {
+            SyncSelection::NoEligible { .. } => 0,
+            SyncSelection::Voters { count, .. } => *count,
+        }
+    }
+
+    /// Quorum-semantics `q = |V| - n` (design section 2.2); 0 when the list
+    /// cannot satisfy `n` (strict with fewer than `n` voters: writes block, so
+    /// nothing is ever acknowledged and nothing can be lost).
+    ///
+    /// This is NOT what Priority writes into `/sync.quorum` today (that is the
+    /// configured N, unchanged in PR1; decision D10).
+    pub fn quorum(&self) -> usize {
+        self.voters().len().saturating_sub(self.confirmations())
     }
 }
 
@@ -283,17 +382,127 @@ mod tests {
 
     #[test]
     fn test_quorum_mode() {
+        // SB-13: Quorum lists ALL eligible voters (no truncation to N) and
+        // `quorum = |V| - n`. Previously this emitted `ANY 2 ("r1","r2")`.
         let mgr = SyncManager::new(SyncMode::Quorum, 2, false);
         let members = vec![
+            make_member("r3", 0),
             make_member("r1", 0),
             make_member("r2", 0),
-            make_member("r3", 0),
         ];
         let snap = snapshot(1000, &[("r1", 1000), ("r2", 1000), ("r3", 1000)]);
         let result = mgr
             .compute_sync_standby_names(&members, "primary", &snap, None, &[])
             .unwrap();
-        assert!(result.starts_with("ANY 2"));
+        assert_eq!(result, "ANY 2 (\"r1\",\"r2\",\"r3\")");
+
+        let sel = mgr
+            .select_sync_standbys(&members, "primary", &snap, None, &[])
+            .unwrap();
+        assert_eq!(sel.voters(), ["r1", "r2", "r3"]);
+        assert_eq!(sel.confirmations(), 2);
+        assert_eq!(sel.quorum(), 1);
+    }
+
+    #[test]
+    fn test_quorum_ignores_priority_and_stickiness() {
+        // Quorum voters are peers: sync_priority and current voters do not
+        // choose who is listed or the order (design D7). Order is by name.
+        let mgr = SyncManager::new(SyncMode::Quorum, 1, false);
+        let members = vec![
+            make_member("b", 9),
+            make_member("a", 1),
+            make_member("c", 5),
+        ];
+        let snap = snapshot(1000, &[("a", 1000), ("b", 1000), ("c", 1000)]);
+        let voters = vec!["c".to_string()];
+        let result = mgr
+            .compute_sync_standby_names(&members, "primary", &snap, None, &voters)
+            .unwrap();
+        assert_eq!(result, "ANY 1 (\"a\",\"b\",\"c\")");
+    }
+
+    #[test]
+    fn test_quorum_count_clamped_and_strict() {
+        let members = vec![make_member("r1", 0), make_member("r2", 0)];
+        let snap = snapshot(1000, &[("r1", 1000), ("r2", 1000)]);
+
+        // Non-strict: n=3 > M=2 -> n=2, q=0 (everyone must confirm).
+        let mgr = SyncManager::new(SyncMode::Quorum, 3, false);
+        let sel = mgr
+            .select_sync_standbys(&members, "primary", &snap, None, &[])
+            .unwrap();
+        assert_eq!(
+            mgr.format_sync_standby_names(&sel).unwrap(),
+            "ANY 2 (\"r1\",\"r2\")"
+        );
+        assert_eq!(sel.quorum(), 0);
+
+        // Strict: n stays 3, list stays 2 names (unsatisfiable, writes block), q=0.
+        let mgr = SyncManager::new(SyncMode::Quorum, 3, true);
+        let sel = mgr
+            .select_sync_standbys(&members, "primary", &snap, None, &[])
+            .unwrap();
+        assert_eq!(
+            mgr.format_sync_standby_names(&sel).unwrap(),
+            "ANY 3 (\"r1\",\"r2\")"
+        );
+        assert_eq!(sel.quorum(), 0);
+    }
+
+    #[test]
+    fn test_quorum_no_eligible_fallbacks_match_priority() {
+        let snap = snapshot(1000, &[]);
+        let members: Vec<Member> = vec![];
+        let strict = SyncManager::new(SyncMode::Quorum, 1, true);
+        assert_eq!(
+            strict.compute_sync_standby_names(&members, "primary", &snap, None, &[]),
+            Some(STRICT_NO_ELIGIBLE_PLACEHOLDER.to_string())
+        );
+        let loose = SyncManager::new(SyncMode::Quorum, 1, false);
+        assert_eq!(
+            loose.compute_sync_standby_names(&members, "primary", &snap, None, &[]),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn test_quorum_lag_filter_still_applies() {
+        // The eligibility/lag filter is shared with Priority: r3 lags and is
+        // not a voter, so it must not appear in the ANY list either.
+        let mgr = SyncManager::new(SyncMode::Quorum, 1, false);
+        let members = vec![
+            make_member("r1", 0),
+            make_member("r2", 0),
+            make_member("r3", 0),
+        ];
+        let snap = snapshot(2000, &[("r1", 1000), ("r2", 1000), ("r3", 100)]);
+        let result = mgr
+            .compute_sync_standby_names(&members, "primary", &snap, Some(100), &[])
+            .unwrap();
+        assert_eq!(result, "ANY 1 (\"r1\",\"r2\")");
+    }
+
+    #[test]
+    fn test_priority_selection_is_truncated_not_quorum() {
+        // Regression pin: Priority still lists only the first N by its
+        // ordering, and its selection reports quorum() = |names| - n = 0.
+        let mgr = SyncManager::new(SyncMode::Priority, 2, false);
+        let members = vec![
+            make_member("r1", 1),
+            make_member("r2", 9),
+            make_member("r3", 5),
+        ];
+        let snap = snapshot(1000, &[("r1", 1000), ("r2", 1000), ("r3", 1000)]);
+        let sel = mgr
+            .select_sync_standbys(&members, "primary", &snap, None, &[])
+            .unwrap();
+        assert_eq!(sel.voters(), ["r2", "r3"]);
+        assert_eq!(sel.quorum(), 0);
+        assert_eq!(
+            mgr.format_sync_standby_names(&sel).unwrap(),
+            "FIRST 2 (\"r2\",\"r3\")"
+        );
     }
 
     #[test]

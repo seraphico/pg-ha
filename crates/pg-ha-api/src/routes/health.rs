@@ -1,5 +1,6 @@
 //! Health check handlers for the router.
 
+use super::router_state::{ReplicaQuery, RouterState};
 use axum::{
     Json,
     extract::{Query, State},
@@ -7,8 +8,6 @@ use axum::{
     response::IntoResponse,
 };
 use serde_json::json;
-
-use super::router_state::{ReplicaQuery, RouterState};
 
 /// GET /primary, GET /, GET /read-write
 /// Returns 200 if this node is the primary with the leader lock.
@@ -232,4 +231,45 @@ pub(crate) async fn get_cluster(State(state): State<RouterState>) -> impl IntoRe
         "members": [],
     }))
     .into_response()
+}
+
+/// GET /wal
+/// Live WAL position and timeline of this node, read from PostgreSQL now (not
+/// the published copy). Open like the other health routes; peers call it
+/// during a quorum election. 503 when unavailable, busy, slow or failing.
+pub(crate) async fn wal_endpoint(State(state): State<RouterState>) -> impl IntoResponse {
+    let unavailable = |msg: String| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": msg })),
+        )
+    };
+    let Some(probe) = state.app.wal_probe().cloned() else {
+        return unavailable("live WAL probe not available".into());
+    };
+    let Some(_permit) = state.app.try_wal_permit() else {
+        return unavailable("busy".into());
+    };
+    let wal = match tokio::time::timeout(state.app.wal_timeout(), probe.probe()).await {
+        Ok(Ok(wal)) => wal,
+        Ok(Err(err)) => return unavailable(err.to_string()),
+        Err(_) => return unavailable("live WAL read timed out".into()),
+    };
+    if wal.timeline.is_none() {
+        return unavailable("timeline unknown".into());
+    }
+    let (name, scope) = {
+        let s = state.app.read().await;
+        (s.name.clone(), s.scope.clone())
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "name": name,
+            "scope": scope,
+            "timeline": wal.timeline,
+            "wal_position": wal.wal_position,
+            "pg_in_recovery": wal.in_recovery,
+        })),
+    )
 }

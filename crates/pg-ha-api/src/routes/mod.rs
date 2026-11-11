@@ -18,7 +18,7 @@ use auth::basic_auth_middleware;
 use config::{get_config, patch_config_endpoint, put_config};
 use health::{
     get_cluster, health_async, health_check, health_primary, health_replica, health_standby_leader,
-    health_sync, liveness, node_status,
+    health_sync, liveness, node_status, wal_endpoint,
 };
 use management::{
     delete_switchover, post_failover, post_reinitialize, post_restart, post_switchover,
@@ -67,7 +67,8 @@ pub fn build_router_with_commands(
         .route("/patroni", get(node_status))
         .route("/cluster", get(get_cluster))
         .route("/metrics", get(get_metrics))
-        .route("/history", get(get_history));
+        .route("/history", get(get_history))
+        .route("/wal", get(wal_endpoint));
 
     // Management endpoints (protected by Basic Auth if configured)
     let mgmt_routes = Router::new()

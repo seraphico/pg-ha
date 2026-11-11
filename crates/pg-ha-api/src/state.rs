@@ -2,10 +2,10 @@
 //!
 //! Updated by the HA loop each cycle, read by API handlers.
 
-use pg_ha_core::ApiSnapshot;
 use pg_ha_core::cluster::{MemberRole, MemberState};
 use pg_ha_core::config::LeaseTiming;
 use pg_ha_core::dcs::DcsAdapter;
+use pg_ha_core::{ApiSnapshot, LiveWalProbe};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -18,8 +18,17 @@ pub struct AppState {
     /// This node's static lease timing; PATCH / PUT /config checks dynamic
     /// `ttl` / `loop_wait` / `retry_timeout` changes against it
     lease_timing: Option<LeaseTiming>,
+    /// Live WAL reader behind the open `GET /wal` endpoint (peer vote probes)
+    wal_probe: Option<Arc<dyn LiveWalProbe>>,
+    /// Caps concurrent `/wal` probes: each one opens a superuser connection
+    wal_permits: Arc<tokio::sync::Semaphore>,
+    /// Outer bound for one `/wal` probe
+    wal_timeout: std::time::Duration,
 }
-
+/// Outer bound for one `/wal` probe; shorter than the 2 s a vote caller waits.
+pub const WAL_ENDPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1800);
+/// Most `/wal` probes served at once; the excess gets 503 "busy".
+pub const WAL_MAX_CONCURRENT: usize = 8;
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
@@ -92,6 +101,9 @@ impl AppState {
             })),
             dcs: None,
             lease_timing: None,
+            wal_probe: None,
+            wal_permits: Arc::new(tokio::sync::Semaphore::new(WAL_MAX_CONCURRENT)),
+            wal_timeout: WAL_ENDPOINT_TIMEOUT,
         }
     }
 
@@ -128,9 +140,34 @@ impl AppState {
             })),
             dcs: Some(dcs),
             lease_timing: Some(lease_timing),
+            wal_probe: None,
+            wal_permits: Arc::new(tokio::sync::Semaphore::new(WAL_MAX_CONCURRENT)),
+            wal_timeout: WAL_ENDPOINT_TIMEOUT,
         }
     }
 
+    /// Install the live WAL reader that serves `GET /wal`
+    pub fn with_wal_probe(mut self, probe: Arc<dyn LiveWalProbe>) -> Self {
+        self.wal_probe = Some(probe);
+        self
+    }
+    /// Test seam: shrink the outer `/wal` timeout (the crate has no paused-clock support)
+    #[cfg(test)]
+    pub(crate) fn with_wal_timeout(mut self, d: std::time::Duration) -> Self {
+        self.wal_timeout = d;
+        self
+    }
+    pub(crate) fn wal_timeout(&self) -> std::time::Duration {
+        self.wal_timeout
+    }
+    /// The live WAL reader, if installed
+    pub fn wal_probe(&self) -> Option<&Arc<dyn LiveWalProbe>> {
+        self.wal_probe.as_ref()
+    }
+    /// Take a `/wal` concurrency permit without waiting; `None` means busy
+    pub fn try_wal_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.wal_permits).try_acquire_owned().ok()
+    }
     pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, NodeState> {
         self.inner.read().await
     }
