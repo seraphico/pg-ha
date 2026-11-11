@@ -20,6 +20,7 @@ pub mod dynamic_config;
 pub mod error;
 pub mod ha;
 pub mod history;
+pub mod live_wal;
 pub mod peer_http;
 pub mod postgresql;
 pub mod quorum;
@@ -46,7 +47,8 @@ pub use dynamic_config::{
 pub use error::{Error, Result};
 pub use ha::{ApiSnapshot, CommandSender, CycleResult, Ha, ShutdownOutcome, StatePublisher};
 pub use history::{History, HistoryEntry, HistoryEventType};
-pub use postgresql::{PgState, Postgresql, WalStatus, parse_lsn};
+pub use live_wal::LiveWalProbe;
+pub use postgresql::{PgLiveWalProbe, PgState, Postgresql, WalStatus, parse_lsn};
 pub use slots::SlotManager;
 pub use standby_cluster::{StandbyCluster, StandbyClusterConfig};
 pub use watchdog::Watchdog;

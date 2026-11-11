@@ -73,8 +73,9 @@ pub struct Postgresql {
     /// pg-ha never starts PostgreSQL again before it exits.
     starts_blocked: bool,
     /// Receiver pair from the last cycle it was streaming (see
-    /// [`ReceivedWal`]). A Mutex because `wal_status` takes `&self`.
-    last_received_wal: std::sync::Mutex<Option<ReceivedWal>>,
+    /// [`ReceivedWal`]). A Mutex because `wal_status` takes `&self`; an Arc so
+    /// [`Postgresql::live_wal_probe`] handles read and update the same memory.
+    last_received_wal: std::sync::Arc<std::sync::Mutex<Option<ReceivedWal>>>,
     /// Test-only seam: when set, [`Postgresql::is_running`] skips the `/proc`
     /// process-identity check (the only platform-forking step) and treats the
     /// live PID as a PostgreSQL process. It lets unit-test fixtures fake a
@@ -89,6 +90,22 @@ pub struct Postgresql {
     fake_running: bool,
 }
 
+/// Live WAL reader backed by a [`Postgresql`] handle from
+/// [`Postgresql::live_wal_probe`].
+pub struct PgLiveWalProbe {
+    pg: Postgresql,
+}
+#[async_trait::async_trait]
+impl crate::live_wal::LiveWalProbe for PgLiveWalProbe {
+    async fn probe(&self) -> Result<WalStatus> {
+        if !self.pg.is_running() {
+            return Err(Error::Postgres("PostgreSQL is not running".into()));
+        }
+        self.pg
+            .wal_status_bounded(crate::live_wal::LIVE_WAL_READ_TIMEOUT)
+            .await
+    }
+}
 /// Internal PostgreSQL process state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgState {
@@ -303,7 +320,7 @@ impl Postgresql {
             state: PgState::Unknown,
             in_recovery: None,
             starts_blocked: false,
-            last_received_wal: std::sync::Mutex::new(None),
+            last_received_wal: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             fake_running: false,
         }
@@ -1040,6 +1057,22 @@ impl Postgresql {
         }
     }
 
+    /// [`Postgresql::wal_status`] bounded by `limit`. On timeout the whole
+    /// future (connect and queries) is dropped, which closes the connection.
+    pub async fn wal_status_bounded(&self, limit: Duration) -> Result<WalStatus> {
+        match tokio::time::timeout(limit, self.wal_status()).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Postgres("live WAL read timed out".into())),
+        }
+    }
+    /// A lightweight handle for live WAL reads that shares this instance's
+    /// remembered receiver pair (so the timeline of a replica whose receiver
+    /// already exited stays exact).
+    pub fn live_wal_probe(&self) -> PgLiveWalProbe {
+        let mut handle = Postgresql::new(self.config.clone());
+        handle.last_received_wal = std::sync::Arc::clone(&self.last_received_wal);
+        PgLiveWalProbe { pg: handle }
+    }
     /// Primary-side replication snapshot: each standby's flushed LSN keyed by
     /// `application_name` (= member name), plus the primary's current flush
     /// LSN. This is the lag data source (OPTION B); `flush_lsn` is the fixed
@@ -2338,5 +2371,51 @@ mod tests {
                 }
             }
         }
+    }
+    // ── live WAL probe sharing ──
+    #[test]
+    fn live_wal_probe_shares_receiver_memory() {
+        let pg = Postgresql::new(test_config());
+        let probe = pg.live_wal_probe();
+        assert!(std::sync::Arc::ptr_eq(
+            &pg.last_received_wal,
+            &probe.pg.last_received_wal
+        ));
+        let pair = ReceivedWal {
+            postmaster_start: "2026-01-01 00:00:00+00".to_string(),
+            flushed_lsn: 900,
+            timeline: 6,
+        };
+        *pg.last_received_wal.lock().unwrap() = Some(pair);
+        let seen = probe.pg.last_received_wal.lock().unwrap().clone();
+        let sample = ReplicaWalSample {
+            receive_lsn: Some(900),
+            replay_lsn: Some(900),
+            checkpoint_timeline: Some(5),
+            receiver: None,
+            postmaster_start: Some("2026-01-01 00:00:00+00".to_string()),
+        };
+        let r = resolve_replica_wal(&sample, seen.as_ref());
+        assert_eq!(r.timeline, Some(6));
+        assert_eq!(r.wal_position, 900);
+    }
+    #[tokio::test]
+    async fn wal_status_bounded_closed_port_is_err() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mut cfg = test_config();
+        cfg.port = port;
+        let pg = Postgresql::new(cfg);
+        let res = pg.wal_status_bounded(Duration::from_secs(5)).await;
+        assert!(res.is_err());
+    }
+    #[tokio::test]
+    async fn live_probe_not_running_is_err() {
+        use crate::live_wal::LiveWalProbe;
+        let pg = Postgresql::new(test_config());
+        let err = pg.live_wal_probe().probe().await.unwrap_err().to_string();
+        assert!(err.contains("not running"), "{err}");
     }
 }
