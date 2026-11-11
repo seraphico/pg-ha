@@ -230,6 +230,9 @@ async fn main() -> anyhow::Result<()> {
     // ─── Initialize HA engine ───
     let wal_probe = Arc::new(postgresql.live_wal_probe());
     let (mut ha, cmd_tx) = Ha::new(config.clone(), dcs.clone(), postgresql);
+    ha.set_peer_probe(Arc::new(pg_ha_core::peer_http::ReqwestPeerWalProbe::new(
+        config.restapi.tls.as_ref(),
+    )?));
 
     // ─── Initialize REST API ───
     let app_state = AppState::with_dcs(

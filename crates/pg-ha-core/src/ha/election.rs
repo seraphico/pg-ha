@@ -8,6 +8,7 @@ use crate::cluster::SyncState;
 use super::helpers::OwnEligibility;
 use super::identity::{self, ElectionStance, PgIdentity, election_stance};
 use super::lineage::Ineligible;
+use super::vote::VoteGate;
 use super::{CycleResult, Ha};
 use crate::timeline_files::ACCEPT_TIMELINE_LOSS_FILE;
 
@@ -228,6 +229,14 @@ impl Ha {
         } else {
             self.is_healthiest_node()
         };
+
+        // SB-13: a quorum-sync candidate must win the live vote first. This
+        // runs before the lease anchor is read, so a slow vote never shortens
+        // the lease. Priority clusters get `NotApplicable` without any I/O.
+        if should_attempt && let VoteGate::Refuse(why) = self.quorum_vote().await {
+            self.is_leader = false;
+            return CycleResult::Follower(why);
+        }
 
         if should_attempt {
             let anchor = super::lease::LeaseAnchor::now();
