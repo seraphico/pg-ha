@@ -392,6 +392,36 @@ pub struct SyncState {
     /// Quorum requirement for leader election from sync standbys
     #[serde(default)]
     pub quorum: u32,
+
+    /// Which synchronous-replication semantics the `quorum` field and the
+    /// `sync_standby` list follow (SB-13). Absent in old `/sync` values and old
+    /// Raft snapshots, which means [`SyncKind::Priority`]. It is skipped on
+    /// serialization while `Priority`, so a Priority `/sync` value stays
+    /// byte-for-byte what older versions wrote and read.
+    #[serde(default, skip_serializing_if = "SyncKind::is_priority")]
+    pub kind: SyncKind,
+}
+
+/// Semantics of a `/sync` value (see [`SyncState::kind`]).
+///
+/// `Priority`: every name in `sync_standby` holds every acknowledged commit
+/// (`FIRST n`); the `quorum` field is legacy and must be ignored.
+/// `Quorum`: `sync_standby` is the voter set V of `ANY n (V)` and `quorum` is
+/// `|V| - n`; membership alone no longer proves a node holds every
+/// acknowledged commit (see `crate::quorum`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncKind {
+    #[default]
+    Priority,
+    Quorum,
+}
+
+impl SyncKind {
+    /// Used by `skip_serializing_if` to keep the Priority wire format unchanged.
+    pub fn is_priority(&self) -> bool {
+        *self == SyncKind::Priority
+    }
 }
 
 impl SyncState {
@@ -506,11 +536,54 @@ mod tests {
             leader: "node1".to_string(),
             sync_standby: Some("node2,node3".to_string()),
             quorum: 0,
+            kind: Default::default(),
         };
         assert!(sync.matches("node2"));
         assert!(sync.matches("NODE3")); // case-insensitive
         assert!(!sync.matches("node1"));
         assert!(!sync.matches("node4"));
+    }
+
+    #[test]
+    fn test_sync_state_kind_backward_compatible() {
+        // Old /sync value and old Raft snapshot content: no `kind` -> Priority.
+        let old = r#"{"leader":"node1","sync_standby":"node2","quorum":1}"#;
+        let s: SyncState = serde_json::from_str(old).unwrap();
+        assert_eq!(s.kind, SyncKind::Priority);
+        assert_eq!(s.quorum, 1);
+        // Even older: no `quorum` either.
+        let older: SyncState =
+            serde_json::from_str(r#"{"leader":"n","sync_standby":null}"#).unwrap();
+        assert_eq!(older.kind, SyncKind::Priority);
+
+        // Priority serializes exactly as before (no `kind` key), so what old
+        // nodes read and what a Priority leader writes does not change.
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(
+            json,
+            r#"{"leader":"node1","sync_standby":"node2","quorum":1}"#
+        );
+
+        // Quorum round-trips, and an old reader (no deny_unknown_fields; the
+        // pre-SB-13 shape is simulated by a map) ignores the extra key.
+        let q = SyncState {
+            kind: SyncKind::Quorum,
+            ..s
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(json.contains(r#""kind":"quorum""#));
+        let back: SyncState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, SyncKind::Quorum);
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreSb13 {
+            leader: String,
+            sync_standby: Option<String>,
+            #[serde(default)]
+            quorum: u32,
+        }
+        let old_reader: PreSb13 = serde_json::from_str(&json).unwrap();
+        assert_eq!(old_reader.sync_standby.as_deref(), Some("node2"));
     }
 
     #[test]

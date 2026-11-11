@@ -849,6 +849,8 @@ impl Ha {
             leader: self.config.name.clone(),
             sync_standby,
             quorum: if enabled { count as u32 } else { 0 },
+            // SB-13 PR1: not wired. Priority is the only kind ever written.
+            kind: crate::cluster::SyncKind::Priority,
         };
         match serde_json::to_string(&state) {
             Ok(json) => {
@@ -2086,6 +2088,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("*".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -2116,6 +2119,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -2146,6 +2150,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -2345,6 +2350,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             failover: Some(Failover {
                 leader: Some("node1".into()),
@@ -2920,6 +2926,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -2965,6 +2972,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -3007,6 +3015,7 @@ mod tests {
                 leader: "node1".into(),
                 sync_standby: Some("node2".into()),
                 quorum: 1,
+                kind: Default::default(),
             }),
             ..Default::default()
         };
@@ -3099,6 +3108,7 @@ mod tests {
             leader: "test_node".into(),
             sync_standby: Some("node2".into()),
             quorum: 1,
+            kind: Default::default(),
         });
         ha.is_leader = true;
         ha.dynamic_config_state.apply_new_config(GlobalConfig {

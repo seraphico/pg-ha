@@ -493,6 +493,7 @@ mod sync_failover_tests {
             leader: leader.to_string(),
             sync_standby: standbys.map(|s| s.to_string()),
             quorum: 1,
+            kind: Default::default(),
         }
     }
 

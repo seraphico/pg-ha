@@ -21,6 +21,7 @@ pub mod error;
 pub mod ha;
 pub mod history;
 pub mod postgresql;
+pub mod quorum;
 pub mod slots;
 pub mod standby_cluster;
 pub(crate) mod standby_config;
@@ -32,7 +33,7 @@ pub use bootstrap::{Bootstrap, BootstrapResult};
 pub use callbacks::{CallbackEvent, CallbackExecutor, CallbacksConfig};
 pub use cascading::{CascadeManager, CascadeNode};
 pub use cluster::{
-    Cluster, ClusterConfig, Failover, Leader, Member, MemberRole, MemberState, SyncState,
+    Cluster, ClusterConfig, Failover, Leader, Member, MemberRole, MemberState, SyncKind, SyncState,
 };
 pub use commands::{CommandResponse, CommandStatus, ManagementCommand};
 pub use config::Config;
