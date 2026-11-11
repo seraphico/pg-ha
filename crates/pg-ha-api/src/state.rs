@@ -210,6 +210,13 @@ impl NodeState {
             .is_some_and(|t| t.elapsed().as_secs() < self.ttl_seconds)
     }
 
+    /// Set this node's own configured tags (`/patroni` reports them, and
+    /// `/replica` honours `noloadbalance`). Called once at startup: the tags
+    /// come from the static config and do not change at runtime.
+    pub fn set_own_tags(&mut self, tags: &pg_ha_core::config::Tags) {
+        self.tags = tags.to_member_tags();
+    }
+
     /// Check if noloadbalance tag is set
     pub fn is_noloadbalance(&self) -> bool {
         self.tags
