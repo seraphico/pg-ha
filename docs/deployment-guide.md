@@ -380,7 +380,7 @@ bootstrap:
   post_bootstrap_sql: [<string>]   # bootstrap 后执行的 SQL 语句
 ```
 
-同步复制相关标签：`tags.nosync`（排除同步备库）、`tags.sync_priority`（同步优先级）。运行时也可通过 `PATCH /config` 开关同步复制，详见 [运维指南](operations-guide.md#同步复制)。
+同步复制相关标签：`tags.nosync`（排除同步备库）、`tags.sync_priority`（同步优先级）。每个节点在每次心跳时把自己的 `tags` 写进 DCS 成员记录，`GET /patroni` 也会返回它们；其他节点用发布出来的值做选举、候选校验、同步备库选择和级联拓扑。运行时也可通过 `PATCH /config` 开关同步复制，详见 [运维指南](operations-guide.md#同步复制)。
 
 ### 环境变量
 
@@ -410,6 +410,7 @@ Docker 入口 `docker/entrypoint.sh` 是另一层：它用下面这些变量**�
 | `PG_HA_API_PORT` / `PG_HA_PROXY_RW_PORT` / `PG_HA_PROXY_RO_PORT` | API 与代理端口 |
 | `PG_HA_RAFT_SELF` / `PG_HA_RAFT_PARTNERS` | 本节点地址，以及逗号分隔的对端列表 |
 | `PG_HA_RAFT_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | 设置了 `PG_HA_RAFT_TLS_CERT` 就写入 `raft.tls` |
+| `PG_HA_TAG_NOFAILOVER` / `_NOLOADBALANCE` / `_NOCLONE` / `_NOSYNC` / `_NOSTREAM` / `_CLONEFROM`（`true` 或 `false`）、`PG_HA_TAG_FAILOVER_PRIORITY` / `_SYNC_PRIORITY`（整数）、`PG_HA_TAG_REPLICATEFROM`（成员名） | 设置了的变量写成 `tags:` 段里对应的键；一个都没设就不写 `tags:` 段（默认）。值不合法时容器启动即退出 |
 | `PG_HA_RESTAPI_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_REQUIRE_CLIENT_CERT` | 设置了 `PG_HA_RESTAPI_TLS_CERT` 就写入 `restapi.tls`（REST API HTTPS/mTLS）；默认不设置即明文 HTTP |
 
 开发集群 `docker-compose.yml` 会设置 Raft TLS，并把 `./docker/tls` 挂到 `/etc/pg-ha/tls`。REST API TLS 默认关闭（`PG_HA_RESTAPI_TLS_CERT` 为空即明文 HTTP）。推荐用 Makefile 开关切换：`make up REST_TLS=off|tls|mtls`（默认 `off`；也可用 `make up-tls` / `make up-mtls`），它会导出下面的 `PG_HA_RESTAPI_TLS_*` 变量；`make status` 与 `tests/e2e/*.sh` 读取同一个 `REST_TLS`（环境变量，默认 `off`；`tls`/`mtls` 时用 `docker/tls` 下的 CA 与客户端证书访问 HTTPS）。同一个端口只能是明文或 TLS 之一，不能同时监听；切换模式直接 `make up REST_TLS=<新模式>` 即可，不必先 `make down`：环境变量变了，`docker compose up -d` 会重建三个容器（Raft/PGDATA 卷保留），入口脚本在容器启动时重写 `/etc/pg-ha.yml`，新模式随之生效（已在 Docker 中实测 off→tls、tls→mtls）。注意 `make restart REST_TLS=...` 不会切换模式（只是重启现有容器，沿用创建时的环境变量）。想连数据一起清空时才用 `make down`。手动启用时，设置 `PG_HA_RESTAPI_TLS_CERT=/etc/pg-ha/tls/server.crt`，mTLS 再加 `PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT=true`（`ca_cert` 默认 `/etc/pg-ha/tls/ca.crt`）。入口生成的 HA 参数是 `loop_wait: 5`、`ttl: 15`、`retry_timeout: 5`（`watchdog.safety_margin` 用默认 5，正好满足 `ttl >= loop_wait + retry_timeout + safety_margin`），REST 认证为 `admin` / `secret`。

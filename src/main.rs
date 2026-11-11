@@ -237,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
         dcs.clone(),
         config.lease_timing(),
     );
+    app_state.update(|s| s.set_own_tags(&config.tags)).await;
     let auth_config = AuthConfig {
         username: config.restapi.username.clone(),
         password: config.restapi.password.clone(),

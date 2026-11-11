@@ -233,9 +233,9 @@ flowchart LR
 /service/{scope}/
 ├── leader          → "node1"              (TTL default 30s, Docker dev cluster is 15s, CAS atomic operation)
 ├── members/
-│   ├── node1       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
-│   ├── node2       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
-│   └── node3       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
+│   ├── node1       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage, tags}  (TTL)
+│   ├── node2       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage, tags}  (TTL)
+│   └── node3       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage, tags}  (TTL)
 ├── timeline        → {timeline, begin, primary, generation, pending?}  (no TTL, CAS, written by the lock holder; see invariants D6)
 ├── initialize      → "system_id"          (atomic create, initialization race)
 ├── config          → {loop_wait, ttl, synchronous_mode, postgresql: {...}}
@@ -243,6 +243,8 @@ flowchart LR
 ├── sync            → {leader, sync_standby, quorum}
 └── history         → [{timestamp, event_type, old_leader, new_leader, reason, timeline?, lsn?}]  (no TTL, CAS, at most 100 entries, appended by the lock-holding primary in the Hold cycle after promote)
 ```
+
+The `tags` in a member record are the node's configured `tags:` section, published as-is on every heartbeat (`touch_member`). Peers read `nofailover`, `failover_priority`, `nosync`, `sync_priority`, `replicatefrom` and the rest from it: the election, switchover/failover candidate validation, synchronous standby selection and the cascade topology in `/cluster` all use it. A record without a `tags` key parses with the defaults.
 
 ## Synchronous Replication Data Flow
 

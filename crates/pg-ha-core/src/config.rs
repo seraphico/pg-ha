@@ -369,6 +369,20 @@ pub struct Tags {
     pub sync_priority: u32,
 }
 
+impl Tags {
+    /// The tags as the key/value map a member record carries
+    /// (`Member.tags`): what `touch_member` publishes to the DCS and what the
+    /// REST API reports for this node.
+    pub fn to_member_tags(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
+            // `Tags` is a plain struct of bools, integers and an optional
+            // string: it always serializes to an object.
+            _ => Default::default(),
+        }
+    }
+}
+
 impl Default for Tags {
     fn default() -> Self {
         Self {
@@ -949,5 +963,19 @@ proxy:
         let tls = reparsed.restapi.tls.expect("tls block should round-trip");
         assert!(tls.require_client_cert);
         assert_eq!(tls.ca_cert, Some(PathBuf::from("/etc/pg-ha/tls/ca.crt")));
+    }
+
+    #[test]
+    fn test_tags_block_rendered_by_entrypoint_parses_and_maps_to_member_tags() {
+        // The shape docker/entrypoint.sh renders from PG_HA_TAG_* variables.
+        let yaml = "nofailover: true\nnoloadbalance: false\nfailover_priority: 0\nsync_priority: 3\nreplicatefrom: \"node2\"\n";
+        let tags: Tags = serde_yaml::from_str(yaml).unwrap();
+        assert!(tags.nofailover);
+        assert_eq!(tags.failover_priority, 0);
+        let map = tags.to_member_tags();
+        assert_eq!(map["nofailover"], serde_json::json!(true));
+        assert_eq!(map["failover_priority"], serde_json::json!(0));
+        assert_eq!(map["sync_priority"], serde_json::json!(3));
+        assert_eq!(map["replicatefrom"], serde_json::json!("node2"));
     }
 }
