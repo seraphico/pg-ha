@@ -228,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
     let postgresql = Postgresql::new(config.postgresql.clone());
 
     // ─── Initialize HA engine ───
+    let wal_probe = Arc::new(postgresql.live_wal_probe());
     let (mut ha, cmd_tx) = Ha::new(config.clone(), dcs.clone(), postgresql);
 
     // ─── Initialize REST API ───
@@ -237,7 +238,8 @@ async fn main() -> anyhow::Result<()> {
         config.ttl,
         dcs.clone(),
         config.lease_timing(),
-    );
+    )
+    .with_wal_probe(wal_probe);
     let auth_config = AuthConfig {
         username: config.restapi.username.clone(),
         password: config.restapi.password.clone(),

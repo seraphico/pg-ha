@@ -714,3 +714,133 @@ async fn test_primary_and_patroni_show_fields() {
     assert_eq!(json["wal_position"], 12345);
     assert_eq!(json["replication_lag"], 0);
 }
+
+// ───────────────────────── GET /wal ─────────────────────────
+mod wal_endpoint {
+    use super::*;
+    use async_trait::async_trait;
+    use pg_ha_core::error::{Error, Result as CoreResult};
+    use pg_ha_core::{LiveWalProbe, WalStatus};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    enum Script {
+        Ok(Option<u64>),
+        Fail,
+        Park(Arc<Notify>),
+        Hang,
+    }
+    struct FakeProbe(Script);
+    #[async_trait]
+    impl LiveWalProbe for FakeProbe {
+        async fn probe(&self) -> CoreResult<WalStatus> {
+            match &self.0 {
+                Script::Ok(tl) => Ok(WalStatus {
+                    timeline: *tl,
+                    wal_position: 4242,
+                    in_recovery: true,
+                }),
+                Script::Fail => Err(Error::Postgres("down".into())),
+                Script::Park(n) => {
+                    n.notified().await;
+                    Ok(WalStatus {
+                        timeline: Some(1),
+                        wal_position: 1,
+                        in_recovery: false,
+                    })
+                }
+                Script::Hang => std::future::pending().await,
+            }
+        }
+    }
+    fn state_with(script: Script) -> AppState {
+        test_state().with_wal_probe(Arc::new(FakeProbe(script)))
+    }
+    async fn get_wal(app: axum::Router) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .oneshot(Request::builder().uri("/wal").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn default_state_is_503() {
+        let (status, _) = get_wal(build_router(test_state())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    #[tokio::test]
+    async fn ok_has_all_fields() {
+        let (status, body) = get_wal(build_router(state_with(Script::Ok(Some(7))))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["name"], "node1");
+        assert_eq!(body["scope"], "test-cluster");
+        assert_eq!(body["timeline"], 7);
+        assert_eq!(body["wal_position"], 4242);
+        assert_eq!(body["pg_in_recovery"], true);
+    }
+    #[tokio::test]
+    async fn probe_error_is_503() {
+        let (status, body) = get_wal(build_router(state_with(Script::Fail))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body["error"].as_str().unwrap().contains("down"));
+    }
+    #[tokio::test]
+    async fn unknown_timeline_is_503() {
+        let (status, _) = get_wal(build_router(state_with(Script::Ok(None)))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    #[tokio::test]
+    async fn ninth_concurrent_request_is_busy_then_recovers() {
+        let gate = Arc::new(Notify::new());
+        let state = state_with(Script::Park(gate.clone()));
+        let app = build_router(state);
+        let mut parked = Vec::new();
+        for _ in 0..crate::state::WAL_MAX_CONCURRENT {
+            parked.push(tokio::spawn(get_wal(app.clone())));
+        }
+        // Let every parked request take its permit and reach the probe.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let (status, body) = get_wal(app.clone()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "busy");
+        gate.notify_waiters();
+        for h in parked {
+            assert_eq!(h.await.unwrap().0, StatusCode::OK);
+        }
+        // Permits are back: a later request is served (parks again, so notify it).
+        let later = tokio::spawn(get_wal(app.clone()));
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        gate.notify_waiters();
+        assert_eq!(later.await.unwrap().0, StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn hanging_probe_times_out_503() {
+        // The probe never completes; only the outer timeout (shrunk) can end it.
+        let state = state_with(Script::Hang).with_wal_timeout(std::time::Duration::from_millis(20));
+        let (status, body) = get_wal(build_router(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body["error"].as_str().unwrap().contains("timed out"));
+    }
+    #[tokio::test]
+    async fn open_when_basic_auth_configured() {
+        let app = build_router_with_commands(
+            state_with(Script::Ok(Some(1))),
+            None,
+            AuthConfig {
+                username: Some("u".into()),
+                password: Some("p".into()),
+            },
+        );
+        let (status, _) = get_wal(app).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}
