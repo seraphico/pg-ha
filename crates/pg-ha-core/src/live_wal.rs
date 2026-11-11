@@ -14,6 +14,8 @@ use crate::postgresql::WalStatus;
 pub const LIVE_WAL_READ_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Reads the local PostgreSQL's current WAL position and timeline.
+// async_trait boxes the future, which clippy flags as double_must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LiveWalProbe: Send + Sync {
     async fn probe(&self) -> Result<WalStatus>;

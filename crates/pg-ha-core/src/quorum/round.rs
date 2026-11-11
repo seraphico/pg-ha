@@ -58,6 +58,8 @@ impl std::fmt::Display for PeerProbeError {
 impl std::error::Error for PeerProbeError {}
 
 /// Reads one peer's live WAL position over the network.
+// async_trait boxes the future, which clippy flags as double_must_use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PeerWalProbe: Send + Sync {
     async fn read(&self, target: &PeerTarget) -> Result<WalPosition, PeerProbeError>;
