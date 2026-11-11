@@ -75,6 +75,10 @@ impl Ha {
             Some(m) if m.is_nofailover() => Some(CommandResponse::rejected(format!(
                 "Candidate '{candidate}' has nofailover tag"
             ))),
+            // failover_priority 0 is the same "never promote" setting.
+            Some(m) if m.failover_priority() == 0 => Some(CommandResponse::rejected(format!(
+                "Candidate '{candidate}' has failover_priority 0"
+            ))),
             Some(m) if m.state != crate::cluster::MemberState::Running => Some(
                 CommandResponse::rejected(format!("Candidate '{candidate}' is not running")),
             ),
