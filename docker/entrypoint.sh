@@ -60,6 +60,43 @@ RAFT_DATA_DIR="/var/lib/pg-ha/raft"
 mkdir -p "$RAFT_DATA_DIR"
 chown postgres:postgres "$RAFT_DATA_DIR"
 
+# Node tags (optional). Nothing is rendered unless a PG_HA_TAG_* variable is
+# set, so the generated config is unchanged by default. Keys match the `tags:`
+# section of the config (see config.rs `Tags`):
+#   booleans (true|false): PG_HA_TAG_NOFAILOVER, PG_HA_TAG_NOLOADBALANCE,
+#     PG_HA_TAG_NOCLONE, PG_HA_TAG_NOSYNC, PG_HA_TAG_NOSTREAM, PG_HA_TAG_CLONEFROM
+#   integers: PG_HA_TAG_FAILOVER_PRIORITY (0 = never promote), PG_HA_TAG_SYNC_PRIORITY
+#   member name: PG_HA_TAG_REPLICATEFROM
+TAGS_YAML=""
+tag_bool() { # <env value> <yaml key>
+    [ -z "$1" ] && return 0
+    case "$1" in
+        true|false) TAGS_YAML="${TAGS_YAML}  $2: $1\n" ;;
+        *) echo "pg-ha entrypoint: tag '$2' must be true or false, got '$1'" >&2; exit 1 ;;
+    esac
+}
+tag_int() { # <env value> <yaml key>
+    [ -z "$1" ] && return 0
+    case "$1" in
+        *[!0-9]*) echo "pg-ha entrypoint: tag '$2' must be a non-negative integer, got '$1'" >&2; exit 1 ;;
+        *) TAGS_YAML="${TAGS_YAML}  $2: $1\n" ;;
+    esac
+}
+tag_bool "$PG_HA_TAG_NOFAILOVER" nofailover
+tag_bool "$PG_HA_TAG_NOLOADBALANCE" noloadbalance
+tag_bool "$PG_HA_TAG_NOCLONE" noclone
+tag_bool "$PG_HA_TAG_NOSYNC" nosync
+tag_bool "$PG_HA_TAG_NOSTREAM" nostream
+tag_bool "$PG_HA_TAG_CLONEFROM" clonefrom
+tag_int "$PG_HA_TAG_FAILOVER_PRIORITY" failover_priority
+tag_int "$PG_HA_TAG_SYNC_PRIORITY" sync_priority
+if [ -n "$PG_HA_TAG_REPLICATEFROM" ]; then
+    case "$PG_HA_TAG_REPLICATEFROM" in
+        *[!A-Za-z0-9._-]*) echo "pg-ha entrypoint: tag 'replicatefrom' must be a member name, got '$PG_HA_TAG_REPLICATEFROM'" >&2; exit 1 ;;
+        *) TAGS_YAML="${TAGS_YAML}  replicatefrom: \"${PG_HA_TAG_REPLICATEFROM}\"\n" ;;
+    esac
+fi
+
 # Generate pg-ha config
 cat > /etc/pg-ha.yml << EOF
 name: ${NODE_NAME}
@@ -140,6 +177,11 @@ bootstrap:
     ttl: ${TTL}
     maximum_lag_on_failover: 1048576
 EOF
+
+# Append the tags block only when a tag was requested.
+if [ -n "$TAGS_YAML" ]; then
+    printf '\ntags:\n%b' "$TAGS_YAML" >> /etc/pg-ha.yml
+fi
 
 echo "=== pg-ha config ==="
 sed 's/password: .*/password: ***/' /etc/pg-ha.yml
