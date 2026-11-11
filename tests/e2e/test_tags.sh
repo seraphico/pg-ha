@@ -48,13 +48,14 @@ dcs_member_record() {
     docker exec "$(name_to_container "$1")" cat /var/lib/pg-ha/raft/state_machine.json 2>/dev/null \
         | jq -r --arg k "/service/$SCOPE/members/$2" '.. | objects | select(has($k)) | .[$k].value' 2>/dev/null | head -n 1
 }
-# Status code of a POST (body goes to $LAST_BODY)
-LAST_BODY=""
+# Status code of a POST; the body is left in $BODY_FILE (the function runs in a
+# command substitution, so a variable would not survive).
+BODY_FILE=$(mktemp -t pg-ha-tags-body.XXXXXX)
 post_code() {
     local out
     out=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 15 -X POST -H "Content-Type: application/json" \
         -d "$2" -w '\n%{http_code}' "$1" 2>/dev/null || printf '\n000')
-    LAST_BODY="${out%$'\n'*}"
+    printf '%s' "${out%$'\n'*}" > "$BODY_FILE"
     echo "${out##*$'\n'}"
 }
 # All three nodes answer, exactly one primary. Replicas are not counted by
@@ -103,6 +104,7 @@ cleanup() {
         done
         wait_ready_after_cleanup
     fi
+    rm -f "$BODY_FILE"
     [ -n "$OVERRIDE_FILE" ] && rm -f "$OVERRIDE_FILE"
 }
 wait_ready_after_cleanup() { wait_for_cluster_ready 240 > /dev/null 2>&1 || log_warn "Cluster not fully ready after cleanup"; }
@@ -242,7 +244,7 @@ test_nosync_excluded() {
 test_switchover_to_nofailover_rejected() {
     local code
     code=$(post_code "$(name_to_url "$P")/switchover" "{\"leader\": \"$P\", \"candidate\": \"$X\"}")
-    log_info "switchover to $X -> HTTP $code: $LAST_BODY"
+    log_info "switchover to $X -> HTTP $code: $(cat "$BODY_FILE")"
     assert_eq "409" "$code" "POST /switchover to nofailover node $X is rejected with 409"
     sleep 20
     assert_eq "200" "$(http_get_status "$(name_to_url "$P")/primary")" "$P is still primary after the rejected switchover"
@@ -250,7 +252,15 @@ test_switchover_to_nofailover_rejected() {
 }
 
 test_failover_never_picks_nofailover() {
-    local c i xprimary=false yprimary=false
+    local c i xprimary=false yprimary=false cur
+    cur=$(find_primary)
+    if [ "$cur" != "$P" ]; then
+        # An earlier step moved the primary (e.g. a switchover that was wrongly accepted):
+        # killing $P would not exercise an election, so do not report a false stall.
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+        log_fail "failover check not run: primary is '$cur', expected $P (an earlier step moved it)"
+        return 0
+    fi
     dpsql "$P" "create table if not exists tags_e2e(i int); insert into tags_e2e select generate_series(1,1000); select pg_switch_wal()" > /dev/null
     sleep 3
     log_info "WAL before kill: $X=$(http_get "$(name_to_url "$X")/patroni" | jq -r .wal_position) $Y=$(http_get "$(name_to_url "$Y")/patroni" | jq -r .wal_position)"
