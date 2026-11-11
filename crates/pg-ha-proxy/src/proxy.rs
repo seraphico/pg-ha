@@ -312,43 +312,7 @@ pub fn build_health_client(
     tls: Option<&pg_ha_core::config::RestApiTlsConfig>,
     timeout: Duration,
 ) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
-    if let Some(tls) = tls {
-        if let Some(ca_path) = &tls.ca_cert {
-            let pem = std::fs::read(ca_path).map_err(|err| {
-                anyhow::anyhow!(
-                    "failed to read REST CA certificate {}: {err}",
-                    ca_path.display()
-                )
-            })?;
-            let cert = reqwest::Certificate::from_pem(&pem).map_err(|err| {
-                anyhow::anyhow!("invalid REST CA certificate {}: {err}", ca_path.display())
-            })?;
-            builder = builder.add_root_certificate(cert);
-        }
-        if tls.require_client_cert {
-            let cert_pem = std::fs::read(&tls.cert).map_err(|err| {
-                anyhow::anyhow!(
-                    "failed to read REST certificate {}: {err}",
-                    tls.cert.display()
-                )
-            })?;
-            let key_pem = std::fs::read(&tls.key).map_err(|err| {
-                anyhow::anyhow!("failed to read REST key {}: {err}", tls.key.display())
-            })?;
-            let mut identity_pem = cert_pem;
-            if !identity_pem.ends_with(b"\n") {
-                identity_pem.push(b'\n');
-            }
-            identity_pem.extend(key_pem);
-            let identity = reqwest::Identity::from_pem(&identity_pem)
-                .map_err(|err| anyhow::anyhow!("invalid REST client identity: {err}"))?;
-            builder = builder.identity(identity);
-        }
-    }
-    builder
-        .build()
-        .map_err(|err| anyhow::anyhow!("failed to build proxy health client: {err}"))
+    pg_ha_core::peer_http::build_peer_client(tls, timeout, "proxy health client")
 }
 
 /// Minimum gap between probe-error log lines for one backend that keeps failing.

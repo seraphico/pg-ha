@@ -20,6 +20,7 @@ pub mod dynamic_config;
 pub mod error;
 pub mod ha;
 pub mod history;
+pub mod peer_http;
 pub mod postgresql;
 pub mod quorum;
 pub mod slots;
