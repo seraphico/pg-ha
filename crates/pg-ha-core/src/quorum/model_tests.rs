@@ -21,7 +21,12 @@
 //! * The planner runs on every cycle with the ground-truth `caught_up` set; a
 //!   random PREFIX of its steps executes (a crash between any two steps).
 //! * Elections: the dead leader's successor is a random live standby that
-//!   reads a random subset of the live nodes with the real vote rule. A granted
+//!   asks the live nodes through the REAL `round::collect_wal_positions` with a
+//!   fake `PeerWalProbe` (paused tokio time, no real sleeping). Per voter the
+//!   world scripts: unreachable, answering at once, answering after the 2 s
+//!   per-request limit (a late answer), or failing with HTTP 503. Late and
+//!   failed voters must be absent from the peers list. The real vote rule
+//!   then decides. A granted
 //!   candidate is promoted through `post_promotion_state` (pre-promote
 //!   `ALTER SYSTEM` first, DCS update later as a separate action), starting a
 //!   new timeline. Many generations are chained.
@@ -52,9 +57,15 @@ use super::*;
 use crate::cluster::{Member, MemberRole, MemberState};
 use crate::postgresql::{ReplicaRow, ReplicationSnapshot};
 use crate::sync::{SyncManager, SyncMode};
+use async_trait::async_trait;
 use proptest::prelude::*;
+use round::{
+    PEER_REQUEST_TIMEOUT, PeerProbeError, PeerTarget, PeerWalProbe, VOTE_ROUND_TIMEOUT,
+    collect_wal_positions,
+};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
@@ -92,7 +103,10 @@ enum Action {
     Kill(usize),
     Revive(usize),
     KillLeader,
-    Elect(usize, u8),
+    /// Candidate, `reach` (voters the candidate can reach), `late` (reachable
+    /// voters that answer after the per-request limit), `fail` (reachable
+    /// voters answering HTTP 503). `late` wins over `fail`.
+    Elect(usize, u8, u8, u8),
     Reconfig {
         n: usize,
         strict: bool,
@@ -112,6 +126,9 @@ struct Stats {
     refused_insufficient: usize,
     refused_behind: usize,
     refused_other: usize,
+    refused_higher_timeline: usize,
+    elections_with_missing_answers: usize,
+    refused_only_for_missing_answers: usize,
     refused_with_acked_missing: usize,
     generations: usize,
 }
@@ -127,12 +144,46 @@ impl Stats {
         self.refused_insufficient += o.refused_insufficient;
         self.refused_behind += o.refused_behind;
         self.refused_other += o.refused_other;
+        self.refused_higher_timeline += o.refused_higher_timeline;
+        self.elections_with_missing_answers += o.elections_with_missing_answers;
+        self.refused_only_for_missing_answers += o.refused_only_for_missing_answers;
         self.refused_with_acked_missing += o.refused_with_acked_missing;
         self.generations += o.generations;
     }
 }
 
+/// How one voter behaves when the candidate asks for its live position.
+#[derive(Clone)]
+enum Script {
+    Immediate,
+    /// Answers after the per-request limit, so the round counts it as a timeout.
+    Late,
+    Fail(PeerProbeError),
+}
+
+/// Fake network for the vote round: answers come from the model's ground truth.
+struct ModelProbe {
+    voters: HashMap<String, (Script, WalPosition)>,
+}
+
+#[async_trait]
+impl PeerWalProbe for ModelProbe {
+    async fn read(&self, target: &PeerTarget) -> Result<WalPosition, PeerProbeError> {
+        let (script, position) = self.voters.get(&target.name).cloned().expect("scripted");
+        match script {
+            Script::Immediate => Ok(position),
+            Script::Late => {
+                tokio::time::sleep(PEER_REQUEST_TIMEOUT + Duration::from_millis(500)).await;
+                Ok(position)
+            }
+            Script::Fail(e) => Err(e),
+        }
+    }
+}
+
 struct World {
+    /// Paused-clock runtime that drives the async vote round, one per run.
+    rt: tokio::runtime::Runtime,
     nodes: Vec<Node>,
     leader: usize,
     leader_dead: bool,
@@ -179,6 +230,11 @@ impl World {
             QuorumState::new::<[&str; 0], [&str; 0], _, _>([], 0, [], 0)
         };
         World {
+            rt: tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("paused runtime"),
             nodes,
             leader: 0,
             leader_dead: false,
@@ -404,7 +460,7 @@ impl World {
                     self.waiting.clear();
                 }
             }
-            Action::Elect(c, reach) => self.elect(*c, *reach)?,
+            Action::Elect(c, reach, late, fail) => self.elect(*c, *reach, *late, *fail)?,
             Action::Reconfig {
                 n,
                 strict,
@@ -446,7 +502,7 @@ impl World {
         Ok(())
     }
 
-    fn elect(&mut self, c: usize, reach: u8) -> Result<(), String> {
+    fn elect(&mut self, c: usize, reach: u8, late: u8, fail: u8) -> Result<(), String> {
         if !self.leader_dead {
             return Ok(());
         }
@@ -460,19 +516,85 @@ impl World {
             timeline: self.nodes[i].tl(),
             lsn: self.nodes[i].lsn(),
         };
-        let peers: Vec<WalPosition> = (0..self.nodes.len())
-            .filter(|&j| j != c && j != self.leader && self.nodes[j].alive)
-            .filter(|&j| reach & (1 << (j % 8)) != 0)
-            .map(wal)
-            .collect();
-        let decision = quorum_vote_decision(&wal(c), &self.st.voters, self.st.quorum, &peers);
+        // Every live node but the candidate is asked, as the real vote does for
+        // each voter that has a running member record.
+        let mut voters_net = HashMap::new();
+        let mut targets = Vec::new();
+        let mut expected: Vec<String> = Vec::new();
+        let mut would_answer: Vec<WalPosition> = Vec::new();
+        let mut missing_answers = false;
+        for j in 0..self.nodes.len() {
+            if j == c || j == self.leader || !self.nodes[j].alive {
+                continue;
+            }
+            let bit = 1u8 << (j % 8);
+            let script = if reach & bit == 0 {
+                Script::Fail(PeerProbeError::Transport("unreachable".into()))
+            } else if late & bit != 0 {
+                missing_answers = true;
+                would_answer.push(wal(j));
+                Script::Late
+            } else if fail & bit != 0 {
+                missing_answers = true;
+                would_answer.push(wal(j));
+                Script::Fail(PeerProbeError::Status(503))
+            } else {
+                expected.push(name(j));
+                would_answer.push(wal(j));
+                Script::Immediate
+            };
+            voters_net.insert(name(j), (script, wal(j)));
+            targets.push(PeerTarget {
+                name: name(j),
+                api_url: format!("http://{}:8008", name(j)),
+            });
+        }
+        let asked = targets.len();
+        let probe: Arc<dyn PeerWalProbe> = Arc::new(ModelProbe { voters: voters_net });
+        let round = self.rt.block_on(collect_wal_positions(
+            probe,
+            targets,
+            PEER_REQUEST_TIMEOUT,
+            VOTE_ROUND_TIMEOUT,
+        ));
+        let mut got: Vec<String> = round.answers.iter().map(|p| p.name.clone()).collect();
+        got.sort();
+        expected.sort();
+        if got != expected || round.failures.len() != asked - expected.len() {
+            return Err(format!(
+                "vote round returned answers {got:?} (failures {:?}), expected exactly {expected:?} of {asked} asked",
+                round.failures
+            ));
+        }
+        if missing_answers {
+            self.stats.elections_with_missing_answers += 1;
+        }
+        let peers = round.answers;
+        let candidate = wal(c);
+        let decision = quorum_vote_decision(&candidate, &self.st.voters, self.st.quorum, &peers);
         match decision {
             VoteDecision::Refused(reason) => {
                 self.stats.elections_refused += 1;
                 match reason {
                     VoteRefusal::InsufficientVotes { .. } => self.stats.refused_insufficient += 1,
                     VoteRefusal::BehindPeer { .. } => self.stats.refused_behind += 1,
+                    VoteRefusal::HigherTimeline { .. } => self.stats.refused_higher_timeline += 1,
                     _ => self.stats.refused_other += 1,
+                }
+                if matches!(reason, VoteRefusal::InsufficientVotes { .. })
+                    && missing_answers
+                    && matches!(
+                        quorum_vote_decision(
+                            &candidate,
+                            &self.st.voters,
+                            self.st.quorum,
+                            &would_answer
+                        ),
+                        VoteDecision::Granted { .. }
+                    )
+                {
+                    // Only the late or failed voters kept this election from passing.
+                    self.stats.refused_only_for_missing_answers += 1;
                 }
                 if self.acked.iter().any(|&x| !self.nodes[c].holds(x)) {
                     // The rule refused a candidate that would have lost data.
@@ -539,7 +661,8 @@ fn action_strategy() -> impl Strategy<Value = Action> {
         2 => any::<usize>().prop_map(Action::Kill),
         3 => any::<usize>().prop_map(Action::Revive),
         2 => Just(Action::KillLeader),
-        5 => (any::<usize>(), any::<u8>()).prop_map(|(c, m)| Action::Elect(c, m)),
+        5 => (any::<usize>(), any::<u8>(), prop_oneof![3 => Just(0u8), 1 => any::<u8>()], prop_oneof![3 => Just(0u8), 1 => any::<u8>()])
+            .prop_map(|(c, m, late, fail)| Action::Elect(c, m, late, fail)),
         2 => (1usize..5, any::<bool>(), prop_oneof![Just(None), (0u64..4).prop_map(Some)], prop_oneof![3 => Just(0u8), 1 => any::<u8>()])
             .prop_map(|(n, strict, lag, excluded)| Action::Reconfig { n, strict, lag, excluded }),
     ]
@@ -613,6 +736,18 @@ fn model_actually_exercises_elections_and_relaxation() {
     assert!(t.generations > 500, "too few promotions: {t:?}");
     assert!(t.elections_refused > 1_000, "too few refusals: {t:?}");
     assert!(
+        t.refused_higher_timeline > 5,
+        "no 'newer timeline' refusals: {t:?}"
+    );
+    assert!(
+        t.elections_with_missing_answers > 200,
+        "late or failed voters were rarely exercised: {t:?}"
+    );
+    assert!(
+        t.refused_only_for_missing_answers > 20,
+        "no election was refused only because voters answered late: {t:?}"
+    );
+    assert!(
         t.refused_behind > 100,
         "no 'behind a voter' refusals: {t:?}"
     );
@@ -626,6 +761,82 @@ fn model_actually_exercises_elections_and_relaxation() {
         t.refused_with_acked_missing > 100,
         "the rule never refused a data-losing candidate, the model is too weak: {t:?}"
     );
+}
+
+// ---- the stale long-tail candidate (higher-timeline rule) ------------------
+
+/// Four standbys, `ANY 2`, so `V = {n1..n4}`, `q = 2`.
+const TAIL_STANDBYS: usize = 4;
+const TAIL_N: usize = 2;
+
+/// The history that only the "a voter on a newer timeline refuses" rule can
+/// stop. `tail_a + tail_b` commits go to the old leader and ONLY n4 receives
+/// them, so they are never acknowledged (`n = 2`) and n4 holds a long tail on
+/// timeline 1. The leader dies, n4 dies too, n1 is elected on a NEW timeline
+/// (shorter than n4's log), a commit is acknowledged by n2 and n3, that leader
+/// dies, and n4 comes back WITHOUT rewind and stands for election with every
+/// voter reachable. Its LSN is at least as high as everyone's, so without the
+/// timeline rule n2 and n3 would both count as votes and n4 would be granted
+/// although it misses the acknowledged commit.
+fn stale_tail_actions(tail_a: usize, tail_b: usize) -> Vec<Action> {
+    vec![
+        Action::Commit(tail_a),
+        Action::Commit(tail_b),
+        // n4 alone receives the unacknowledged tail.
+        Action::Advance(4, 64),
+        Action::KillLeader,
+        Action::Kill(4),
+        // n1 wins on a new timeline with n2 and n3 as its two votes.
+        Action::Elect(1, 0xFF, 0, 0),
+        Action::Finalize,
+        Action::Commit(1),
+        // n2 and n3 rewind to the new leader and acknowledge the commit.
+        Action::Advance(2, 64),
+        Action::Advance(3, 64),
+        Action::KillLeader,
+        // The stale node returns with its tail intact and asks for the lead.
+        Action::Revive(4),
+        Action::Elect(4, 0xFF, 0, 0),
+    ]
+}
+
+/// Targeted prefix with random tail sizes; the normal random suffix follows.
+fn stale_tail_prefix() -> impl Strategy<Value = Vec<Action>> {
+    (2usize..5, 2usize..5).prop_map(|(a, b)| stale_tail_actions(a, b))
+}
+
+#[test]
+fn stale_long_tail_candidate_is_refused_by_higher_timeline() {
+    let mut w = World::new(TAIL_STANDBYS, TAIL_N, true);
+    for (k, a) in stale_tail_actions(3, 3).iter().enumerate() {
+        w.apply(a).unwrap_or_else(|e| panic!("step {k}: {e}"));
+    }
+    // The stale node's log is longer than the new leader's, and it missed the
+    // acknowledged commit: the rule is the only thing that stopped it.
+    assert!(w.nodes[4].lsn() > w.nodes[1].lsn());
+    assert!(w.nodes[4].tl() < w.nodes[1].tl());
+    assert_eq!(w.acked.len(), 2, "genesis and the new-timeline commit");
+    assert!(w.acked.iter().any(|&x| !w.nodes[4].holds(x)));
+    assert_eq!(w.stats.generations, 1, "n4 must not have been promoted");
+    assert_eq!(w.stats.elections_granted, 1);
+    assert_eq!(w.stats.refused_higher_timeline, 1);
+    assert_eq!(w.stats.elections_refused, 1);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(600))]
+
+    /// Same property as the main model, behind the targeted stale-tail prefix.
+    #[test]
+    fn stale_tail_histories_never_lose_acknowledged_commits(
+        prefix in stale_tail_prefix(),
+        suffix in prop::collection::vec(action_strategy(), 0..60),
+    ) {
+        let mut actions = prefix;
+        actions.extend(suffix);
+        let stats = run_world(TAIL_STANDBYS, TAIL_N, true, &actions).map_err(TestCaseError::fail)?;
+        prop_assert!(stats.refused_higher_timeline >= 1, "prefix missed its target: {:?}", stats);
+    }
 }
 
 // ---- planner-only properties ---------------------------------------------
