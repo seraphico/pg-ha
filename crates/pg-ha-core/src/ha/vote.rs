@@ -4,6 +4,10 @@
 //! It only applies when `/sync` says `kind == Quorum` (and `synchronous_mode`
 //! is on). Otherwise [`Ha::quorum_vote`] returns `NotApplicable` before doing
 //! any I/O, so the Priority election is unchanged.
+//!
+//! Timing: the candidate's own live WAL read (`LIVE_WAL_READ_TIMEOUT`) and the
+//! peer round (`VOTE_ROUND_TIMEOUT`) run concurrently, so the whole vote takes
+//! at most `max(LIVE_WAL_READ_TIMEOUT, VOTE_ROUND_TIMEOUT)` (3 s), not their sum.
 use tracing::warn;
 
 use super::Ha;
@@ -55,22 +59,6 @@ impl Ha {
         let quorum = state.quorum as usize;
         let my_name = self.config.name.to_ascii_lowercase();
 
-        let own = match self.local_wal.probe().await {
-            Ok(status) => status,
-            Err(e) => {
-                return VoteGate::Refuse(format!("quorum vote refused: own WAL unreadable: {e}"));
-            }
-        };
-        let Some(own_timeline) = own.timeline else {
-            return VoteGate::Refuse("quorum vote refused: own timeline unknown".to_string());
-        };
-        let candidate = WalPosition {
-            name: self.config.name.clone(),
-            in_recovery: own.in_recovery,
-            timeline: own_timeline,
-            lsn: own.wal_position,
-        };
-
         let https = self.config.restapi.tls.is_some();
         let targets: Vec<PeerTarget> = voters
             .iter()
@@ -87,12 +75,43 @@ impl Ha {
             })
             .collect();
 
-        let Some(probe) = self.peer_probe.clone() else {
-            return VoteGate::Refuse("quorum vote refused: no peer probe installed".to_string());
+        // The own live read and the peer round are independent (the targets do
+        // not depend on the own position), so they run concurrently: the whole
+        // vote is bounded by max(LIVE_WAL_READ_TIMEOUT, VOTE_ROUND_TIMEOUT).
+        let peer_probe = self.peer_probe.clone();
+        let peer_round = async {
+            match peer_probe {
+                Some(probe) => Some(
+                    collect_wal_positions(probe, targets, PEER_REQUEST_TIMEOUT, VOTE_ROUND_TIMEOUT)
+                        .await,
+                ),
+                None => None,
+            }
+        };
+        let (own, round) = tokio::join!(self.local_wal.probe(), peer_round);
+
+        // Refusal precedence is the same as when the own read ran first: an
+        // unreadable own WAL wins over everything else, and peer failures of
+        // that round are not logged.
+        let own = match own {
+            Ok(status) => status,
+            Err(e) => {
+                return VoteGate::Refuse(format!("quorum vote refused: own WAL unreadable: {e}"));
+            }
+        };
+        let Some(own_timeline) = own.timeline else {
+            return VoteGate::Refuse("quorum vote refused: own timeline unknown".to_string());
+        };
+        let candidate = WalPosition {
+            name: self.config.name.clone(),
+            in_recovery: own.in_recovery,
+            timeline: own_timeline,
+            lsn: own.wal_position,
         };
 
-        let round =
-            collect_wal_positions(probe, targets, PEER_REQUEST_TIMEOUT, VOTE_ROUND_TIMEOUT).await;
+        let Some(round) = round else {
+            return VoteGate::Refuse("quorum vote refused: no peer probe installed".to_string());
+        };
 
         if round.answers.is_empty()
             && let Some((peer, err)) = round.failures.first()

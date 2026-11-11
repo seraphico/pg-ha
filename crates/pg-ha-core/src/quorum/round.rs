@@ -18,7 +18,9 @@ use super::WalPosition;
 /// Longest a single peer request may take.
 pub const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Longest the whole round (all peers together) may take.
+/// Longest the peer round (all peers together) may take. The whole vote also
+/// includes the candidate's own live read, which runs concurrently with this
+/// round, so the vote is bounded by `max(LIVE_WAL_READ_TIMEOUT, VOTE_ROUND_TIMEOUT)`.
 pub const VOTE_ROUND_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A voter to ask: its member name and REST base URL.

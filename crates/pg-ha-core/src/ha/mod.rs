@@ -8884,6 +8884,28 @@ mod tests {
             }
         }
 
+        /// The candidate's own live reading, after a delay.
+        struct SlowLocal(Duration, std::result::Result<WalStatus, String>);
+
+        #[async_trait::async_trait]
+        impl LiveWalProbe for SlowLocal {
+            async fn probe(&self) -> Result<WalStatus> {
+                tokio::time::sleep(self.0).await;
+                self.1.clone().map_err(crate::error::Error::Postgres)
+            }
+        }
+
+        fn slow_local(delay: Duration, lsn: u64) -> Arc<dyn LiveWalProbe> {
+            Arc::new(SlowLocal(
+                delay,
+                Ok(WalStatus {
+                    timeline: Some(1),
+                    wal_position: lsn,
+                    in_recovery: true,
+                }),
+            ))
+        }
+
         /// Panics if the election touches the own-WAL probe.
         struct PanicLocal;
 
@@ -9595,7 +9617,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        // The whole vote is bounded: peers that never answer cost 3 s at most.
+        // The peer round is bounded: peers that never answer cost 3 s at most.
         #[tokio::test(start_paused = true)]
         async fn hanging_voters_are_cut_off_within_the_round_budget() {
             let dcs = Arc::new(MockDcs::new());
@@ -9615,6 +9637,82 @@ mod tests {
             let start = tokio::time::Instant::now();
             assert!(matches!(ha.quorum_vote().await, VoteGate::Refuse(_)));
             assert!(start.elapsed() <= Duration::from_secs(3));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // The own live read (1.5 s) runs concurrently with the peer round: the
+        // whole vote is bounded by max(1.5 s, 3 s), not their 4.5 s sum.
+        #[tokio::test(start_paused = true)]
+        async fn slow_own_read_and_hanging_peers_stay_within_the_round_budget() {
+            let dcs = Arc::new(MockDcs::new());
+            let peers = Arc::new(
+                FakePeers::new()
+                    .ok("node2", 1, 90)
+                    .ok("node3", 1, 90)
+                    .delay(Duration::from_secs(3600)),
+            );
+            let (ha, dir) = build(
+                "vote-slow-own-hang",
+                Setup::quorum(),
+                &dcs,
+                slow_local(crate::live_wal::LIVE_WAL_READ_TIMEOUT, 100),
+                Some(peers),
+            );
+            let start = tokio::time::Instant::now();
+            assert!(matches!(ha.quorum_vote().await, VoteGate::Refuse(_)));
+            assert!(
+                start.elapsed() <= Duration::from_secs(3),
+                "vote took {:?}",
+                start.elapsed()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A failing own read is refused with the usual reason while the peers
+        // answer; no panic, and the peers' answers are not used.
+        #[tokio::test(start_paused = true)]
+        async fn failing_own_read_is_refused_while_peers_answer() {
+            let dcs = Arc::new(MockDcs::new());
+            let bad: Arc<dyn LiveWalProbe> =
+                Arc::new(SlowLocal(Duration::from_millis(10), Err("pg down".into())));
+            let (ha, dir) = build(
+                "vote-ownerr-peers-ok",
+                Setup::quorum(),
+                &dcs,
+                bad,
+                Some(Arc::new(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 90),
+                )),
+            );
+            match ha.quorum_vote().await {
+                VoteGate::Refuse(m) => {
+                    assert_eq!(
+                        m,
+                        "quorum vote refused: own WAL unreadable: PostgreSQL error: pg down"
+                    )
+                }
+                other => panic!("expected refusal, got {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A slow own read with immediate peers still grants, and the grant is
+        // not delayed beyond the own read.
+        #[tokio::test(start_paused = true)]
+        async fn slow_own_read_with_fast_peers_is_granted_without_extra_delay() {
+            let dcs = Arc::new(MockDcs::new());
+            let (ha, dir) = build(
+                "vote-slow-own-fast-peers",
+                Setup::quorum(),
+                &dcs,
+                slow_local(crate::live_wal::LIVE_WAL_READ_TIMEOUT, 100),
+                Some(Arc::new(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 90),
+                )),
+            );
+            let start = tokio::time::Instant::now();
+            assert_eq!(ha.quorum_vote().await, VoteGate::Pass);
+            assert_eq!(start.elapsed(), crate::live_wal::LIVE_WAL_READ_TIMEOUT);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
