@@ -844,3 +844,46 @@ mod wal_endpoint {
         assert_eq!(status, StatusCode::OK);
     }
 }
+
+/// The node's own configured tags reach the API state: `/patroni` reports
+/// them and a healthy replica with `noloadbalance` is 503 on `/replica`.
+#[tokio::test]
+async fn test_own_noloadbalance_tag_from_config_makes_replica_503() {
+    let state = test_state();
+    set_replica(&state).await;
+    let (status, _) = body_text(state.clone(), "/replica").await;
+    assert_eq!(status, StatusCode::OK, "healthy replica without the tag");
+
+    let tags = pg_ha_core::config::Tags {
+        noloadbalance: true,
+        nosync: true,
+        ..Default::default()
+    };
+    state.update(|s| s.set_own_tags(&tags)).await;
+
+    let (status, body) = body_text(state.clone(), "/replica").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["reason"], "noloadbalance");
+
+    let (_, body) = body_text(state, "/patroni").await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["tags"]["noloadbalance"], true);
+    assert_eq!(json["tags"]["nosync"], true);
+    assert_eq!(json["tags"]["failover_priority"], 1);
+}
+
+#[tokio::test]
+async fn test_default_own_tags_keep_replica_200_and_report_defaults() {
+    let state = test_state();
+    set_replica(&state).await;
+    state
+        .update(|s| s.set_own_tags(&pg_ha_core::config::Tags::default()))
+        .await;
+    let (status, _) = body_text(state.clone(), "/replica").await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = body_text(state, "/patroni").await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["tags"]["nofailover"], false);
+    assert_eq!(json["tags"]["noloadbalance"], false);
+}

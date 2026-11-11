@@ -233,9 +233,9 @@ flowchart LR
 /service/{scope}/
 ├── leader          → "node1"              (TTL 默认 30s，开发集群 Docker 为 15s, CAS 原子操作)
 ├── members/
-│   ├── node1       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
-│   ├── node2       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
-│   └── node3       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage}  (TTL)
+│   ├── node1       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage, tags}  (TTL)
+│   ├── node2       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage, tags}  (TTL)
+│   └── node3       → {conn_url, api_url, state, role, wal_position, timeline, rewind_check, lineage, tags}  (TTL)
 ├── timeline        → {timeline, begin, primary, generation, pending?}  (无 TTL, CAS, 持锁节点写; 见 invariants D6)
 ├── initialize      → "system_id"          (原子创建, 初始化竞争)
 ├── config          → {loop_wait, ttl, synchronous_mode, postgresql: {...}}
@@ -243,6 +243,8 @@ flowchart LR
 ├── sync            → {leader, sync_standby, quorum}
 └── history         → [{timestamp, event_type, old_leader, new_leader, reason, timeline?, lsn?}]  (无 TTL, CAS, 最多 100 条, 持锁主库在 promote 后的 Hold 周期追加)
 ```
+
+成员记录里的 `tags` 是该节点配置文件 `tags:` 段的原样发布（每次心跳 `touch_member` 写入），对端据此读取 `nofailover`、`failover_priority`、`nosync`、`sync_priority`、`replicatefrom` 等：选举、switchover/failover 候选校验、同步备库选择和 `/cluster` 的级联拓扑都用它。没有 `tags` 键的记录按默认值解析。
 
 ## 同步复制数据流
 

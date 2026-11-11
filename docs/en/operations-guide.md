@@ -178,13 +178,13 @@ With `scheduled_at`, the response is HTTP 409 and `message` contains `scheduled 
 {"status": "rejected", "message": "Candidate 'node3' is not a synchronous standby (sync mode requires /sync membership)"}
 ```
 
-A candidate that does not exist, has `nofailover`, or is not Running is also 409. A candidate that carries a rewind-check marker (`pg-ha.rewind_check`, not yet verified with pg_rewind) is also 409, and the same applies to `POST /failover`:
+A candidate that does not exist, has `nofailover` or `failover_priority: 0`, or is not Running is also 409. (Candidates are checked against the tags each node publishes in its member record. A node that is itself the designated candidate also refuses to promote when its own config says `nofailover` or `failover_priority: 0`.) A candidate that carries a rewind-check marker (`pg-ha.rewind_check`, not yet verified with pg_rewind) is also 409, and the same applies to `POST /failover`:
 
 ```json
 {"status": "rejected", "message": "Candidate 'node2' has a rewind-check marker (not yet verified with pg_rewind)"}
 ```
 
-After the request is accepted, if the candidate cannot take part in the election under [invariants.md](invariants.md) 1a "D6" (for example it is not on the latest timeline), other nodes log WARN `Designated candidate <c> may not take part in the election (it is not shown to be on the latest timeline); proceeding as if no candidate were designated` and elect as if no candidate had been designated: the `leader` in `/failover` is still excluded, and the lock is not given back to the old primary that just stepped down.
+After the request is accepted, if the candidate cannot take part in the election under [invariants.md](invariants.md) 1a "D6" (for example it is not on the latest timeline), other nodes log WARN `Designated candidate <c> may not take part in the election (it is not running, is not allowed to fail over, or is not shown to be on the latest timeline); proceeding as if no candidate were designated` and elect as if no candidate had been designated: the `leader` in `/failover` is still excluded, and the lock is not given back to the old primary that just stepped down.
 
 When no candidate is specified, and aside from this node there is no member that is running, allowed to fail over, and (when sync is on) a member of `/sync`, the response is 409. `/failover` is not written, and PostgreSQL is not stopped:
 
@@ -196,7 +196,7 @@ When no candidate is specified, and aside from this node there is no member that
 
 **What an immediate switchover does on the node that initiates it** (it does not run CHECKPOINT first; CHECKPOINT runs only on the shutdown path, when the process receives SIGTERM/SIGINT):
 
-1. Validate the candidate (it exists, is Running, is not nofailover, has no rewind marker, and meets the synchronous-replication eligibility check). If writing `/failover` fails, abort and return an error, without stopping PostgreSQL
+1. Validate the candidate (it exists, is Running, is not nofailover and has no failover_priority 0, has no rewind marker, and meets the synchronous-replication eligibility check). If writing `/failover` fails, abort and return an error, without stopping PostgreSQL
 2. Write `{leader, candidate}` to DCS `/failover`
 3. Renew the leader lock once (the HA loop does not run while the command executes). If renewal fails, fence according to lease expiry and return the error `Switchover aborted: leader lock renewal failed; ...`
 4. Write `standby.signal` and fsync it. When there is a candidate, point `primary_conninfo` in `postgresql.auto.conf` at the candidate; when there is not, delete `primary_conninfo`. Other settings in `postgresql.auto.conf` are kept

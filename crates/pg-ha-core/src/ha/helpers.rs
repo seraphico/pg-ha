@@ -845,6 +845,10 @@ impl Ha {
             "rewind_check": self.has_rewind_check_marker(),
             // W2: peers must not defer to a node that cannot be primary.
             "watchdog_failed": self.watchdog_blocks_leadership(),
+            // Peers read nofailover / failover_priority / nosync /
+            // sync_priority / replicatefrom ... from here. A record without
+            // the key (older node) parses with defaults.
+            "tags": self.config.tags.to_member_tags(),
         });
 
         if let Some(pos) = wal_position {

@@ -2465,7 +2465,32 @@ mod tests {
         bin_dir: Option<PathBuf>,
         port: u16,
     ) -> (Ha, PathBuf, CommandSender) {
+        identity_test_ha_full(
+            name,
+            label,
+            dcs,
+            in_recovery,
+            standby_signal,
+            bin_dir,
+            port,
+            Tags::default(),
+        )
+    }
+
+    /// `identity_test_ha_on_port` with this node's own configured tags.
+    #[allow(clippy::too_many_arguments)]
+    fn identity_test_ha_full(
+        name: &str,
+        label: &str,
+        dcs: Arc<MockDcs>,
+        in_recovery: Option<bool>,
+        standby_signal: bool,
+        bin_dir: Option<PathBuf>,
+        port: u16,
+        tags: Tags,
+    ) -> (Ha, PathBuf, CommandSender) {
         let mut config = test_config(name);
+        config.tags = tags;
         config.postgresql.port = port;
         config.postgresql.bin_dir = bin_dir.unwrap_or_else(no_bin_dir);
         let (pg, data_dir) = with_fake_running_pg(&config, label);
@@ -6116,6 +6141,527 @@ mod tests {
         let member: Member = serde_json::from_value(data).unwrap();
         assert!(member.rewind_check);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────── Member tags are published (touch_member) ───────────────────
+
+    /// Every tag set to a non-default value, so a missing or ignored key shows.
+    fn all_non_default_tags() -> Tags {
+        Tags {
+            nofailover: true,
+            noloadbalance: true,
+            noclone: true,
+            nosync: true,
+            nostream: true,
+            clonefrom: true,
+            replicatefrom: Some("node9".to_string()),
+            failover_priority: 0,
+            sync_priority: 7,
+        }
+    }
+
+    /// The record `touch_member` publishes for a node configured with `tags`,
+    /// read back the way a peer reads it from the DCS.
+    async fn published_member(name: &str, label: &str, tags: Tags) -> Member {
+        let dcs = Arc::new(MockDcs::new());
+        let (ha, dir, _tx) =
+            identity_test_ha_full(name, label, dcs.clone(), Some(true), true, None, 1, tags);
+        ha.touch_member().await.unwrap();
+        let data = dcs.last_member_data.lock().unwrap().clone().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        serde_json::from_value(data).unwrap()
+    }
+
+    /// A running peer on the latest timeline with `wal`, whose tags are the
+    /// ones `touch_member` published for `tags` (not a hand-written literal).
+    async fn published_peer(name: &str, label: &str, tags: Tags, wal: u64) -> Member {
+        let published = published_member(name, label, tags).await;
+        let mut peer = running_member(name, wal);
+        peer.tags = published.tags;
+        peer
+    }
+
+    #[tokio::test]
+    async fn test_touch_member_publishes_tags_reproduction() {
+        let member = published_member(
+            "node2",
+            "tags-repro",
+            Tags {
+                nofailover: true,
+                failover_priority: 0,
+                nosync: true,
+                ..Tags::default()
+            },
+        )
+        .await;
+        assert!(member.is_nofailover(), "nofailover lost: {:?}", member.tags);
+        assert_eq!(member.failover_priority(), 0, "tags: {:?}", member.tags);
+        assert!(member.is_nosync(), "nosync lost: {:?}", member.tags);
+    }
+
+    #[tokio::test]
+    async fn test_touch_member_publishes_every_tag() {
+        let member = published_member("node2", "tags-all", all_non_default_tags()).await;
+        assert!(member.is_nofailover());
+        assert_eq!(member.failover_priority(), 0);
+        assert!(member.is_nosync());
+        assert_eq!(member.sync_priority(), 7);
+        assert!(member.is_noloadbalance());
+        assert_eq!(member.tags["noclone"], serde_json::json!(true));
+        assert_eq!(member.tags["nostream"], serde_json::json!(true));
+        assert_eq!(member.tags["clonefrom"], serde_json::json!(true));
+        assert_eq!(member.tags["replicatefrom"], serde_json::json!("node9"));
+    }
+
+    #[tokio::test]
+    async fn test_touch_member_default_tags_keep_defaults() {
+        let member = published_member("node2", "tags-default", Tags::default()).await;
+        assert!(!member.is_nofailover());
+        assert_eq!(member.failover_priority(), 1);
+        assert!(!member.is_nosync());
+        assert_eq!(member.sync_priority(), 0);
+        assert!(!member.is_noloadbalance());
+    }
+
+    #[tokio::test]
+    async fn test_touch_member_does_not_publish_version() {
+        let dcs = Arc::new(MockDcs::new());
+        let (ha, dir) = identity_test_ha("node1", "tags-no-version", dcs.clone(), Some(true), true);
+        ha.touch_member().await.unwrap();
+        let data = dcs.last_member_data.lock().unwrap().clone().unwrap();
+        assert!(data.get("version").is_none(), "{data}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_member_record_without_tags_key_parses_with_defaults() {
+        let old = r#"{"name":"n","conn_url":"","api_url":"","state":"running","role":"replica"}"#;
+        let member: Member = serde_json::from_str(old).unwrap();
+        assert!(member.tags.is_empty());
+        assert!(!member.is_nofailover());
+        assert_eq!(member.failover_priority(), 1);
+        assert!(!member.is_nosync());
+    }
+
+    // Consumer round trips: each peer below carries the tags of a record that
+    // touch_member published, not a hand-written literal.
+
+    #[tokio::test]
+    async fn test_election_does_not_defer_to_published_nofailover_peer() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(1));
+        let (mut ha, dir) = identity_test_ha("node2", "rt-nofailover", dcs, Some(true), true);
+        let peer = published_peer(
+            "node1",
+            "rt-nofailover-peer",
+            Tags {
+                nofailover: true,
+                ..Tags::default()
+            },
+            900,
+        )
+        .await;
+        ha.cluster = unlocked(vec![peer, member_with_tl("node2", 100, 1)], Some(1));
+        assert!(ha.is_healthiest_node(), "node1 will never campaign");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_election_does_not_defer_to_published_priority_zero_peer() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(1));
+        let (mut ha, dir) = identity_test_ha("node2", "rt-prio0", dcs, Some(true), true);
+        let peer = published_peer(
+            "node1",
+            "rt-prio0-peer",
+            Tags {
+                failover_priority: 0,
+                ..Tags::default()
+            },
+            900,
+        )
+        .await;
+        ha.cluster = unlocked(vec![peer, member_with_tl("node2", 100, 1)], Some(1));
+        assert!(ha.is_healthiest_node(), "node1 will never campaign");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_election_wal_tie_goes_to_published_higher_failover_priority() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(1));
+        // node1 sorts before node2, so only the published priority can make
+        // node2 win the tie.
+        let (mut ha, dir) = identity_test_ha("node1", "rt-prio-tie", dcs, Some(true), true);
+        let peer = published_peer(
+            "node2",
+            "rt-prio-tie-peer",
+            Tags {
+                failover_priority: 5,
+                ..Tags::default()
+            },
+            100,
+        )
+        .await;
+        ha.cluster = unlocked(vec![member_with_tl("node1", 100, 1), peer], Some(1));
+        assert!(!ha.is_healthiest_node(), "node2 has the higher priority");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_designated_nofailover_candidate_is_not_honoured_by_peers() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(1));
+        let (mut ha, dir) = identity_test_ha("node2", "rt-honour", dcs.clone(), Some(true), true);
+        let candidate = published_peer(
+            "node1",
+            "rt-honour-peer",
+            Tags {
+                nofailover: true,
+                ..Tags::default()
+            },
+            900,
+        )
+        .await;
+        ha.cluster = Cluster {
+            failover: Some(Failover {
+                leader: None,
+                candidate: Some("node1".into()),
+                scheduled_at: None,
+            }),
+            ..unlocked(vec![candidate, member_with_tl("node2", 100, 1)], Some(1))
+        };
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(
+            !follower_msg_or_empty(&result).contains("deferring to designated candidate"),
+            "{result}"
+        );
+        assert!(ha.is_leader(), "{result}");
+        assert!(lock_held_by(&dcs).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn follower_msg_or_empty(result: &CycleResult) -> &str {
+        match result {
+            CycleResult::Follower(m) => m,
+            _ => "",
+        }
+    }
+
+    /// The candidate node itself must honour its own config, not just peers.
+    async fn assert_self_candidate_does_not_promote(tags: Tags, label: &str) {
+        let dcs = Arc::new(MockDcs::new().with_timeline(1));
+        let (mut ha, dir, _tx) =
+            identity_test_ha_full("node1", label, dcs.clone(), Some(true), true, None, 1, tags);
+        ha.cluster = Cluster {
+            failover: Some(Failover {
+                leader: Some("node2".into()),
+                candidate: Some("node1".into()),
+                scheduled_at: None,
+            }),
+            ..unlocked(
+                vec![
+                    member_with_tl("node1", 900, 1),
+                    member_with_tl("node2", 800, 1),
+                ],
+                Some(1),
+            )
+        };
+
+        let result = ha.process_unhealthy_cluster().await;
+
+        assert!(!ha.is_leader(), "{result}");
+        assert_eq!(lock_held_by(&dcs), None, "{result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_nofailover_node_designated_as_candidate_does_not_promote() {
+        assert_self_candidate_does_not_promote(
+            Tags {
+                nofailover: true,
+                ..Tags::default()
+            },
+            "self-cand-nofailover",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_priority_zero_node_designated_as_candidate_does_not_promote() {
+        assert_self_candidate_does_not_promote(
+            Tags {
+                failover_priority: 0,
+                ..Tags::default()
+            },
+            "self-cand-prio0",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_default_tags_node_designated_as_candidate_promotes() {
+        let dcs = Arc::new(MockDcs::new().with_timeline(1));
+        let (mut ha, dir) =
+            identity_test_ha("node1", "self-cand-default", dcs.clone(), Some(true), true);
+        ha.cluster = Cluster {
+            failover: Some(Failover {
+                leader: Some("node2".into()),
+                candidate: Some("node1".into()),
+                scheduled_at: None,
+            }),
+            ..unlocked(
+                vec![
+                    member_with_tl("node1", 100, 1),
+                    member_with_tl("node2", 800, 1),
+                ],
+                Some(1),
+            )
+        };
+        let result = ha.process_unhealthy_cluster().await;
+        assert!(ha.is_leader(), "{result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Leader `node1` (this Ha) with a published-tags `node2` as the target.
+    async fn candidate_validation_ha(
+        label: &str,
+        tags: Tags,
+    ) -> (Ha, PathBuf, CommandSender, Arc<MockDcs>) {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir, tx) = identity_test_ha_full(
+            "node1",
+            label,
+            dcs.clone(),
+            Some(false),
+            false,
+            None,
+            1,
+            Tags::default(),
+        );
+        ha.is_leader = true;
+        let peer = published_peer("node2", &format!("{label}-peer"), tags, 100).await;
+        ha.cluster = Cluster {
+            timeline: rec(1),
+            leader: Some(Leader {
+                name: "node1".into(),
+                version: 1,
+            }),
+            members: vec![running_member("node1", 100), peer],
+            ..Default::default()
+        };
+        (ha, dir, tx, dcs)
+    }
+
+    #[tokio::test]
+    async fn test_failover_rejects_published_nofailover_candidate() {
+        let (mut ha, dir, tx, dcs) = candidate_validation_ha(
+            "rt-fo-nofailover",
+            Tags {
+                nofailover: true,
+                ..Tags::default()
+            },
+        )
+        .await;
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Failover {
+                candidate: Some("node2".into()),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert!(resp.message.contains("nofailover"), "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_switchover_rejects_published_nofailover_candidate() {
+        let (mut ha, dir, tx, dcs) = candidate_validation_ha(
+            "rt-so-nofailover",
+            Tags {
+                nofailover: true,
+                ..Tags::default()
+            },
+        )
+        .await;
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Switchover {
+                leader: Some("node1".into()),
+                candidate: Some("node2".into()),
+                scheduled_at: None,
+            },
+        )
+        .await;
+        assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert!(resp.message.contains("nofailover"), "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        assert!(ha.is_leader(), "a rejected switchover must not demote");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_failover_rejects_published_priority_zero_candidate() {
+        let (mut ha, dir, tx, dcs) = candidate_validation_ha(
+            "rt-fo-prio0",
+            Tags {
+                failover_priority: 0,
+                ..Tags::default()
+            },
+        )
+        .await;
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Failover {
+                candidate: Some("node2".into()),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_failover_accepts_published_default_tags_candidate() {
+        let (mut ha, dir, tx, dcs) =
+            candidate_validation_ha("rt-fo-default", Tags::default()).await;
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Failover {
+                candidate: Some("node2".into()),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn replicas_at(lsn: u64, names: &[&str]) -> crate::postgresql::ReplicationSnapshot {
+        crate::postgresql::ReplicationSnapshot {
+            primary_flush_lsn: lsn,
+            replicas: names
+                .iter()
+                .map(|n| crate::postgresql::ReplicaRow {
+                    application_name: n.to_string(),
+                    flush_lsn: lsn,
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_manager_skips_published_nosync_peer() {
+        let n2 = published_peer(
+            "node2",
+            "rt-nosync-2",
+            Tags {
+                nosync: true,
+                ..Tags::default()
+            },
+            100,
+        )
+        .await;
+        let n3 = published_peer("node3", "rt-nosync-3", Tags::default(), 100).await;
+        let mgr = crate::sync::SyncManager::new(crate::sync::SyncMode::Priority, 1, false);
+        let names = mgr.compute_sync_standby_names(
+            &[n2, n3],
+            "node1",
+            &replicas_at(100, &["node2", "node3"]),
+            None,
+            &[],
+        );
+        assert_eq!(names.as_deref(), Some("FIRST 1 (\"node3\")"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_manager_orders_by_published_sync_priority() {
+        let n2 = published_peer("node2", "rt-syncprio-2", Tags::default(), 100).await;
+        let n3 = published_peer(
+            "node3",
+            "rt-syncprio-3",
+            Tags {
+                sync_priority: 9,
+                ..Tags::default()
+            },
+            100,
+        )
+        .await;
+        let mgr = crate::sync::SyncManager::new(crate::sync::SyncMode::Priority, 1, false);
+        let names = mgr.compute_sync_standby_names(
+            &[n2, n3],
+            "node1",
+            &replicas_at(100, &["node2", "node3"]),
+            None,
+            &[],
+        );
+        assert_eq!(names.as_deref(), Some("FIRST 1 (\"node3\")"));
+    }
+
+    /// Open point (a): when every standby is nosync nothing is eligible. The
+    /// existing code already defines the outcome: non-strict degrades to
+    /// async (empty), strict emits the unsatisfiable placeholder so commits
+    /// wait. Publishing tags only makes this reachable; it is not changed.
+    #[tokio::test]
+    async fn test_sync_manager_all_standbys_nosync_keeps_defined_behaviour() {
+        let nosync = Tags {
+            nosync: true,
+            ..Tags::default()
+        };
+        let n2 = published_peer("node2", "rt-allnosync-2", nosync.clone(), 100).await;
+        let n3 = published_peer("node3", "rt-allnosync-3", nosync, 100).await;
+        let members = [n2, n3];
+        let snap = replicas_at(100, &["node2", "node3"]);
+
+        let relaxed = crate::sync::SyncManager::new(crate::sync::SyncMode::Priority, 1, false);
+        assert_eq!(
+            relaxed
+                .compute_sync_standby_names(&members, "node1", &snap, None, &[])
+                .as_deref(),
+            Some("")
+        );
+        let strict = crate::sync::SyncManager::new(crate::sync::SyncMode::Priority, 1, true);
+        assert_eq!(
+            strict
+                .compute_sync_standby_names(&members, "node1", &snap, None, &[])
+                .as_deref(),
+            Some(crate::sync::STRICT_NO_ELIGIBLE_PLACEHOLDER)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cascade_topology_shows_published_replicatefrom() {
+        let n3 = published_peer(
+            "node3",
+            "rt-cascade-3",
+            Tags {
+                replicatefrom: Some("node2".to_string()),
+                ..Tags::default()
+            },
+            100,
+        )
+        .await;
+        let cluster = Cluster {
+            leader: Some(Leader {
+                name: "node1".into(),
+                version: 1,
+            }),
+            members: vec![
+                running_member("node1", 100),
+                running_member("node2", 100),
+                n3,
+            ],
+            ..Default::default()
+        };
+        let topology = crate::cascading::CascadeManager::build_cascade_topology(&cluster);
+        let node3 = topology.iter().find(|n| n.name == "node3").unwrap();
+        assert_eq!(node3.upstream.as_deref(), Some("node2"));
+        assert_eq!(node3.replicatefrom.as_deref(), Some("node2"));
     }
 
     #[tokio::test]

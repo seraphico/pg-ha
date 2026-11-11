@@ -191,7 +191,7 @@ impl Ha {
         {
             warn!(
                 candidate = %c,
-                "Designated candidate {c} may not take part in the election (it is not shown to be on the latest timeline); proceeding as if no candidate were designated"
+                "Designated candidate {c} may not take part in the election (it is not running, is not allowed to fail over, or is not shown to be on the latest timeline); proceeding as if no candidate were designated"
             );
         }
 
@@ -283,13 +283,24 @@ impl Ha {
     }
 
     /// Designated candidate this node will defer to. `None` when the key has
-    /// no candidate, or the candidate is in the member list and may not
-    /// campaign (nofailover, not Running, or D6 ineligible — A25). A missing
+    /// no candidate, or the candidate may not campaign (nofailover or
+    /// failover_priority 0, not Running, or D6 ineligible — A25). A missing
     /// member is still honoured (API already rejected known-bad candidates).
+    ///
+    /// When the candidate is this node, its own config decides: it never
+    /// promotes itself against its own nofailover / failover_priority 0, even
+    /// if the request got past the API (stale or unpublished peer view).
     fn honoured_candidate(&self) -> Option<&str> {
         let candidate = self.cluster.failover.as_ref()?.candidate.as_deref()?;
+        if candidate == self.config.name
+            && (self.config.tags.nofailover || self.config.tags.failover_priority == 0)
+        {
+            return None;
+        }
         if let Some(m) = self.cluster.get_member(candidate)
-            && (m.is_nofailover() || m.state != crate::cluster::MemberState::Running)
+            && (m.is_nofailover()
+                || m.failover_priority() == 0
+                || m.state != crate::cluster::MemberState::Running)
         {
             return None;
         }

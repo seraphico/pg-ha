@@ -178,13 +178,13 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
 {"status": "rejected", "message": "Candidate 'node3' is not a synchronous standby (sync mode requires /sync membership)"}
 ```
 
-候选不存在、带 `nofailover` 或不在 Running，同样是 409。候选带 rewind 检查标记（`pg-ha.rewind_check`，尚未经 pg_rewind 验证）时也是 409，`POST /failover` 同样：
+候选不存在、带 `nofailover` 或 `failover_priority: 0`、或不在 Running，同样是 409。（候选按各节点在成员记录里发布的 tags 校验；节点自己被指定为候选时，如果自己的配置是 `nofailover` 或 `failover_priority: 0`，也拒绝升主。）候选带 rewind 检查标记（`pg-ha.rewind_check`，尚未经 pg_rewind 验证）时也是 409，`POST /failover` 同样：
 
 ```json
 {"status": "rejected", "message": "Candidate 'node2' has a rewind-check marker (not yet verified with pg_rewind)"}
 ```
 
-请求受理之后 candidate 按 [invariants.md](invariants.md) 1a「D6」不能参选时（例如它不在最新 timeline 上），其他节点打 WARN `Designated candidate <c> may not take part in the election (it is not shown to be on the latest timeline); proceeding as if no candidate were designated`，按没有指定 candidate 选举：仍排除 `/failover` 里的 `leader`，不把锁还给刚退下来的旧主。
+请求受理之后 candidate 按 [invariants.md](invariants.md) 1a「D6」不能参选时（例如它不在最新 timeline 上），其他节点打 WARN `Designated candidate <c> may not take part in the election (it is not running, is not allowed to fail over, or is not shown to be on the latest timeline); proceeding as if no candidate were designated`，按没有指定 candidate 选举：仍排除 `/failover` 里的 `leader`，不把锁还给刚退下来的旧主。
 
 不指定 candidate、且除本节点外没有处于 running、允许 failover、并且（sync 开启时）属于 `/sync` 的成员时，返回 409，不写 `/failover`、不停库：
 
@@ -196,7 +196,7 @@ curl -u admin:secret -X POST http://localhost:8008/switchover \
 
 **立即 Switchover 在发起节点上的动作**（没有先跑 CHECKPOINT；CHECKPOINT 只在进程收到 SIGTERM/SIGINT 的停机路径里）：
 
-1. 校验候选（存在、Running、非 nofailover、无 rewind 标记、含同步复制资格）；写 `/failover` 失败则中止并返回 error，不停库
+1. 校验候选（存在、Running、非 nofailover 且 failover_priority 非 0、无 rewind 标记、含同步复制资格）；写 `/failover` 失败则中止并返回 error，不停库
 2. 把 `{leader, candidate}` 写入 DCS `/failover`
 3. 续一次 leader lock（命令执行期间 HA 循环不跑）；续锁失败则按租约到期围栏，返回 error `Switchover aborted: leader lock renewal failed; ...`
 4. 写入 `standby.signal` 并 fsync；有 candidate 时把 `postgresql.auto.conf` 的 `primary_conninfo` 指到候选，没有时删除 `primary_conninfo`；`postgresql.auto.conf` 的其他设置保留

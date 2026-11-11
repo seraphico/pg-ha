@@ -215,12 +215,15 @@ impl Cluster {
         self.members.iter().find(|m| m.name == name)
     }
 
-    /// Get suitable clone sources (prefer clonefrom-tagged, then leader)
+    /// Get suitable clone sources (prefer clonefrom-tagged, then leader).
+    /// Members tagged `noclone` are never returned, like `select_clone_source`.
     pub fn get_clone_member(&self, exclude_name: &str) -> Option<&Member> {
+        let cloneable = |m: &Member| {
+            m.name != exclude_name && m.tags.get("noclone").and_then(|v| v.as_bool()) != Some(true)
+        };
         // Prefer members with clonefrom tag
         let clone_source = self.members.iter().find(|m| {
-            m.name != exclude_name
-                && m.tags.get("clonefrom").and_then(|v| v.as_bool()) == Some(true)
+            cloneable(m) && m.tags.get("clonefrom").and_then(|v| v.as_bool()) == Some(true)
         });
         if clone_source.is_some() {
             return clone_source;
@@ -230,7 +233,7 @@ impl Cluster {
             return self
                 .members
                 .iter()
-                .find(|m| m.name == leader.name && m.name != exclude_name);
+                .find(|m| m.name == leader.name && cloneable(m));
         }
         None
     }
@@ -653,5 +656,42 @@ mod tests {
         // Should prefer node2 (has clonefrom tag)
         let source = cluster.get_clone_member("node3").unwrap();
         assert_eq!(source.name, "node2");
+    }
+
+    #[test]
+    fn test_cluster_get_clone_member_skips_noclone() {
+        let member = |name: &str, tags: &[(&str, bool)]| Member {
+            name: name.to_string(),
+            conn_url: String::new(),
+            api_url: String::new(),
+            state: MemberState::Running,
+            role: MemberRole::Replica,
+            wal_position: None,
+            timeline: None,
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+                .collect(),
+            version: None,
+            rewind_check: false,
+            lineage: None,
+            watchdog_failed: false,
+        };
+        let cluster = Cluster {
+            leader: Some(Leader {
+                name: "node1".to_string(),
+                version: 1,
+            }),
+            members: vec![
+                member("node1", &[("noclone", true)]),
+                member("node2", &[("clonefrom", true), ("noclone", true)]),
+                member("node3", &[("clonefrom", true)]),
+            ],
+            ..Default::default()
+        };
+        // node2 is clonefrom but noclone: node3 is chosen.
+        assert_eq!(cluster.get_clone_member("node9").unwrap().name, "node3");
+        // Only noclone members left (leader included): no source.
+        assert!(cluster.get_clone_member("node3").is_none());
     }
 }
