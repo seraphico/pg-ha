@@ -432,6 +432,8 @@ pub fn quorum_vote_decision(
     VoteDecision::Granted { votes: votes.len() }
 }
 
+pub mod round;
+
 #[cfg(test)]
 mod model_tests;
 
