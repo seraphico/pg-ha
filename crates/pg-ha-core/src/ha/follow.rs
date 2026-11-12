@@ -226,7 +226,9 @@ impl Ha {
     ///    not ready (A12: lock holder running as a primary in the DCS view
     ///    and in a live check), without counting it as a failure
     /// 1. Stop PostgreSQL (a primary through `fence_primary`)
-    /// 2. Check the source live again, then run pg_rewind against it
+    /// 2. Check the source live again, make sure the data directory is cleanly
+    ///    shut down (SB-28: single-user crash recovery without the signal
+    ///    files, only when pg_control says it is not), then run pg_rewind
     /// 3. Remove the marker, write standby.signal + primary_conninfo
     /// 4. Start PostgreSQL in standby mode
     ///
@@ -330,17 +332,30 @@ impl Ha {
             ));
         }
 
-        info!(source = %leader_name, "Running pg_rewind to resync from current primary");
-        if let Err(e) = self.postgresql.rewind(&leader_connstr).await {
+        // SB-28: pg_rewind needs a cleanly shut down target. After an unclean
+        // stop it would run a single-user server itself, which dies on
+        // standby.signal; do the crash recovery here without the signal files.
+        // A failure ends in the same hold (or opt-in rebuild) as a pg_rewind failure.
+        let outcome = match self.postgresql.ensure_clean_shutdown_for_rewind().await {
+            Ok(()) => {
+                info!(source = %leader_name, "Running pg_rewind to resync from current primary");
+                self.postgresql
+                    .rewind(&leader_connstr)
+                    .await
+                    .map_err(|e| ("pg_rewind", "rewind", e))
+            }
+            Err(e) => Err(("Clean shutdown before pg_rewind", "clean shutdown", e)),
+        };
+        if let Err((what, failed, e)) = outcome {
             if rebuild_enabled {
                 warn!(
-                    "pg_rewind failed: {e} — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup"
+                    "{what} failed: {e} — remove_data_directory_on_rewind_failure is enabled, rebuilding with pg_basebackup"
                 );
                 return self
-                    .rebuild_from_leader(leader_name, &leader_connstr, "rewind", &e)
+                    .rebuild_from_leader(leader_name, &leader_connstr, failed, &e)
                     .await;
             }
-            return self.enter_rewind_hold("pg_rewind", &error_text(&e)).await;
+            return self.enter_rewind_hold(what, &error_text(&e)).await;
         }
 
         // Step 3: the rewind check is done (also for "no rewind required").

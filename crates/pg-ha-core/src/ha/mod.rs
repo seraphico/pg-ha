@@ -4441,6 +4441,14 @@ mod tests {
         PgCtlFastStopFails,
         /// pg_ctl stop: every mode fails. Modes recorded.
         PgCtlStopFails,
+        /// SB-28: pg_controldata prints the state in `pg-ha-test.state`; a
+        /// `postgres --single` that dies when standby.signal / recovery.signal
+        /// exists, otherwise sets the state to `shut down`; pg_rewind fails
+        /// unless the state is clean (like the real one on a single-user
+        /// failure). Every tool appends its name to `pg-ha-test.calls`.
+        UncleanTarget,
+        /// As `UncleanTarget`, but the single-user run fails (PANIC).
+        UncleanTargetSingleUserFails,
     }
 
     /// pg_rewind --target-pgdata <dir> ...: $2 is the data directory.
@@ -4449,7 +4457,7 @@ mod tests {
     const FAKE_PSQL_PRIMARY: &str = "echo f\nexit 0\n";
 
     impl FakeBin {
-        const ALL: [FakeBin; 11] = [
+        const ALL: [FakeBin; 13] = [
             FakeBin::ControldataInProduction,
             FakeBin::ControldataShutDownInRecovery,
             FakeBin::PgCtlStopOk,
@@ -4461,6 +4469,8 @@ mod tests {
             FakeBin::PgCtlFastStopHangs,
             FakeBin::PgCtlFastStopFails,
             FakeBin::PgCtlStopFails,
+            FakeBin::UncleanTarget,
+            FakeBin::UncleanTargetSingleUserFails,
         ];
 
         fn dir_name(self) -> &'static str {
@@ -4476,6 +4486,8 @@ mod tests {
                 FakeBin::PgCtlFastStopHangs => "pg-ctl-fast-stop-hangs",
                 FakeBin::PgCtlFastStopFails => "pg-ctl-fast-stop-fails",
                 FakeBin::PgCtlStopFails => "pg-ctl-stop-fails",
+                FakeBin::UncleanTarget => "unclean-target",
+                FakeBin::UncleanTargetSingleUserFails => "unclean-target-single-user-fails",
             }
         }
 
@@ -4536,8 +4548,53 @@ mod tests {
                     "pg_ctl",
                     "[ \"$1\" = stop ] || exit 1\necho \"$5\" >> \"$3/pg-ha-test.stop_modes\"\nexit 1\n",
                 )],
+                FakeBin::UncleanTarget => unclean_target_scripts(FAKE_UNCLEAN_SINGLE_OK),
+                FakeBin::UncleanTargetSingleUserFails => {
+                    unclean_target_scripts(FAKE_UNCLEAN_SINGLE_FAILS)
+                }
             }
         }
+    }
+
+    /// `postgres --single -F -D <dir> template1`: `$4` is the data directory.
+    /// Like the real server it dies when a signal file exists.
+    const FAKE_UNCLEAN_SINGLE_PREFIX: &str = "d=\"$4\"\necho \"postgres $*\" >> \"$d/pg-ha-test.calls\"\n\
+         if [ -e \"$d/standby.signal\" ] || [ -e \"$d/recovery.signal\" ]; then\n\
+         echo 'FATAL:  standby mode is not supported by single-user servers' >&2\nexit 1\nfi\n";
+    const FAKE_UNCLEAN_SINGLE_OK: &str = "echo 'shut down' > \"$d/pg-ha-test.state\"\nexit 0\n";
+    const FAKE_UNCLEAN_SINGLE_FAILS: &str =
+        "echo 'PANIC:  could not locate a valid checkpoint record' >&2\nexit 1\n";
+
+    fn unclean_target_scripts(single_body: &'static str) -> Vec<(&'static str, &'static str)> {
+        // The script text must be 'static: build it once per body.
+        static OK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        static FAILS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let cell = if single_body == FAKE_UNCLEAN_SINGLE_OK {
+            &OK
+        } else {
+            &FAILS
+        };
+        let postgres: &'static str = cell
+            .get_or_init(|| format!("{FAKE_UNCLEAN_SINGLE_PREFIX}{single_body}"))
+            .as_str();
+        vec![
+            // -D <dir>: $2 is the data directory.
+            (
+                "pg_controldata",
+                "echo controldata >> \"$2/pg-ha-test.calls\"\n\
+                 echo \"Database cluster state:               $(cat \"$2/pg-ha-test.state\")\"\n",
+            ),
+            ("postgres", postgres),
+            // --target-pgdata <dir>: $2 is the data directory.
+            (
+                "pg_rewind",
+                "echo pg_rewind >> \"$2/pg-ha-test.calls\"\ntouch \"$2/pg-ha-test.rewind_called\"\n\
+                 case \"$(cat \"$2/pg-ha-test.state\")\" in\n\
+                 'shut down'|'shut down in recovery') echo 'pg_rewind: no rewind required'; exit 0;;\nesac\n\
+                 echo 'pg_rewind: error: postgres single-user mode in target cluster failed' >&2\nexit 1\n",
+            ),
+            ("psql", FAKE_PSQL_PRIMARY),
+        ]
     }
 
     static FAKE_BINS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -7838,6 +7895,175 @@ mod tests {
             "{hold}"
         );
         assert!(dir.join("PG_VERSION").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────── SB-28: clean shutdown before pg_rewind ───────────────────
+
+    fn sb28_calls(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("pg-ha-test.calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn sb28_single_user_cmd(dir: &std::path::Path) -> String {
+        format!("postgres --single -F -D {} template1", dir.display())
+    }
+
+    /// Stopped node2 with standby.signal, the marker, node1 ready, and a
+    /// pg_control state for the fake tools.
+    fn unclean_target_ha(label: &str, kind: FakeBin, state: &str) -> (Ha, PathBuf, CommandSender) {
+        let (ha, dir, tx) = rewind_test_ha(label, kind);
+        std::fs::write(dir.join("pg-ha-test.state"), state).unwrap();
+        (ha, dir, tx)
+    }
+
+    #[tokio::test]
+    async fn test_rejoin_unclean_target_runs_single_user_then_pg_rewind() {
+        for (i, state) in ["in archive recovery", "in production"]
+            .into_iter()
+            .enumerate()
+        {
+            let (mut ha, dir, _tx) =
+                unclean_target_ha(&format!("sb28-ok{i}"), FakeBin::UncleanTarget, state);
+            std::fs::write(dir.join("recovery.signal"), "r").unwrap();
+
+            let result = ha.rejoin_as_replica("node1").await;
+
+            assert_eq!(
+                sb28_calls(&dir),
+                [
+                    "controldata".to_string(),
+                    sb28_single_user_cmd(&dir),
+                    "controldata".to_string(),
+                    "pg_rewind".to_string(),
+                ],
+                "{state}: state, single-user run, state again, pg_rewind"
+            );
+            assert!(rewind_called(&dir), "{state}");
+            assert_eq!(
+                marker(&dir),
+                None,
+                "{state}: marker removed after pg_rewind"
+            );
+            // The start after the rewind fails here (no pg_ctl): the old hold-on-start path.
+            let hold = std::fs::read_to_string(dir.join(REWIND_HOLD_FILE)).expect("hold file");
+            assert!(
+                hold.starts_with("Starting PostgreSQL after pg_rewind failed"),
+                "{state}: {hold} / {result}"
+            );
+            assert!(dir.join("standby.signal").is_file(), "{state}");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("recovery.signal")).unwrap(),
+                "r",
+                "{state}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_fail_count_with_unclean_target_rewinds_after_single_user() {
+        // The SB-28 path: PostgreSQL cannot start, the directory is not cleanly
+        // shut down, standby.signal exists.
+        let (mut ha, dir, _tx) = unclean_target_ha(
+            "sb28-fail-count",
+            FakeBin::UncleanTarget,
+            "in archive recovery",
+        );
+        ha.start_fail_count = 3;
+
+        let _ = ha.handle_postgres_not_running().await;
+
+        assert_eq!(
+            sb28_calls(&dir),
+            [
+                "controldata".to_string(),
+                sb28_single_user_cmd(&dir),
+                "controldata".to_string(),
+                "pg_rewind".to_string(),
+            ]
+        );
+        assert!(rewind_called(&dir));
+        assert!(dir.join("standby.signal").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rejoin_clean_target_skips_single_user() {
+        for (i, state) in ["shut down", "shut down in recovery"]
+            .into_iter()
+            .enumerate()
+        {
+            let (mut ha, dir, _tx) =
+                unclean_target_ha(&format!("sb28-clean{i}"), FakeBin::UncleanTarget, state);
+
+            let _ = ha.rejoin_as_replica("node1").await;
+
+            assert_eq!(
+                sb28_calls(&dir),
+                ["controldata".to_string(), "pg_rewind".to_string()],
+                "{state}: no single-user run on a clean target"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rejoin_single_user_failure_holds_like_a_rewind_failure() {
+        let (mut ha, dir, _tx) = unclean_target_ha(
+            "sb28-hold",
+            FakeBin::UncleanTargetSingleUserFails,
+            "in archive recovery",
+        );
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(
+            matches!(result, CycleResult::Error(ref m) if m == HOLD_RESULT),
+            "{result}"
+        );
+        assert_eq!(
+            sb28_calls(&dir),
+            ["controldata".to_string(), sb28_single_user_cmd(&dir)],
+            "pg_rewind is not run after a failed clean-shutdown step"
+        );
+        assert!(!rewind_called(&dir));
+        let hold = std::fs::read_to_string(dir.join(REWIND_HOLD_FILE)).expect("hold file");
+        assert!(
+            hold.starts_with("Clean shutdown before pg_rewind failed: ")
+                && hold.contains("PANIC:  could not locate a valid checkpoint record"),
+            "{hold}"
+        );
+        assert!(ha.rewind_hold && ha.rewind_hold_persisted);
+        assert!(marker(&dir).is_some(), "marker kept");
+        assert!(dir.join("PG_VERSION").exists(), "data directory kept");
+        assert!(dir.join("standby.signal").is_file(), "signal restored");
+        assert_eq!(ha.postgresql().state(), PgState::Unknown, "not started");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rejoin_single_user_failure_rebuilds_when_enabled() {
+        let (mut ha, dir, _tx) = unclean_target_ha(
+            "sb28-rebuild",
+            FakeBin::UncleanTargetSingleUserFails,
+            "in production",
+        );
+        ha.config.postgresql.remove_data_directory_on_rewind_failure = true;
+
+        let result = ha.rejoin_as_replica("node1").await;
+
+        assert!(
+            is_error_starting(&result, "Rejoin failed: clean shutdown=")
+                && matches!(result, CycleResult::Error(ref m) if m.contains(", basebackup=")),
+            "{result}"
+        );
+        assert!(!dir.join("PG_VERSION").exists(), "data directory emptied");
+        assert!(!dir.join(REWIND_HOLD_FILE).exists());
+        assert!(!rewind_called(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

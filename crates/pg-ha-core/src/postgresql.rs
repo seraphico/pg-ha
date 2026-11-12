@@ -41,6 +41,102 @@ const RECOVERY_OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// PGCONNECT_TIMEOUT=5).
 const SOURCE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound for the single-user crash recovery run before `pg_rewind`
+/// (SB-28). It replays all WAL since the last checkpoint, which `max_wal_size`
+/// (default 1 GB) and `checkpoint_timeout` normally keep to seconds or a few
+/// minutes; a deployment with a very large `max_wal_size` on slow storage can
+/// need much longer. 30 minutes is far above the normal case (a limit that
+/// cuts off a slow but healthy recovery would turn into a hold for nothing)
+/// and still ends a hung child (stuck I/O, a lock) instead of blocking the HA
+/// loop forever. A timeout kills the child; the node then goes into the
+/// ordinary rewind hold and the operator can release it (delete
+/// `pg-ha.rewind_failed`) to retry.
+const SINGLE_USER_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// How long to wait for the output readers of the single-user child after it
+/// exited or was killed (a grandchild holding the pipe open must not hang us).
+const SINGLE_USER_OUTPUT_GRACE: Duration = Duration::from_secs(5);
+
+const RECOVERY_SIGNAL: &str = "recovery.signal";
+const SIGNAL_ASIDE_SUFFIX: &str = ".pg-ha-aside";
+
+/// pg_control states in which `pg_rewind` needs no crash recovery.
+fn is_clean_shutdown_state(state: &str) -> bool {
+    matches!(state.trim(), "shut down" | "shut down in recovery")
+}
+
+/// `standby.signal` / `recovery.signal` renamed to `<name>.pg-ha-aside` while
+/// a single-user server runs. Renaming (not deleting and rewriting) keeps the
+/// content and metadata exactly; absent files stay absent. [`restore`] puts
+/// them back; `Drop` does the same if it was not called (panic, dropped
+/// future). A leftover aside file of a dead pg-ha is restored by [`take`].
+///
+/// [`restore`]: SignalFilesAside::restore
+/// [`take`]: SignalFilesAside::take
+struct SignalFilesAside {
+    dir: PathBuf,
+    moved: Vec<&'static str>,
+}
+
+impl SignalFilesAside {
+    fn take(dir: &std::path::Path) -> std::io::Result<Self> {
+        let mut aside = Self {
+            dir: dir.to_path_buf(),
+            moved: Vec::new(),
+        };
+        for name in [crate::standby_config::STANDBY_SIGNAL, RECOVERY_SIGNAL] {
+            let original = dir.join(name);
+            let parked = dir.join(format!("{name}{SIGNAL_ASIDE_SUFFIX}"));
+            let parked_exists = std::fs::symlink_metadata(&parked).is_ok();
+            let original_exists = std::fs::symlink_metadata(&original).is_ok();
+            if parked_exists && !original_exists {
+                // A pg-ha that died inside the window left it: put it back first.
+                std::fs::rename(&parked, &original)?;
+            } else if parked_exists {
+                // The original was rewritten since: the parked copy is stale.
+                std::fs::remove_file(&parked)?;
+            }
+            if std::fs::symlink_metadata(&original).is_ok() {
+                std::fs::rename(&original, &parked)?;
+                aside.moved.push(name);
+            }
+        }
+        Ok(aside)
+    }
+
+    /// Rename every parked file back; tries all, returns the first error.
+    fn restore(&mut self) -> std::io::Result<()> {
+        let mut first_err = None;
+        let mut failed = Vec::new();
+        for name in std::mem::take(&mut self.moved) {
+            let original = self.dir.join(name);
+            let parked = self.dir.join(format!("{name}{SIGNAL_ASIDE_SUFFIX}"));
+            if let Err(e) = std::fs::rename(&parked, &original) {
+                first_err.get_or_insert(e);
+                failed.push(name);
+            }
+        }
+        self.moved = failed;
+        if let Ok(dir) = std::fs::File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for SignalFilesAside {
+    fn drop(&mut self) {
+        if !self.moved.is_empty()
+            && let Err(e) = self.restore()
+        {
+            error!(
+                "Could not restore standby.signal / recovery.signal in {}: {e}",
+                self.dir.display()
+            );
+        }
+    }
+}
+
 /// Pure: exit status + stdout of the `SELECT pg_is_in_recovery()` probe ->
 /// Some(true) = answers as a primary, Some(false) = in recovery, None = no
 /// usable answer.
@@ -362,6 +458,10 @@ impl Postgresql {
 
     fn pg_controldata_bin(&self) -> PathBuf {
         self.config.bin_dir.join("pg_controldata")
+    }
+
+    fn postgres_bin(&self) -> PathBuf {
+        self.config.bin_dir.join("postgres")
     }
 
     fn psql_bin(&self) -> PathBuf {
@@ -792,6 +892,167 @@ impl Postgresql {
         Err(Error::Postgres(
             "Could not find cluster state in pg_controldata output".into(),
         ))
+    }
+
+    /// SB-28: make the (stopped) target of a `pg_rewind` cleanly shut down.
+    ///
+    /// `pg_rewind` wants `shut down` / `shut down in recovery` in pg_control.
+    /// Otherwise it runs `postgres --single -F -D <pgdata> template1` itself,
+    /// and that single-user server dies on `standby.signal` ("standby mode is
+    /// not supported by single-user servers"), which is the state of every
+    /// replica pg-ha tries to rejoin after an unclean stop. So here:
+    ///
+    /// 1. pg_controldata says `shut down` or `shut down in recovery`: return
+    ///    at once, nothing touched. (If pg_controldata cannot be read, also
+    ///    return: nothing is known, `pg_rewind` reports its own error, exactly
+    ///    as before this step existed; `prepare_standby_start` treats an
+    ///    unreadable control file the same way.)
+    /// 2. A live postmaster for this data directory: error, nothing touched
+    ///    (single-user mode on a running instance would corrupt it).
+    /// 3. `standby.signal` and `recovery.signal` are renamed aside, `postgres
+    ///    --single -F -D <pgdata> template1` runs with stdin from /dev/null
+    ///    (crash recovery, end-of-recovery checkpoint on the SAME timeline, no
+    ///    promotion, no new timeline), the signal files are renamed back in
+    ///    every outcome, and pg_controldata must then say `shut down`.
+    ///
+    /// Crash-safety of the window in which `standby.signal` is absent: the
+    /// signal files go back through a guard (`Drop` too, so a panic or a
+    /// dropped future restores them), and a leftover `*.pg-ha-aside` file of a
+    /// pg-ha process that died inside the window is renamed back by the next
+    /// call. If pg-ha itself is killed in the window, a lost `standby.signal`
+    /// is not a data hazard because pg-ha is the only thing that starts
+    /// PostgreSQL here and every start path writes the standby configuration
+    /// first. Checked in the code: `handle_postgres_not_running` ->
+    /// `prepare_standby_start` -> `start()`; `rejoin_as_replica` ->
+    /// `write_standby_config` -> `start()` (after pg_rewind and after
+    /// `rebuild_from_leader`); the restart command -> `prepare_standby_start`
+    /// -> `start()`; the clone path writes it in `Bootstrap::configure_clone`;
+    /// the primary path starts only under the leader lock. A PostgreSQL
+    /// started by someone else without the file would be a writable instance,
+    /// which is the same exposure any operator action on a stopped directory
+    /// has.
+    pub async fn ensure_clean_shutdown_for_rewind(&self) -> Result<()> {
+        self.ensure_clean_shutdown_with_timeout(SINGLE_USER_RECOVERY_TIMEOUT)
+            .await
+    }
+
+    async fn ensure_clean_shutdown_with_timeout(&self, timeout: Duration) -> Result<()> {
+        let state = match self.controldata_state().await {
+            Ok(state) => state,
+            Err(e) => {
+                warn!(
+                    "Could not read the cluster state from pg_controldata ({e}); leaving the clean-shutdown check to pg_rewind"
+                );
+                return Ok(());
+            }
+        };
+        if is_clean_shutdown_state(&state) {
+            return Ok(());
+        }
+        if self.is_running() {
+            return Err(Error::Postgres(format!(
+                "cannot run single-user crash recovery: a postmaster is running for {} (pg_control: '{state}')",
+                self.config.data_dir.display()
+            )));
+        }
+        info!(
+            "pg_control reports '{state}': running single-user crash recovery before pg_rewind (without standby.signal / recovery.signal)"
+        );
+        let mut aside = SignalFilesAside::take(&self.config.data_dir).map_err(|e| {
+            Error::Postgres(format!(
+                "could not move standby.signal / recovery.signal aside: {e}"
+            ))
+        })?;
+        let ran = self.run_single_user_recovery(timeout).await;
+        let restored = aside.restore();
+        ran?;
+        restored.map_err(|e| {
+            Error::Postgres(format!(
+                "single-user crash recovery finished but standby.signal / recovery.signal could not be restored: {e}"
+            ))
+        })?;
+        let after = self.controldata_state().await.map_err(|e| {
+            Error::Postgres(format!(
+                "single-user crash recovery finished but pg_controldata failed: {e}"
+            ))
+        })?;
+        if !is_clean_shutdown_state(&after) {
+            return Err(Error::Postgres(format!(
+                "single-user crash recovery finished but pg_control reports '{after}', not 'shut down'"
+            )));
+        }
+        info!("Single-user crash recovery finished; pg_control reports '{after}'");
+        Ok(())
+    }
+
+    /// `postgres --single -F -D <pgdata> template1` with stdin from /dev/null
+    /// (the command `pg_rewind` runs itself), under `timeout`. The child is
+    /// killed and reaped on timeout; its output is logged on failure.
+    async fn run_single_user_recovery(&self, timeout: Duration) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut command = Command::new(self.postgres_bin());
+        command
+            .args(["--single", "-F", "-D", self.data_dir_str(), "template1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .map_err(|e| Error::Postgres(format!("could not start postgres --single: {e}")))?;
+        async fn drain<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> String {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf).await;
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+        let stdout_task = tokio::spawn(drain(child.stdout.take()));
+        let stderr_task = tokio::spawn(drain(child.stderr.take()));
+        let waited = tokio::time::timeout(timeout, child.wait()).await;
+        let timed_out = waited.is_err();
+        if timed_out {
+            // kill() also waits, so the child is reaped.
+            if let Err(e) = child.kill().await {
+                warn!("Could not kill the timed-out postgres --single: {e}");
+            }
+        }
+        let collect = |task: tokio::task::JoinHandle<String>| async move {
+            tokio::time::timeout(SINGLE_USER_OUTPUT_GRACE, task)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+        };
+        let stdout = collect(stdout_task).await;
+        let stderr = collect(stderr_task).await;
+        match waited {
+            Ok(Ok(status)) if status.success() => {
+                debug!(%stdout, %stderr, "postgres --single finished");
+                Ok(())
+            }
+            Ok(Ok(status)) => {
+                error!(%status, %stdout, %stderr, "postgres --single failed");
+                Err(Error::Postgres(format!(
+                    "postgres --single failed ({status}): {}{}",
+                    stderr.trim(),
+                    stdout.trim()
+                )))
+            }
+            Ok(Err(e)) => {
+                error!(%stdout, %stderr, "waiting for postgres --single failed: {e}");
+                Err(Error::Postgres(format!(
+                    "waiting for postgres --single failed: {e}"
+                )))
+            }
+            Err(_) => {
+                error!(%stdout, %stderr, "postgres --single timed out");
+                Err(Error::Postgres(format!(
+                    "postgres --single timed out after {timeout:?} and was killed: {}",
+                    stderr.trim()
+                )))
+            }
+        }
     }
 
     /// Get the latest checkpoint's TimeLineID from pg_controldata.
@@ -1536,6 +1797,404 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    // ─────────────────── SB-28: clean shutdown before pg_rewind ───────────────────
+
+    /// Fake `postgres --single` bodies. The common prefix records the call,
+    /// stores its PID and, like the real server, dies when standby.signal (or
+    /// recovery.signal) exists. `$4` is the data directory (`--single -F -D <dir>`).
+    const FAKE_SINGLE_OK: &str = "echo 'shut down' > \"$d/pg-ha-test.state\"\nexit 0\n";
+    const FAKE_SINGLE_FAILS: &str =
+        "echo 'PANIC:  could not locate a valid checkpoint record' >&2\nexit 1\n";
+    const FAKE_SINGLE_HANGS: &str = "exec sleep 30\n";
+    const FAKE_SINGLE_LEAVES_STATE: &str = "exit 0\n";
+    const SB28_SINGLE_BODIES: [&str; 4] = [
+        FAKE_SINGLE_OK,
+        FAKE_SINGLE_FAILS,
+        FAKE_SINGLE_HANGS,
+        FAKE_SINGLE_LEAVES_STATE,
+    ];
+
+    struct CleanShutdownFixture {
+        root: PathBuf,
+        data: PathBuf,
+        pg: Postgresql,
+    }
+
+    impl Drop for CleanShutdownFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    static SB28_BINS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+    /// Shared bin_dir for one fake postgres body, with or without a fake
+    /// pg_controldata. The scripts take every path from their arguments, so
+    /// they are written, synced and closed once for all tests (no ETXTBSY on
+    /// Linux from a test writing a script while another test forks).
+    fn sb28_bin(single: &str, with_controldata: bool) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let root = SB28_BINS.get_or_init(|| {
+            let root = std::env::temp_dir().join(format!("pg-ha-sb28-bins-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            // -D <dir>: $2 is the data directory.
+            let controldata = "echo controldata >> \"$2/pg-ha-test.calls\"\n\
+                 echo \"Database cluster state:               $(cat \"$2/pg-ha-test.state\")\"\n";
+            for (i, body) in SB28_SINGLE_BODIES.iter().enumerate() {
+                let postgres = format!(
+                    "d=\"$4\"\necho \"postgres $*\" >> \"$d/pg-ha-test.calls\"\necho $$ > \"$d/pg-ha-test.postgres_pid\"\n\
+                     if [ -e \"$d/standby.signal\" ] || [ -e \"$d/recovery.signal\" ]; then\n\
+                     echo 'FATAL:  standby mode is not supported by single-user servers' >&2\nexit 1\nfi\n{body}"
+                );
+                for with_cd in [false, true] {
+                    let bin = root.join(format!("{i}-{with_cd}"));
+                    std::fs::create_dir_all(&bin).unwrap();
+                    let mut tools = vec![("postgres", postgres.as_str())];
+                    if with_cd {
+                        tools.push(("pg_controldata", controldata));
+                    }
+                    for (tool, text) in tools {
+                        let path = bin.join(tool);
+                        let mut f = std::fs::File::create(&path).unwrap();
+                        f.write_all(format!("#!/bin/sh\n{text}").as_bytes()).unwrap();
+                        f.sync_all().unwrap();
+                        drop(f);
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                            .unwrap();
+                    }
+                }
+            }
+            root
+        });
+        let i = SB28_SINGLE_BODIES
+            .iter()
+            .position(|b| *b == single)
+            .expect("known fake body");
+        root.join(format!("{i}-{with_controldata}"))
+    }
+
+    impl CleanShutdownFixture {
+        /// `state` = what the fake pg_controldata prints (None: no
+        /// pg_controldata in bin_dir). `single` = body of the fake postgres.
+        fn new(label: &str, state: Option<&str>, single: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "pg-ha-sb28-{label}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let data = root.join("data");
+            std::fs::create_dir_all(&data).unwrap();
+            if let Some(state) = state {
+                std::fs::write(data.join("pg-ha-test.state"), state).unwrap();
+            }
+            let mut config = test_config();
+            config.bin_dir = sb28_bin(single, state.is_some());
+            config.data_dir = data.clone();
+            Self {
+                root,
+                data,
+                pg: Postgresql::new(config),
+            }
+        }
+
+        fn put(&self, name: &str, content: &str) {
+            std::fs::write(self.data.join(name), content).unwrap();
+        }
+
+        fn read(&self, name: &str) -> Option<String> {
+            std::fs::read_to_string(self.data.join(name)).ok()
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.read("pg-ha-test.calls")
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn single_user_cmd(&self) -> String {
+            format!("postgres --single -F -D {} template1", self.data.display())
+        }
+
+        fn asides(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.data)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(SIGNAL_ASIDE_SUFFIX))
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    #[test]
+    fn sb28_clean_shutdown_state_table() {
+        for (state, clean) in [
+            ("shut down", true),
+            ("shut down in recovery", true),
+            (" shut down in recovery ", true),
+            ("in archive recovery", false),
+            ("in production", false),
+            ("in crash recovery", false),
+            ("shutting down", false),
+            ("", false),
+        ] {
+            assert_eq!(is_clean_shutdown_state(state), clean, "{state:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sb28_clean_states_change_nothing_and_never_run_postgres() {
+        for (i, state) in ["shut down", "shut down in recovery"]
+            .into_iter()
+            .enumerate()
+        {
+            let fx = CleanShutdownFixture::new(&format!("clean{i}"), Some(state), FAKE_SINGLE_OK);
+            fx.put("standby.signal", "");
+            fx.put("recovery.signal", "r");
+            fx.pg.ensure_clean_shutdown_for_rewind().await.unwrap();
+            assert_eq!(fx.calls(), ["controldata"], "{state}");
+            assert_eq!(fx.read("pg-ha-test.postgres_pid"), None, "{state}");
+            assert_eq!(fx.read("standby.signal").as_deref(), Some(""), "{state}");
+            assert_eq!(fx.read("recovery.signal").as_deref(), Some("r"), "{state}");
+            assert!(fx.asides().is_empty(), "{state}");
+            assert_eq!(fx.read("pg-ha-test.state").as_deref(), Some(state));
+        }
+    }
+
+    #[tokio::test]
+    async fn sb28_unclean_state_runs_single_user_without_signals_in_order() {
+        for (i, state) in ["in archive recovery", "in production", "in crash recovery"]
+            .into_iter()
+            .enumerate()
+        {
+            // The fake postgres exits 1 when a signal file exists at the call.
+            let fx = CleanShutdownFixture::new(&format!("unclean{i}"), Some(state), FAKE_SINGLE_OK);
+            fx.put("standby.signal", "");
+            fx.put("recovery.signal", "recovery-content");
+            fx.pg.ensure_clean_shutdown_for_rewind().await.unwrap();
+            assert_eq!(
+                fx.calls(),
+                [
+                    "controldata".to_string(),
+                    fx.single_user_cmd(),
+                    "controldata".to_string()
+                ],
+                "{state}: state read, single-user run with the exact arguments, state re-read"
+            );
+            assert_eq!(fx.read("standby.signal").as_deref(), Some(""), "{state}");
+            assert_eq!(
+                fx.read("recovery.signal").as_deref(),
+                Some("recovery-content"),
+                "{state}"
+            );
+            assert!(fx.asides().is_empty(), "{state}");
+            assert_eq!(fx.read("pg-ha-test.state").as_deref(), Some("shut down\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sb28_absent_signal_files_stay_absent() {
+        let only_recovery =
+            CleanShutdownFixture::new("only-rec", Some("in production"), FAKE_SINGLE_OK);
+        only_recovery.put("recovery.signal", "x");
+        only_recovery
+            .pg
+            .ensure_clean_shutdown_for_rewind()
+            .await
+            .unwrap();
+        assert!(!only_recovery.data.join("standby.signal").exists());
+        assert_eq!(only_recovery.read("recovery.signal").as_deref(), Some("x"));
+
+        let only_standby =
+            CleanShutdownFixture::new("only-stby", Some("in production"), FAKE_SINGLE_OK);
+        only_standby.put("standby.signal", "");
+        only_standby
+            .pg
+            .ensure_clean_shutdown_for_rewind()
+            .await
+            .unwrap();
+        assert!(!only_standby.data.join("recovery.signal").exists());
+        assert!(only_standby.data.join("standby.signal").is_file());
+
+        let neither = CleanShutdownFixture::new("neither", Some("in production"), FAKE_SINGLE_OK);
+        neither.pg.ensure_clean_shutdown_for_rewind().await.unwrap();
+        assert!(!neither.data.join("standby.signal").exists());
+        assert!(!neither.data.join("recovery.signal").exists());
+        assert!(neither.asides().is_empty());
+        assert_eq!(neither.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sb28_single_user_failure_is_an_error_and_restores_signals() {
+        let fx = CleanShutdownFixture::new("fails", Some("in archive recovery"), FAKE_SINGLE_FAILS);
+        fx.put("standby.signal", "");
+        fx.put("recovery.signal", "rc");
+        let err = fx
+            .pg
+            .ensure_clean_shutdown_for_rewind()
+            .await
+            .expect_err("single-user failure must be an error");
+        let text = err.to_string();
+        assert!(
+            text.contains("postgres --single failed") && text.contains("PANIC"),
+            "{text}"
+        );
+        assert_eq!(
+            fx.calls(),
+            ["controldata".to_string(), fx.single_user_cmd()],
+            "no state re-read after a failed run"
+        );
+        assert_eq!(fx.read("standby.signal").as_deref(), Some(""));
+        assert_eq!(fx.read("recovery.signal").as_deref(), Some("rc"));
+        assert!(fx.asides().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sb28_single_user_timeout_kills_the_child_and_restores_signals() {
+        let fx =
+            CleanShutdownFixture::new("timeout", Some("in archive recovery"), FAKE_SINGLE_HANGS);
+        fx.put("standby.signal", "");
+        fx.put("recovery.signal", "rc");
+        let started = std::time::Instant::now();
+        let err = fx
+            .pg
+            .ensure_clean_shutdown_with_timeout(Duration::from_secs(2))
+            .await
+            .expect_err("a hanging single-user server must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("timed out") && text.contains("killed"),
+            "{text}"
+        );
+        let pid: i32 = fx
+            .read("pg-ha-test.postgres_pid")
+            .expect("the fake postgres started")
+            .trim()
+            .parse()
+            .unwrap();
+        // Killed and reaped: the PID no longer exists (a zombie would still answer kill 0).
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "child {pid} is still alive or unreaped"
+        );
+        assert_eq!(fx.read("standby.signal").as_deref(), Some(""));
+        assert_eq!(fx.read("recovery.signal").as_deref(), Some("rc"));
+        assert!(fx.asides().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sb28_state_that_is_still_not_clean_is_an_error() {
+        let fx =
+            CleanShutdownFixture::new("not-clean", Some("in production"), FAKE_SINGLE_LEAVES_STATE);
+        fx.put("standby.signal", "");
+        let err = fx
+            .pg
+            .ensure_clean_shutdown_for_rewind()
+            .await
+            .expect_err("post-check must reject");
+        let text = err.to_string();
+        assert!(
+            text.contains("in production") && text.contains("not 'shut down'"),
+            "{text}"
+        );
+        assert_eq!(fx.calls().len(), 3, "state re-read happened");
+        assert_eq!(
+            fx.read("standby.signal").as_deref(),
+            Some(""),
+            "signals restored"
+        );
+        assert!(fx.asides().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sb28_refuses_while_a_postmaster_is_running() {
+        let mut fx = CleanShutdownFixture::new("running", Some("in production"), FAKE_SINGLE_OK);
+        fx.put("standby.signal", "");
+        fx.put("recovery.signal", "rc");
+        // The test process stands in for a live postmaster (see set_fake_running).
+        fx.put("postmaster.pid", &format!("{}\n", std::process::id()));
+        fx.pg.set_fake_running(true);
+        assert!(fx.pg.is_running());
+        let err = fx
+            .pg
+            .ensure_clean_shutdown_for_rewind()
+            .await
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("a postmaster is running"), "{err}");
+        assert_eq!(fx.calls(), ["controldata"], "postgres --single never ran");
+        assert_eq!(
+            fx.read("standby.signal").as_deref(),
+            Some(""),
+            "nothing touched"
+        );
+        assert_eq!(fx.read("recovery.signal").as_deref(), Some("rc"));
+        assert!(fx.asides().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sb28_unreadable_controldata_leaves_the_check_to_pg_rewind() {
+        let fx = CleanShutdownFixture::new("no-controldata", None, FAKE_SINGLE_OK);
+        fx.put("standby.signal", "");
+        fx.pg.ensure_clean_shutdown_for_rewind().await.unwrap();
+        assert_eq!(
+            fx.read("pg-ha-test.postgres_pid"),
+            None,
+            "postgres never ran"
+        );
+        assert_eq!(fx.read("standby.signal").as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn sb28_leftover_aside_files_of_a_dead_run_are_restored() {
+        let fx = CleanShutdownFixture::new("leftover", Some("in production"), FAKE_SINGLE_OK);
+        // standby.signal: parked, original missing -> comes back.
+        fx.put("standby.signal.pg-ha-aside", "parked");
+        // recovery.signal: parked copy is stale, the original is newer -> original wins.
+        fx.put("recovery.signal.pg-ha-aside", "stale");
+        fx.put("recovery.signal", "newer");
+        fx.pg.ensure_clean_shutdown_for_rewind().await.unwrap();
+        assert_eq!(fx.read("standby.signal").as_deref(), Some("parked"));
+        assert_eq!(fx.read("recovery.signal").as_deref(), Some("newer"));
+        assert!(fx.asides().is_empty());
+    }
+
+    #[test]
+    fn sb28_signal_guard_restores_on_drop() {
+        // The panic / dropped-future path: restore() is never called.
+        let root = std::env::temp_dir().join(format!("pg-ha-sb28-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("standby.signal"), "s").unwrap();
+        {
+            let _guard = SignalFilesAside::take(&root).unwrap();
+            assert!(!root.join("standby.signal").exists(), "moved aside");
+            assert!(root.join("standby.signal.pg-ha-aside").exists());
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("standby.signal")).unwrap(),
+            "s"
+        );
+        assert!(!root.join("standby.signal.pg-ha-aside").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sb28_single_user_timeout_is_generous_but_bounded() {
+        assert!(SINGLE_USER_RECOVERY_TIMEOUT >= Duration::from_secs(10 * 60));
+        assert!(SINGLE_USER_RECOVERY_TIMEOUT <= Duration::from_secs(2 * 60 * 60));
     }
 
     #[test]
