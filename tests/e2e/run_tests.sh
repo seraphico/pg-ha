@@ -63,6 +63,7 @@ while [[ $# -gt 0 ]]; do
             echo "  connections      Database connection tests"
             echo "  rejoin           Old primary rejoin tests"
             echo "  tags             Node tags: DCS publication, candidate checks, nosync"
+            echo "  rewind_unclean   SB-28: ahead replica killed uncleanly rejoins by itself"
             echo "  consistency      Cross-layer consistency tests"
             echo "  ha_full          Full HA lifecycle tests"
             echo ""
@@ -229,6 +230,7 @@ run_all_tests() {
         "test_pause_mode.sh:Pause Mode"
         "test_rejoin.sh:Old Primary Rejoin"
         "test_tags.sh:Node Tags"
+        "test_rewind_unclean.sh:Rewind After Unclean Shutdown"
         "test_consistency.sh:Cross-layer Consistency"
         "test_ha_full.sh:Full HA Lifecycle"
     )
@@ -273,6 +275,7 @@ run_specific_test() {
         connections|db) file="test_db_connections.sh" ;;
         rejoin)     file="test_rejoin.sh" ;;
         tags)       file="test_tags.sh" ;;
+        rewind_unclean|sb28) file="test_rewind_unclean.sh" ;;
         consistency) file="test_consistency.sh" ;;
         ha_full|full) file="test_ha_full.sh" ;;
         *)
