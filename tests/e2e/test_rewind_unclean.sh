@@ -156,11 +156,17 @@ setup_scenario() {
     cur=$(find_primary)
     assert_not_empty "$cur" "Primary exists before the scenario" || return 1
     if [ "$cur" = "$A" ]; then
-        local code
-        code=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 15 -o /dev/null -w '%{http_code}' -X POST \
-            -H "Content-Type: application/json" -d "{\"leader\": \"$A\", \"candidate\": \"node1\"}" \
-            "$(name_to_url "$A")/switchover" 2>/dev/null || echo 000)
-        log_info "switchover $A -> node1: HTTP $code"
+        local code try
+        # Right after a bootstrap the candidate may not be a healthy replica yet (HTTP 409): wait, then retry.
+        wait_nodes_settled 120 || return 1
+        for try in 1 2 3 4 5; do
+            code=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 15 -o /dev/null -w '%{http_code}' -X POST \
+                -H "Content-Type: application/json" -d "{\"leader\": \"$A\", \"candidate\": \"node1\"}" \
+                "$(name_to_url "$A")/switchover" 2>/dev/null || echo 000)
+            log_info "switchover $A -> node1 (try $try): HTTP $code"
+            [ "$code" = "200" ] && break
+            sleep 15
+        done
         wait_for_role "$(name_to_url node1)" primary 90 || return 1
         wait_nodes_settled 240 || return 1
     fi
@@ -227,8 +233,12 @@ fail_over_to_b() {
     KILLED=()
     sleep 30   # $A's walreceiver now loops on "new timeline 2 forked off ... before current recovery point"
     local na nb
-    na=$(dpsql "$A" 'select count(*) from sb28')
-    nb=$(dpsql "$B" 'select count(*) from sb28')
+    for i in $(seq 1 15); do   # the new primary may need a moment before it answers psql
+        na=$(dpsql "$A" 'select count(*) from sb28')
+        nb=$(dpsql "$B" 'select count(*) from sb28')
+        [ -n "$na" ] && [ -n "$nb" ] && break
+        sleep 2
+    done
     log_info "rows after failover: $A=$na (ahead) $B=$nb (new primary)"
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ -n "$na" ] && [ -n "$nb" ] && [ "$na" -gt "$nb" ]; then
