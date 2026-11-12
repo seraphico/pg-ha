@@ -1,0 +1,168 @@
+# 5-node pg-ha cluster for local development / testing (1 primary + 4 replicas).
+#
+# Separate from docker-compose.yml (3-node): distinct container names
+# (pg-ha5-*), volumes (pg-ha5-*) and network (pg-ha5-net), so both files can
+# coexist on disk. They CANNOT RUN AT THE SAME TIME: host ports are shared
+# (PG 5432-5434, REST 8008-8010, proxy 6432-6437). Run `make down` first.
+#
+# Host ports: node1..3 identical to the 3-node file; node4/node5 continue the pattern.
+#   node4: PG 5435, REST 8011, proxy 6438/6439
+#   node5: PG 5436, REST 8012, proxy 6440/6441
+#
+# Commands (Linux binaries must exist under target/$RUST_TARGET/release; `make build`):
+#   export RUST_TARGET=x86_64-unknown-linux-gnu   # or aarch64-unknown-linux-gnu on Mac ARM
+#   docker compose -f docker-compose.5node.yml build node1   # image is built once, shared by all nodes
+#   docker compose -f docker-compose.5node.yml up -d
+#   curl -s localhost:8008/cluster                           # REST ports 8008..8012
+#   docker compose -f docker-compose.5node.yml down -v       # wipe containers + volumes
+# TLS: the shared dev cert docker/tls/server.crt has SANs for node1..node5 (and the 3-node
+# container names), so one cert serves both compose files.
+# REST TLS defaults off (plain HTTP), same variables as docker-compose.yml.
+
+x-pg-ha-env: &pg-ha-env
+  PG_HA_SCOPE: test-cluster
+  POSTGRES_PASSWORD: secret
+  PGDATA: /var/lib/postgresql/data
+  PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT: ${PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT:-false}
+  PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+  PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
+  PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
+  PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
+  PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
+  # REST API TLS: default OFF (empty cert = plaintext HTTP).
+  PG_HA_RESTAPI_TLS_CERT: ${PG_HA_RESTAPI_TLS_CERT:-}
+  PG_HA_RESTAPI_TLS_KEY: ${PG_HA_RESTAPI_TLS_KEY:-/etc/pg-ha/tls/server.key}
+  PG_HA_RESTAPI_TLS_CA_CERT: ${PG_HA_RESTAPI_TLS_CA_CERT:-/etc/pg-ha/tls/ca.crt}
+  PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT: ${PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT:-false}
+
+# Shared by all nodes. Only node1 carries the build section; the others reuse the image.
+x-pg-ha-node: &pg-ha-node
+  image: pg-ha-5node:latest
+  pull_policy: never
+  networks:
+    - pg-ha5-net
+
+services:
+  node1:
+    <<: *pg-ha-node
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
+        PG_VERSION: ${PG_VERSION:-16}
+    pull_policy: build
+    container_name: pg-ha5-node1
+    hostname: node1
+    environment:
+      <<: *pg-ha-env
+      PG_HA_NAME: node1
+      PG_HA_RAFT_SELF: "node1:2380"
+      PG_HA_RAFT_PARTNERS: "node2:2380,node3:2380,node4:2380,node5:2380"
+    ports:
+      - "5432:5432"   # PostgreSQL
+      - "8008:8008"   # REST API
+      - "6432:6432"   # Proxy RW
+      - "6433:6433"   # Proxy RO
+    volumes:
+      - node1-raft:/var/lib/pg-ha/raft
+      - node1-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
+  node2:
+    <<: *pg-ha-node
+    container_name: pg-ha5-node2
+    hostname: node2
+    environment:
+      <<: *pg-ha-env
+      PG_HA_NAME: node2
+      PG_HA_RAFT_SELF: "node2:2380"
+      PG_HA_RAFT_PARTNERS: "node1:2380,node3:2380,node4:2380,node5:2380"
+    ports:
+      - "5433:5432"
+      - "8009:8008"
+      - "6434:6432"
+      - "6435:6433"
+    volumes:
+      - node2-raft:/var/lib/pg-ha/raft
+      - node2-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
+  node3:
+    <<: *pg-ha-node
+    container_name: pg-ha5-node3
+    hostname: node3
+    environment:
+      <<: *pg-ha-env
+      PG_HA_NAME: node3
+      PG_HA_RAFT_SELF: "node3:2380"
+      PG_HA_RAFT_PARTNERS: "node1:2380,node2:2380,node4:2380,node5:2380"
+    ports:
+      - "5434:5432"
+      - "8010:8008"
+      - "6436:6432"
+      - "6437:6433"
+    volumes:
+      - node3-raft:/var/lib/pg-ha/raft
+      - node3-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
+  node4:
+    <<: *pg-ha-node
+    container_name: pg-ha5-node4
+    hostname: node4
+    environment:
+      <<: *pg-ha-env
+      PG_HA_NAME: node4
+      PG_HA_RAFT_SELF: "node4:2380"
+      PG_HA_RAFT_PARTNERS: "node1:2380,node2:2380,node3:2380,node5:2380"
+    ports:
+      - "5435:5432"
+      - "8011:8008"
+      - "6438:6432"
+      - "6439:6433"
+    volumes:
+      - node4-raft:/var/lib/pg-ha/raft
+      - node4-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
+  node5:
+    <<: *pg-ha-node
+    container_name: pg-ha5-node5
+    hostname: node5
+    environment:
+      <<: *pg-ha-env
+      PG_HA_NAME: node5
+      PG_HA_RAFT_SELF: "node5:2380"
+      PG_HA_RAFT_PARTNERS: "node1:2380,node2:2380,node3:2380,node4:2380"
+    ports:
+      - "5436:5432"
+      - "8012:8008"
+      - "6440:6432"
+      - "6441:6433"
+    volumes:
+      - node5-raft:/var/lib/pg-ha/raft
+      - node5-pgdata:/var/lib/postgresql/data
+      - ./docker/tls:/etc/pg-ha/tls:ro
+
+networks:
+  pg-ha5-net:
+    driver: bridge
+
+volumes:
+  node1-raft:
+    name: pg-ha5-node1-raft
+  node2-raft:
+    name: pg-ha5-node2-raft
+  node3-raft:
+    name: pg-ha5-node3-raft
+  node4-raft:
+    name: pg-ha5-node4-raft
+  node5-raft:
+    name: pg-ha5-node5-raft
+  node1-pgdata:
+    name: pg-ha5-node1-pgdata
+  node2-pgdata:
+    name: pg-ha5-node2-pgdata
+  node3-pgdata:
+    name: pg-ha5-node3-pgdata
+  node4-pgdata:
+    name: pg-ha5-node4-pgdata
+  node5-pgdata:
+    name: pg-ha5-node5-pgdata
