@@ -31,6 +31,8 @@ pub fn redact_connstr(connstr: &str) -> String {
 /// Timeout for spawned PG connection futures.
 /// If PG is unresponsive, the task will be cancelled after this duration.
 const PG_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound for one `SHOW synchronous_standby_names` (connect plus query).
+const SHOW_SYNC_NAMES_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound for one `pg_is_in_recovery()` observation. A PostgreSQL that
 /// cannot answer within this time is treated as "unknown" for the cycle, so a
@@ -1465,6 +1467,56 @@ impl Postgresql {
         self.reload().await?;
         info!(%value, "Updated synchronous_standby_names");
         Ok(())
+    }
+
+    /// The value PostgreSQL is currently using for
+    /// `synchronous_standby_names`, exactly as `SHOW` returns it (verbatim:
+    /// no case change, no whitespace or quote normalisation; empty when
+    /// unset). Unlike `set_synchronous_standby_names` the whole call (connect
+    /// and query) is bounded by [`SHOW_SYNC_NAMES_TIMEOUT`]; on timeout or any
+    /// failure it returns `Err`, which the caller treats as "make no change".
+    pub async fn current_synchronous_standby_names(&self) -> Result<String> {
+        Self::show_synchronous_standby_names(self.connection_string(), SHOW_SYNC_NAMES_TIMEOUT)
+            .await
+    }
+
+    /// Bound the whole `SHOW` (connect + query) by `bound`.
+    async fn show_synchronous_standby_names(connstr: String, bound: Duration) -> Result<String> {
+        match tokio::time::timeout(bound, Self::show_sync_names_unbounded(connstr)).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Postgres(format!(
+                "SHOW synchronous_standby_names timed out after {bound:?}"
+            ))),
+        }
+    }
+
+    async fn show_sync_names_unbounded(connstr: String) -> Result<String> {
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
+
+        tokio::spawn(async move {
+            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
+                Ok(Err(e)) => debug!("Connection closed: {e}"),
+                Err(_) => warn!("PG connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Ok(Ok(())) => {}
+            }
+        });
+
+        let rows = client
+            .simple_query("SHOW synchronous_standby_names")
+            .await
+            .map_err(|e| Error::Postgres(format!("SHOW synchronous_standby_names failed: {e}")))?;
+        for msg in rows {
+            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg
+                && let Some(value) = row.get(0)
+            {
+                return Ok(value.to_owned());
+            }
+        }
+        Err(Error::Postgres(
+            "SHOW synchronous_standby_names returned no row".into(),
+        ))
     }
 
     // ─────────────────────── State accessors ───────────────────────
@@ -3076,5 +3128,141 @@ mod tests {
         let pg = Postgresql::new(test_config());
         let err = pg.live_wal_probe().probe().await.unwrap_err().to_string();
         assert!(err.contains("not running"), "{err}");
+    }
+
+    // ───────────── SHOW synchronous_standby_names (SB-13 PR3a) ─────────────
+
+    /// The bound covers the whole call. A server that accepts the TCP
+    /// connection and then never answers the startup message must produce an
+    /// error at the bound, not hang (the unbounded style of
+    /// `set_synchronous_standby_names` would wait forever here).
+    #[tokio::test]
+    async fn show_sync_names_is_bounded_when_server_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hold = tokio::spawn(async move {
+            // Accept and keep the socket open, say nothing.
+            let (_sock, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let started = std::time::Instant::now();
+        let err = Postgresql::show_synchronous_standby_names(
+            format!("host=127.0.0.1 port={port} user=postgres dbname=postgres"),
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        let elapsed = started.elapsed();
+        hold.abort();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// Nothing listening: an error (connection refused), not a value.
+    #[tokio::test]
+    async fn show_sync_names_connection_refused_is_an_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let err = Postgresql::show_synchronous_standby_names(
+            format!("host=127.0.0.1 port={port} user=postgres dbname=postgres"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::Postgres(_)), "{err}");
+    }
+
+    /// The production bound is 5 s and the public method goes through it.
+    #[test]
+    fn show_sync_names_bound_is_five_seconds() {
+        assert_eq!(SHOW_SYNC_NAMES_TIMEOUT, Duration::from_secs(5));
+    }
+
+    /// REAL POSTGRESQL (ignored by default). Needs a superuser connection
+    /// string in `PG_HA_TEST_PG_CONN` (skipped when unset), for example
+    /// `host=127.0.0.1 port=55432 user=postgres password=pw dbname=postgres`.
+    /// Changes `synchronous_standby_names` with `ALTER SYSTEM` on that server,
+    /// reads it back through the production code and asserts the string is
+    /// returned verbatim, then resets it. Never point it at a server you care
+    /// about.
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL: set PG_HA_TEST_PG_CONN"]
+    async fn real_pg_current_synchronous_standby_names_is_verbatim() {
+        let Ok(connstr) = std::env::var("PG_HA_TEST_PG_CONN") else {
+            eprintln!("PG_HA_TEST_PG_CONN not set: skipped");
+            return;
+        };
+        let (admin, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .expect("admin connection");
+        let conn_task = tokio::spawn(connection);
+
+        // value written -> must be read back unchanged (probe report section 4)
+        let cases = [
+            "ANY 1 (\"s1\",\"s2\")",
+            "",
+            "any 1 (s1, s2)",
+            "  ANY   1  ( \"s1\" ,  \"s2\" )  ",
+            "ANY 1 (\"a\"\"b\")",
+            "*",
+        ];
+        for written in cases {
+            let sql = format!(
+                "ALTER SYSTEM SET synchronous_standby_names TO '{}'",
+                written.replace('\'', "''")
+            );
+            admin.simple_query(&sql).await.expect("alter system");
+            admin
+                .simple_query("SELECT pg_reload_conf()")
+                .await
+                .expect("reload");
+            // A reload is a signal: allow up to 3 s for it to land.
+            let mut polls = 0;
+            let mut got = String::new();
+            for _ in 0..30 {
+                polls += 1;
+                got = Postgresql::show_synchronous_standby_names(
+                    connstr.clone(),
+                    SHOW_SYNC_NAMES_TIMEOUT,
+                )
+                .await
+                .expect("show");
+                if got == written {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            eprintln!("written {written:?} -> read {got:?} after {polls} poll(s)");
+            assert_eq!(got, written);
+        }
+
+        // Unreachable address (TEST-NET-1, packets are dropped or refused):
+        // an error within the bound, never a hang.
+        let started = std::time::Instant::now();
+        let err = Postgresql::show_synchronous_standby_names(
+            "host=192.0.2.1 port=5432 user=postgres dbname=postgres".to_string(),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(err.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+
+        admin
+            .simple_query("ALTER SYSTEM RESET synchronous_standby_names")
+            .await
+            .expect("reset");
+        admin
+            .simple_query("SELECT pg_reload_conf()")
+            .await
+            .expect("reload");
+        drop(admin);
+        let _ = conn_task.await;
     }
 }

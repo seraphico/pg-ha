@@ -28,6 +28,7 @@ pub mod slots;
 pub mod standby_cluster;
 pub(crate) mod standby_config;
 pub mod sync;
+pub mod sync_value;
 pub(crate) mod timeline_files;
 pub mod watchdog;
 

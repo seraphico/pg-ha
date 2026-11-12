@@ -281,7 +281,7 @@ struct Candidate<'a> {
 
 /// Double-quote an identifier for `synchronous_standby_names`, escaping any
 /// embedded double quotes by doubling them (PostgreSQL identifier rules).
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
