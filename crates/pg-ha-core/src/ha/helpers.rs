@@ -782,6 +782,7 @@ impl Ha {
     pub(super) fn reset_sync_cache(&mut self) {
         self.applied_sync_standby_names = None;
         self.sync_pg_list_changed_flush_lsn = None;
+        self.quorum_exec = Default::default();
     }
 
     /// Update member info in DCS (heartbeat)
