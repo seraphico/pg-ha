@@ -366,6 +366,13 @@ enum Act {
     Pg(String),
 }
 
+/// Is lowering `q` forbidden this cycle? Yes when the mark was taken in this
+/// very cycle (one more observation first: the walsender state may lag SHOW)
+/// or when the value in force cannot be read as `(S, n)`.
+fn relax_blocked(mark_was_current: bool, reasonable: bool) -> bool {
+    !mark_was_current || !reasonable
+}
+
 fn needed_quorum(state: &QuorumState) -> usize {
     state
         .voters
@@ -577,7 +584,7 @@ impl QuorumExec {
         self.mark = Some(mark.clone());
         let caught = caught_up(&state.voters, &snapshot, &mark);
         // A mark taken just now, or an unreadable value in force: q stays.
-        let relax_blocked = !mark_was_current || !obs.reasonable;
+        let relax_blocked = relax_blocked(mark_was_current, obs.reasonable);
 
         // 7. Plan.
         let strict = input.mode != EffectiveSyncMode::Off && input.strict;

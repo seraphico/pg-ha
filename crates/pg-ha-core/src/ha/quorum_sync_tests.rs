@@ -748,6 +748,14 @@ fn q_is_not_lowered_while_a_wildcard_is_in_force_even_if_the_mark_is_old() {
     assert_eq!(io.pg_sets.len(), 1);
 }
 
+#[test]
+fn relaxation_is_blocked_by_a_fresh_mark_or_an_unreadable_value() {
+    assert!(!relax_blocked(true, true));
+    assert!(relax_blocked(false, true), "fresh mark");
+    assert!(relax_blocked(true, false), "unreadable value");
+    assert!(relax_blocked(false, false));
+}
+
 // ───────────────────────────── strict mode ─────────────────────────────
 
 fn strict_input(count: usize, names: &[&str], s: Option<SyncState>) -> ExecInput {
