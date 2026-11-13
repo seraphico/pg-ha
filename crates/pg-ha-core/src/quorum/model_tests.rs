@@ -67,6 +67,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod executor_model;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
     id: u64,
