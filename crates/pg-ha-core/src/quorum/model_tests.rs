@@ -131,6 +131,8 @@ struct Stats {
     refused_only_for_missing_answers: usize,
     refused_with_acked_missing: usize,
     generations: usize,
+    /// Promotions where `/sync.leader` differed from the real previous leader.
+    stale_promotions: usize,
 }
 
 impl Stats {
@@ -149,6 +151,7 @@ impl Stats {
         self.refused_only_for_missing_answers += o.refused_only_for_missing_answers;
         self.refused_with_acked_missing += o.refused_with_acked_missing;
         self.generations += o.generations;
+        self.stale_promotions += o.stale_promotions;
     }
 }
 
@@ -204,6 +207,11 @@ struct World {
     cfg_strict: bool,
     cfg_lag: Option<u64>,
     cfg_excluded: u8,
+    /// DCS `/sync.leader`: the last node that finalised its own `/sync`.
+    sync_leader: usize,
+    /// Production only knows `/sync.leader`: pass it, not the real previous
+    /// leader, as `old_leader` of `post_promotion_state`.
+    stale_old_leader: bool,
     stats: Stats,
 }
 
@@ -249,6 +257,8 @@ impl World {
             cfg_strict: false,
             cfg_lag: None,
             cfg_excluded: 0,
+            sync_leader: 0,
+            stale_old_leader: false,
             stats: Stats::default(),
         }
     }
@@ -383,6 +393,7 @@ impl World {
 
     fn finalize_dcs(&mut self) -> Result<(), String> {
         if let Some((v, q)) = self.pending_dcs.take() {
+            self.sync_leader = self.leader;
             self.st.voters = v;
             self.st.quorum = q;
             self.check("after promotion DCS update")?;
@@ -621,7 +632,15 @@ impl World {
 
     fn promote(&mut self, c: usize) -> Result<(), String> {
         let old = self.leader;
-        let post = post_promotion_state(&self.st, &name(c), &name(old))
+        let old_for_state = if self.stale_old_leader {
+            self.sync_leader
+        } else {
+            old
+        };
+        if old_for_state != old {
+            self.stats.stale_promotions += 1;
+        }
+        let post = post_promotion_state(&self.st, &name(c), &name(old_for_state))
             .ok_or_else(|| format!("granted candidate got no promotion state: {:?}", self.st))?;
         let tl = self.next_tl;
         self.next_tl += 1;
@@ -674,7 +693,18 @@ fn run_world(
     steady: bool,
     actions: &[Action],
 ) -> Result<Stats, String> {
+    run_world_with(false, standbys, n0, steady, actions)
+}
+
+fn run_world_with(
+    stale_old_leader: bool,
+    standbys: usize,
+    n0: usize,
+    steady: bool,
+    actions: &[Action],
+) -> Result<Stats, String> {
     let mut w = World::new(standbys, n0, steady);
+    w.stale_old_leader = stale_old_leader;
     for (k, a) in actions.iter().enumerate() {
         w.apply(a).map_err(|e| format!("step {k}: {e}"))?;
     }
@@ -837,6 +867,92 @@ proptest! {
         let stats = run_world(TAIL_STANDBYS, TAIL_N, true, &actions).map_err(TestCaseError::fail)?;
         prop_assert!(stats.refused_higher_timeline >= 1, "prefix missed its target: {:?}", stats);
     }
+}
+
+// ---- stale `/sync.leader` as `old_leader` (PR3 plan 4.2) -------------------
+
+/// Double failover inside one window: the first new leader dies before it
+/// finalises `/sync`, so the second promotion only sees the older
+/// `/sync.leader`.
+fn double_failover_prefix() -> impl Strategy<Value = Vec<Action>> {
+    (1usize..4, 1usize..5, 1usize..5, any::<u8>(), any::<u8>()).prop_map(
+        |(commits, c1, c2, adv, reach)| {
+            vec![
+                Action::Commit(commits),
+                Action::Advance(1, adv as usize % 4 + 1),
+                Action::Advance(2, adv as usize % 3 + 1),
+                Action::Advance(3, adv as usize % 5 + 1),
+                Action::KillLeader,
+                Action::Elect(c1, 0xFF, 0, 0),
+                // no Finalize: the new leader dies before it writes /sync
+                Action::KillLeader,
+                Action::Elect(c2, reach | 1, 0, 0),
+            ]
+        },
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(CASES))]
+
+    /// Same property as the main model, with `old_leader` taken from the stale
+    /// `/sync.leader` like production does.
+    #[test]
+    fn stale_sync_leader_random_histories_keep_invariant_i(
+        standbys in 2usize..6,
+        n0 in 1usize..4,
+        steady in any::<bool>(),
+        actions in prop::collection::vec(action_strategy(), 10..140),
+    ) {
+        run_world_with(true, standbys, n0, steady, &actions).map_err(TestCaseError::fail)?;
+    }
+
+    /// Targeted: a double failover with no finalisation in between, then the
+    /// normal random suffix.
+    #[test]
+    fn stale_sync_leader_double_failover_keeps_invariant_i(
+        standbys in 3usize..6,
+        n0 in 1usize..4,
+        prefix in double_failover_prefix(),
+        suffix in prop::collection::vec(action_strategy(), 0..80),
+    ) {
+        let mut actions = prefix;
+        actions.extend(suffix);
+        run_world_with(true, standbys, n0, true, &actions).map_err(TestCaseError::fail)?;
+    }
+}
+
+/// The stale-leader scenarios must really promote with a stale `old_leader`.
+#[test]
+fn stale_sync_leader_scenario_is_exercised() {
+    use proptest::test_runner::{Config, TestRunner};
+    let total = Mutex::new(Stats::default());
+    let mut runner = TestRunner::new(Config {
+        cases: CASES,
+        ..Config::default()
+    });
+    let strat = (
+        3usize..6,
+        1usize..4,
+        double_failover_prefix(),
+        prop::collection::vec(action_strategy(), 0..80),
+    );
+    runner
+        .run(&strat, |(s, n0, prefix, suffix)| {
+            let mut actions = prefix;
+            actions.extend(suffix);
+            let st = run_world_with(true, s, n0, true, &actions).map_err(TestCaseError::fail)?;
+            total.lock().unwrap().add(&st);
+            Ok(())
+        })
+        .unwrap();
+    let t = total.lock().unwrap().clone();
+    eprintln!("stale /sync.leader coverage over {CASES} histories: {t:#?}");
+    assert!(
+        t.stale_promotions > 100,
+        "stale old_leader rarely used: {t:?}"
+    );
+    assert!(t.generations > 300, "too few promotions: {t:?}");
 }
 
 // ---- planner-only properties ---------------------------------------------
