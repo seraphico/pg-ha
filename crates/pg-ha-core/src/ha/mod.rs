@@ -7198,6 +7198,7 @@ mod tests {
             },
         )
         .await;
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -7207,6 +7208,11 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert!(
+            resp.message.contains("failover_priority"),
+            "{}",
+            resp.message
+        );
         assert!(dcs.last_failover_value.lock().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7818,6 +7824,7 @@ mod tests {
             ..Default::default()
         };
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
