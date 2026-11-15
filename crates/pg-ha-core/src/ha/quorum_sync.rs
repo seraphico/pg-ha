@@ -49,6 +49,17 @@
 //!    `FIRST`-to-`ANY` rewrite after T8, the strict placeholder for an empty
 //!    target, and the hand-off to the Priority code (T7, T9).
 //!
+//! # The pre-promote write (PR3c)
+//!
+//! [`pre_promote_sync`] is the other half of T10. `promote_and_confirm` calls
+//! it once, after `arm_watchdog` and before `record_pending_promote`: it
+//! installs `ANY n' (V')` on the standby and waits for SHOW to show that shape,
+//! so the node is never writable under a value that breaks SI-1. Any failure
+//! means "do not promote": the lock is given back as the watchdog-arm failure
+//! does and no pending promote is recorded. Step 3 above then finds
+//! `PromotionWindow { expected_pg_matches: true }` and writes `/sync`. Without
+//! the pre-promote value (restart, manual promote) it takes the reset path.
+//!
 //! # Documented readings
 //!
 //! * Strict mode with fewer eligible standbys than `N`: the target is empty and
