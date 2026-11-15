@@ -34,6 +34,7 @@ pub(crate) mod identity;
 mod lag;
 mod lease;
 mod lineage;
+pub(crate) mod quorum_sync;
 mod shutdown;
 mod vote;
 
@@ -189,6 +190,9 @@ pub struct Ha {
     peer_probe: Option<Arc<dyn PeerWalProbe>>,
     /// SB-13: this node's own live WAL reading for the vote.
     local_wal: Arc<dyn LiveWalProbe>,
+    /// SB-13: the quorum-sync executor's memory (mark, restart rule). Cleared
+    /// by `reset_sync_cache`. Unused unless `quorum_executor_applies`.
+    quorum_exec: quorum_sync::QuorumExec,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -234,6 +238,7 @@ impl Ha {
             wal_sample: std::sync::Mutex::new(None),
             peer_probe: None,
             local_wal,
+            quorum_exec: Default::default(),
         };
         (ha, cmd_tx)
     }
@@ -707,6 +712,9 @@ impl Ha {
     /// On a `replication_status` error no change is made this cycle (neither
     /// PG nor `/sync` is touched), exactly like a `wal_status` failure.
     async fn enforce_synchronous_replication(&mut self) {
+        if self.quorum_executor_applies() {
+            return self.enforce_quorum_sync().await;
+        }
         let cfg = &self.dynamic_config_state.last_config;
         let enabled = cfg.synchronous_mode.unwrap_or(false);
         let strict = cfg.synchronous_mode_strict.unwrap_or(false);
@@ -3170,6 +3178,192 @@ mod tests {
         );
         assert_eq!(ha.applied_sync_standby_names, before);
         assert_eq!(ha.sync_pg_list_changed_flush_lsn, Some(4242));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────── SB-13 PR3b: the quorum executor seam ───────────────────
+
+    /// The sync-related inputs of one `quorum_executor_applies` probe.
+    fn probe_applies(
+        ha: &mut Ha,
+        mode: Option<bool>,
+        sync_state: Option<SyncState>,
+        over: Option<quorum_sync::EffectiveSyncMode>,
+    ) -> bool {
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: mode,
+            ..Default::default()
+        });
+        ha.cluster.sync_state = sync_state;
+        let _guard = quorum_sync::ModeOverrideGuard::set(over);
+        ha.quorum_executor_applies()
+    }
+
+    #[test]
+    fn test_quorum_executor_never_applies_to_priority_or_off_inputs() {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestRunner};
+        let (ha, dir) = identity_test_ha(
+            "test_node",
+            "pr3b-applies",
+            Arc::new(MockDcs::new()),
+            Some(false),
+            false,
+        );
+        let ha = std::cell::RefCell::new(ha);
+        let mut runner = TestRunner::new(Config {
+            cases: 2000,
+            ..Config::default()
+        });
+        let strat = (
+            prop_oneof![Just(None), Just(Some(false)), Just(Some(true))],
+            prop::option::of((
+                "[a-z0-9_-]{0,8}",
+                prop::option::of("[a-z0-9,]{0,12}"),
+                0u32..6,
+            )),
+        );
+        runner
+            .run(&strat, |(mode, sync)| {
+                let sync_state = sync.map(|(leader, standby, quorum)| SyncState {
+                    leader,
+                    sync_standby: standby,
+                    quorum,
+                    kind: Default::default(),
+                });
+                let applies = probe_applies(&mut ha.borrow_mut(), mode, sync_state, None);
+                prop_assert!(
+                    !applies,
+                    "mode {mode:?} must never reach the quorum executor"
+                );
+                Ok(())
+            })
+            .unwrap();
+        // Positive controls: a Quorum /sync, or the test-only mode, apply.
+        let mut ha = ha.into_inner();
+        let quorum_sync = Some(SyncState {
+            leader: "n0".into(),
+            sync_standby: None,
+            quorum: 0,
+            kind: crate::cluster::SyncKind::Quorum,
+        });
+        for mode in [None, Some(false), Some(true)] {
+            assert!(probe_applies(&mut ha, mode, quorum_sync.clone(), None));
+            assert!(probe_applies(
+                &mut ha,
+                mode,
+                None,
+                Some(quorum_sync::EffectiveSyncMode::Quorum)
+            ));
+            assert!(!probe_applies(
+                &mut ha,
+                mode,
+                None,
+                Some(quorum_sync::EffectiveSyncMode::Priority)
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_effective_sync_mode_is_priority_or_off_in_production() {
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "pr3b-mode",
+            Arc::new(MockDcs::new()),
+            Some(false),
+            false,
+        );
+        for (setting, expected) in [
+            (None, quorum_sync::EffectiveSyncMode::Off),
+            (Some(false), quorum_sync::EffectiveSyncMode::Off),
+            (Some(true), quorum_sync::EffectiveSyncMode::Priority),
+        ] {
+            ha.dynamic_config_state.apply_new_config(GlobalConfig {
+                synchronous_mode: setting,
+                ..Default::default()
+            });
+            assert_eq!(ha.effective_sync_mode(), expected);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_reset_sync_cache_clears_the_quorum_executor() {
+        let (mut ha, dir) = identity_test_ha(
+            "test_node",
+            "pr3b-reset",
+            Arc::new(MockDcs::new()),
+            Some(false),
+            false,
+        );
+        ha.quorum_exec = quorum_sync::QuorumExec::warmed_for_test();
+        assert!(!ha.quorum_exec.is_fresh_for_test());
+        ha.reset_sync_cache();
+        assert!(ha.quorum_exec.is_fresh_for_test());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Priority wire form of the T7 / T9 final states is exactly what
+    /// `write_sync_state` sends today.
+    #[tokio::test]
+    async fn test_quorum_priority_wire_form_equals_write_sync_state() {
+        use crate::cluster::SyncKind;
+        let dcs = Arc::new(MockDcs::new());
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "pr3b-wire", dcs.clone(), Some(false), false);
+        let set = |names: &[&str]| -> std::collections::BTreeSet<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        };
+        // (names, enabled, count): T7 is (any, false, any), T9 is (S, true, N).
+        let cases = [
+            (set(&[]), false, 1usize),
+            (set(&[]), false, 3),
+            (set(&["node2"]), true, 1),
+            (set(&["node2", "node3"]), true, 2),
+            (set(&[]), true, 3),
+        ];
+        for (names, enabled, count) in cases {
+            dcs.sync_writes.lock().unwrap().clear();
+            assert!(ha.write_sync_state(&names, enabled, count).await);
+            let today = dcs.sync_writes.lock().unwrap().last().cloned().unwrap();
+            let field = if enabled { count as u32 } else { 0 };
+            let ours = serde_json::to_string(&quorum_sync::build_sync_state(
+                "test_node",
+                &names,
+                field,
+                SyncKind::Priority,
+            ))
+            .unwrap();
+            assert_eq!(
+                ours, today,
+                "names {names:?} enabled {enabled} count {count}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With Priority or Off and a Priority `/sync`, `enforce_synchronous_replication`
+    /// must not enter the executor: no reload, no write, memory untouched.
+    #[tokio::test]
+    async fn test_priority_cycle_does_not_touch_the_quorum_executor() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) =
+            identity_test_ha("test_node", "pr3b-prio", dcs.clone(), Some(false), false);
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_leader = true;
+        ha.quorum_exec = quorum_sync::QuorumExec::warmed_for_test();
+        for mode in [None, Some(false), Some(true)] {
+            ha.dynamic_config_state.apply_new_config(GlobalConfig {
+                synchronous_mode: mode,
+                ..Default::default()
+            });
+            ha.enforce_synchronous_replication().await;
+        }
+        assert!(
+            !ha.quorum_exec.is_fresh_for_test(),
+            "the executor memory must be left alone"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
