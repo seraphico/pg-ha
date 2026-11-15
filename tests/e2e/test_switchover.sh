@@ -7,8 +7,11 @@
 #   - Cluster remains healthy after switchover
 #   - The first switchover is posted right after the cluster is ready, with no
 #     sleep and no retry (SB-29: a stale cluster view rejected it)
-#   - Switchover posted to the new primary right after a failover is accepted
-#     and does not fence that primary (SB-29)
+#   - Switchover posted to the new primary right after a failover never gets
+#     HTTP 500 and never fences that primary (SB-29); a true 409 'is not
+#     running' is accepted while the candidate restarts to follow the new
+#     primary, and a switchover once the candidate is a healthy replica must
+#     then be accepted
 
 set -euo pipefail
 
@@ -187,11 +190,32 @@ test_switchover_after_failover() {
     done
     local candidate_name
     candidate_name=$(get_node_name "$candidate_url")
-    # Post at once, no sleep and no retry.
-    local response
+    # 1) Post at once, no sleep and no retry. This is the SB-29 check: main
+    #    answered HTTP 500 "leader lock renewal failed" here and fenced the new
+    #    primary. The candidate may legitimately be restarting PostgreSQL to
+    #    follow the new primary at this moment, so a true "is not running" 409
+    #    is a correct answer; a 500 or any other code is not.
+    local response code
     response=$(post_with_status "$new_primary/switchover" "{\"candidate\": \"$candidate_name\"}")
-    log_info "Switchover to $candidate_name via $new_container: $response"
-    assert_eq "200" "${response%% *}" "Switchover right after the failover returns HTTP 200"
+    code="${response%% *}"
+    log_info "Immediate switchover to $candidate_name via $new_container: $response"
+    if [ "$code" = "200" ]; then
+        log_pass "Immediate switchover right after the failover was accepted (HTTP 200)"
+    elif [ "$code" = "409" ] && [[ "$response" == *"is not running"* ]]; then
+        log_pass "Immediate switchover right after the failover was rejected with a true 'not running' (HTTP 409), not a 500"
+    else
+        log_fail "Immediate switchover right after the failover returned '$response' (expected 200, or 409 'is not running'; never 500)"
+    fi
+    if [ "$code" != "200" ]; then
+        # The new primary must still be leading after the rejection.
+        assert_eq "200" "$(http_get_status "$new_primary/primary")" "$new_container is still primary after the rejected switchover"
+        # 2) What an operator does next: wait until the candidate is a healthy
+        #    replica, then switch over. This must be accepted.
+        wait_for_role "$candidate_url" "replica" 90 || true
+        response=$(post_with_status "$new_primary/switchover" "{\"candidate\": \"$candidate_name\"}")
+        log_info "Switchover to $candidate_name once it is a healthy replica: $response"
+        assert_eq "200" "${response%% *}" "Switchover after the failover returns HTTP 200 once the candidate is a healthy replica"
+    fi
     local after
     after=$(wait_for_new_primary "$new_primary" 60 | url_only)
     assert_not_empty "$after" "A primary is available within 60s after the switchover"
