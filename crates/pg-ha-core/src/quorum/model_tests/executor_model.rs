@@ -879,7 +879,7 @@ impl XWorld {
         if c.pg_owner == c.w.leader {
             c.standby_pg[c.pg_owner] = c.pg.clone();
         }
-        let keep = leftover & 0x80 != 0 && c.standby_pg[cn].file != "";
+        let keep = leftover & 0x80 != 0 && !c.standby_pg[cn].file.is_empty();
         if !keep {
             let names: Names = (0..c.w.nodes.len())
                 .filter(|&i| i != cn && i != c.w.leader && leftover & (1 << (i % 7)) != 0)
