@@ -825,6 +825,34 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+// Test-only: a test about something else that happens to reach the promote
+// path with a Quorum `/sync` (the vote-ordering test) has no PostgreSQL to
+// write to; it skips the pre-promote write explicitly.
+#[cfg(test)]
+thread_local! {
+    static SKIP_PRE_PROMOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Skips the pre-promote write of `Ha::pre_promote_sync` on this thread until
+/// dropped.
+#[cfg(test)]
+pub(crate) struct SkipPrePromoteGuard;
+
+#[cfg(test)]
+impl SkipPrePromoteGuard {
+    pub(crate) fn new() -> Self {
+        SKIP_PRE_PROMOTE.with(|m| m.set(true));
+        SkipPrePromoteGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for SkipPrePromoteGuard {
+    fn drop(&mut self) {
+        SKIP_PRE_PROMOTE.with(|m| m.set(false));
+    }
+}
+
 /// Sets the test-only mode for this thread and clears it on drop.
 #[cfg(test)]
 pub(crate) struct ModeOverrideGuard;
@@ -964,6 +992,10 @@ impl Ha {
     /// The pre-promote write (plan 4), on the real PostgreSQL. Zero I/O unless
     /// the quorum executor applies and `/sync.kind` is Quorum.
     pub(super) async fn pre_promote_sync(&mut self) -> std::result::Result<(), String> {
+        #[cfg(test)]
+        if SKIP_PRE_PROMOTE.with(|m| m.get()) {
+            return Ok(());
+        }
         let mode = self.effective_sync_mode();
         let mut io = RealIo {
             pg: &self.postgresql,

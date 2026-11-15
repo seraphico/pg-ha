@@ -10160,6 +10160,9 @@ mod tests {
         // (i) a slow vote runs before the acquire and never shortens the lease.
         #[tokio::test(start_paused = true)]
         async fn slow_vote_happens_before_acquire_and_does_not_shorten_the_lease() {
+            // PR3c: this test is about the vote and the lease, not the
+            // pre-promote write (there is no PostgreSQL to write to).
+            let _skip = quorum_sync::SkipPrePromoteGuard::new();
             let dcs = Arc::new(MockDcs::new());
             let peers = Arc::new(
                 FakePeers::new()
