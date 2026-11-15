@@ -1445,6 +1445,10 @@ mod tests {
         touch_count: std::sync::atomic::AtomicUsize,
         /// Dynamic `/config` value for `get_config_value`.
         config_value: Mutex<Option<String>>,
+        /// When set, `get_cluster` returns Err.
+        fail_cluster_reads: std::sync::atomic::AtomicBool,
+        /// Number of `get_cluster` calls.
+        cluster_reads: std::sync::atomic::AtomicUsize,
     }
 
     impl MockDcs {
@@ -1467,6 +1471,8 @@ mod tests {
                 lock_ttl: std::sync::atomic::AtomicU64::new(30),
                 touch_count: std::sync::atomic::AtomicUsize::new(0),
                 config_value: Mutex::new(None),
+                fail_cluster_reads: std::sync::atomic::AtomicBool::new(false),
+                cluster_reads: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -1497,6 +1503,8 @@ mod tests {
                 lock_ttl: std::sync::atomic::AtomicU64::new(30),
                 touch_count: std::sync::atomic::AtomicUsize::new(0),
                 config_value: Mutex::new(None),
+                fail_cluster_reads: std::sync::atomic::AtomicBool::new(false),
+                cluster_reads: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -1504,6 +1512,12 @@ mod tests {
             *self.cluster.lock().unwrap() = cluster;
         }
 
+        /// Make the DCS answer `get_cluster` with `cluster`, timeline
+        /// included (the snapshot a test put in `ha.cluster`).
+        fn mirror_cluster(&self, cluster: &Cluster) {
+            self.set_cluster(cluster.clone());
+            *self.timeline.lock().unwrap() = cluster.timeline.clone();
+        }
         fn with_timeline(self, timeline: u64) -> Self {
             *self.timeline.lock().unwrap() = ClusterTimeline::Record {
                 record: test_record(timeline),
@@ -1535,6 +1549,10 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
+        fn fail_cluster_reads(&self) {
+            self.fail_cluster_reads
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         fn fail_failover_writes(&self) {
             self.fail_failover_writes
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1575,6 +1593,14 @@ mod tests {
     #[async_trait::async_trait]
     impl DcsAdapter for MockDcs {
         async fn get_cluster(&self) -> Result<Cluster> {
+            self.cluster_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .fail_cluster_reads
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::Error::Dcs("injected DCS read failure".into()));
+            }
             let mut cluster = self.cluster.lock().unwrap().clone();
             cluster.timeline = self.timeline_value();
             Ok(cluster)
@@ -2998,6 +3024,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        dcs.mirror_cluster(&ha.cluster);
         ha.process_commands().await;
         let resp = reply_rx.recv().await.unwrap();
         assert_eq!(resp.status, CommandStatus::Rejected);
@@ -3042,6 +3069,7 @@ mod tests {
             ))
             .await
             .unwrap();
+        dcs.mirror_cluster(&ha.cluster);
         ha.process_commands().await;
         let resp = reply_rx.recv().await.unwrap();
         assert_eq!(resp.status, CommandStatus::Rejected);
@@ -3085,10 +3113,247 @@ mod tests {
             ))
             .await
             .unwrap();
+        dcs.mirror_cluster(&ha.cluster);
         ha.process_commands().await;
         let resp = reply_rx.recv().await.unwrap();
         assert_eq!(resp.status, CommandStatus::Accepted);
         assert!(dcs.last_failover_value.lock().unwrap().is_some());
+    }
+
+    // ─────────────────── SB-29: commands validate a fresh cluster ───────────────────
+
+    fn with_member_state(mut cluster: Cluster, name: &str, state: MemberState) -> Cluster {
+        for m in cluster.members.iter_mut().filter(|m| m.name == name) {
+            m.state = state.clone();
+        }
+        cluster
+    }
+
+    fn switchover_to(candidate: Option<&str>) -> ManagementCommand {
+        ManagementCommand::Switchover {
+            leader: Some("node1".into()),
+            candidate: candidate.map(Into::into),
+            scheduled_at: None,
+        }
+    }
+
+    fn failover_to(candidate: &str) -> ManagementCommand {
+        ManagementCommand::Failover {
+            candidate: Some(candidate.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_switchover_accepts_candidate_running_in_the_dcs_but_stopped_in_the_snapshot() {
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("sb29-so-fresh", "old");
+        let fresh = ha.cluster.clone();
+        ha.cluster = with_member_state(fresh.clone(), "node2", MemberState::Stopped);
+        dcs.mirror_cluster(&fresh);
+        let resp = send_cmd(&mut ha, &tx, switchover_to(Some("node2"))).await;
+        assert!(!resp.message.contains("not running"), "{}", resp.message);
+        assert!(!resp.message.contains("renewal failed"), "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_some());
+        assert_eq!(
+            ha.cluster.get_member("node2").unwrap().state,
+            MemberState::Running
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_switchover_rejects_candidate_stopped_in_the_dcs_but_running_in_the_snapshot() {
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("sb29-so-stale-ok", "old");
+        dcs.mirror_cluster(&with_member_state(
+            ha.cluster.clone(),
+            "node2",
+            MemberState::Stopped,
+        ));
+        let resp = send_cmd(&mut ha, &tx, switchover_to(Some("node2"))).await;
+        assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert_eq!(resp.message, "Candidate 'node2' is not running");
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        assert!(ha.is_leader());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_failover_accepts_candidate_running_in_the_dcs_but_stopped_in_the_snapshot() {
+        let dcs = Arc::new(MockDcs::new());
+        let config = test_config("node1");
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, tx) = Ha::new(config, dcs.clone(), pg);
+        let fresh = leader_cluster("node3", "node2");
+        ha.cluster = with_member_state(fresh.clone(), "node2", MemberState::Stopped);
+        dcs.mirror_cluster(&fresh);
+        let resp = send_cmd(&mut ha, &tx, failover_to("node2")).await;
+        assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_failover_rejects_candidate_stopped_in_the_dcs_but_running_in_the_snapshot() {
+        let dcs = Arc::new(MockDcs::new());
+        let config = test_config("node1");
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, tx) = Ha::new(config, dcs.clone(), pg);
+        ha.cluster = leader_cluster("node3", "node2");
+        dcs.mirror_cluster(&with_member_state(
+            ha.cluster.clone(),
+            "node2",
+            MemberState::Stopped,
+        ));
+        let resp = send_cmd(&mut ha, &tx, failover_to("node2")).await;
+        assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert_eq!(resp.message, "Candidate 'node2' is not running");
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_failover_accepts_candidate_missing_from_the_snapshot_but_in_the_dcs() {
+        let dcs = Arc::new(MockDcs::new());
+        let config = test_config("node1");
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, tx) = Ha::new(config, dcs.clone(), pg);
+        dcs.mirror_cluster(&leader_cluster("node3", "node2"));
+        let resp = send_cmd(&mut ha, &tx, failover_to("node2")).await;
+        assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+    }
+
+    #[tokio::test]
+    async fn test_switchover_without_candidate_uses_the_fresh_successor_check() {
+        // Snapshot: the only other member is Stopped. DCS: it is Running.
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("sb29-so-nocand-fresh", "old");
+        let fresh = ha.cluster.clone();
+        ha.cluster = with_member_state(fresh.clone(), "node2", MemberState::Stopped);
+        dcs.mirror_cluster(&fresh);
+        let resp = send_cmd(&mut ha, &tx, switchover_to(None)).await;
+        assert!(
+            !resp.message.contains("No other running member"),
+            "{}",
+            resp.message
+        );
+        assert!(dcs.last_failover_value.lock().unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Reverse: snapshot Running, DCS Stopped.
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("sb29-so-nocand-stale", "old");
+        dcs.mirror_cluster(&with_member_state(
+            ha.cluster.clone(),
+            "node2",
+            MemberState::Stopped,
+        ));
+        let resp = send_cmd(&mut ha, &tx, switchover_to(None)).await;
+        assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert!(
+            resp.message.starts_with("No other running member"),
+            "{}",
+            resp.message
+        );
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_switchover_right_after_promotion_does_not_fence_the_new_primary() {
+        // The snapshot is from before the promotion (no leader); the DCS
+        // already shows this node as leader. Candidate and no-candidate forms.
+        for candidate in [Some("node2"), None] {
+            let (mut ha, dir, tx, dcs) = switchover_test_ha("sb29-so-promoted", "old");
+            dcs.mirror_cluster(&ha.cluster.clone());
+            ha.cluster.leader = None;
+            let resp = send_cmd(&mut ha, &tx, switchover_to(candidate)).await;
+            assert!(
+                !resp.message.contains("renewal failed"),
+                "{candidate:?}: {}",
+                resp.message
+            );
+            // The normal demote path ran (no pg_ctl here: the stop fails).
+            assert!(
+                resp.message
+                    .starts_with("Switchover initiated, but stopping PostgreSQL failed"),
+                "{candidate:?}: {}",
+                resp.message
+            );
+            let m = marker(&dir).unwrap_or_default();
+            assert!(!m.contains(LEASE_EXPIRED_REASON), "{candidate:?}: {m}");
+            assert_eq!(lock_held_by(&dcs).as_deref(), Some("node1"));
+            assert!(ha.is_leader());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commands_use_the_old_snapshot_when_the_dcs_read_fails() {
+        // Snapshot Running, DCS Stopped but unreadable: the snapshot decides.
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("sb29-so-read-err", "old");
+        dcs.mirror_cluster(&with_member_state(
+            ha.cluster.clone(),
+            "node2",
+            MemberState::Stopped,
+        ));
+        dcs.fail_cluster_reads();
+        let resp = send_cmd(&mut ha, &tx, switchover_to(Some("node2"))).await;
+        assert!(!resp.message.contains("not running"), "{}", resp.message);
+        assert!(dcs.last_failover_value.lock().unwrap().is_some());
+        assert!(ha.cluster.get_member("node2").is_some());
+        assert_eq!(
+            ha.cluster.get_member("node2").unwrap().state,
+            MemberState::Running
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Snapshot Stopped, DCS Running but unreadable: still rejected.
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("sb29-so-read-err2", "old");
+        ha.cluster = with_member_state(ha.cluster.clone(), "node2", MemberState::Stopped);
+        dcs.fail_cluster_reads();
+        let resp = send_cmd(&mut ha, &tx, switchover_to(Some("node2"))).await;
+        assert_eq!(resp.message, "Candidate 'node2' is not running");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Failover and no-candidate switchover keep the snapshot too.
+        let dcs = Arc::new(MockDcs::new());
+        let config = test_config("node1");
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, tx) = Ha::new(config, dcs.clone(), pg);
+        ha.cluster = leader_cluster("node3", "node2");
+        dcs.fail_cluster_reads();
+        let resp = send_cmd(&mut ha, &tx, failover_to("node2")).await;
+        assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+        assert!(ha.cluster.leader.is_some());
+
+        let (mut ha, dir, tx, dcs) = switchover_test_ha("sb29-so-read-err3", "old");
+        ha.cluster = with_member_state(ha.cluster.clone(), "node2", MemberState::Stopped);
+        dcs.fail_cluster_reads();
+        let resp = send_cmd(&mut ha, &tx, switchover_to(None)).await;
+        assert!(
+            resp.message.starts_with("No other running member"),
+            "{}",
+            resp.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_command_batch_reloads_the_cluster_once() {
+        let dcs = Arc::new(MockDcs::new());
+        let config = test_config("node1");
+        let pg = Postgresql::new(config.postgresql.clone());
+        let (mut ha, tx) = Ha::new(config, dcs.clone(), pg);
+        dcs.mirror_cluster(&leader_cluster("node3", "node2"));
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            let (reply_tx, reply_rx) = mpsc::channel(1);
+            tx.send((failover_to("node2"), reply_tx)).await.unwrap();
+            replies.push(reply_rx);
+        }
+        ha.process_commands().await;
+        for mut r in replies {
+            assert_eq!(r.recv().await.unwrap().status, CommandStatus::Accepted);
+        }
+        assert_eq!(
+            dcs.cluster_reads.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     // ─────────────────── Standby config writer and sync cache (D7) ───────────────────
@@ -3574,6 +3839,7 @@ mod tests {
     async fn test_switchover_with_candidate_keeps_auto_conf_lines() {
         let (mut ha, dir, tx, dcs) = switchover_test_ha("c1-so-cand", "old");
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -3610,6 +3876,7 @@ mod tests {
     async fn test_switchover_without_candidate_removes_conninfo() {
         let (mut ha, dir, tx, dcs) = switchover_test_ha("c1-so-nocand", "old");
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -4307,6 +4574,7 @@ mod tests {
         let (mut ha, dir, tx, dcs) = switchover_test_ha("c2-so-write-fail", "old");
         std::fs::create_dir(dir.join("standby.signal")).unwrap();
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -4341,6 +4609,7 @@ mod tests {
     async fn test_switchover_stop_failure_sets_stop_pending() {
         let (mut ha, dir, tx, dcs) = switchover_test_ha("c2-so-stop-fail", "old");
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -6173,6 +6442,7 @@ mod tests {
         ha.cluster = leader_cluster("node1", "test_node");
         ha.cluster.timeline = generation_record(1, 1);
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(&mut ha, &tx, ManagementCommand::Restart).await;
 
         assert_eq!(resp.status, CommandStatus::Rejected);
@@ -6448,12 +6718,13 @@ mod tests {
     async fn test_switchover_rejects_a_candidate_with_a_failed_watchdog() {
         let dcs = Arc::new(MockDcs::with_leader("node1"));
         let (mut ha, dir, tx) =
-            identity_test_ha_with_cmd("node1", "w2-cand", dcs, Some(false), false, None);
+            identity_test_ha_with_cmd("node1", "w2-cand", dcs.clone(), Some(false), false, None);
         ha.is_leader = true;
         let mut cluster = leader_cluster("node1", "node2");
         cluster.members[1].watchdog_failed = true;
         ha.cluster = cluster;
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -6874,6 +7145,7 @@ mod tests {
             },
         )
         .await;
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -6898,6 +7170,7 @@ mod tests {
             },
         )
         .await;
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -6925,6 +7198,7 @@ mod tests {
             },
         )
         .await;
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -6934,6 +7208,11 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert!(
+            resp.message.contains("failover_priority"),
+            "{}",
+            resp.message
+        );
         assert!(dcs.last_failover_value.lock().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6942,6 +7221,7 @@ mod tests {
     async fn test_failover_accepts_published_default_tags_candidate() {
         let (mut ha, dir, tx, dcs) =
             candidate_validation_ha("rt-fo-default", Tags::default()).await;
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -7544,6 +7824,7 @@ mod tests {
             ..Default::default()
         };
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -7587,6 +7868,7 @@ mod tests {
             ..leader_cluster("node1", "node2")
         };
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -7621,6 +7903,7 @@ mod tests {
             None,
         );
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -7658,6 +7941,7 @@ mod tests {
             None,
         );
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -7701,6 +7985,7 @@ mod tests {
             None,
         );
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,
@@ -7745,6 +8030,7 @@ mod tests {
         ha.is_leader = true;
         ha.cluster = leader_cluster("node1", "node2");
 
+        dcs.mirror_cluster(&ha.cluster);
         let resp = send_cmd(
             &mut ha,
             &tx,

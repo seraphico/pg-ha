@@ -1,7 +1,7 @@
 //! Command processing: switchover, failover, restart, and reinitialize commands
 //! received from the management API.
 
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::cluster::MemberRole;
 use crate::commands::{CommandResponse, ManagementCommand};
@@ -18,7 +18,13 @@ fn marked_candidate_message(candidate: &str) -> String {
 
 impl Ha {
     /// Process pending management commands from the API
+    ///
+    /// Commands run before `run_cycle` loads the cluster, so `self.cluster`
+    /// would be the previous cycle's view (SB-29). The first command of a
+    /// batch that is not rejected for shutdown reloads it from the DCS; a
+    /// failed read keeps the old snapshot.
     pub(super) async fn process_commands(&mut self) {
+        let mut refreshed = false;
         while let Ok((cmd, reply_tx)) = self.cmd_rx.try_recv() {
             if self.shutting_down {
                 let _ = reply_tx
@@ -27,6 +33,15 @@ impl Ha {
                     ))
                     .await;
                 continue;
+            }
+            if !refreshed {
+                refreshed = true;
+                match self.dcs.get_cluster().await {
+                    Ok(cluster) => self.cluster = cluster,
+                    Err(e) => debug!(
+                        "Could not reload the cluster before handling a command: {e}; using the previous snapshot"
+                    ),
+                }
             }
             let response = match cmd {
                 ManagementCommand::Switchover {
