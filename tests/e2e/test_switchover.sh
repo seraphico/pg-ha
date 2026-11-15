@@ -5,6 +5,10 @@
 #   - POST /switchover → leader changes to specified candidate
 #   - Old leader becomes replica
 #   - Cluster remains healthy after switchover
+#   - The first switchover is posted right after the cluster is ready, with no
+#     sleep and no retry (SB-29: a stale cluster view rejected it)
+#   - Switchover posted to the new primary right after a failover is accepted
+#     and does not fence that primary (SB-29)
 
 set -euo pipefail
 
@@ -12,6 +16,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 log_section "TEST: Manual Switchover"
+# POST and print "<http_code> <body>" (http_post drops the status code).
+post_with_status() {
+    local url="$1"
+    local data="$2"
+    local out
+    out=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 15 -w $'\n%{http_code}' \
+        -X POST -H "Content-Type: application/json" -d "$data" "$url" 2>/dev/null) || true
+    local code="${out##*$'\n'}"
+    local body="${out%$'\n'*}"
+    [ "$code" = "$out" ] && body=""
+    echo "${code:-000} $body"
+}
+# wait_for_* print their log lines on stdout too; keep only the URL line.
+url_only() {
+    grep -E '^https?://[^ ]+$' | tail -n 1
+}
 
 # --- Test: Switchover to specific candidate ---
 test_switchover_to_candidate() {
@@ -35,10 +55,12 @@ test_switchover_to_candidate() {
     log_info "Switchover candidate: $candidate_name ($candidate_url)"
 
     # Perform switchover
+    # No sleep and no retry: the cluster was just reported ready (SB-29).
     log_info "Posting switchover request..."
     local response
-    response=$(http_post "$primary_url/switchover" "{\"candidate\": \"$candidate_name\"}")
+    response=$(post_with_status "$primary_url/switchover" "{\"candidate\": \"$candidate_name\"}")
     log_info "Switchover response: $response"
+    assert_eq "200" "${response%% *}" "Switchover right after ready returns HTTP 200"
 
     # Wait for the candidate to become primary
     if wait_for_role "$candidate_url" "primary" 60; then
@@ -136,7 +158,52 @@ test_switchover_auto_candidate() {
     fi
 }
 
+# --- Test: Switchover right after a failover (SB-29) ---
+test_switchover_after_failover() {
+    log_info "Testing switchover right after a failover..."
+    local old_primary
+    old_primary=$(wait_for_primary 60 | url_only)
+    assert_not_empty "$old_primary" "Primary exists before the failover"
+    [ -z "$old_primary" ] && return
+    local old_container
+    old_container=$(node_url_to_container "$old_primary")
+    local since
+    since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    docker_kill "$old_container" > /dev/null 2>&1
+    local new_primary
+    new_primary=$(wait_for_new_primary "$old_primary" 90 | url_only)
+    assert_not_empty "$new_primary" "New primary elected after killing $old_container"
+    if [ -z "$new_primary" ]; then
+        docker_start "$old_container" > /dev/null 2>&1
+        return
+    fi
+    local new_container
+    new_container=$(node_url_to_container "$new_primary")
+    local candidate_url="" node
+    for node in "${ALL_NODES[@]}"; do
+        if [ "$node" != "$old_primary" ] && [ "$node" != "$new_primary" ]; then
+            candidate_url="$node"
+        fi
+    done
+    local candidate_name
+    candidate_name=$(get_node_name "$candidate_url")
+    # Post at once, no sleep and no retry.
+    local response
+    response=$(post_with_status "$new_primary/switchover" "{\"candidate\": \"$candidate_name\"}")
+    log_info "Switchover to $candidate_name via $new_container: $response"
+    assert_eq "200" "${response%% *}" "Switchover right after the failover returns HTTP 200"
+    local after
+    after=$(wait_for_new_primary "$new_primary" 60 | url_only)
+    assert_not_empty "$after" "A primary is available within 60s after the switchover"
+    local markers
+    markers=$(docker logs --since "$since" "$new_container" 2>&1 | grep -c "Created rewind-check marker" || true)
+    assert_eq "0" "$markers" "$new_container was not fenced (no rewind-check marker since the kill)"
+    # Bring the killed node back so the cluster is whole again.
+    docker_start "$old_container" > /dev/null 2>&1
+    wait_for_cluster_ready 180 || log_warn "Cluster not ready after restarting $old_container"
+}
 # --- Run tests ---
+wait_for_cluster_ready 240 || log_warn "Cluster not ready before the first switchover"
 test_switchover_to_candidate
 sleep 5
 test_old_leader_demotes
@@ -147,4 +214,6 @@ sleep 10
 wait_for_cluster_ready 60 || log_warn "Cluster not ready for auto-candidate test"
 test_switchover_auto_candidate
 
+wait_for_cluster_ready 120 || log_warn "Cluster not ready for the failover test"
+test_switchover_after_failover
 print_results
