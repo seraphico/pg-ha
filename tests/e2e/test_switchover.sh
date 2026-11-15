@@ -190,14 +190,22 @@ test_switchover_after_failover() {
     # Post at once, no sleep and no retry.
     local response
     response=$(post_with_status "$new_primary/switchover" "{\"candidate\": \"$candidate_name\"}")
+    # A fence marks the node before the reply; the clean demotion of an
+    # accepted switchover marks it later, on restart as a replica. So only
+    # markers logged up to the reply (plus 0.5 s) count as a fence.
+    local cutoff
+    cutoff=$(perl -MTime::HiRes=time -MPOSIX=strftime -e \
+        'my $t = time + 0.5; printf "%s.%06dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime($t)), ($t - int($t)) * 1e6')
     log_info "Switchover to $candidate_name via $new_container: $response"
     assert_eq "200" "${response%% *}" "Switchover right after the failover returns HTTP 200"
     local after
     after=$(wait_for_new_primary "$new_primary" 60 | url_only)
     assert_not_empty "$after" "A primary is available within 60s after the switchover"
     local markers
-    markers=$(docker logs --since "$since" "$new_container" 2>&1 | grep -c "Created rewind-check marker" || true)
-    assert_eq "0" "$markers" "$new_container was not fenced (no rewind-check marker since the kill)"
+    markers=$(docker logs --since "$since" "$new_container" 2>&1 \
+        | grep "Created rewind-check marker" \
+        | awk -v cut="$cutoff" '{ if ($1 <= cut) n++ } END { print n + 0 }')
+    assert_eq "0" "$markers" "$new_container was not fenced (no rewind-check marker from the kill to the reply)"
     # Bring the killed node back so the cluster is whole again.
     docker_start "$old_container" > /dev/null 2>&1
     wait_for_cluster_ready 180 || log_warn "Cluster not ready after restarting $old_container"
