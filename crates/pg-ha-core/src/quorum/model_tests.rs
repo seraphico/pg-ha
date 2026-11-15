@@ -214,6 +214,10 @@ struct World {
     /// Production only knows `/sync.leader`: pass it, not the real previous
     /// leader, as `old_leader` of `post_promotion_state`.
     stale_old_leader: bool,
+    /// A granted election stops before `promote` and records the candidate in
+    /// `granted` (the executor-in-model drives the pre-promote write itself).
+    hold_promotion: bool,
+    granted: Option<usize>,
     stats: Stats,
 }
 
@@ -261,6 +265,8 @@ impl World {
             cfg_excluded: 0,
             sync_leader: 0,
             stale_old_leader: false,
+            hold_promotion: false,
+            granted: None,
             stats: Stats::default(),
         }
     }
@@ -626,6 +632,10 @@ impl World {
                         peers,
                         self.nodes[c].log.len()
                     ));
+                }
+                if self.hold_promotion {
+                    self.granted = Some(c);
+                    return Ok(());
                 }
                 self.promote(c)
             }

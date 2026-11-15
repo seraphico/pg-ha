@@ -33,6 +33,12 @@ struct FakeIo {
     dcs_state: Option<SyncState>,
     dcs_writes: Vec<SyncState>,
     pg_sets: Vec<String>,
+    /// `set_pg` never returns (the 5 s bound must cut it).
+    hang_set_pg: bool,
+    /// After a `set_pg` that applies, SHOW returns the old value this many
+    /// more times (a reload that lands late).
+    stale_shows: usize,
+    landing: Option<(String, usize)>,
 }
 
 impl FakeIo {
@@ -52,6 +58,9 @@ impl FakeIo {
             dcs_state: None,
             dcs_writes: Vec::new(),
             pg_sets: Vec::new(),
+            hang_set_pg: false,
+            stale_shows: 0,
+            landing: None,
         }
     }
 
@@ -95,6 +104,13 @@ impl SyncIo for FakeIo {
         if self.show_err {
             return Err(Error::Postgres("show failed".into()));
         }
+        if let Some((v, left)) = self.landing.take() {
+            if left == 0 {
+                self.show = v;
+            } else {
+                self.landing = Some((v, left - 1));
+            }
+        }
         Ok(self.show.clone())
     }
 
@@ -108,12 +124,19 @@ impl SyncIo for FakeIo {
 
     async fn set_pg(&mut self, value: &str) -> Result<()> {
         self.calls.push(format!("set:{value}"));
+        if self.hang_set_pg {
+            std::future::pending::<()>().await;
+        }
         if self.set_pg_err {
             return Err(Error::Postgres("set failed".into()));
         }
         self.pg_sets.push(value.to_string());
         if self.set_pg_applies {
-            self.show = value.to_string();
+            if self.stale_shows == 0 {
+                self.show = value.to_string();
+            } else {
+                self.landing = Some((value.to_string(), self.stale_shows));
+            }
         }
         Ok(())
     }
@@ -1014,5 +1037,343 @@ fn build_sync_state_matches_the_priority_wire_form() {
     assert_eq!(
         serde_json::to_string(&none).unwrap(),
         r#"{"leader":"n0","sync_standby":null,"quorum":0}"#
+    );
+}
+
+// ───────────────────────────── SB-13 PR3c: pre_promote_sync ─────────────────────────────
+
+/// Panics on any call: the Priority/Off paths must not even look at the lease.
+struct PanicIo;
+
+#[async_trait]
+impl SyncIo for PanicIo {
+    async fn show_sync_names(&mut self) -> Result<String> {
+        panic!("show_sync_names called");
+    }
+    async fn replication(&mut self) -> Result<ReplicationSnapshot> {
+        panic!("replication called");
+    }
+    async fn set_pg(&mut self, _: &str) -> Result<()> {
+        panic!("set_pg called");
+    }
+    async fn reload(&mut self) -> Result<()> {
+        panic!("reload called");
+    }
+    async fn write_dcs(&mut self, _: &SyncState) -> Result<bool> {
+        panic!("write_dcs called");
+    }
+    fn lease_ok(&self) -> bool {
+        panic!("lease_ok called");
+    }
+}
+
+fn paused_rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap()
+}
+
+fn pre<IO: SyncIo>(
+    io: &mut IO,
+    mode: EffectiveSyncMode,
+    me: &str,
+    s: Option<&SyncState>,
+) -> std::result::Result<(), String> {
+    paused_rt().block_on(pre_promote_sync(io, mode, me, s))
+}
+
+/// `/sync` of the dead leader n0: V = {n1,n2,n3}, q = 1. For n1 the value to
+/// install is `ANY 2 ("n0","n2","n3")` (V' = V - n1 + n0, n' = |V| - q = 2).
+fn old_sync() -> SyncState {
+    sync("n0", "n1,n2,n3", 1, SyncKind::Quorum)
+}
+const PRE_VALUE: &str = "ANY 2 (\"n0\",\"n2\",\"n3\")";
+
+#[test]
+fn pre_promote_writes_the_post_promotion_value_then_confirms_with_show() {
+    let mut io = FakeIo::new("", &ALL);
+    io.set_pg_applies = true;
+    pre(&mut io, Q, "n1", Some(&old_sync())).unwrap();
+    // idempotency probe, the write, the confirmation: in this order.
+    assert_eq!(io.calls, vec!["show", &format!("set:{PRE_VALUE}"), "show"]);
+    assert!(io.dcs_writes.is_empty(), "/sync is the executor's job");
+}
+
+#[test]
+fn pre_promote_is_also_used_while_the_mode_is_priority_but_the_sync_is_quorum() {
+    // T7 / T9 window: the executor still applies, so a promotion installs it.
+    for mode in [
+        EffectiveSyncMode::Off,
+        EffectiveSyncMode::Priority,
+        EffectiveSyncMode::Quorum,
+    ] {
+        let mut io = FakeIo::new("", &ALL);
+        io.set_pg_applies = true;
+        pre(&mut io, mode, "n1", Some(&old_sync())).unwrap();
+        assert_eq!(io.pg_sets, vec![PRE_VALUE.to_string()], "{mode:?}");
+    }
+}
+
+#[test]
+fn pre_promote_is_idempotent_and_compares_the_shape_not_the_text() {
+    // Same shape, different spelling: nothing is written (m19, m21).
+    for shown in [
+        PRE_VALUE,
+        "any 2 ( \"n3\" , \"n0\",\"N2\" )",
+        "ANY 2 (n0, n2, n3)",
+        "  ANY 2 (\"n0\",\"n2\",\"n3\")  ",
+    ] {
+        let mut io = FakeIo::new(shown, &ALL);
+        pre(&mut io, Q, "n1", Some(&old_sync())).unwrap();
+        assert_eq!(io.calls, vec!["show"], "{shown:?}");
+    }
+}
+
+#[test]
+fn pre_promote_rewrites_every_other_shape() {
+    for shown in [
+        "",
+        "ANY 1 (\"n0\",\"n2\",\"n3\")",
+        "ANY 2 (\"n1\",\"n2\",\"n3\")",
+        "FIRST 2 (\"n0\",\"n2\",\"n3\")",
+        "ANY 2 (\"n0\",\"n2\")",
+        "ANY 2 (*)",
+        "not a value (",
+    ] {
+        let mut io = FakeIo::new(shown, &ALL);
+        io.set_pg_applies = true;
+        pre(&mut io, Q, "n1", Some(&old_sync())).unwrap();
+        assert_eq!(io.pg_sets, vec![PRE_VALUE.to_string()], "{shown:?}");
+    }
+}
+
+#[test]
+fn pre_promote_writes_even_when_the_idempotency_probe_cannot_read() {
+    let mut io = FakeIo::new("", &ALL);
+    io.show_err = true;
+    io.set_pg_applies = true;
+    // The first SHOW fails, the write goes ahead, the confirmation fails too.
+    assert!(pre(&mut io, Q, "n1", Some(&old_sync())).is_err());
+    assert_eq!(io.pg_sets, vec![PRE_VALUE.to_string()]);
+}
+
+#[test]
+fn pre_promote_waits_for_a_late_reload_but_not_forever() {
+    // Lands after 5 stale SHOWs (0.5 s): confirmed.
+    let mut io = FakeIo::new("", &ALL);
+    io.set_pg_applies = true;
+    io.stale_shows = 5;
+    pre(&mut io, Q, "n1", Some(&old_sync())).unwrap();
+    // Never lands: an error after the 2 s window, one write only (m15).
+    let mut io = FakeIo::new("", &ALL);
+    io.set_pg_applies = true;
+    io.stale_shows = 10_000;
+    let r = (paused_rt().block_on(pre_promote_sync(&mut io, Q, "n1", Some(&old_sync()))),);
+    assert!(r.0.unwrap_err().contains("not confirmed"));
+    assert_eq!(io.pg_sets.len(), 1);
+    let shows = io.calls.iter().filter(|c| *c == "show").count();
+    assert!((20..=23).contains(&shows), "polled {shows} times in ~2 s");
+}
+
+#[test]
+fn pre_promote_does_not_accept_any_other_value_as_confirmation() {
+    for stuck in ["", "ANY 1 (\"n9\")", "ANY 2 (\"n0\",\"n2\")", "garbage ("] {
+        let mut io = FakeIo::new(stuck, &ALL);
+        // set_pg_applies false: SHOW stays at `stuck`.
+        assert!(
+            pre(&mut io, Q, "n1", Some(&old_sync())).is_err(),
+            "{stuck:?}"
+        );
+    }
+}
+
+#[test]
+fn pre_promote_set_failure_is_an_error_without_confirmation() {
+    let mut io = FakeIo::new("", &ALL);
+    io.set_pg_err = true;
+    let e = pre(&mut io, Q, "n1", Some(&old_sync())).unwrap_err();
+    assert!(e.contains("pre-promote write failed"), "{e}");
+    assert_eq!(
+        io.calls.last().map(String::as_str),
+        Some(&*format!("set:{PRE_VALUE}"))
+    );
+}
+
+#[test]
+fn pre_promote_write_is_bounded_to_five_seconds() {
+    let mut io = FakeIo::new("", &ALL);
+    io.hang_set_pg = true;
+    let r = paused_rt().block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            pre_promote_sync(&mut io, Q, "n1", Some(&old_sync())),
+        )
+        .await
+    });
+    let e = r
+        .expect("the write must be cut by its own bound")
+        .unwrap_err();
+    assert!(e.contains("timed out"), "{e}");
+}
+
+#[test]
+fn pre_promote_without_a_lease_writes_nothing() {
+    let mut io = FakeIo::new("", &ALL);
+    io.lease_false_from = Some(0);
+    assert!(pre(&mut io, Q, "n1", Some(&old_sync())).is_err());
+    assert!(io.calls.is_empty());
+}
+
+#[test]
+fn pre_promote_installs_nothing_for_a_non_voter_or_when_q_covers_every_voter() {
+    // me is not a voter (m20); q >= |V|; both leave it to the reset path.
+    for (me, s) in [
+        ("n9", sync("n0", "n1,n2,n3", 1, SyncKind::Quorum)),
+        ("n1", sync("n0", "n1,n2,n3", 3, SyncKind::Quorum)),
+        ("n1", sync("n0", "n1,n2,n3", 5, SyncKind::Quorum)),
+        ("n1", sync("n0", "", 0, SyncKind::Quorum)),
+    ] {
+        let r = pre(&mut PanicIo, Q, me, Some(&s));
+        assert_eq!(r, Ok(()), "{me} {s:?}");
+    }
+}
+
+#[test]
+fn pre_promote_skips_a_sync_of_its_own_and_priority_or_absent_syncs() {
+    for s in [
+        Some(sync("n1", "n2,n3", 1, SyncKind::Quorum)),
+        Some(sync("n0", "n1,n2", 1, SyncKind::Priority)),
+        Some(sync("", "n1,n2", 1, SyncKind::Quorum)),
+        None,
+    ] {
+        assert_eq!(pre(&mut PanicIo, Q, "n1", s.as_ref()), Ok(()), "{s:?}");
+    }
+}
+
+#[test]
+fn pre_promote_leader_name_is_compared_case_insensitively() {
+    let s = sync("N1", "n2,n3", 1, SyncKind::Quorum);
+    assert_eq!(pre(&mut PanicIo, Q, "n1", Some(&s)), Ok(()));
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1500))]
+
+    /// ZERO I/O for every Priority/Off input: any mode that is not Quorum,
+    /// `/sync` absent or of kind Priority (the default when `kind` is absent),
+    /// any leader, names, quorum and `me`. `PanicIo` panics on ANY call,
+    /// the counting fake sees none.
+    #[test]
+    fn pre_promote_is_zero_io_for_every_priority_and_off_input(
+        mode in proptest::prelude::prop_oneof![
+            proptest::prelude::Just(EffectiveSyncMode::Off),
+            proptest::prelude::Just(EffectiveSyncMode::Priority),
+        ],
+        sync_in in proptest::prelude::prop::option::of((
+            "[a-zA-Z0-9_-]{0,6}",
+            proptest::prelude::prop::option::of("[a-z0-9,]{0,14}"),
+            0u32..8,
+        )),
+        me in "[a-zA-Z0-9_-]{1,6}",
+    ) {
+        let s = sync_in.map(|(leader, standby, quorum)| SyncState {
+            leader,
+            sync_standby: standby,
+            quorum,
+            kind: SyncKind::Priority,
+        });
+        proptest::prop_assert_eq!(pre(&mut PanicIo, mode, &me, s.as_ref()), Ok(()));
+        let mut io = FakeIo::new("", &ALL);
+        proptest::prop_assert_eq!(pre(&mut io, mode, &me, s.as_ref()), Ok(()));
+        proptest::prop_assert!(io.calls.is_empty(), "calls: {:?}", io.calls);
+        // `kind` absent in the stored JSON means Priority.
+        let json = s.as_ref().map(|s| {
+            let mut v = serde_json::to_value(s).unwrap();
+            v.as_object_mut().unwrap().remove("kind");
+            v
+        });
+        if let Some(v) = json {
+            let back: SyncState = serde_json::from_value(v).unwrap();
+            proptest::prop_assert_eq!(back.kind, SyncKind::Priority);
+            proptest::prop_assert_eq!(pre(&mut PanicIo, mode, &me, Some(&back)), Ok(()));
+        }
+    }
+
+    /// Whatever the voter set, a written value is `ANY n' (V')` with
+    /// `1 <= n' <= |V'|`, `V' = V - me + leader`, `n' = |V| - q`; nothing is
+    /// written when `post_promotion_state` is `None`.
+    #[test]
+    fn pre_promote_values_are_always_valid_and_match_the_design(
+        voters in proptest::prelude::prop::collection::btree_set("[a-e]", 0..6),
+        q in 0u32..8,
+        me in "[a-e]",
+        leader in "[f-h]",
+    ) {
+        let names = voters.iter().cloned().collect::<Vec<_>>().join(",");
+        let s = sync(&leader, &names, q, SyncKind::Quorum);
+        let mut io = FakeIo::new("", &ALL);
+        io.set_pg_applies = true;
+        let r = pre(&mut io, Q, &me, Some(&s));
+        let is_voter = voters.contains(&me);
+        let applies = is_voter && (q as usize) < voters.len();
+        if !applies {
+            proptest::prop_assert_eq!(r, Ok(()));
+            proptest::prop_assert!(io.calls.is_empty());
+        } else {
+            proptest::prop_assert_eq!(r, Ok(()));
+            proptest::prop_assert_eq!(io.pg_sets.len(), 1);
+            let shape = parse_sync_value(&io.pg_sets[0]).unwrap();
+            let mut want: Names = voters.iter().cloned().collect();
+            want.remove(&me);
+            want.insert(leader.clone());
+            proptest::prop_assert_eq!(shape.names_folded(), want.clone());
+            proptest::prop_assert_eq!(shape.n, voters.len() - q as usize);
+            proptest::prop_assert!(shape.n >= 1 && shape.n <= want.len());
+            proptest::prop_assert_eq!(shape.keyword, SyncKeyword::Any);
+            proptest::prop_assert!(!shape.names.contains(&me));
+        }
+    }
+}
+
+/// End to end on one fake: the pre-promote write, then the executor's own
+/// finalization. After the write the executor sees an expected PromotionWindow
+/// and writes `(me, V', q)`; without the write (restart, manual promote) it
+/// takes the reset path.
+#[test]
+fn finalization_after_the_pre_promote_write_installs_v_prime_and_without_it_resets() {
+    let inp = |sync: &SyncState| ExecInput {
+        me: "n1".into(),
+        mode: Q,
+        count: 2,
+        strict: false,
+        lag_threshold: None,
+        members: ["n0", "n2", "n3"]
+            .iter()
+            .map(|n| member(n, false))
+            .collect(),
+        sync: Some(sync.clone()),
+    };
+    // With the write.
+    let mut io = FakeIo::new("", &ALL);
+    io.set_pg_applies = true;
+    pre(&mut io, Q, "n1", Some(&old_sync())).unwrap();
+    assert_eq!(io.show, PRE_VALUE);
+    let o = cycle(&mut ready(), &mut io, &inp(&old_sync()));
+    assert_eq!(o, ExecOutcome::Progressed);
+    assert_eq!(
+        io.dcs_writes.first().map(dcs_desc).as_deref(),
+        Some("dcs:n1:n0,n2,n3:1:Quorum"),
+        "the first write is V' with q kept"
+    );
+    // Without the write: the node runs a value of its own.
+    let mut io = FakeIo::new("", &ALL);
+    let o = cycle(&mut ready(), &mut io, &inp(&old_sync()));
+    assert_eq!(o, ExecOutcome::Progressed);
+    assert_eq!(
+        io.dcs_writes.first().map(dcs_desc).as_deref(),
+        Some("dcs:n1::0:Quorum"),
+        "no pre-promote value in force: reset to an empty voter set"
     );
 }

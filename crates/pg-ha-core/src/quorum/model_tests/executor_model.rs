@@ -32,12 +32,32 @@
 //! * The executor's explicit `reload()` lands the file at once. Only the
 //!   reload inside `set_pg` can be late or lost. The restart rule depends on
 //!   this (probe P1: no stale SHOW was ever seen after a reload).
-//! * The pre-promote `ALTER SYSTEM` (plan 3c, not built in 3b) is atomic and
-//!   happens at promotion, as in the planner model. A `blind` promotion is the
-//!   case where it did not happen; the new leader then runs a stale value and
-//!   `Commit` is ignored until the first `/sync` finalization succeeded (the
-//!   window before it is exactly what 3c closes), and SI-1 is not checked in
-//!   it. Invariant I is.
+//! * PR3c: promotion goes through the REAL `pre_promote_sync` (the function
+//!   `promote_and_confirm` calls) on the candidate's OWN PostgreSQL value, and
+//!   the candidate promotes only when it returns `Ok`. The faults of plan 5.2
+//!   are injected into it: `set_pg` failing before or after writing the file, a
+//!   reload that lands after k SHOWs or is lost (SHOW stays old), the lease
+//!   expiring, a crash of pg-ha after any I/O call, plus a crash right after
+//!   the write and a failing `pg_ctl promote` (the retry must find the value in
+//!   force). The finalization is the executor's own step.
+//!   In the window between the promotion and the finalization the model now
+//!   CHECKS SI-1 on `(DCS, effective)` and `(DCS, file)` excluding the sitting
+//!   leader (the new one), invariant I, and lets the new leader commit and
+//!   acknowledge (`window_commits` in the coverage test). Only the standby
+//!   candidate's value before the promotion is exempt from SI-1 (a standby
+//!   acknowledges nothing); SI-1 is asked the moment `promote` happens.
+//! * A `blind` promotion (a manual `pg_ctl promote`, which bypasses
+//!   `promote_and_confirm`) is the case where no pre-promote write happened: the
+//!   new leader runs whatever its standby value was, `Commit` is ignored until
+//!   the first `/sync` finalization succeeded and SI-1 is not checked in that
+//!   window. 3c cannot close it (nothing runs before such a promotion);
+//!   invariant I is still checked.
+//! * Not modelled: the old leader coming back as a WRITABLE primary during the
+//!   window (SI-3: that is the watchdog's and the lease's job, not this
+//!   function's). Its return as a standby is (`Revive` after the promotion).
+//!   The standby's value is a local file: a value written to a node that then
+//!   does not promote stays in its `postgresql.auto.conf`, which the model
+//!   keeps per node.
 //! * `Elect` only runs while `/sync` is a Quorum one: the Priority election
 //!   rules are not modelled. The Priority code itself is not modelled either:
 //!   `GoPriority` jumps to the state it converges to (`FIRST k (S)`, `/sync`
@@ -50,7 +70,9 @@
 
 use super::*;
 use crate::cluster::{SyncKind, SyncState};
-use crate::ha::quorum_sync::{EffectiveSyncMode, ExecInput, ExecOutcome, QuorumExec, SyncIo};
+use crate::ha::quorum_sync::{
+    EffectiveSyncMode, ExecInput, ExecOutcome, QuorumExec, SyncIo, pre_promote_sync,
+};
 use crate::sync::quote_ident;
 use crate::sync_value::{parse_sync_value, render_quorum_value};
 use std::cell::Cell;
@@ -120,10 +142,21 @@ enum XAction {
         reach: u8,
         late: u8,
         fail: u8,
-        /// The new leader did not get the pre-promote value (unknown history).
+        /// The promotion does not go through `promote_and_confirm` (a manual
+        /// `pg_ctl promote`, PostgreSQL promoted by other means): no
+        /// pre-promote write, unknown history.
         blind: bool,
-        /// Its own stale value in that case (bit i: n_i is listed; 0: empty).
+        /// The candidate's own standby value (bit i: n_i is listed; 0: empty),
+        /// unless bit 7 is set: then the value this node already holds (left
+        /// by an earlier failed attempt, or by its time as a leader).
         leftover: u8,
+        /// Faults injected into the REAL `pre_promote_sync` (SET_PG failures,
+        /// late or lost reload, lease, crash after the k-th I/O call).
+        fault: Fault,
+        /// 0: `pg_ctl promote` runs. 1: pg-ha dies right after the pre-promote
+        /// write succeeded. 2: `pg_ctl promote` fails (retried by a later
+        /// election, which must find the value in force).
+        after: u8,
     },
     Exec(Fault),
     /// A pending reload is delivered.
@@ -161,6 +194,19 @@ struct XStats {
     reload_delivered_late: usize,
     set_pg_calls: usize,
     commits_skipped_blind: usize,
+    /// Real `pre_promote_sync` runs: outcome and path.
+    pre_ok: usize,
+    pre_err: usize,
+    pre_crash: usize,
+    /// It found the value already in force (no `set_pg` call in that run).
+    pre_idempotent: usize,
+    /// SHOW did not confirm (value stayed old or the reload was lost).
+    pre_unconfirmed: usize,
+    /// The write succeeded and the node still did not promote.
+    wrote_not_promoted: usize,
+    promote_fail_after_write: usize,
+    /// Commits made by the new leader while `/sync` still names the old one.
+    window_commits: usize,
 }
 
 impl XStats {
@@ -186,6 +232,14 @@ impl XStats {
         self.reload_delivered_late += o.reload_delivered_late;
         self.set_pg_calls += o.set_pg_calls;
         self.commits_skipped_blind += o.commits_skipped_blind;
+        self.pre_ok += o.pre_ok;
+        self.pre_err += o.pre_err;
+        self.pre_crash += o.pre_crash;
+        self.pre_idempotent += o.pre_idempotent;
+        self.pre_unconfirmed += o.pre_unconfirmed;
+        self.wrote_not_promoted += o.wrote_not_promoted;
+        self.promote_fail_after_write += o.promote_fail_after_write;
+        self.window_commits += o.window_commits;
     }
 }
 
@@ -218,6 +272,15 @@ struct Core {
     mode: EffectiveSyncMode,
     /// A blind promotion has no finalized `/sync` yet: no commits, no SI-1.
     blind_open: bool,
+    /// The PostgreSQL value in `pg` belongs to a node that is still a standby
+    /// (the candidate during its pre-promote write): SI-1 is a statement about
+    /// a writable primary, so it is not asked of it. It is asked the moment the
+    /// node promotes.
+    pg_standby: bool,
+    /// Whose PostgreSQL `pg` is.
+    pg_owner: usize,
+    /// Each node's own value while it is not the one in `pg`.
+    standby_pg: Vec<PgVals>,
     since_restart: bool,
     violation: Option<String>,
     x: XStats,
@@ -320,7 +383,7 @@ impl Core {
                         ));
                     }
                 }
-                if !self.blind_open {
+                if !self.blind_open && !self.pg_standby {
                     for (which, text) in
                         [("effective", &self.pg.effective), ("file", &self.pg.file)]
                     {
@@ -389,7 +452,21 @@ impl Core {
                 }
             })
             .collect();
-        let sync = self.dcs.present.then(|| SyncState {
+        let sync = self.dcs_sync();
+        ExecInput {
+            me: name(w.leader),
+            mode: self.mode,
+            count: w.cfg_n,
+            strict: w.cfg_strict,
+            lag_threshold: w.cfg_lag,
+            members,
+            sync,
+        }
+    }
+
+    /// `/sync` as the HA loop reads it.
+    fn dcs_sync(&self) -> Option<SyncState> {
+        self.dcs.present.then(|| SyncState {
             leader: name(self.dcs.leader),
             sync_standby: if self.dcs.voters.is_empty() {
                 None
@@ -405,16 +482,7 @@ impl Core {
             },
             quorum: self.dcs.quorum as u32,
             kind: self.dcs.kind,
-        });
-        ExecInput {
-            me: name(w.leader),
-            mode: self.mode,
-            count: w.cfg_n,
-            strict: w.cfg_strict,
-            lag_threshold: w.cfg_lag,
-            members,
-            sync,
-        }
+        })
     }
 
     fn snapshot(&self) -> ReplicationSnapshot {
@@ -650,6 +718,16 @@ impl XWorld {
             },
             mode,
             blind_open: false,
+            pg_standby: false,
+            pg_owner: 0,
+            standby_pg: vec![
+                PgVals {
+                    file: String::new(),
+                    effective: String::new(),
+                    land_after: None,
+                };
+                standbys + 1
+            ],
             since_restart: false,
             violation: None,
             x: XStats::default(),
@@ -665,7 +743,10 @@ impl XWorld {
         XWorld {
             core,
             exec: QuorumExec::default(),
+            // Paused clock: the pre-promote confirmation sleeps.
             rt: tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
                 .build()
                 .expect("runtime"),
         }
@@ -766,43 +847,116 @@ impl XWorld {
         c.mode = EffectiveSyncMode::Priority;
     }
 
+    /// A granted election is followed by the REAL `pre_promote_sync` on the
+    /// candidate's own PostgreSQL value, with the faults of `fault`, and only
+    /// when it returns `Ok` does the candidate promote (`promote_and_confirm`'s
+    /// order). A `blind` promotion skips it (it does not go through
+    /// `promote_and_confirm`).
+    #[allow(clippy::too_many_arguments)]
     fn elect(
         &mut self,
         (cand, reach, late, fail): (usize, u8, u8, u8),
         blind: bool,
         leftover: u8,
+        fault: Fault,
+        after: u8,
     ) -> Result<(), String> {
         let c = &mut self.core;
         if !(c.dcs.present && c.dcs.kind == SyncKind::Quorum) {
             return Ok(());
         }
         c.sync_w();
-        let gens = c.w.stats.generations;
-        c.w.elect(cand, reach, late, fail)?;
-        if c.w.stats.generations == gens {
+        c.w.hold_promotion = true;
+        c.w.granted = None;
+        let elected = c.w.elect(cand, reach, late, fail);
+        c.w.hold_promotion = false;
+        elected?;
+        let Some(cn) = c.w.granted.take() else {
             return Ok(());
+        };
+        // The dead leader's own value goes back to its node; the candidate's
+        // is the one in force from here on.
+        if c.pg_owner == c.w.leader {
+            c.standby_pg[c.pg_owner] = c.pg.clone();
         }
-        // Promoted. The planner model installed the pre-promote value in its
-        // state; the DCS is still the old leader's.
-        c.w.pending_dcs = None;
-        let text = if blind {
+        let keep = leftover & 0x80 != 0 && !c.standby_pg[cn].file.is_empty();
+        if !keep {
             let names: Names = (0..c.w.nodes.len())
-                .filter(|&i| i != c.w.leader && leftover & (1 << (i % 8)) != 0)
+                .filter(|&i| i != cn && i != c.w.leader && leftover & (1 << (i % 7)) != 0)
                 .map(name)
                 .collect();
-            if names.is_empty() {
+            let text = if names.is_empty() {
                 String::new()
             } else {
                 any_text(&names, 1)
+            };
+            c.standby_pg[cn] = PgVals {
+                file: text.clone(),
+                effective: text,
+                land_after: None,
+            };
+        }
+        c.pg = c.standby_pg[cn].clone();
+        c.pg_owner = cn;
+        c.pg_standby = true;
+
+        if !blind {
+            c.begin_cycle(fault);
+            let sync = c.dcs_sync();
+            let mode = c.mode;
+            let me = name(cn);
+            let crash = std::sync::Arc::new(Notify::new());
+            let sets_before = c.x.set_pg_calls;
+            let outcome = self.rt.block_on(async {
+                let mut io = ModelIo {
+                    c: &mut *c,
+                    crash: crash.clone(),
+                };
+                tokio::select! {
+                    r = pre_promote_sync(&mut io, mode, &me, sync.as_ref()) => Some(r),
+                    _ = crash.notified() => None,
+                }
+            });
+            let c = &mut self.core;
+            match outcome {
+                None => {
+                    c.x.pre_crash += 1;
+                    c.standby_pg[cn] = c.pg.clone();
+                    self.restart();
+                    return Ok(());
+                }
+                Some(Err(_)) => {
+                    c.x.pre_err += 1;
+                    if c.pg.file != c.pg.effective {
+                        c.x.pre_unconfirmed += 1;
+                    }
+                    c.standby_pg[cn] = c.pg.clone();
+                    return Ok(());
+                }
+                Some(Ok(())) => {
+                    c.x.pre_ok += 1;
+                    if c.x.set_pg_calls == sets_before {
+                        c.x.pre_idempotent += 1;
+                    }
+                }
             }
-        } else {
-            any_text(&c.w.st.pg_names, c.w.st.pg_n)
-        };
-        c.pg = PgVals {
-            file: text.clone(),
-            effective: text,
-            land_after: None,
-        };
+            if after != 0 {
+                let c = &mut self.core;
+                c.x.wrote_not_promoted += 1;
+                c.standby_pg[cn] = c.pg.clone();
+                if after == 1 {
+                    self.restart();
+                } else {
+                    c.x.promote_fail_after_write += 1;
+                }
+                return Ok(());
+            }
+        }
+
+        let c = &mut self.core;
+        c.w.promote(cn)?;
+        c.w.pending_dcs = None;
+        c.pg_standby = false;
         c.blind_open = blind;
         c.since_restart = false;
         self.exec = QuorumExec::default();
@@ -815,6 +969,12 @@ impl XWorld {
                 if matches!(b, Action::Commit(_)) && self.core.blind_open {
                     self.core.x.commits_skipped_blind += 1;
                 } else {
+                    if matches!(b, Action::Commit(_))
+                        && self.core.w.leader_alive()
+                        && self.core.dcs.leader != self.core.w.leader
+                    {
+                        self.core.x.window_commits += 1;
+                    }
                     self.core.sync_w();
                     // The checks are the model's own (`check_x`): ignore the
                     // planner model's.
@@ -828,7 +988,15 @@ impl XWorld {
                 fail,
                 blind,
                 leftover,
-            } => self.elect((*c, *reach, *late, *fail), *blind, *leftover)?,
+                fault,
+                after,
+            } => self.elect(
+                (*c, *reach, *late, *fail),
+                *blind,
+                *leftover,
+                fault.clone(),
+                *after,
+            )?,
             XAction::Exec(f) => return self.run_exec(f.clone()),
             XAction::ReloadLands => self.core.land(),
             XAction::Restart => self.restart(),
@@ -891,8 +1059,17 @@ fn base_strategy() -> impl Strategy<Value = Action> {
 fn xaction_strategy() -> impl Strategy<Value = XAction> {
     prop_oneof![
         30 => base_strategy().prop_map(XAction::Base),
-        5 => (any::<usize>(), any::<u8>(), prop_oneof![3 => Just(0u8), 1 => any::<u8>()], prop_oneof![3 => Just(0u8), 1 => any::<u8>()], prop_oneof![5 => Just(false), 1 => Just(true)], any::<u8>())
-            .prop_map(|(c, reach, late, fail, blind, leftover)| XAction::Elect { c, reach, late, fail, blind, leftover }),
+        7 => (
+            any::<usize>(),
+            any::<u8>(),
+            prop_oneof![3 => Just(0u8), 1 => any::<u8>()],
+            prop_oneof![3 => Just(0u8), 1 => any::<u8>()],
+            prop_oneof![6 => Just(false), 1 => Just(true)],
+            any::<u8>(),
+            fault_strategy(),
+            prop_oneof![6 => Just(0u8), 1 => Just(1u8), 1 => Just(2u8)],
+        )
+            .prop_map(|(c, reach, late, fail, blind, leftover, fault, after)| XAction::Elect { c, reach, late, fail, blind, leftover, fault, after }),
         26 => fault_strategy().prop_map(XAction::Exec),
         3 => Just(XAction::ReloadLands),
         1 => Just(XAction::Restart),
@@ -987,4 +1164,21 @@ fn model_executor_actually_exercises_the_paths() {
     assert!(t.finalize_match > 90, "match finalization rare: {t:?}");
     assert!(t.finalize_reset > 20, "reset finalization rare: {t:?}");
     assert!(t.commits_skipped_blind > 10, "no blind window: {t:?}");
+    assert!(t.pre_ok > 150, "pre_promote_sync rarely succeeded: {t:?}");
+    assert!(t.pre_err > 40, "pre_promote_sync rarely failed: {t:?}");
+    assert!(t.pre_crash > 15, "no crash inside pre_promote_sync: {t:?}");
+    assert!(t.pre_idempotent > 5, "no idempotent retry: {t:?}");
+    assert!(t.pre_unconfirmed > 20, "SHOW never stayed old: {t:?}");
+    assert!(
+        t.wrote_not_promoted > 30,
+        "no write without promotion: {t:?}"
+    );
+    assert!(
+        t.promote_fail_after_write > 15,
+        "no failed pg_ctl promote after the write: {t:?}"
+    );
+    assert!(
+        t.window_commits > 50,
+        "the new leader never committed in the promotion window: {t:?}"
+    );
 }
