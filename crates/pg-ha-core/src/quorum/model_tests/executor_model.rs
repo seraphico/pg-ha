@@ -1114,12 +1114,21 @@ proptest! {
 /// fails the property above proves less than it claims.
 #[test]
 fn model_executor_actually_exercises_the_paths() {
-    use proptest::test_runner::{Config, TestRunner};
+    use proptest::test_runner::{Config, TestRng, TestRunner};
     let total = Mutex::new(XStats::default());
-    let mut runner = TestRunner::new(Config {
+    // Fixed seed: this test asserts coverage MINIMUMS, which are a property of
+    // the generator, not of the system. With a random seed a run can land just
+    // below a minimum (CI on 2026-11-15 hit pre_idempotent = 5 with a minimum of > 5). The
+    // invariant-checking property tests keep their random seeds.
+    let config = Config {
         cases: XCASES,
         ..Config::default()
-    });
+    };
+    let mut runner = TestRunner::new_with_rng(
+        config.clone(),
+        TestRng::deterministic_rng(config.rng_algorithm),
+    );
+
     let strat = (
         2usize..6,
         1usize..4,
