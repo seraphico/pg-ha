@@ -844,6 +844,95 @@ impl Drop for ModeOverrideGuard {
     }
 }
 
+/// Does the quorum executor drive `/sync` and `synchronous_standby_names`?
+/// Only for the Quorum mode, or while a `kind: Quorum` `/sync` still has to be
+/// taken back (T7, T9). Pure.
+pub(crate) fn executor_applies(mode: EffectiveSyncMode, sync: Option<&SyncState>) -> bool {
+    mode == EffectiveSyncMode::Quorum || sync.is_some_and(|s| s.kind == SyncKind::Quorum)
+}
+
+/// How long the pre-promote write waits for SHOW to show the new value (the
+/// reload is a signal), and how often it looks.
+pub(crate) const PRE_PROMOTE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const PRE_PROMOTE_CONFIRM_STEP: Duration = Duration::from_millis(100);
+
+/// The PRE-PROMOTE write (SB-13 PR3c, plan 4): before `pg_ctl promote`, install
+/// `ANY n' (V')` on this standby so that the moment it becomes writable the
+/// value already satisfies SI-1 against the old `/sync` (`post_promotion_state`,
+/// design T10). Finalization of `/sync` itself is the executor's job afterwards.
+///
+/// Zero I/O, and `Ok(())`, unless [`executor_applies`] and `/sync` is a live
+/// `kind: Quorum` record of ANOTHER leader. Also `Ok(())` without a write when
+/// `post_promotion_state` is `None` (this node is not a voter, or `q >= |V|`):
+/// there is nothing safe to install and finalization takes the reset path.
+///
+/// `Err` means "do not promote": the lease is gone, the value cannot be
+/// rendered, a call failed or timed out ([`IO_TIMEOUT`]), or SHOW did not show
+/// the new shape within [`PRE_PROMOTE_CONFIRM_TIMEOUT`]. When SHOW already
+/// shows the shape (a retry after a failed `pg_ctl promote`) nothing is written.
+pub(crate) async fn pre_promote_sync<IO: SyncIo>(
+    io: &mut IO,
+    mode: EffectiveSyncMode,
+    me: &str,
+    sync: Option<&SyncState>,
+) -> std::result::Result<(), String> {
+    if !executor_applies(mode, sync) {
+        return Ok(());
+    }
+    let Some(s) = sync.filter(|s| !s.is_empty() && s.kind == SyncKind::Quorum) else {
+        return Ok(());
+    };
+    // `/sync` of this very node is not a previous leader's.
+    if s.leader.eq_ignore_ascii_case(me) {
+        return Ok(());
+    }
+    let current = QuorumState::new(s.sync_standby_names(), s.quorum as usize, [""; 0], 0);
+    let Some(post) = post_promotion_state(&current, me, &s.leader) else {
+        return Ok(());
+    };
+    let wanted = QuorumTarget::new(&post.pg_names, post.pg_n);
+    let text = render_quorum_value(&wanted, false)
+        .map_err(|e| format!("cannot render the pre-promote value: {e}"))?;
+    let key = parse_sync_value(&text)
+        .map_err(|e| format!("rendered pre-promote value {text:?} is unreadable: {e}"))?
+        .key();
+
+    if !io.lease_ok() {
+        return Err("the leader lease is gone".into());
+    }
+    // Idempotent retry: already in force, write nothing.
+    if let Ok(raw) = bounded("SHOW synchronous_standby_names", io.show_sync_names()).await
+        && shows(&raw, &key)
+    {
+        info!("pre-promote: synchronous_standby_names already {raw:?}");
+        return Ok(());
+    }
+    bounded("pre-promote set", io.set_pg(&text))
+        .await
+        .map_err(|e| format!("pre-promote write failed: {e}"))?;
+    let deadline = tokio::time::Instant::now() + PRE_PROMOTE_CONFIRM_TIMEOUT;
+    loop {
+        if let Ok(raw) = bounded("SHOW synchronous_standby_names", io.show_sync_names()).await
+            && shows(&raw, &key)
+        {
+            info!("pre-promote: wrote and confirmed {text:?} before promoting");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "pre-promote value {text:?} not confirmed by SHOW within {}ms",
+                PRE_PROMOTE_CONFIRM_TIMEOUT.as_millis()
+            ));
+        }
+        tokio::time::sleep(PRE_PROMOTE_CONFIRM_STEP).await;
+    }
+}
+
+/// Does `raw` parse to the shape `key`?
+fn shows(raw: &str, key: &ShapeKey) -> bool {
+    parse_sync_value(raw).is_ok_and(|s| !s.strict_hold && s.key() == *key)
+}
+
 impl Ha {
     /// The mode the HA loop wants. PR3b can say `Priority` or `Off` only; the
     /// `Quorum` answer exists for tests until PR4 adds the setting.
@@ -869,12 +958,26 @@ impl Ha {
     /// still has to be taken back (T7, T9). False for every Priority or Off
     /// cluster whose `/sync` is not a Quorum one.
     pub(super) fn quorum_executor_applies(&self) -> bool {
-        self.effective_sync_mode() == EffectiveSyncMode::Quorum
-            || self
-                .cluster
-                .sync_state
-                .as_ref()
-                .is_some_and(|s| s.kind == SyncKind::Quorum)
+        executor_applies(self.effective_sync_mode(), self.cluster.sync_state.as_ref())
+    }
+
+    /// The pre-promote write (plan 4), on the real PostgreSQL. Zero I/O unless
+    /// the quorum executor applies and `/sync.kind` is Quorum.
+    pub(super) async fn pre_promote_sync(&mut self) -> std::result::Result<(), String> {
+        let mode = self.effective_sync_mode();
+        let mut io = RealIo {
+            pg: &self.postgresql,
+            dcs: &*self.dcs,
+            lease: self.leader_lease,
+            paused: self.is_paused,
+        };
+        pre_promote_sync(
+            &mut io,
+            mode,
+            &self.config.name,
+            self.cluster.sync_state.as_ref(),
+        )
+        .await
     }
 
     /// One cycle of the quorum executor on the real PostgreSQL and DCS.

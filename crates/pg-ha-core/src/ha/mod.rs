@@ -576,6 +576,11 @@ impl Ha {
             self.release_lock_as_standby().await;
             return CycleResult::Error(format!("not promoting: {e}"));
         }
+        if let Err(e) = self.pre_promote_sync().await {
+            error!("Not promoting: {e}; releasing the leader lock (PostgreSQL is still a standby)");
+            self.release_lock_as_standby().await;
+            return CycleResult::Error(format!("not promoting: {e}"));
+        }
 
         // D6 (I2): record a pending promote before promoting, so no other
         // node campaigns on the base timeline while this one may be creating
@@ -4643,6 +4648,10 @@ mod tests {
         UncleanTarget,
         /// As `UncleanTarget`, but the single-user run fails (PANIC).
         UncleanTargetSingleUserFails,
+        /// SB-13 PR3c: pg_ctl records every invocation in
+        /// `pg-ha-test.pg_ctl_calls` and succeeds (`promote -D <dir> -w`:
+        /// `$3` is the data directory).
+        PgCtlRecords,
     }
 
     /// pg_rewind --target-pgdata <dir> ...: $2 is the data directory.
@@ -4651,7 +4660,7 @@ mod tests {
     const FAKE_PSQL_PRIMARY: &str = "echo f\nexit 0\n";
 
     impl FakeBin {
-        const ALL: [FakeBin; 13] = [
+        const ALL: [FakeBin; 14] = [
             FakeBin::ControldataInProduction,
             FakeBin::ControldataShutDownInRecovery,
             FakeBin::PgCtlStopOk,
@@ -4665,6 +4674,7 @@ mod tests {
             FakeBin::PgCtlStopFails,
             FakeBin::UncleanTarget,
             FakeBin::UncleanTargetSingleUserFails,
+            FakeBin::PgCtlRecords,
         ];
 
         fn dir_name(self) -> &'static str {
@@ -4682,6 +4692,7 @@ mod tests {
                 FakeBin::PgCtlStopFails => "pg-ctl-stop-fails",
                 FakeBin::UncleanTarget => "unclean-target",
                 FakeBin::UncleanTargetSingleUserFails => "unclean-target-single-user-fails",
+                FakeBin::PgCtlRecords => "pg-ctl-records",
             }
         }
 
@@ -4746,6 +4757,10 @@ mod tests {
                 FakeBin::UncleanTargetSingleUserFails => {
                     unclean_target_scripts(FAKE_UNCLEAN_SINGLE_FAILS)
                 }
+                FakeBin::PgCtlRecords => vec![(
+                    "pg_ctl",
+                    "echo \"$*\" >> \"$3/pg-ha-test.pg_ctl_calls\"\nexit 0\n",
+                )],
             }
         }
     }
@@ -5617,6 +5632,153 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ─────────────────── SB-13 PR3c: the pre-promote write ───────────────────
+    fn pg_ctl_calls(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("pg-ha-test.pg_ctl_calls"))
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+    /// A standby holding the lock, about to promote, with `/sync` as given.
+    fn promoting_ha(
+        label: &str,
+        dcs: Arc<MockDcs>,
+        mode: Option<bool>,
+        sync: Option<SyncState>,
+    ) -> (Ha, PathBuf) {
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "test_node",
+            label,
+            dcs.clone(),
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::PgCtlRecords)),
+        );
+        put_history(&dir, 2);
+        ha.dynamic_config_state.apply_new_config(GlobalConfig {
+            synchronous_mode: mode,
+            ..Default::default()
+        });
+        ha.cluster = self_led(Some(2), Some(2));
+        ha.cluster.timeline = dcs.timeline_value();
+        ha.cluster.sync_state = sync;
+        (ha, dir)
+    }
+    /// BEHAVIOURAL GOLDEN (Priority and Off): the observable calls of the
+    /// promote path up to `pg_ctl promote`, which is as far as a test without
+    /// a PostgreSQL server can go (`observe_recovery` needs a connection, so
+    /// the steps after it, `confirm_promote`, `touch_member` success and
+    /// `enforce_synchronous_replication`, stay an open item for PR4). The
+    /// pre-promote write must add NOTHING here: one pending record in
+    /// `/timeline`, exactly one `pg_ctl` call (`promote`), no `/sync` write,
+    /// no `ALTER SYSTEM`, the lock kept.
+    #[tokio::test]
+    async fn test_priority_promote_path_golden_sequence() {
+        let priority_sync = SyncState {
+            leader: "old_leader".into(),
+            sync_standby: Some("node2,node3".into()),
+            quorum: 1,
+            kind: Default::default(),
+        };
+        let cases = [
+            ("golden-off", None, None),
+            ("golden-off-false", Some(false), None),
+            ("golden-priority-nosync", Some(true), None),
+            ("golden-priority", Some(true), Some(priority_sync)),
+        ];
+        for (label, mode, sync) in cases {
+            let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
+            let (mut ha, dir) = promoting_ha(label, dcs.clone(), mode, sync);
+            let result = ha.process_healthy_cluster().await;
+            assert!(
+                matches!(result, CycleResult::Error(ref m)
+                    if m.starts_with("promote reported success but PostgreSQL is")),
+                "{label}: got {result}"
+            );
+            assert_eq!(
+                pg_ctl_calls(&dir),
+                vec![format!("promote -D {} -w", dir.display())],
+                "{label}: exactly one pg_ctl call, the promote"
+            );
+            let writes = dcs.timeline_writes();
+            assert_eq!(writes.len(), 1, "{label}: one pending record");
+            assert!(
+                writes[0].pending.is_some(),
+                "{label}: the record is a pending promote"
+            );
+            assert!(
+                dcs.sync_writes.lock().unwrap().is_empty(),
+                "{label}: no /sync write on the promote path"
+            );
+            assert_eq!(
+                lock_held_by(&dcs).as_deref(),
+                Some("test_node"),
+                "{label}: the lock is kept"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    /// Decision 3: when the pre-promote write fails, do NOT promote, give the
+    /// lock back like the watchdog-arm failure, and record no pending promote.
+    /// Here the failure is the PostgreSQL connection (port 1).
+    #[tokio::test]
+    async fn test_pre_promote_failure_does_not_promote_and_releases_the_lock() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
+        let sync = SyncState {
+            leader: "old_leader".into(),
+            sync_standby: Some("test_node,node2,node3".into()),
+            quorum: 1,
+            kind: crate::cluster::SyncKind::Quorum,
+        };
+        let (mut ha, dir) = promoting_ha("pre-promote-fail", dcs.clone(), Some(true), Some(sync));
+        ha.is_leader = true;
+        let _guard =
+            quorum_sync::ModeOverrideGuard::set(Some(quorum_sync::EffectiveSyncMode::Quorum));
+        let result = ha.process_healthy_cluster().await;
+        assert!(
+            matches!(result, CycleResult::Error(ref m)
+                if m.starts_with("not promoting: pre-promote write failed")),
+            "got: {result}"
+        );
+        assert!(pg_ctl_calls(&dir).is_empty(), "pg_ctl promote not called");
+        assert!(dcs.timeline_writes().is_empty(), "no pending written");
+        assert_eq!(ha.promote_pending, None);
+        assert_eq!(lock_held_by(&dcs), None, "the lock is given back");
+        assert!(!ha.is_leader());
+        assert_eq!(ha.postgresql().observed_in_recovery(), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// The one new call sits right after `arm_watchdog` and before
+    /// `record_pending_promote`, and its failure gives the lock back.
+    #[test]
+    fn test_pre_promote_call_order_in_promote_and_confirm() {
+        let promote = body(include_str!("mod.rs"), "async fn promote_and_confirm");
+        assert_before(
+            promote,
+            "self.arm_watchdog()",
+            "self.pre_promote_sync()",
+            "arm_watchdog first",
+        );
+        assert_before(
+            promote,
+            "self.pre_promote_sync()",
+            "self.record_pending_promote()",
+            "no pending promote before the pre-promote write",
+        );
+        assert_before(
+            promote,
+            "self.pre_promote_sync()",
+            "self.postgresql.promote()",
+            "the write precedes pg_ctl promote",
+        );
+        assert_eq!(promote.matches("pre_promote_sync()").count(), 1);
+        let on_err = section(
+            promote,
+            "self.pre_promote_sync()",
+            &["self.record_pending_promote()"],
+        );
+        assert!(on_err.contains("self.release_lock_as_standby().await"));
+        assert!(on_err.contains("return CycleResult::Error"));
+    }
     #[tokio::test]
     async fn test_promote_not_attempted_when_the_record_changed() {
         let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
