@@ -1352,9 +1352,6 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
- "serde",
- "serde_json",
- "serde_yaml",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1364,7 +1361,6 @@ dependencies = [
 name = "pg-ha-api"
 version = "0.1.23"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64",
@@ -1373,7 +1369,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
- "tracing",
 ]
 
 [[package]]
@@ -1400,10 +1395,8 @@ version = "0.1.23"
 dependencies = [
  "clap",
  "reqwest",
- "serde",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1413,17 +1406,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "axum-server",
  "bincode",
  "crc32fast",
- "futures-util",
  "openraft",
  "pg-ha-core",
  "proptest",
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -1435,9 +1425,7 @@ dependencies = [
  "anyhow",
  "futures",
  "pg-ha-core",
- "proptest",
  "reqwest",
- "serde",
  "tokio",
  "tracing",
 ]

@@ -8,11 +8,9 @@ description = "TCP load balancer proxy (replaces HAProxy)"
 pg-ha-core = { path = "../pg-ha-core" }
 tokio = { workspace = true }
 tracing = { workspace = true }
-serde = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 futures = "0.3"
 
 [dev-dependencies]
-proptest = "1"
 tokio = { workspace = true, features = ["test-util"] }
