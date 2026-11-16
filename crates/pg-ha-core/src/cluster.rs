@@ -427,7 +427,41 @@ impl SyncKind {
     }
 }
 
+/// SB-13: has `q` been relaxed to `|V| - n`? `voters` is `|V|`, `n` the
+/// number PostgreSQL enforces (`ANY n`, 0 when `synchronous_standby_names` is
+/// empty). While voters exist but `n` is still 0 the value is not settled:
+/// `q = |V|` there is the "not relaxed yet" state, not a finished one.
+pub fn quorum_is_settled(voters: usize, q: usize, n: usize) -> bool {
+    if voters > 0 && n == 0 {
+        return false;
+    }
+    q == voters.saturating_sub(n)
+}
+
 impl SyncState {
+    /// Number of distinct voters (names, case-insensitive).
+    pub fn voter_count(&self) -> usize {
+        self.sync_standby_names()
+            .iter()
+            .map(|n| n.to_ascii_lowercase())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    /// SB-13: is this a Quorum `/sync` whose `q` equals `|V| - n`, given the
+    /// `n` the leader observed with `SHOW synchronous_standby_names`? `None`
+    /// when the kind is not Quorum or `n` is unknown.
+    pub fn quorum_settled(&self, observed_n: Option<usize>) -> Option<bool> {
+        if self.kind != SyncKind::Quorum {
+            return None;
+        }
+        Some(quorum_is_settled(
+            self.voter_count(),
+            self.quorum as usize,
+            observed_n?,
+        ))
+    }
+
     /// Check if sync state is effectively empty/unset
     pub fn is_empty(&self) -> bool {
         self.leader.is_empty()
@@ -491,6 +525,41 @@ impl Failover {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quorum_is_settled_means_q_equals_voters_minus_n_and_n_is_on() {
+        // 3 nodes, ANY 1 of 2 voters: q = 1 is settled, q = 2 is the window.
+        assert!(quorum_is_settled(2, 1, 1));
+        assert!(!quorum_is_settled(2, 2, 1));
+        // 5 nodes, ANY 2 of 4.
+        assert!(quorum_is_settled(4, 2, 2));
+        assert!(!quorum_is_settled(4, 4, 2));
+        // Voters but PostgreSQL still asynchronous (n = 0): not settled.
+        assert!(!quorum_is_settled(2, 2, 0));
+        // No voters, nothing to relax.
+        assert!(quorum_is_settled(0, 0, 0));
+    }
+
+    #[test]
+    fn sync_state_quorum_settled_needs_a_quorum_kind_and_a_known_n() {
+        let state = |kind, q| SyncState {
+            leader: "node1".into(),
+            sync_standby: Some("node2,Node3,node2".into()),
+            quorum: q,
+            kind,
+        };
+        assert_eq!(state(SyncKind::Quorum, 1).voter_count(), 2);
+        assert_eq!(
+            state(SyncKind::Quorum, 1).quorum_settled(Some(1)),
+            Some(true)
+        );
+        assert_eq!(
+            state(SyncKind::Quorum, 2).quorum_settled(Some(1)),
+            Some(false)
+        );
+        assert_eq!(state(SyncKind::Quorum, 1).quorum_settled(None), None);
+        assert_eq!(state(SyncKind::Priority, 1).quorum_settled(Some(1)), None);
+    }
 
     #[test]
     fn test_failover_deserializes_member_alias() {

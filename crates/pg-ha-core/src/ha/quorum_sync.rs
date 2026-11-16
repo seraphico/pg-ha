@@ -221,6 +221,12 @@ pub(crate) struct QuorumExec {
     /// The unreadable `synchronous_standby_names` value last seen and for how
     /// many consecutive cycles.
     unreadable: Option<(String, u32)>,
+    /// `n` as the last cycle saw it in SHOW (0 when the list is empty). Read
+    /// by the REST API (`GET /cluster`) while this node leads.
+    observed_n: Option<usize>,
+    /// Consecutive cycles `q > |V| - n` has held (None: not open). Rate limit
+    /// for the "failover is not possible" warning.
+    window_cycles: Option<u32>,
 }
 
 /// How often a standing warning is repeated, in executor cycles (the same
@@ -480,6 +486,8 @@ impl QuorumExec {
             pending: None,
             warned: None,
             unreadable: None,
+            observed_n: None,
+            window_cycles: None,
         }
     }
 
@@ -488,6 +496,36 @@ impl QuorumExec {
     pub(crate) fn is_fresh_for_test(&self) -> bool {
         self.mark.is_none() && !self.reloaded_since_start && self.pending.is_none()
     }
+    #[cfg(test)]
+    pub(crate) fn set_observed_n_for_test(&mut self, n: Option<usize>) {
+        self.observed_n = n;
+    }
+
+    /// `n` the last cycle read from SHOW.
+    pub(crate) fn observed_n(&self) -> Option<usize> {
+        self.observed_n
+    }
+
+    /// Rate limit for the "q not relaxed" warning: true when the window opens
+    /// and on every 30th consecutive cycle it stays open; closing resets it.
+    /// Pure.
+    pub(crate) fn note_window(&mut self, open: bool) -> bool {
+        if !open {
+            self.window_cycles = None;
+            return false;
+        }
+        match &mut self.window_cycles {
+            Some(cycles) => {
+                *cycles += 1;
+                *cycles % WARN_EVERY_CYCLES == 0
+            }
+            slot => {
+                *slot = Some(1);
+                true
+            }
+        }
+    }
+
     /// Rate limit for the "unreadable value" warning: true on the first
     /// sight of a value, when the text changes, and on every 30th consecutive
     /// cycle; a readable value resets it. Pure.
@@ -619,6 +657,20 @@ impl QuorumExec {
                 }
                 wrote = true;
             }
+        }
+
+        // Observability: what SHOW says now, and whether `/sync` still holds
+        // `q > |V| - n` (nobody can win a vote then; see `vote.rs`).
+        let n_now = state.effective_n();
+        self.observed_n = Some(n_now);
+        let quorum_kind = live.is_some_and(|s| s.kind == SyncKind::Quorum);
+        let (v_now, q_now) = (state.voters.len(), state.quorum);
+        let window_open =
+            quorum_kind && v_now > 0 && !crate::cluster::quorum_is_settled(v_now, q_now, n_now);
+        if self.note_window(window_open) {
+            warn!(
+                "quorum sync: q={q_now} is above |V| - n ({v_now} - {n_now}); failover is not possible until q is relaxed (a primary lost now would leave the cluster without a leader)"
+            );
         }
 
         // 4. An unconfirmed SetPg is retried alone.

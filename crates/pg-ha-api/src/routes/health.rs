@@ -205,6 +205,31 @@ pub(crate) async fn node_status(State(state): State<RouterState>) -> impl IntoRe
     }))
 }
 
+/// The `sync` object of `GET /cluster`, from a fresh `/sync` read (SB-13).
+///
+/// `kind` is `priority` or `quorum`; `voters` are the names in `/sync`;
+/// `quorum` is `q` and is null for `priority` (the field is legacy there).
+/// `n` (as `SHOW synchronous_standby_names` reported it) and `settled`
+/// (`q == |voters| - n`) are known only to the leader's executor, so they are
+/// null on other nodes, on a priority `/sync`, and before the first read.
+fn sync_json(
+    sync: Option<&pg_ha_core::cluster::SyncState>,
+    observed_n: Option<usize>,
+) -> serde_json::Value {
+    use pg_ha_core::cluster::SyncKind;
+    let Some(sync) = sync.filter(|s| !s.is_empty()) else {
+        return serde_json::Value::Null;
+    };
+    let quorum = sync.kind == SyncKind::Quorum;
+    json!({
+        "kind": if quorum { "quorum" } else { "priority" },
+        "voters": sync.sync_standby_names(),
+        "quorum": quorum.then_some(sync.quorum),
+        "n": if quorum { observed_n } else { None },
+        "settled": sync.quorum_settled(observed_n),
+    })
+}
+
 /// GET /cluster — Cluster members summary with cascade topology
 pub(crate) async fn get_cluster(State(state): State<RouterState>) -> impl IntoResponse {
     let s = state.app.read().await;
@@ -217,6 +242,7 @@ pub(crate) async fn get_cluster(State(state): State<RouterState>) -> impl IntoRe
                 return Json(json!({
                     "scope": s.scope,
                     "members": topology,
+                    "sync": sync_json(cluster.sync_state.as_ref(), s.quorum_n),
                 }))
                 .into_response();
             }
@@ -229,6 +255,7 @@ pub(crate) async fn get_cluster(State(state): State<RouterState>) -> impl IntoRe
     Json(json!({
         "scope": s.scope,
         "members": [],
+        "sync": null,
     }))
     .into_response()
 }

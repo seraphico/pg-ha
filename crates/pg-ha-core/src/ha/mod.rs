@@ -89,6 +89,10 @@ pub struct ApiSnapshot {
     /// SB-10: bytes behind the leader's last published position (see
     /// `lag::replication_lag_bytes`). 0 on a primary, None when unknown.
     pub replication_lag: Option<u64>,
+    /// SB-13: `n` of `synchronous_standby_names` as the quorum executor last
+    /// read it with SHOW. Only while this node leads and the executor runs;
+    /// None otherwise.
+    pub quorum_n: Option<usize>,
 }
 
 /// Hook that writes an [`ApiSnapshot`] into the REST API state. The HA engine
@@ -194,10 +198,17 @@ pub struct Ha {
     /// SB-13: the quorum-sync executor's memory (mark, restart rule). Cleared
     /// by `reset_sync_cache`. Unused unless `quorum_executor_applies`.
     quorum_exec: quorum_sync::QuorumExec,
+    /// SB-13: when the "cluster cannot elect a primary until `/sync` is
+    /// relaxed" ERROR was last logged (at most every `QUORUM_STALL_LOG_INTERVAL`).
+    quorum_stall_logged_at: Option<std::time::Instant>,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
 const REWIND_HOLD_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the "no primary can be elected until `/sync` is relaxed" ERROR
+/// is repeated on a leaderless candidate.
+const QUORUM_STALL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Sender half for submitting commands to the HA engine
 pub type CommandSender = mpsc::Sender<(ManagementCommand, mpsc::Sender<CommandResponse>)>;
@@ -240,6 +251,7 @@ impl Ha {
             peer_probe: None,
             local_wal,
             quorum_exec: Default::default(),
+            quorum_stall_logged_at: None,
         };
         (ha, cmd_tx)
     }
@@ -294,6 +306,7 @@ impl Ha {
             pending_restart: self.pending_restart(),
             shutting_down: self.shutting_down,
             rewind_check: self.has_rewind_check_marker(),
+            quorum_n: self.quorum_observed_n(),
         }
     }
 
@@ -10462,6 +10475,424 @@ mod tests {
     }
 
     // ─────────────────── SB-13: quorum vote step ───────────────────
+    // ─────────── SB-13: refuse a switchover / failover the vote cannot grant ───────────
+    mod quorum_win_tests {
+        use super::*;
+        use crate::cluster::SyncKind;
+        use crate::quorum::{Names, VoteDecision, WalPosition, quorum_vote_decision};
+
+        fn qmember(name: &str, running: bool) -> Member {
+            let mut m = running_member(name, 100);
+            m.api_url = format!("http://{name}:8008");
+            if !running {
+                m.state = MemberState::Stopped;
+            }
+            m
+        }
+
+        fn sync_of(voters: &str, q: u32, kind: SyncKind) -> SyncState {
+            SyncState {
+                leader: "node1".into(),
+                sync_standby: Some(voters.into()),
+                quorum: q,
+                kind,
+            }
+        }
+
+        /// node1 leads; `others` are the other members.
+        fn leader_ha(
+            label: &str,
+            mode: SynchronousMode,
+            others: Vec<Member>,
+            sync: Option<SyncState>,
+        ) -> (Ha, PathBuf, CommandSender, Arc<MockDcs>) {
+            let (mut ha, dir, tx, dcs) = switchover_test_ha(label, "old");
+            ha.dynamic_config_state.apply_new_config(GlobalConfig {
+                synchronous_mode: Some(mode),
+                ..Default::default()
+            });
+            let mut members = vec![qmember("node1", true)];
+            members.extend(others);
+            ha.cluster.members = members;
+            ha.cluster.sync_state = sync;
+            dcs.mirror_cluster(&ha.cluster);
+            (ha, dir, tx, dcs)
+        }
+
+        fn three(running: [bool; 2]) -> Vec<Member> {
+            vec![qmember("node2", running[0]), qmember("node3", running[1])]
+        }
+
+        /// The leader kept the lock, did not demote, and wrote no `/failover`.
+        fn assert_not_demoted(ha: &Ha, dir: &PathBuf, dcs: &MockDcs) {
+            assert!(dcs.last_failover_value.lock().unwrap().is_none());
+            assert_eq!(lock_held_by(dcs).as_deref(), Some("node1"));
+            assert!(ha.is_leader());
+            assert!(!dir.join("standby.signal").exists(), "not demoted");
+        }
+
+        #[tokio::test]
+        async fn switchover_is_refused_when_q_is_not_below_the_voter_count() {
+            for candidate in [Some("node2"), None] {
+                let sync = sync_of("node2,node3", 2, SyncKind::Quorum);
+                let (mut ha, dir, tx, dcs) = leader_ha(
+                    "win-so-q-eq-v",
+                    SynchronousMode::Quorum,
+                    three([true, true]),
+                    Some(sync),
+                );
+                ha.quorum_exec.set_observed_n_for_test(Some(1));
+                let resp = send_cmd(&mut ha, &tx, switchover_to(candidate)).await;
+                assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+                assert_eq!(
+                    resp.message,
+                    "quorum not settled: failover is impossible until q is relaxed (q=2, voters=2, n=1)",
+                    "{candidate:?}"
+                );
+                assert_not_demoted(&ha, &dir, &dcs);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        #[tokio::test]
+        async fn switchover_is_refused_when_too_few_other_voters_are_running() {
+            for candidate in [Some("node2"), None] {
+                // q = 2 of 3 voters, node3 stopped: node2 sees only node4.
+                let sync = sync_of("node2,node3,node4", 2, SyncKind::Quorum);
+                let others = vec![
+                    qmember("node2", true),
+                    qmember("node3", false),
+                    qmember("node4", true),
+                ];
+                let (mut ha, dir, tx, dcs) = leader_ha(
+                    "win-so-offline",
+                    SynchronousMode::Quorum,
+                    others,
+                    Some(sync),
+                );
+                let resp = send_cmd(&mut ha, &tx, switchover_to(candidate)).await;
+                assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+                assert_eq!(
+                    resp.message,
+                    "not enough voters online for the candidate to win the vote (need q=2, online=1)",
+                    "{candidate:?}"
+                );
+                assert_not_demoted(&ha, &dir, &dcs);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_voter_without_an_api_url_is_not_counted_online() {
+            let sync = sync_of("node2,node3", 1, SyncKind::Quorum);
+            let mut others = three([true, true]);
+            others[1].api_url = String::new();
+            let (mut ha, dir, tx, dcs) =
+                leader_ha("win-so-no-url", SynchronousMode::Quorum, others, Some(sync));
+            let resp = send_cmd(&mut ha, &tx, switchover_to(Some("node2"))).await;
+            assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+            assert!(resp.message.contains("online=0"), "{}", resp.message);
+            assert_not_demoted(&ha, &dir, &dcs);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn switchover_is_accepted_when_the_vote_can_be_won() {
+            for candidate in [Some("node2"), None] {
+                let sync = sync_of("node2,node3", 1, SyncKind::Quorum);
+                let (mut ha, dir, tx, dcs) = leader_ha(
+                    "win-so-ok",
+                    SynchronousMode::Quorum,
+                    three([true, true]),
+                    Some(sync),
+                );
+                let resp = send_cmd(&mut ha, &tx, switchover_to(candidate)).await;
+                // No pg_ctl here: the demote path runs and its stop fails.
+                assert!(
+                    resp.message
+                        .starts_with("Switchover initiated, but stopping PostgreSQL failed"),
+                    "{candidate:?}: {}",
+                    resp.message
+                );
+                assert!(dcs.last_failover_value.lock().unwrap().is_some());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        #[tokio::test]
+        async fn no_candidate_switchover_is_refused_when_no_member_can_win() {
+            // q = 2 of 3 voters with node4 down: node2 and node3 each see one.
+            let sync = sync_of("node2,node3,node4", 2, SyncKind::Quorum);
+            let others = vec![
+                qmember("node2", true),
+                qmember("node3", true),
+                qmember("node4", false),
+            ];
+            let (mut ha, dir, tx, dcs) = leader_ha(
+                "win-so-one-wins",
+                SynchronousMode::Quorum,
+                others,
+                Some(sync),
+            );
+            // node2: others node3 (up), node4 (down) -> 1 < 2: refused.
+            assert!(ha.quorum_win_refusal("node2").is_some());
+            assert!(!ha.has_switchover_successor());
+            let resp = send_cmd(&mut ha, &tx, switchover_to(None)).await;
+            assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+            assert_not_demoted(&ha, &dir, &dcs);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn failover_with_a_candidate_follows_the_same_rule() {
+            let sync = sync_of("node2,node3", 2, SyncKind::Quorum);
+            let (mut ha, dir, tx, dcs) = leader_ha(
+                "win-fo-refused",
+                SynchronousMode::Quorum,
+                three([true, true]),
+                Some(sync),
+            );
+            let resp = send_cmd(&mut ha, &tx, failover_to("node2")).await;
+            assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+            assert!(
+                resp.message.starts_with("quorum not settled"),
+                "{}",
+                resp.message
+            );
+            assert!(dcs.last_failover_value.lock().unwrap().is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let sync = sync_of("node2,node3,node4", 2, SyncKind::Quorum);
+            let others = vec![
+                qmember("node2", true),
+                qmember("node3", false),
+                qmember("node4", true),
+            ];
+            let (mut ha, dir, tx, dcs) = leader_ha(
+                "win-fo-offline",
+                SynchronousMode::Quorum,
+                others,
+                Some(sync),
+            );
+            let resp = send_cmd(&mut ha, &tx, failover_to("node2")).await;
+            assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+            assert!(
+                resp.message.starts_with("not enough voters online"),
+                "{}",
+                resp.message
+            );
+            assert!(dcs.last_failover_value.lock().unwrap().is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let sync = sync_of("node2,node3", 1, SyncKind::Quorum);
+            let (mut ha, dir, tx, dcs) = leader_ha(
+                "win-fo-ok",
+                SynchronousMode::Quorum,
+                three([true, true]),
+                Some(sync),
+            );
+            let resp = send_cmd(&mut ha, &tx, failover_to("node2")).await;
+            assert_eq!(resp.status, CommandStatus::Accepted, "{}", resp.message);
+            assert!(dcs.last_failover_value.lock().unwrap().is_some());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The window after `quorum -> async` (T7): `/sync` is still a quorum
+        /// one with voters, so the vote still applies and so does the precheck.
+        #[tokio::test]
+        async fn the_precheck_applies_while_a_quorum_sync_is_in_force_in_async_mode() {
+            let sync = sync_of("node2,node3", 2, SyncKind::Quorum);
+            let (mut ha, dir, tx, dcs) = leader_ha(
+                "win-async-t7",
+                SynchronousMode::Async,
+                three([true, true]),
+                Some(sync),
+            );
+            let resp = send_cmd(&mut ha, &tx, switchover_to(Some("node2"))).await;
+            assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+            assert!(
+                resp.message.starts_with("quorum not settled"),
+                "{}",
+                resp.message
+            );
+            assert_not_demoted(&ha, &dir, &dcs);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Priority (`sync`) and `async` never see the precheck, whatever the
+        /// legacy `quorum` field says.
+        #[tokio::test]
+        async fn sync_and_async_behave_as_before() {
+            let cases: [(&str, SynchronousMode, Option<SyncState>); 5] = [
+                (
+                    "sync-priority-big-q",
+                    SynchronousMode::Sync,
+                    Some(sync_of("node2", 9, SyncKind::Priority)),
+                ),
+                (
+                    "sync-priority-q0",
+                    SynchronousMode::Sync,
+                    Some(sync_of("node2", 0, SyncKind::Priority)),
+                ),
+                ("async-none", SynchronousMode::Async, None),
+                (
+                    "async-priority",
+                    SynchronousMode::Async,
+                    Some(sync_of("node2", 9, SyncKind::Priority)),
+                ),
+                (
+                    "async-quorum-no-voters",
+                    SynchronousMode::Async,
+                    Some(SyncState {
+                        sync_standby: None,
+                        ..sync_of("", 3, SyncKind::Quorum)
+                    }),
+                ),
+            ];
+            for (label, mode, sync) in cases {
+                for candidate in [Some("node2"), None] {
+                    let (mut ha, dir, tx, _dcs) = leader_ha(
+                        &format!("win-{label}"),
+                        mode,
+                        three([true, false]),
+                        sync.clone(),
+                    );
+                    assert_eq!(ha.quorum_win_refusal("node2"), None, "{label}");
+                    let resp = send_cmd(&mut ha, &tx, switchover_to(candidate)).await;
+                    assert!(
+                        resp.message
+                            .starts_with("Switchover initiated, but stopping PostgreSQL failed"),
+                        "{label} {candidate:?}: {}",
+                        resp.message
+                    );
+                    let resp = send_cmd(&mut ha, &tx, failover_to("node2")).await;
+                    assert_eq!(
+                        resp.status,
+                        CommandStatus::Accepted,
+                        "{label}: {}",
+                        resp.message
+                    );
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+        }
+
+        /// The precheck says "can win" exactly when the real vote would grant
+        /// it in the best case: every Running voter answers, in recovery, on
+        /// the same timeline and at the same LSN. Never stricter, never laxer.
+        #[test]
+        fn the_precheck_matches_the_best_case_of_quorum_vote_decision() {
+            let (mut ha, dir, _tx, _dcs) =
+                leader_ha("win-consistency", SynchronousMode::Quorum, Vec::new(), None);
+            // This node (node1) is only the HA engine; the leader is another
+            // node, so no voter is excluded as the demoting leader.
+            ha.is_leader = false;
+            for v in 1..=5usize {
+                for q in 0..=6usize {
+                    for online_others in 0..v {
+                        let names: Vec<String> = (0..v).map(|i| format!("v{i}")).collect();
+                        // v0 is the candidate; `online_others` of the rest run.
+                        ha.cluster.members = names
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| qmember(n, i == 0 || i <= online_others))
+                            .collect();
+                        ha.cluster.leader = None;
+                        ha.cluster.sync_state =
+                            Some(sync_of(&names.join(","), q as u32, SyncKind::Quorum));
+                        let voters: Names = names.iter().cloned().collect();
+                        let me = WalPosition {
+                            name: "v0".into(),
+                            in_recovery: true,
+                            timeline: 1,
+                            lsn: 100,
+                        };
+                        let answers: Vec<WalPosition> = (1..=online_others)
+                            .map(|i| WalPosition {
+                                name: format!("v{i}"),
+                                ..me.clone()
+                            })
+                            .collect();
+                        let grants = matches!(
+                            quorum_vote_decision(&me, &voters, q, &answers),
+                            VoteDecision::Granted { .. }
+                        );
+                        assert_eq!(
+                            ha.quorum_win_refusal("v0").is_none(),
+                            grants,
+                            "v={v} q={q} online_others={online_others}"
+                        );
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn the_message_names_n_only_while_this_node_leads() {
+            let (mut ha, dir, _tx, _dcs) = leader_ha(
+                "win-n",
+                SynchronousMode::Quorum,
+                three([true, true]),
+                Some(sync_of("node2,node3", 2, SyncKind::Quorum)),
+            );
+            ha.quorum_exec.set_observed_n_for_test(Some(1));
+            assert!(ha.quorum_win_refusal("node2").unwrap().ends_with("n=1)"));
+            assert_eq!(ha.api_snapshot().quorum_n, Some(1));
+            ha.is_leader = false;
+            assert!(
+                ha.quorum_win_refusal("node2")
+                    .unwrap()
+                    .ends_with("voters=2)")
+            );
+            assert_eq!(ha.api_snapshot().quorum_n, None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn the_log_is_due_once_per_interval() {
+            let now = std::time::Instant::now();
+            let interval = std::time::Duration::from_secs(60);
+            assert!(vote::log_due(None, now, interval));
+            assert!(!vote::log_due(Some(now), now, interval));
+            let later = now + std::time::Duration::from_secs(59);
+            assert!(!vote::log_due(Some(now), later, interval));
+            let later = now + interval;
+            assert!(vote::log_due(Some(now), later, interval));
+        }
+
+        #[tokio::test]
+        async fn the_stall_error_is_logged_once_per_interval_and_only_for_q_at_least_v() {
+            let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _guard = tracing::subscriber::set_default(ErrorCounter(errors.clone()));
+            let count = || errors.load(std::sync::atomic::Ordering::SeqCst);
+            let refusal = "quorum vote refused: InsufficientVotes { got: 1, need: 2 }";
+            let (mut ha, dir, _tx, _dcs) = leader_ha(
+                "win-stall-log",
+                SynchronousMode::Quorum,
+                three([true, true]),
+                Some(sync_of("node2,node3", 2, SyncKind::Quorum)),
+            );
+            assert!(ha.note_unelectable_quorum(refusal));
+            assert!(!ha.note_unelectable_quorum(refusal), "rate limited");
+            assert_eq!(count(), 1);
+            // Another refusal reason: no stall message, and the limiter resets.
+            assert!(!ha.note_unelectable_quorum("quorum vote refused: BehindPeer"));
+            assert!(ha.note_unelectable_quorum(refusal));
+            assert_eq!(count(), 2);
+            // After the interval it is logged again.
+            ha.quorum_stall_logged_at = std::time::Instant::now()
+                .checked_sub(QUORUM_STALL_LOG_INTERVAL + std::time::Duration::from_secs(1));
+            assert!(ha.note_unelectable_quorum(refusal));
+            assert_eq!(count(), 3);
+            // q < |V|: an ordinary refusal, no ERROR.
+            ha.cluster.sync_state = Some(sync_of("node2,node3", 1, SyncKind::Quorum));
+            assert!(!ha.note_unelectable_quorum(refusal));
+            assert_eq!(count(), 3);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     mod quorum_vote_tests {
         use super::*;
         use crate::cluster::SyncKind;
@@ -10702,6 +11133,45 @@ mod tests {
             match result {
                 CycleResult::Follower(m) if m.starts_with("quorum vote refused") => m,
                 other => panic!("expected a quorum vote refusal, got: {other}"),
+            }
+        }
+
+        /// A leaderless candidate refused with q >= |V| logs the stall ERROR
+        /// from the election path, once per interval; q < |V| logs none.
+        #[tokio::test]
+        async fn a_refused_candidate_with_q_at_least_v_logs_the_stall_error_once() {
+            let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _guard = tracing::subscriber::set_default(ErrorCounter(errors.clone()));
+            let count = || errors.load(std::sync::atomic::Ordering::SeqCst);
+            for (q, voters, expected) in [
+                (2u32, "test_node,node2", 1),
+                (1, "test_node,node2,node3", 0),
+            ] {
+                let before = count();
+                let dcs = Arc::new(MockDcs::new());
+                let setup = Setup {
+                    voters: if q == 2 { "test_node,node2" } else { voters },
+                    quorum: q,
+                    ..Setup::quorum()
+                };
+                let (mut ha, dir) = build(
+                    &format!("vote-stall-{q}"),
+                    setup,
+                    &dcs,
+                    local(Some(1), 100),
+                    // q = 2: the one other voter answers, 1 < 2. q = 1: no answer.
+                    Some(Arc::new(if q == 2 {
+                        FakePeers::new().ok("node2", 1, 50)
+                    } else {
+                        FakePeers::new()
+                    })),
+                );
+                for _ in 0..2 {
+                    let result = ha.process_unhealthy_cluster().await;
+                    assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+                }
+                assert_eq!(count() - before, expected, "q={q}");
+                let _ = std::fs::remove_dir_all(&dir);
             }
         }
 

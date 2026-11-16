@@ -486,12 +486,17 @@ struct ConfigDcs {
     history: std::sync::Mutex<Vec<pg_ha_core::history::HistoryEntry>>,
     /// Number of `set_config_value` calls.
     writes: std::sync::atomic::AtomicUsize,
+    /// The `/sync` value `get_cluster` reports.
+    sync: std::sync::Mutex<Option<pg_ha_core::cluster::SyncState>>,
 }
 
 #[async_trait::async_trait]
 impl pg_ha_core::dcs::DcsAdapter for ConfigDcs {
     async fn get_cluster(&self) -> pg_ha_core::Result<pg_ha_core::cluster::Cluster> {
-        Ok(Default::default())
+        Ok(pg_ha_core::cluster::Cluster {
+            sync_state: self.sync.lock().unwrap().clone(),
+            ..Default::default()
+        })
     }
     async fn attempt_to_acquire_leader(&self) -> pg_ha_core::Result<bool> {
         Ok(false)
@@ -556,6 +561,7 @@ fn config_state(stored: &str) -> (AppState, std::sync::Arc<ConfigDcs>) {
         config: std::sync::Mutex::new(Some(stored.to_string())),
         history: std::sync::Mutex::new(Vec::new()),
         writes: std::sync::atomic::AtomicUsize::new(0),
+        sync: std::sync::Mutex::new(None),
     });
     let state = AppState::with_dcs(
         "node1".into(),
@@ -998,4 +1004,121 @@ async fn test_default_own_tags_keep_replica_200_and_report_defaults() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["tags"]["nofailover"], false);
     assert_eq!(json["tags"]["noloadbalance"], false);
+}
+
+// ─── GET /cluster: the `sync` object (SB-13) ───
+
+fn sync_value(
+    voters: Option<&str>,
+    quorum: u32,
+    kind: pg_ha_core::cluster::SyncKind,
+) -> pg_ha_core::cluster::SyncState {
+    pg_ha_core::cluster::SyncState {
+        leader: "node1".into(),
+        sync_standby: voters.map(Into::into),
+        quorum,
+        kind,
+    }
+}
+
+async fn cluster_sync(
+    sync: Option<pg_ha_core::cluster::SyncState>,
+    quorum_n: Option<usize>,
+) -> serde_json::Value {
+    let (state, dcs) = config_state("{}");
+    *dcs.sync.lock().unwrap() = sync;
+    state.update(|s| s.quorum_n = quorum_n).await;
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/cluster")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["scope"], "test-cluster");
+    json
+}
+
+#[tokio::test]
+async fn cluster_sync_is_null_without_a_sync_state() {
+    let json = cluster_sync(None, None).await;
+    assert!(json.as_object().unwrap().contains_key("sync"));
+    assert!(json["sync"].is_null());
+}
+
+#[tokio::test]
+async fn cluster_sync_reports_an_unrelaxed_quorum_window() {
+    use pg_ha_core::cluster::SyncKind;
+    let json = cluster_sync(
+        Some(sync_value(Some("node2,node3"), 2, SyncKind::Quorum)),
+        Some(1),
+    )
+    .await;
+    assert_eq!(
+        json["sync"],
+        serde_json::json!({
+            "kind": "quorum",
+            "voters": ["node2", "node3"],
+            "quorum": 2,
+            "n": 1,
+            "settled": false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn cluster_sync_reports_a_settled_quorum() {
+    use pg_ha_core::cluster::SyncKind;
+    let json = cluster_sync(
+        Some(sync_value(Some("node2,node3"), 1, SyncKind::Quorum)),
+        Some(1),
+    )
+    .await;
+    assert_eq!(json["sync"]["quorum"], 1);
+    assert_eq!(json["sync"]["settled"], true);
+}
+
+#[tokio::test]
+async fn cluster_sync_has_null_n_and_settled_when_this_node_does_not_know_n() {
+    use pg_ha_core::cluster::SyncKind;
+    // A replica, or a leader before its first read: kind, voters and q only.
+    let json = cluster_sync(
+        Some(sync_value(Some("node2,node3"), 2, SyncKind::Quorum)),
+        None,
+    )
+    .await;
+    assert_eq!(json["sync"]["kind"], "quorum");
+    assert_eq!(
+        json["sync"]["voters"],
+        serde_json::json!(["node2", "node3"])
+    );
+    assert_eq!(json["sync"]["quorum"], 2);
+    assert!(json["sync"]["n"].is_null());
+    assert!(json["sync"]["settled"].is_null());
+}
+
+#[tokio::test]
+async fn cluster_sync_for_priority_hides_the_legacy_quorum_field() {
+    use pg_ha_core::cluster::SyncKind;
+    // Even with an `n` left over from a quorum period: not a quorum `/sync`.
+    let json = cluster_sync(
+        Some(sync_value(Some("node2"), 1, SyncKind::Priority)),
+        Some(1),
+    )
+    .await;
+    assert_eq!(
+        json["sync"],
+        serde_json::json!({
+            "kind": "priority",
+            "voters": ["node2"],
+            "quorum": null,
+            "n": null,
+            "settled": null,
+        })
+    );
 }

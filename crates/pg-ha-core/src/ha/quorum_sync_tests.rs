@@ -1526,3 +1526,38 @@ fn warnings_do_not_change_what_a_cycle_does() {
     };
     assert_eq!(run(true), run(false));
 }
+// ───────────────────────── q-not-relaxed window (observability) ─────────────────────────
+#[test]
+fn the_executor_records_n_from_show_each_cycle() {
+    let two = "ANY 1 (\"n1\",\"n2\")";
+    let inp = input(
+        Q,
+        1,
+        &["n1", "n2"],
+        Some(sync("n0", "n1,n2", 2, SyncKind::Quorum)),
+    );
+    let mut exec = ready_with_mark(two, 500);
+    assert_eq!(exec.observed_n(), None);
+    let mut io = FakeIo::new(two, &[("n1", 1000), ("n2", 1000)]);
+    cycle(&mut exec, &mut io, &inp);
+    assert_eq!(exec.observed_n(), Some(1));
+    // An empty list is asynchronous: n = 0.
+    let mut exec = ready();
+    let mut io = FakeIo::new("", &[("n1", 1000), ("n2", 1000)]);
+    cycle(&mut exec, &mut io, &inp);
+    assert_eq!(exec.observed_n(), Some(0));
+}
+#[test]
+fn the_window_warning_fires_on_open_and_every_30th_cycle_and_resets_on_close() {
+    let mut exec = QuorumExec::default();
+    assert!(!exec.note_window(false));
+    assert!(exec.note_window(true), "first cycle of the window");
+    for _ in 1..29 {
+        assert!(!exec.note_window(true));
+    }
+    assert!(exec.note_window(true), "30th cycle");
+    assert!(!exec.note_window(true));
+    // Closed: silent, and the next window warns at once again.
+    assert!(!exec.note_window(false));
+    assert!(exec.note_window(true));
+}

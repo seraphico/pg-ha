@@ -257,6 +257,7 @@ impl Ha {
         // runs before the lease anchor is read, so a slow vote never shortens
         // the lease. Priority clusters get `NotApplicable` without any I/O.
         if should_attempt && let VoteGate::Refuse(why) = self.quorum_vote().await {
+            self.note_unelectable_quorum(&why);
             self.is_leader = false;
             return CycleResult::Follower(why);
         }
@@ -355,13 +356,35 @@ impl Ha {
     /// other than this node who is allowed to campaign? Checked before
     /// demotion: the stepped-down leader is excluded, so "no" means the
     /// cluster would be left with no one who may take the lock.
+    ///
+    /// SB-13: under a quorum `/sync` the successor must also be able to win
+    /// the vote (`quorum_win_refusal`), or the demotion would strand the cluster.
     pub(super) fn has_switchover_successor(&self) -> bool {
-        if self.sync_config_unresolved() {
-            return false;
+        self.switchover_successors()
+            .any(|member| self.quorum_win_refusal(&member.name).is_none())
+    }
+
+    /// Why a no-candidate switchover has no successor, when members would
+    /// qualify but none can win the quorum vote. `None` otherwise.
+    pub(super) fn switchover_quorum_refusal(&self) -> Option<String> {
+        let mut first = None;
+        for member in self.switchover_successors() {
+            match self.quorum_win_refusal(&member.name) {
+                None => return None,
+                refusal => first = first.or(refusal),
+            }
         }
+        first
+    }
+
+    /// Members that may campaign after a no-candidate switchover, ignoring the
+    /// quorum vote.
+    fn switchover_successors(&self) -> impl Iterator<Item = &crate::cluster::Member> {
+        let unresolved = self.sync_config_unresolved();
         let sync_mode = self.dynamic_config_state.last_config.sync_mode();
-        self.cluster.members.iter().any(|member| {
-            member.name != self.config.name
+        self.cluster.members.iter().filter(move |member| {
+            !unresolved
+                && member.name != self.config.name
                 && !member.is_nofailover()
                 && member.failover_priority() != 0
                 && member.state == crate::cluster::MemberState::Running

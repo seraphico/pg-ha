@@ -9,7 +9,7 @@
 //! Timing: the candidate's own live WAL read (`LIVE_WAL_READ_TIMEOUT`) and the
 //! peer round (`VOTE_ROUND_TIMEOUT`) run concurrently, so the whole vote takes
 //! at most `max(LIVE_WAL_READ_TIMEOUT, VOTE_ROUND_TIMEOUT)` (3 s), not their sum.
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::Ha;
 use super::lag;
@@ -19,6 +19,15 @@ use crate::quorum::round::{
     PEER_REQUEST_TIMEOUT, PeerTarget, VOTE_ROUND_TIMEOUT, collect_wal_positions,
 };
 use crate::quorum::{Names, VoteDecision, WalPosition, quorum_vote_decision};
+
+/// Is a rate-limited log line due? `last` is when it was last logged.
+pub(super) fn log_due(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= interval)
+}
 
 /// Outcome of the vote step.
 #[derive(Debug, PartialEq, Eq)]
@@ -145,6 +154,114 @@ impl Ha {
                 }
             }
         }
+    }
+
+    /// `n` the executor last read from SHOW; only while this node leads and the
+    /// executor applies (else it is stale or not ours).
+    pub(super) fn quorum_observed_n(&self) -> Option<usize> {
+        if self.is_leader && self.quorum_executor_applies() {
+            self.quorum_exec.observed_n()
+        } else {
+            None
+        }
+    }
+
+    /// Can `candidate` possibly win the quorum vote? `Some(reason)` when it
+    /// cannot, so a switchover or failover is refused BEFORE the lock is given
+    /// up (a refused vote after that leaves the cluster without a primary).
+    ///
+    /// Same inputs as [`Ha::quorum_vote`]: it applies when `/sync` is a quorum
+    /// one with voters (`quorum_sync_in_force`), and the vote counts only the
+    /// OTHER voters that answered. A voter can answer only if it is a Running
+    /// member with an API URL (the vote's own targets), so the best case is
+    /// that count. The candidate wins at best when `online >= q`; `q >= |V|`
+    /// is the case `online <= |V| - 1 < q`, named separately because it is the
+    /// "not relaxed yet" window. The leader (it stops, or is dead) is not
+    /// counted. Nothing about LSNs or timelines is judged here: a candidate
+    /// that passes can still lose the vote, which is the vote's call.
+    pub(super) fn quorum_win_refusal(&self, candidate: &str) -> Option<String> {
+        let state = self
+            .cluster
+            .sync_state
+            .as_ref()
+            .filter(|s| super::election::quorum_sync_in_force(Some(s)))?;
+        let voters: Names = state
+            .sync_standby_names()
+            .into_iter()
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let me = candidate.to_ascii_lowercase();
+        if !voters.contains(&me) {
+            // Not a voter: the sync-eligibility check owns that refusal.
+            return None;
+        }
+        let q = state.quorum as usize;
+        let v = voters.len();
+        if q >= v {
+            let n = self
+                .quorum_observed_n()
+                .map(|n| format!(", n={n}"))
+                .unwrap_or_default();
+            return Some(format!(
+                "quorum not settled: failover is impossible until q is relaxed (q={q}, voters={v}{n})"
+            ));
+        }
+        let leader = self
+            .cluster
+            .leader
+            .as_ref()
+            .map(|l| l.name.to_ascii_lowercase());
+        let own = self.config.name.to_ascii_lowercase();
+        let online = voters
+            .iter()
+            .filter(|name| **name != me)
+            .filter(|name| leader.as_deref() != Some(name.as_str()))
+            .filter(|name| !(self.is_leader && **name == own))
+            .filter(|name| {
+                self.cluster
+                    .get_member(name)
+                    .is_some_and(|m| m.state == MemberState::Running && !m.api_url.is_empty())
+            })
+            .count();
+        if online < q {
+            return Some(format!(
+                "not enough voters online for the candidate to win the vote (need q={q}, online={online})"
+            ));
+        }
+        None
+    }
+
+    /// Log (rate limited) that a candidate was refused because `q >= |V|`:
+    /// nobody can win, and without a leader nothing relaxes `q`. True when the
+    /// line was logged. `refusal` is the text of the refused vote.
+    pub(super) fn note_unelectable_quorum(&mut self, refusal: &str) -> bool {
+        let stalled = refusal.contains("InsufficientVotes")
+            && self.cluster.sync_state.as_ref().is_some_and(|s| {
+                super::election::quorum_sync_in_force(Some(s))
+                    && s.quorum as usize >= s.voter_count()
+            });
+        if !stalled {
+            self.quorum_stall_logged_at = None;
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if !log_due(
+            self.quorum_stall_logged_at,
+            now,
+            super::QUORUM_STALL_LOG_INTERVAL,
+        ) {
+            return false;
+        }
+        self.quorum_stall_logged_at = Some(now);
+        let (q, v) = self
+            .cluster
+            .sync_state
+            .as_ref()
+            .map_or((0, 0), |s| (s.quorum, s.voter_count()));
+        error!(
+            "The cluster cannot elect a primary: /sync has q={q} with {v} voters (q >= |V|), so no candidate can collect enough votes, and nothing relaxes q while there is no leader. It stays without a primary until /sync is relaxed (tracked as SB-36)"
+        );
+        true
     }
 
     /// Test seam: replace this node's own live WAL reader.
