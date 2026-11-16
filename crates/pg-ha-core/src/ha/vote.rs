@@ -1,8 +1,9 @@
 //! SB-13: the live quorum vote a candidate must win before it asks for the
 //! leader lock.
 //!
-//! It only applies when `/sync` says `kind == Quorum` (and `synchronous_mode`
-//! is on). Otherwise [`Ha::quorum_vote`] returns `NotApplicable` before doing
+//! It applies when `/sync` says `kind == Quorum` and either `synchronous_mode`
+//! is on or `/sync` still names voters (the window after `quorum -> async`,
+//! before the executor has taken `/sync` back). Otherwise [`Ha::quorum_vote`] returns `NotApplicable` before doing
 //! any I/O, so the Priority election is unchanged.
 //!
 //! Timing: the candidate's own live WAL read (`LIVE_WAL_READ_TIMEOUT`) and the
@@ -38,12 +39,10 @@ impl Ha {
     /// never a cycle error.
     pub(super) async fn quorum_vote(&self) -> VoteGate {
         let sync_on = self.dynamic_config_state.last_config.sync_mode();
-        let Some(state) = self
-            .cluster
-            .sync_state
-            .as_ref()
-            .filter(|s| sync_on.is_synchronous() && s.kind == SyncKind::Quorum)
-        else {
+        let Some(state) = self.cluster.sync_state.as_ref().filter(|s| {
+            s.kind == SyncKind::Quorum
+                && (sync_on.is_synchronous() || super::election::quorum_sync_in_force(Some(s)))
+        }) else {
             return VoteGate::NotApplicable;
         };
 

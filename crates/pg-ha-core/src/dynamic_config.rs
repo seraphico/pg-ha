@@ -275,6 +275,9 @@ pub struct DynamicConfigState {
 
     /// The stored `/config` that failed to parse, if it is still invalid.
     pub invalid: Option<InvalidConfig>,
+    /// The last read of `/config` failed (a DCS error, not a parse error) and
+    /// no valid configuration is known. Holds when it was last logged.
+    read_error: Option<Instant>,
 }
 
 /// A stored `/config` that could not be parsed, and when it was last logged.
@@ -296,7 +299,25 @@ impl DynamicConfigState {
             pending_restart_params: HashMap::new(),
             has_baseline: false,
             invalid: None,
+            read_error: None,
         }
+    }
+    /// Record that reading `/config` failed. Returns true when the caller
+    /// should log it now (the first time and every `CONFIG_ERROR_LOG_INTERVAL`)
+    /// and only when there is no baseline: with a baseline `last_config` stays
+    /// in force and nothing becomes unresolved, so this returns false and the
+    /// caller keeps its per-cycle warning.
+    pub fn note_read_error(&mut self, now: Instant) -> bool {
+        if self.has_baseline {
+            return false;
+        }
+        let log_now = self
+            .read_error
+            .is_none_or(|t| now.duration_since(t) >= CONFIG_ERROR_LOG_INTERVAL);
+        if log_now {
+            self.read_error = Some(now);
+        }
+        log_now
     }
 
     /// Record that the stored `/config` (`raw`) does not parse. Returns true
@@ -304,6 +325,8 @@ impl DynamicConfigState {
     /// changed, and every `CONFIG_ERROR_LOG_INTERVAL`. `last_config` is not
     /// touched, so the last valid configuration stays in force.
     pub fn note_invalid(&mut self, raw: &str, reason: String, now: Instant) -> bool {
+        // The read itself worked.
+        self.read_error = None;
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         raw.hash(&mut h);
@@ -331,12 +354,14 @@ impl DynamicConfigState {
     pub fn note_absent(&mut self) {
         self.has_baseline = true;
         self.invalid = None;
+        self.read_error = None;
     }
 
-    /// True when the stored `/config` is invalid and no valid one was ever
-    /// applied: nothing says whether synchronous replication is wanted.
+    /// True when the stored `/config` is invalid or could not be read and no
+    /// valid one was ever applied: nothing says whether synchronous
+    /// replication is wanted. The defaults in `last_config` must not be used.
     pub fn sync_config_unresolved(&self) -> bool {
-        !self.has_baseline && self.invalid.is_some()
+        !self.has_baseline && (self.invalid.is_some() || self.read_error.is_some())
     }
 
     /// Process a new config from DCS. Returns the detected changes.
@@ -345,6 +370,7 @@ impl DynamicConfigState {
         if self.invalid.take().is_some() {
             info!("stored /config is valid again; applying it");
         }
+        self.read_error = None;
         self.has_baseline = true;
         let changes = detect_changes(&self.last_config, &new_config);
 
@@ -970,5 +996,45 @@ mod tests {
         assert!(!st.sync_config_unresolved());
         st.note_absent();
         assert!(st.invalid.is_none() && st.has_baseline);
+    }
+
+    #[test]
+    fn read_error_without_baseline_is_unresolved_and_rate_limited() {
+        let t0 = Instant::now();
+        let mut st = DynamicConfigState::new();
+        assert!(!st.sync_config_unresolved(), "nothing read yet");
+        assert!(st.note_read_error(t0), "first failure logs");
+        assert!(st.sync_config_unresolved());
+        assert!(!st.note_read_error(t0 + Duration::from_secs(30)));
+        assert!(!st.note_read_error(t0 + Duration::from_secs(59)));
+        assert!(st.note_read_error(t0 + CONFIG_ERROR_LOG_INTERVAL));
+        assert!(!st.note_read_error(t0 + CONFIG_ERROR_LOG_INTERVAL + Duration::from_secs(1)));
+        // A successful read clears it, whatever it says.
+        st.note_absent();
+        assert!(!st.sync_config_unresolved());
+        let mut st = DynamicConfigState::new();
+        st.note_read_error(t0);
+        st.apply_new_config(GlobalConfig::default());
+        assert!(!st.sync_config_unresolved());
+        let mut st = DynamicConfigState::new();
+        st.note_read_error(t0);
+        st.note_invalid("{}", "bad".into(), t0);
+        assert!(
+            st.sync_config_unresolved(),
+            "invalid document: still unresolved"
+        );
+    }
+
+    #[test]
+    fn read_error_with_baseline_changes_nothing() {
+        let mut st = DynamicConfigState::new();
+        st.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(SynchronousMode::Quorum),
+            ..Default::default()
+        });
+        assert!(!st.note_read_error(Instant::now()));
+        assert!(!st.sync_config_unresolved());
+        assert!(st.has_baseline);
+        assert_eq!(st.last_config.sync_mode(), SynchronousMode::Quorum);
     }
 }

@@ -3,7 +3,7 @@
 
 use tracing::{error, info, warn};
 
-use crate::cluster::SyncState;
+use crate::cluster::{SyncKind, SyncState};
 use crate::synchronous_mode::SynchronousMode;
 
 use super::helpers::OwnEligibility;
@@ -13,16 +13,26 @@ use super::vote::VoteGate;
 use super::{CycleResult, Ha};
 use crate::timeline_files::ACCEPT_TIMELINE_LOSS_FILE;
 
+/// Does `/sync` say that acknowledged commits live only on a voter quorum
+/// (`kind: quorum` with at least one voter)? Keyed on the stored state, not on
+/// the configured mode: after `quorum -> async` (T7) `/sync` keeps the voters
+/// until the executor has taken it back, and a leader lost in that window left
+/// commits acknowledged under `ANY n` on some voters only.
+pub(crate) fn quorum_sync_in_force(sync_state: Option<&SyncState>) -> bool {
+    sync_state.is_some_and(|s| s.kind == SyncKind::Quorum && !s.sync_standby_names().is_empty())
+}
+
 /// Whether `name` may acquire the leader lock under current sync settings.
 ///
-/// When sync mode is `async`, always true. Otherwise only names listed in
-/// `/sync.sync_standby` are allowed; missing/empty/`*` means nobody.
+/// When sync mode is `async` and `/sync` is not a quorum one with voters,
+/// always true. Otherwise only names listed in `/sync.sync_standby` are
+/// allowed; missing/empty/`*` means nobody.
 pub(crate) fn sync_failover_allowed(
     name: &str,
     mode: SynchronousMode,
     sync_state: Option<&SyncState>,
 ) -> bool {
-    if !mode.is_synchronous() {
+    if !mode.is_synchronous() && !quorum_sync_in_force(sync_state) {
         return true;
     }
     let Some(state) = sync_state else {
@@ -536,6 +546,56 @@ mod sync_failover_tests {
             "node3",
             SynchronousMode::Async,
             Some(&sync("node1", Some("node2")))
+        ));
+    }
+
+    fn quorum_sync(standbys: Option<&str>) -> SyncState {
+        SyncState {
+            kind: crate::cluster::SyncKind::Quorum,
+            ..sync("old", standbys)
+        }
+    }
+
+    /// SB-13 PR4 gap 1: a `kind: quorum` `/sync` with voters restricts the
+    /// election whatever the configured mode says (quorum -> async, T7 not
+    /// done; quorum -> sync, T9 not done).
+    #[test]
+    fn quorum_sync_state_restricts_every_mode() {
+        let s = quorum_sync(Some("node2,node3"));
+        for mode in [
+            SynchronousMode::Async,
+            SynchronousMode::Sync,
+            SynchronousMode::Quorum,
+        ] {
+            assert!(sync_failover_allowed("node2", mode, Some(&s)), "{mode}");
+            assert!(sync_failover_allowed("NODE3", mode, Some(&s)), "{mode}");
+            assert!(!sync_failover_allowed("node4", mode, Some(&s)), "{mode}");
+        }
+    }
+
+    /// Async clusters are unaffected: no `/sync`, an empty one, or a quorum
+    /// one without voters.
+    #[test]
+    fn async_mode_ignores_a_quorum_sync_state_without_voters() {
+        let a = SynchronousMode::Async;
+        assert!(sync_failover_allowed("node4", a, None));
+        assert!(sync_failover_allowed("node4", a, Some(&quorum_sync(None))));
+        assert!(sync_failover_allowed(
+            "node4",
+            a,
+            Some(&quorum_sync(Some("")))
+        ));
+        assert!(sync_failover_allowed(
+            "node4",
+            a,
+            Some(&quorum_sync(Some(" , ")))
+        ));
+        // Pinned: a Priority `/sync` that still names a sync standby does not
+        // restrict async mode (open item, see the PR4 gap-fix commit).
+        assert!(sync_failover_allowed(
+            "node4",
+            a,
+            Some(&sync("old", Some("node2")))
         ));
     }
 
