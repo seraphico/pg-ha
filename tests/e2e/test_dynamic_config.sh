@@ -5,6 +5,7 @@
 #   - PUT /config with new parameters → all nodes see change
 #   - PATCH /config with PG restart param → pending_restart flag set
 #   - PATCH /config with null → key removed
+#   - PATCH /config with an invalid synchronous_mode (old boolean form) → 400, config unchanged
 
 set -euo pipefail
 
@@ -132,6 +133,20 @@ test_patch_null_removes_key() {
         TESTS_FAILED=$((TESTS_FAILED + 1))
         log_fail "Key not removed (value: $lag_after)"
     fi
+}
+
+# --- Test: an invalid synchronous_mode is rejected and never stored ---
+test_patch_invalid_synchronous_mode() {
+    log_info "Testing PATCH /config with synchronous_mode: true (old boolean form)..."
+    local primary_url
+    primary_url=$(get_primary)
+    local before after code
+    before=$(http_get "$primary_url/config" | jq -S -c . 2>/dev/null)
+    code=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 10 -o /dev/null -w '%{http_code}' -X PATCH \
+        -H "Content-Type: application/json" -d '{"synchronous_mode": true}' "$primary_url/config" 2>/dev/null || echo 000)
+    assert_eq "400" "$code" "PATCH /config synchronous_mode=true is rejected"
+    after=$(http_get "$primary_url/config" | jq -S -c . 2>/dev/null)
+    assert_eq "$before" "$after" "GET /config unchanged after the rejected PATCH"
 }
 
 # --- Cleanup: restore defaults ---

@@ -29,6 +29,7 @@ pub mod standby_cluster;
 pub(crate) mod standby_config;
 pub mod sync;
 pub mod sync_value;
+pub mod synchronous_mode;
 pub(crate) mod timeline_files;
 pub mod watchdog;
 
@@ -52,4 +53,5 @@ pub use live_wal::LiveWalProbe;
 pub use postgresql::{PgLiveWalProbe, PgState, Postgresql, WalStatus, parse_lsn};
 pub use slots::SlotManager;
 pub use standby_cluster::{StandbyCluster, StandbyClusterConfig};
+pub use synchronous_mode::SynchronousMode;
 pub use watchdog::Watchdog;

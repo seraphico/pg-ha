@@ -372,7 +372,7 @@ bootstrap:
     loop_wait: <u64>
     ttl: <u64>
     maximum_lag_on_failover: <u64>   # 选举拒绝落后集群最大 wal_position 超过 N 字节的候选；None/缺省=关闭
-    synchronous_mode: <bool>       # 同步复制开关 (默认: false)
+    synchronous_mode: <async|sync|quorum> # 复制模式 (默认: async)：async 异步复制 / sync 同步复制(按优先级) / quorum 法定人数同步复制；只接受这三个小写字符串，其它值（含 true/false）使启动失败；启用 quorum 要求所有节点使用相同版本的 pg-ha
     synchronous_mode_strict: <bool># 无同步备库时是否阻塞写 (默认: false)
     synchronous_node_count: <u32>  # 同步备库数量 (默认: 1)
   post_init: [<string>]            # 初始化后执行的 SQL 脚本路径

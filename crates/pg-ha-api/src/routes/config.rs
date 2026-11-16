@@ -78,6 +78,10 @@ pub(crate) async fn put_config(
         }
     };
 
+    // PUT replaces the whole document, so a stored document that does not
+    // parse is no obstacle (it is how an operator repairs one). It only
+    // serves as the "current" side of the lease timing check, where the
+    // default configuration is the right stand-in.
     let current_config: GlobalConfig = match dcs.get_config_value().await {
         Ok(Some(value)) => serde_json::from_str(&value).unwrap_or_default(),
         Ok(None) => GlobalConfig::default(),
@@ -130,9 +134,25 @@ pub(crate) async fn patch_config_endpoint(
         }
     };
 
-    // Read current config from DCS
+    // Read current config from DCS. A stored document that does not parse is
+    // NOT replaced by the defaults: patching on top of them would drop every
+    // other stored key and silently switch synchronous replication off. The
+    // operator repairs it with PUT /config.
     let current_config: GlobalConfig = match dcs.get_config_value().await {
-        Ok(Some(value)) => serde_json::from_str(&value).unwrap_or_default(),
+        Ok(Some(value)) => match serde_json::from_str(&value) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": format!(
+                            "stored /config is invalid ({e}); fix it with PUT /config"
+                        )
+                    })),
+                )
+                    .into_response();
+            }
+        },
         Ok(None) => GlobalConfig::default(),
         Err(e) => {
             return (

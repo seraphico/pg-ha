@@ -4,6 +4,7 @@
 use tracing::{error, info, warn};
 
 use crate::cluster::SyncState;
+use crate::synchronous_mode::SynchronousMode;
 
 use super::helpers::OwnEligibility;
 use super::identity::{self, ElectionStance, PgIdentity, election_stance};
@@ -14,14 +15,14 @@ use crate::timeline_files::ACCEPT_TIMELINE_LOSS_FILE;
 
 /// Whether `name` may acquire the leader lock under current sync settings.
 ///
-/// When sync mode is off, always true. When on, only names listed in
+/// When sync mode is `async`, always true. Otherwise only names listed in
 /// `/sync.sync_standby` are allowed; missing/empty/`*` means nobody.
 pub(crate) fn sync_failover_allowed(
     name: &str,
-    sync_mode_enabled: bool,
+    mode: SynchronousMode,
     sync_state: Option<&SyncState>,
 ) -> bool {
-    if !sync_mode_enabled {
+    if !mode.is_synchronous() {
         return true;
     }
     let Some(state) = sync_state else {
@@ -38,12 +39,27 @@ pub(crate) fn sync_failover_allowed(
 }
 
 impl Ha {
+    /// The stored `/config` is invalid and no valid one was ever applied, so
+    /// whether synchronous replication is wanted is unknown. Every
+    /// synchronous-replication and election decision waits for a fix.
+    pub(super) fn sync_config_unresolved(&self) -> bool {
+        self.dynamic_config_state.sync_config_unresolved()
+    }
+
     /// Cluster has no leader — run election
     pub(super) async fn process_unhealthy_cluster(&mut self) -> CycleResult {
         if self.is_paused {
             return CycleResult::Follower("no action in pause mode (cluster has no leader)".into());
         }
 
+        // No valid /config was ever applied and the stored one is invalid:
+        // nobody knows whether synchronous replication is wanted, so no
+        // election (a promotion without the /sync gate could lose commits).
+        if self.sync_config_unresolved() {
+            return CycleResult::Follower(
+                "invalid /config in DCS and no valid configuration known: not campaigning".into(),
+            );
+        }
         // D6 / 2A first: data of an older history generation never
         // campaigns, and is never rebuilt by rewinding it (D5 Rebuild).
         if let Some(r) = self.enforce_generation().await {
@@ -199,10 +215,7 @@ impl Ha {
             if candidate == self.config.name {
                 let allowed = sync_failover_allowed(
                     &self.config.name,
-                    self.dynamic_config_state
-                        .last_config
-                        .synchronous_mode
-                        .unwrap_or(false),
+                    self.dynamic_config_state.last_config.sync_mode(),
                     self.cluster.sync_state.as_ref(),
                 );
                 if allowed {
@@ -333,11 +346,10 @@ impl Ha {
     /// demotion: the stepped-down leader is excluded, so "no" means the
     /// cluster would be left with no one who may take the lock.
     pub(super) fn has_switchover_successor(&self) -> bool {
-        let sync_mode = self
-            .dynamic_config_state
-            .last_config
-            .synchronous_mode
-            .unwrap_or(false);
+        if self.sync_config_unresolved() {
+            return false;
+        }
+        let sync_mode = self.dynamic_config_state.last_config.sync_mode();
         self.cluster.members.iter().any(|member| {
             member.name != self.config.name
                 && !member.is_nofailover()
@@ -373,12 +385,11 @@ impl Ha {
         if !self.postgresql.is_running() {
             return false;
         }
+        if self.sync_config_unresolved() {
+            return false;
+        }
 
-        let sync_mode = self
-            .dynamic_config_state
-            .last_config
-            .synchronous_mode
-            .unwrap_or(false);
+        let sync_mode = self.dynamic_config_state.last_config.sync_mode();
         if !sync_failover_allowed(
             &self.config.name,
             sync_mode,
@@ -507,6 +518,7 @@ impl Ha {
 mod sync_failover_tests {
     use super::sync_failover_allowed;
     use crate::cluster::SyncState;
+    use crate::synchronous_mode::SynchronousMode;
 
     fn sync(leader: &str, standbys: Option<&str>) -> SyncState {
         SyncState {
@@ -519,29 +531,29 @@ mod sync_failover_tests {
 
     #[test]
     fn sync_off_allows_anyone() {
-        assert!(sync_failover_allowed("node3", false, None));
+        assert!(sync_failover_allowed("node3", SynchronousMode::Async, None));
         assert!(sync_failover_allowed(
             "node3",
-            false,
+            SynchronousMode::Async,
             Some(&sync("node1", Some("node2")))
         ));
     }
 
     #[test]
     fn sync_on_missing_state_denies() {
-        assert!(!sync_failover_allowed("node2", true, None));
+        assert!(!sync_failover_allowed("node2", SynchronousMode::Sync, None));
     }
 
     #[test]
     fn sync_on_empty_standby_denies() {
         assert!(!sync_failover_allowed(
             "node2",
-            true,
+            SynchronousMode::Sync,
             Some(&sync("node1", None))
         ));
         assert!(!sync_failover_allowed(
             "node2",
-            true,
+            SynchronousMode::Sync,
             Some(&sync("node1", Some("")))
         ));
     }
@@ -550,12 +562,12 @@ mod sync_failover_tests {
     fn sync_on_star_placeholder_denies_all() {
         assert!(!sync_failover_allowed(
             "node2",
-            true,
+            SynchronousMode::Sync,
             Some(&sync("node1", Some("*")))
         ));
         assert!(!sync_failover_allowed(
             "*",
-            true,
+            SynchronousMode::Sync,
             Some(&sync("node1", Some("*")))
         ));
     }
@@ -563,8 +575,20 @@ mod sync_failover_tests {
     #[test]
     fn sync_on_listed_member_allowed() {
         let state = sync("node1", Some("node2,node3"));
-        assert!(sync_failover_allowed("node2", true, Some(&state)));
-        assert!(sync_failover_allowed("NODE3", true, Some(&state))); // case-insensitive via matches
-        assert!(!sync_failover_allowed("node4", true, Some(&state)));
+        assert!(sync_failover_allowed(
+            "node2",
+            SynchronousMode::Sync,
+            Some(&state)
+        ));
+        assert!(sync_failover_allowed(
+            "NODE3",
+            SynchronousMode::Sync,
+            Some(&state)
+        )); // case-insensitive via matches
+        assert!(!sync_failover_allowed(
+            "node4",
+            SynchronousMode::Sync,
+            Some(&state)
+        ));
     }
 }

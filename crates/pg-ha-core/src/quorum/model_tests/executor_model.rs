@@ -70,11 +70,10 @@
 
 use super::*;
 use crate::cluster::{SyncKind, SyncState};
-use crate::ha::quorum_sync::{
-    EffectiveSyncMode, ExecInput, ExecOutcome, QuorumExec, SyncIo, pre_promote_sync,
-};
+use crate::ha::quorum_sync::{ExecInput, ExecOutcome, QuorumExec, SyncIo, pre_promote_sync};
 use crate::sync::quote_ident;
 use crate::sync_value::{parse_sync_value, render_quorum_value};
+use crate::synchronous_mode::SynchronousMode;
 use std::cell::Cell;
 use tokio::sync::Notify;
 
@@ -269,7 +268,7 @@ struct Core {
     w: World,
     dcs: Dcs,
     pg: PgVals,
-    mode: EffectiveSyncMode,
+    mode: SynchronousMode,
     /// A blind promotion has no finalized `/sync` yet: no commits, no SI-1.
     blind_open: bool,
     /// The PostgreSQL value in `pg` belongs to a node that is still a standby
@@ -461,6 +460,7 @@ impl Core {
             lag_threshold: w.cfg_lag,
             members,
             sync,
+            watchdog_on: true,
         }
     }
 
@@ -693,7 +693,7 @@ impl XWorld {
                     kind: SyncKind::Quorum,
                 },
                 any_text(&names, n),
-                EffectiveSyncMode::Quorum,
+                SynchronousMode::Quorum,
             )
         } else {
             (
@@ -705,7 +705,7 @@ impl XWorld {
                     kind: SyncKind::Priority,
                 },
                 String::new(),
-                EffectiveSyncMode::Off,
+                SynchronousMode::Async,
             )
         };
         let mut core = Core {
@@ -771,8 +771,8 @@ impl XWorld {
         if !c.w.leader_alive() {
             return Ok(());
         }
-        let applies = c.mode == EffectiveSyncMode::Quorum
-            || (c.dcs.present && c.dcs.kind == SyncKind::Quorum);
+        let applies =
+            c.mode == SynchronousMode::Quorum || (c.dcs.present && c.dcs.kind == SyncKind::Quorum);
         if !applies {
             return Ok(());
         }
@@ -797,9 +797,9 @@ impl XWorld {
         match outcome {
             None => self.restart(),
             Some(ExecOutcome::HandedOff) => match self.core.mode {
-                EffectiveSyncMode::Off => self.core.x.t7_done += 1,
-                EffectiveSyncMode::Priority => self.core.x.t9_done += 1,
-                EffectiveSyncMode::Quorum => {}
+                SynchronousMode::Async => self.core.x.t7_done += 1,
+                SynchronousMode::Sync => self.core.x.t9_done += 1,
+                SynchronousMode::Quorum => {}
             },
             Some(_) => {}
         }
@@ -844,7 +844,7 @@ impl XWorld {
             effective: text,
             land_after: None,
         };
-        c.mode = EffectiveSyncMode::Priority;
+        c.mode = SynchronousMode::Sync;
     }
 
     /// A granted election is followed by the REAL `pre_promote_sync` on the
@@ -1002,9 +1002,9 @@ impl XWorld {
             XAction::Restart => self.restart(),
             XAction::SetMode(m) => {
                 self.core.mode = match m % 3 {
-                    0 => EffectiveSyncMode::Off,
-                    1 => EffectiveSyncMode::Priority,
-                    _ => EffectiveSyncMode::Quorum,
+                    0 => SynchronousMode::Async,
+                    1 => SynchronousMode::Sync,
+                    _ => SynchronousMode::Quorum,
                 }
             }
             XAction::GoPriority => self.go_priority(),

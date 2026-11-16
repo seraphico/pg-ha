@@ -67,11 +67,12 @@ impl Ha {
     }
 
     fn reject_if_sync_ineligible_candidate(&self, candidate: &str) -> Option<CommandResponse> {
-        let sync_mode = self
-            .dynamic_config_state
-            .last_config
-            .synchronous_mode
-            .unwrap_or(false);
+        if self.sync_config_unresolved() {
+            return Some(CommandResponse::rejected(format!(
+                "Candidate '{candidate}' rejected: the stored /config is invalid and no valid configuration is known (fix it with PUT /config)"
+            )));
+        }
+        let sync_mode = self.dynamic_config_state.last_config.sync_mode();
         if sync_failover_allowed(candidate, sync_mode, self.cluster.sync_state.as_ref()) {
             return None;
         }

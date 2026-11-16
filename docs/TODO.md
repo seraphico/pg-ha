@@ -28,7 +28,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 - 优雅停机：等待 `shutdown.drain_timeout_secs`（期间续锁）→ Leader 上 CHECKPOINT + 停库（`-m fast`，失败再 `-m immediate`），受 leader 租约限制 → 停库后才释放 leader lock；停不掉时不退出
 - Prometheus metrics、文本或 JSON 日志（`log_format` 或 `PG_HA_LOG_FORMAT`）
 - Docker Compose 3 节点开发集群、`make up` / `make test`
-- 动态同步复制（Priority 模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
+- 动态同步复制（`async` / `sync` / `quorum` 三种模式）、`/sync` `/async` 健康检查、级联复制（`tags.replicatefrom`）
 - Standby cluster：动态配置 `standby_cluster` 已接入 HA 循环的远端跟随；`Ha::cascade_promote` 无 REST/CLI 入口
 
 **还没接到运行路径上的接口**：（`GET /history` 已由 SB-09 接通——DCS `/history` key，failover / switchover 在 promote 后的 Hold 周期尽力追加；）（Raft 快照落盘已由 SB-06 闭合——快照持久化到 `snapshot.json`、重启读回，见下文 #14；`/failover` 无 TTL 已由 SB-05 闭合——非空意图带集群 `ttl` 自过期，见下文 #13；成员 `conn_url` 含密码已由 SB-07 Option A 闭合——密码不再写入 DCS；Failsafe 已由 SB-04 裁定为 NO-GO 并移除表面代码，见下文 #4）。同步侧的 `maximum_lag_on_syncnode` 已接入；选举侧的 `maximum_lag_on_failover`（SB-11）和 REST `replication_lag`（SB-10）均已接入。
@@ -37,7 +37,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 
 ## P0 — 阻塞上线（必须在生产部署前完成）
 
-编号 13、14 仍开放；编号 15（成员 `conn_url` 含密码）已由 SB-07 Option A 闭合。编号 1（REST API TLS，SB-03）与编号 2 已完成；编号 2 留在这里是因为同步复制的 Quorum、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
+编号 13、14 仍开放；编号 15（成员 `conn_url` 含密码）已由 SB-07 Option A 闭合。编号 1（REST API TLS，SB-03）与编号 2 已完成；编号 2 留在这里是因为同步复制的 Quorum 运维文档、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
 
 ### 1. REST API TLS 支持 ✅ 已完成（SB-03）
 
@@ -88,13 +88,13 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 
 ### 2. 同步复制 Failover 约束 — ✅ 已完成（S5）
 
-**已实现**：`synchronous_mode` 启用时，自动选举与指定 `candidate` 的 Failover/Switchover 均强制候选属于 DCS `/sync.sync_standby`；名单缺失、空或为 `*` 时不晋升；不合格候选返回 409，`status` 为 `rejected`。权威来源仅为 DCS `/sync`。`synchronous_mode_strict` 只影响写阻塞，不参与选举。
+**已实现**：`synchronous_mode` 为 `"sync"` 或 `"quorum"` 时，自动选举与指定 `candidate` 的 Failover/Switchover 均强制候选属于 DCS `/sync.sync_standby`；名单缺失、空或为 `*` 时不晋升；不合格候选返回 409，`status` 为 `rejected`。权威来源仅为 DCS `/sync`。`synchronous_mode_strict` 只影响写阻塞，不参与选举。
 
 **SB-01 已补齐（同步侧）**：`maximum_lag_on_syncnode`（动态配置，单位字节，`None`=关闭）已接入——`enforce_synchronous_replication` 从 `pg_stat_replication` 读实时 lag，只有实际在流复制且 lag 在阈值内的备库才算合格并被加进 `/sync`。两阶段写入（DCS `/sync` 始终是 PG `synchronous_standby_names` 的子集，加/删对称顺序）落地；strict 用不可满足的占位名单真正阻塞写入（不是 `'*'`）。详见 [invariants.md](invariants.md) S5 与 [operations-guide.md](operations-guide.md)「两阶段过渡窗口」。
 
 **仍开放**：
 
-- Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但 `enforce_synchronous_replication` 固定使用 `SyncMode::Priority`，动态配置没有模式开关（仅 Priority / `FIRST N` 可用）
+- Quorum 模式的运维文档：`synchronous_mode: "quorum"` 已可选（SB-13 PR4）；`/wal`、mark 与 gate 语义、僵尸主库警告和推荐拓扑的完整说明仍待补写
 - ~~**SB-11**~~ ✅ 已完成：`maximum_lag_on_failover` 已接入 `is_healthiest_node`——参照是当轮已通过资格/running/sync 闸门的候选集合（含自身）里最大的 `wal_position`，落后超阈值的候选（含自身）不参选，`wal_position` 未知者保守排除；阈值 `None`（默认）功能关闭、与接入前逐字节等价（与同步侧的 `maximum_lag_on_syncnode` 一致）
 - ~~**SB-10**~~ ✅ 已完成：`/patroni`、`/primary`、`/replica` 和 `/metrics` 的 `timeline`、`wal_position`、`replication_lag` 由 HA 循环经 `ApiSnapshot` 填充（复用 `touch_member` 的 `wal_status`，不多一次查询）。lag = leader 最后发布的位置减本节点位置（字节，最小 0，近似：写入重时最多少约一个 `loop_wait`，衡量已收到而非已应用）；主库为 0，未知为 `null` / 指标省略；`/replica?lag=` 对未知 fail-open
 

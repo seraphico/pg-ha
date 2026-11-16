@@ -90,7 +90,7 @@ cleanup() {
     for c in ${KILLED[@]+"${KILLED[@]}"}; do docker start "$c" > /dev/null 2>&1 || true; done
     if [ "$SYNC_CHANGED" = true ] && [ -n "$(find_primary)" ]; then
         curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 10 -X PATCH -H "Content-Type: application/json" \
-            -d '{"synchronous_mode":false}' "$(name_to_url "$(find_primary)")/config" > /dev/null 2>&1 || true
+            -d '{"synchronous_mode":"async"}' "$(name_to_url "$(find_primary)")/config" > /dev/null 2>&1 || true
     fi
     if [ "$TAGS_APPLIED" = true ]; then
         log_info "Cleanup: recreating the tagged nodes (${X:-} ${Y:-}) without tags"
@@ -216,10 +216,10 @@ test_nosync_excluded() {
     done
     assert_eq "2" "$streaming" "Both standbys stream from $P before sync mode is enabled"
     code=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 10 -o /dev/null -w '%{http_code}' -X PATCH \
-        -H "Content-Type: application/json" -d '{"synchronous_mode":true,"synchronous_node_count":2}' \
+        -H "Content-Type: application/json" -d '{"synchronous_mode":"sync","synchronous_node_count":2}' \
         "$(name_to_url "$P")/config" 2>/dev/null || echo 000)
     SYNC_CHANGED=true
-    assert_eq "200" "$code" "PATCH /config synchronous_mode=true, count=2"
+    assert_eq "200" "$code" "PATCH /config synchronous_mode=sync, count=2"
     for i in $(seq 1 40); do
         names=$(dpsql "$P" "show synchronous_standby_names")
         [[ "$names" == *"$X"* ]] && break
@@ -236,7 +236,7 @@ test_nosync_excluded() {
         TESTS_PASSED=$((TESTS_PASSED + 1)); log_pass "nosync node $Y is excluded from synchronous_standby_names"
     fi
     curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 10 -o /dev/null -X PATCH -H "Content-Type: application/json" \
-        -d '{"synchronous_mode":false}' "$(name_to_url "$P")/config" 2>/dev/null
+        -d '{"synchronous_mode":"async"}' "$(name_to_url "$P")/config" 2>/dev/null
     SYNC_CHANGED=false
     sleep 10
 }

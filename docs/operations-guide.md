@@ -146,7 +146,7 @@ Failsafe 在 pg-ha 的内嵌 RaftDcs 下不适用，已移除（SB-04 NO-GO）�
 
 Switchover 是计划内的主从切换，不丢数据。要求当前 Primary 健康且可达。
 
-> ⚠️ **同步复制**：若已启用 `synchronous_mode`，指定的 `candidate` 必须在当前 DCS `/sync.sync_standby` 名单中，否则返回 **409**（不 demote、不写 failover key）。可先用各节点的 `GET /sync`（200 = 在名单中的健康 Replica）确认候选。详见下文「同步复制」。
+> ⚠️ **同步复制**：若 `synchronous_mode` 为 `"sync"` 或 `"quorum"`，指定的 `candidate` 必须在当前 DCS `/sync.sync_standby` 名单中，否则返回 **409**（不 demote、不写 failover key）。可先用各节点的 `GET /sync`（200 = 在名单中的健康 Replica）确认候选。详见下文「同步复制」。
 
 ```bash
 # 指定 leader 和 candidate
@@ -254,7 +254,7 @@ pg_rewind succeeded; removed the rewind-check marker
 
 Failover 用于 Primary 不可达时的紧急切换。无需当前 Primary 参与。
 
-> ⚠️ **同步复制**：启用 `synchronous_mode` 时，指定的 `candidate` 同样必须属于 `/sync` 名单，否则 **409**。不指定 candidate 时写入选举请求后，仍只有名单内节点会抢锁；名单为空则可能长时间无主（保已确认事务）。详见「同步复制」。
+> ⚠️ **同步复制**：`synchronous_mode` 为 `"sync"` 或 `"quorum"` 时，指定的 `candidate` 同样必须属于 `/sync` 名单，否则 **409**。不指定 candidate 时写入选举请求后，仍只有名单内节点会抢锁；名单为空则可能长时间无主（保已确认事务）。详见「同步复制」。
 
 ```bash
 # 指定 candidate
@@ -342,19 +342,19 @@ curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
   -d '{"pause": false}'
 
-# 启用同步复制（默认关闭）
+# 启用同步复制（默认 "async" 异步复制；"sync" = 同步复制(按优先级)，"quorum" = 法定人数同步复制）
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
   -d '{
-    "synchronous_mode": true,
+    "synchronous_mode": "sync",
     "synchronous_mode_strict": false,
     "synchronous_node_count": 1
   }'
 
-# 关闭同步复制
+# 关闭同步复制（回到异步复制）
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
-  -d '{"synchronous_mode": false}'
+  -d '{"synchronous_mode": "async"}'
 ```
 
 ### 全量替换 (PUT)
@@ -444,7 +444,7 @@ pg-ha 通过 PostgreSQL 的 `synchronous_standby_names` 参数控制哪些节点
 
 ```
 FIRST 1 ("node2")              -- Priority：N 既是需要确认的个数，也是名单长度。运行路径只发这种
-ANY 2 ("node1","node2","node3") -- Quorum：任意 2 个确认。代码能生成，运行路径没有开关选中它
+ANY 2 ("node1","node2","node3") -- Quorum：任意 2 个确认（`synchronous_mode` 为 `"quorum"` 时使用）
 ```
 
 名字一律加双引号。`synchronous_node_count = 1` 时名单里只有一个名字，不会写成 `FIRST 1 (node2,node3)`。
@@ -528,19 +528,31 @@ node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `synchronous_mode` | bool | `false` | 是否启用同步复制。关闭时 `synchronous_standby_names` 被清空 |
+| `synchronous_mode` | string | `"async"` | 复制模式，只接受三个小写字符串：`"async"` 异步复制（`synchronous_standby_names` 被清空）、`"sync"` 同步复制(按优先级，`FIRST N (...)`)、`"quorum"` 法定人数同步复制（`ANY N (...)`）。布尔值（`true` / `false`）、`"on"` / `"off"` 和其它拼写或大小写（如 `"Sync"`、`"QUORUM"`）一律被拒绝 |
 | `synchronous_mode_strict` | bool | `false` | 无可用 sync standby 时的行为：`false` = 退化为异步继续写入；`true` = 阻塞所有写入 |
-| `synchronous_node_count` | u32 | `1` | 需要多少个同步备库确认。`FIRST N` 中的 N（仅 Priority 模式，见下文） |
+| `synchronous_node_count` | u32 | `1` | 需要多少个同步备库确认。`FIRST N` / `ANY N` 中的 N |
 | `maximum_lag_on_syncnode` | u64（字节） | 不设 = 关闭 | 备库落后 Primary 超过这么多字节（`flush_lsn` 差值）时，不把它算作合格同步备库、不加进 `/sync`。没有「禁用」哨兵值，`None`（不设置或 PATCH 为 `null`）就是关闭 |
 
 **`maximum_lag_on_syncnode` 如何取值**：这是对**同步备库**的 lag 门槛，lag 从 Primary 的 `pg_stat_replication` 实时计算（单位字节）。取一个明显高于正常峰值 lag 的值：设太小会在写入高峰时频繁把备库踢出 `/sync`、触发两阶段过渡窗口；设太大则失去意义。先用 `SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn) FROM pg_stat_replication;` 观察正常和高峰时段的实际 lag，再取峰值之上的量级（例如峰值 10 MB 则设 64 MB）。不确定时先不设（关闭），只靠「实际正在流复制」这一条筛选。
 
-**Failover / Switchover：** 启用 `synchronous_mode` 后，只有当前 `/sync` 名单中的节点可以成为新主；指定不在名单中的 `candidate` 会返回 409。名单为空时（包括两阶段过渡窗口中 `/sync` 暂时收缩为空）不会自动晋升（保已确认事务）。
+**Failover / Switchover：** `synchronous_mode` 为 `"sync"` 或 `"quorum"` 时，只有当前 `/sync` 名单中的节点可以成为新主；指定不在名单中的 `candidate` 会返回 409。名单为空时（包括两阶段过渡窗口中 `/sync` 暂时收缩为空）不会自动晋升（保已确认事务）。
 
-**仅支持 Priority（FIRST N）模式**：HA 循环固定使用 `SyncMode::Priority`，即只生成 `FIRST N (...)`。Quorum（`ANY N`）**没有接到运行路径上**——`SyncManager` 能生成 `ANY N (...)`，但没有任何动态配置项把它选中。不要指望通过配置切到 Quorum。
+**三种取值**：
+
+| 值 | 名称 | `synchronous_standby_names` |
+|----|------|------------------------------|
+| `"async"`（默认） | 异步复制 | 空，不设同步备库 |
+| `"sync"` | 同步复制(按优先级) | `FIRST N (...)`，按 `sync_priority` / `nosync` 选备库 |
+| `"quorum"` | 法定人数同步复制 | `ANY N (...)`，由 Quorum 执行器维护 |
+
+只接受上表中的小写字符串，其它值（包括旧的 `true` / `false`）都会被拒绝：`PATCH` / `PUT /config` 返回 **400**，错误信息列出可接受的值，且不写入 DCS。
+
+**已存入 DCS 的无效配置**（例如开发集群里遗留的 `synchronous_mode: true`，或手工改坏）不会被任何节点应用，也不会退化成 `"async"`：运行中的节点保留上一份有效配置，并以 ERROR 级别记录出错的键和可接受的值（同一内容每 60 秒最多一条）；刚启动、还没有任何有效配置的节点不改动同步复制、不参与选举，直到用 `PUT /config` 写入有效配置。此时对已存无效配置做 `PATCH` 返回 **409**。`bootstrap.dcs` 里的无效值会使节点启动失败。
+
+**启用 `"quorum"` 的要求**：集群里所有节点必须运行相同版本的 pg-ha，不支持混合版本。`quorum` 模式下日志会在以下情况输出 WARN：`synchronous_node_count` 为 1 而合格投票节点有 3 个或更多；未启用看门狗（存在僵尸主库风险）；所有合格投票节点都带 `nofailover` 标签（它们参与投票但不能被选为主）。
 
 **如何选择**：
-- 大多数场景用 `synchronous_mode: true, strict: false, count: 1` — 正常时同步保护，极端时不停服务
+- 大多数场景用 `synchronous_mode: "sync", strict: false, count: 1` — 正常时同步保护，极端时不停服务
 - 金融/订单场景用 `strict: true` — 宁可停服务也不丢数据
 - 5 节点集群可考虑 `count: 2` — 数据存 3 份才确认
 
@@ -573,7 +585,7 @@ tags:
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
   -d '{
-    "synchronous_mode": true,
+    "synchronous_mode": "sync",
     "synchronous_mode_strict": false,
     "synchronous_node_count": 1
   }'
@@ -597,7 +609,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8010/async  # async st
 # 5. 关闭同步复制
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
-  -d '{"synchronous_mode": false}'
+  -d '{"synchronous_mode": "async"}'
 ```
 
 ### Bootstrap 预设
@@ -607,7 +619,7 @@ curl -u admin:secret -X PATCH http://localhost:8008/config \
 ```yaml
 bootstrap:
   dcs:
-    synchronous_mode: true
+    synchronous_mode: "sync"
     synchronous_mode_strict: false
     synchronous_node_count: 1
 ```
@@ -616,9 +628,8 @@ bootstrap:
 
 ### 当前范围与限制
 
-- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（HA 循环固定用 Priority / `FIRST N`）、节点变动时自动更新、两阶段写入（DCS `/sync` 始终是 PG 名单的子集）、`maximum_lag_on_syncnode` lag 门槛、「实际正在流复制」筛选（必须出现在 `pg_stat_replication`）、strict 用不可满足的占位名单真正阻塞写入（不是 `'*'`）、发布 DCS `/sync`、`/sync` `/async` 健康检查、Failover / Switchover 时强制 `/sync` 成员资格
+- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（`"sync"` 用 Priority / `FIRST N`，`"quorum"` 用 `ANY N`）、节点变动时自动更新、两阶段写入（DCS `/sync` 始终是 PG 名单的子集）、`maximum_lag_on_syncnode` lag 门槛、「实际正在流复制」筛选（必须出现在 `pg_stat_replication`）、strict 用不可满足的占位名单真正阻塞写入（不是 `'*'`）、发布 DCS `/sync`、`/sync` `/async` 健康检查、Failover / Switchover 时强制 `/sync` 成员资格
 - 尚未实现（登记在 [TODO.md](TODO.md)）：
-  - Quorum 模式：`SyncMode::Quorum` 能生成 `ANY N (...)`，但运行路径没有配置项把它选中（仅 Priority 可用）
   - `maximum_lag_on_failover`：选举会读（SB-11）。落后当轮合格候选里最大 `wal_position` 超过该字节数的节点不参选；`null` 或省略表示关闭
 
 ---

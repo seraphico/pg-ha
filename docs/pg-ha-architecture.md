@@ -266,12 +266,15 @@ flowchart LR
 
 Primary 在持有 Leader Lock 时读取动态配置：
 
-- `synchronous_mode=false`（默认）：清空 `synchronous_standby_names`，写空 `/sync`
-- `synchronous_mode=true`：按 `sync_priority` / `nosync` 选出同步备库，设置 `FIRST N (...)`，并写入 `/sync`
+- `synchronous_mode="async"`（异步复制，默认）：清空 `synchronous_standby_names`，写空 `/sync`
+- `synchronous_mode="sync"`（同步复制，按优先级）：按 `sync_priority` / `nosync` 选出同步备库，设置 `FIRST N (...)`，并写入 `/sync`
+- `synchronous_mode="quorum"`（法定人数同步复制）：设置 `ANY N (...)`，`/sync` 带 `kind: quorum`，由 Quorum 执行器维护
+
+取值只接受这三个小写字符串；其它值（包括 `true` / `false`）被拒绝，不会退化成 `async`。
 
 目标值未变化时跳过重复 `ALTER SYSTEM` + reload。`/sync`、`/async` 健康检查读取 `/sync.sync_standby` 判断节点角色。
 
-当前范围：同步复制配置与状态发布已实现；Failover / Switchover 在 `synchronous_mode` 启用时强制候选节点属于 DCS `/sync.sync_standby`（S5）。Quorum 模式下的选举/切换约束尚未实现。
+当前范围：同步复制配置与状态发布已实现；Failover / Switchover 在 `synchronous_mode` 为 `"sync"` 或 `"quorum"` 时强制候选节点属于 DCS `/sync.sync_standby`（S5）。`"quorum"` 模式下 `/sync.kind` 为 quorum，选举前还会按投票节点的实时 WAL 位置判断候选是否安全（`ha/vote.rs`）；启用 `quorum` 要求所有节点运行相同版本的 pg-ha。
 
 ## 模块依赖关系
 

@@ -484,6 +484,8 @@ async fn test_history_reads_the_dcs() {
 struct ConfigDcs {
     config: std::sync::Mutex<Option<String>>,
     history: std::sync::Mutex<Vec<pg_ha_core::history::HistoryEntry>>,
+    /// Number of `set_config_value` calls.
+    writes: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -513,6 +515,8 @@ impl pg_ha_core::dcs::DcsAdapter for ConfigDcs {
         Ok(true)
     }
     async fn set_config_value(&self, value: &str) -> pg_ha_core::Result<bool> {
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.config.lock().unwrap() = Some(value.to_string());
         Ok(true)
     }
@@ -551,6 +555,7 @@ fn config_state(stored: &str) -> (AppState, std::sync::Arc<ConfigDcs>) {
     let dcs = std::sync::Arc::new(ConfigDcs {
         config: std::sync::Mutex::new(Some(stored.to_string())),
         history: std::sync::Mutex::new(Vec::new()),
+        writes: std::sync::atomic::AtomicUsize::new(0),
     });
     let state = AppState::with_dcs(
         "node1".into(),
@@ -640,6 +645,107 @@ async fn test_config_accepts_timing_that_meets_lease_requirement() {
     let (status, body) = send_config(state, "PATCH", r#"{"pause":true}"#).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(stored_config(&dcs)["pause"], true);
+}
+
+const ACCEPTED: &str = r#"expected one of \"async\", \"sync\", \"quorum\" (lowercase)"#;
+
+fn config_writes(dcs: &ConfigDcs) -> usize {
+    dcs.writes.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Invalid `synchronous_mode` values are a 400 naming the accepted values,
+/// and nothing reaches the DCS (PATCH and PUT).
+#[tokio::test]
+async fn test_config_rejects_invalid_synchronous_mode_and_writes_nothing() {
+    let stored = r#"{"loop_wait":5,"ttl":15,"synchronous_mode":"sync"}"#;
+    for bad in [
+        "true",
+        "false",
+        r#""on""#,
+        r#""off""#,
+        r#""Sync""#,
+        r#""QUORUM""#,
+        r#""""#,
+        "1",
+        "[]",
+    ] {
+        for (method, body) in [
+            ("PATCH", format!(r#"{{"synchronous_mode":{bad}}}"#)),
+            (
+                "PUT",
+                format!(r#"{{"loop_wait":5,"ttl":15,"synchronous_mode":{bad}}}"#),
+            ),
+        ] {
+            let (state, dcs) = config_state(stored);
+            let (status, resp) = send_config(state, method, &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {bad}: {resp}");
+            assert!(
+                resp.contains("synchronous_mode: invalid value"),
+                "{method} {bad}: {resp}"
+            );
+            assert!(resp.contains(ACCEPTED), "{method} {bad}: {resp}");
+            assert_eq!(config_writes(&dcs), 0, "{method} {bad}: nothing written");
+            assert_eq!(dcs.config.lock().unwrap().as_deref(), Some(stored));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_patch_config_accepts_the_three_strings() {
+    for mode in ["async", "sync", "quorum"] {
+        let (state, dcs) = config_state(r#"{"loop_wait":5,"ttl":15}"#);
+        let (status, resp) = send_config(
+            state.clone(),
+            "PATCH",
+            &format!(r#"{{"synchronous_mode":"{mode}"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{mode}: {resp}");
+        assert_eq!(stored_config(&dcs)["synchronous_mode"], mode);
+        assert_eq!(stored_config(&dcs)["ttl"], 15, "other keys kept");
+        // GET /config returns the string form.
+        let (status, resp) = body_text(state, "/config").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["synchronous_mode"], mode);
+    }
+    // PUT too, and null removes the key (back to the async default).
+    let (state, dcs) = config_state(r#"{"synchronous_mode":"quorum","ttl":15,"loop_wait":5}"#);
+    let (status, _) = send_config(state, "PATCH", r#"{"synchronous_mode":null}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(stored_config(&dcs).get("synchronous_mode").is_none());
+    let (state, dcs) = config_state("{}");
+    let (status, resp) = send_config(state, "PUT", r#"{"synchronous_mode":"quorum"}"#).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(stored_config(&dcs)["synchronous_mode"], "quorum");
+}
+
+/// A stored document that does not parse (an old `synchronous_mode: true`) is
+/// never patched on top of the defaults: 409, nothing written. PUT repairs it.
+#[tokio::test]
+async fn test_patch_config_refuses_an_invalid_stored_document() {
+    let stored = r#"{"synchronous_mode":true,"synchronous_node_count":2,"ttl":15,"loop_wait":5}"#;
+    let (state, dcs) = config_state(stored);
+    let (status, resp) = send_config(state.clone(), "PATCH", r#"{"pause":true}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+    assert!(resp.contains("stored /config is invalid"), "{resp}");
+    assert!(resp.contains(ACCEPTED), "{resp}");
+    assert_eq!(config_writes(&dcs), 0);
+    assert_eq!(dcs.config.lock().unwrap().as_deref(), Some(stored));
+    // Even a PATCH that carries a valid value for the bad key is refused:
+    // the operator sees the whole document and replaces it.
+    let (status, _) = send_config(state.clone(), "PATCH", r#"{"synchronous_mode":"sync"}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(config_writes(&dcs), 0);
+    let (status, resp) = send_config(
+        state,
+        "PUT",
+        r#"{"synchronous_mode":"sync","synchronous_node_count":2,"ttl":15,"loop_wait":5}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(stored_config(&dcs)["synchronous_mode"], "sync");
+    assert_eq!(config_writes(&dcs), 1);
 }
 
 async fn body_text(state: AppState, uri: &str) -> (StatusCode, String) {

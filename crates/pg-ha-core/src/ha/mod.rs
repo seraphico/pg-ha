@@ -24,6 +24,7 @@ use crate::postgresql::Postgresql;
 use crate::quorum::round::PeerWalProbe;
 use crate::standby_cluster::StandbyCluster;
 use crate::sync::{SyncManager, SyncMode};
+use crate::synchronous_mode::SynchronousMode;
 
 mod commands;
 pub(crate) mod election;
@@ -717,11 +718,18 @@ impl Ha {
     /// On a `replication_status` error no change is made this cycle (neither
     /// PG nor `/sync` is touched), exactly like a `wal_status` failure.
     async fn enforce_synchronous_replication(&mut self) {
+        // An unparseable stored /config with no valid baseline says nothing
+        // about synchronous replication. Leave PostgreSQL and /sync alone:
+        // acting on the default (async) would switch it off silently.
+        if self.sync_config_unresolved() {
+            return;
+        }
         if self.quorum_executor_applies() {
             return self.enforce_quorum_sync().await;
         }
         let cfg = &self.dynamic_config_state.last_config;
-        let enabled = cfg.synchronous_mode.unwrap_or(false);
+        // The executor above took every Quorum cycle, so here it is Sync or Async.
+        let enabled = cfg.sync_mode() == SynchronousMode::Sync;
         let strict = cfg.synchronous_mode_strict.unwrap_or(false);
         let count = cfg.synchronous_node_count.unwrap_or(1) as usize;
         let threshold = cfg.maximum_lag_on_syncnode;
@@ -754,9 +762,8 @@ impl Ha {
                 }
             };
 
-            // SyncMode::Priority is hardcoded: quorum (ANY N) is intentionally
-            // NOT wired for SB-01, so Priority (FIRST N) is the only supported
-            // mode. See decision 10 in the SB-01 plan.
+            // This path is Priority (FIRST N) only: Quorum (ANY N) is handled
+            // by the executor in `ha/quorum_sync.rs` before we get here.
             let manager = SyncManager::new(SyncMode::Priority, count, strict);
             let desired = match manager.compute_sync_standby_names(
                 &self.cluster.members,
@@ -1254,7 +1261,11 @@ impl Ha {
     async fn process_dynamic_config(&mut self) {
         let config_value = match self.dcs.get_config_value().await {
             Ok(Some(val)) => val,
-            Ok(None) => return, // No config key in DCS, nothing to do
+            Ok(None) => {
+                // No config key in DCS: the default (async) is a legitimate baseline.
+                self.dynamic_config_state.note_absent();
+                return;
+            }
             Err(e) => {
                 warn!("Failed to read /config from DCS: {e}");
                 return;
@@ -1264,7 +1275,26 @@ impl Ha {
         let new_config: GlobalConfig = match serde_json::from_str(&config_value) {
             Ok(c) => c,
             Err(e) => {
-                warn!("Failed to parse dynamic config from DCS: {e}");
+                // Never apply a document that does not parse, and never fall
+                // back to the defaults: that would turn synchronous
+                // replication off silently. The last valid config stays.
+                let reason = e.to_string();
+                let had_baseline = self.dynamic_config_state.has_baseline;
+                if self.dynamic_config_state.note_invalid(
+                    &config_value,
+                    reason.clone(),
+                    std::time::Instant::now(),
+                ) {
+                    if had_baseline {
+                        error!(
+                            "invalid /config in DCS, NOT applied (keeping the last valid configuration): {reason}"
+                        );
+                    } else {
+                        error!(
+                            "invalid /config in DCS, NOT applied (no valid configuration known yet: not changing synchronous replication and not campaigning until it is fixed with PUT /config): {reason}"
+                        );
+                    }
+                }
                 return;
             }
         };
@@ -1383,6 +1413,9 @@ impl Ha {
         }
     }
 }
+
+#[cfg(test)]
+mod fake_pg;
 
 #[cfg(test)]
 mod tests {
@@ -2110,7 +2143,7 @@ mod tests {
         let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
 
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
-            synchronous_mode: Some(true),
+            synchronous_mode: Some(SynchronousMode::Sync),
             ..Default::default()
         });
         ha.cluster = Cluster {
@@ -2133,7 +2166,7 @@ mod tests {
         let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
 
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
-            synchronous_mode: Some(true),
+            synchronous_mode: Some(SynchronousMode::Sync),
             ..Default::default()
         });
         ha.cluster = Cluster {
@@ -2161,7 +2194,7 @@ mod tests {
         let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
 
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
-            synchronous_mode: Some(true),
+            synchronous_mode: Some(SynchronousMode::Sync),
             ..Default::default()
         });
         ha.cluster = Cluster {
@@ -2192,7 +2225,7 @@ mod tests {
         let (mut ha, _cmd_tx) = Ha::new(config, dcs, pg);
 
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
-            synchronous_mode: Some(true),
+            synchronous_mode: Some(SynchronousMode::Sync),
             ..Default::default()
         });
         ha.cluster = Cluster {
@@ -2224,7 +2257,7 @@ mod tests {
 
         // synchronous_mode false / default — WAL comparison only
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
-            synchronous_mode: Some(false),
+            synchronous_mode: Some(SynchronousMode::Async),
             ..Default::default()
         });
         ha.cluster = Cluster {
@@ -2395,7 +2428,7 @@ mod tests {
         ha.postgresql.set_observed_in_recovery(Some(true));
 
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
-            synchronous_mode: Some(true),
+            synchronous_mode: Some(SynchronousMode::Sync),
             ..Default::default()
         });
         ha.cluster = Cluster {
@@ -2993,7 +3026,7 @@ mod tests {
 
         ha.is_leader = true;
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
-            synchronous_mode: Some(true),
+            synchronous_mode: Some(SynchronousMode::Sync),
             ..Default::default()
         });
         ha.cluster = Cluster {
@@ -3044,7 +3077,7 @@ mod tests {
         let (mut ha, cmd_tx) = Ha::new(config, dcs.clone(), pg);
 
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
-            synchronous_mode: Some(true),
+            synchronous_mode: Some(SynchronousMode::Sync),
             ..Default::default()
         });
         ha.cluster = Cluster {
@@ -3088,7 +3121,7 @@ mod tests {
         let (mut ha, cmd_tx) = Ha::new(config, dcs.clone(), pg);
 
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
-            synchronous_mode: Some(true),
+            synchronous_mode: Some(SynchronousMode::Sync),
             ..Default::default()
         });
         ha.cluster = Cluster {
@@ -3432,7 +3465,7 @@ mod tests {
         });
         ha.is_leader = true;
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
-            synchronous_mode: Some(true),
+            synchronous_mode: Some(SynchronousMode::Sync),
             ..Default::default()
         });
         let before = applied_sync();
@@ -3456,21 +3489,19 @@ mod tests {
     /// The sync-related inputs of one `quorum_executor_applies` probe.
     fn probe_applies(
         ha: &mut Ha,
-        mode: Option<bool>,
+        mode: Option<SynchronousMode>,
         sync_state: Option<SyncState>,
-        over: Option<quorum_sync::EffectiveSyncMode>,
     ) -> bool {
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
             synchronous_mode: mode,
             ..Default::default()
         });
         ha.cluster.sync_state = sync_state;
-        let _guard = quorum_sync::ModeOverrideGuard::set(over);
         ha.quorum_executor_applies()
     }
 
     #[test]
-    fn test_quorum_executor_never_applies_to_priority_or_off_inputs() {
+    fn test_quorum_executor_never_applies_to_sync_or_async_settings() {
         use proptest::prelude::*;
         use proptest::test_runner::{Config, TestRunner};
         let (ha, dir) = identity_test_ha(
@@ -3486,7 +3517,11 @@ mod tests {
             ..Config::default()
         });
         let strat = (
-            prop_oneof![Just(None), Just(Some(false)), Just(Some(true))],
+            prop_oneof![
+                Just(None),
+                Just(Some(SynchronousMode::Async)),
+                Just(Some(SynchronousMode::Sync))
+            ],
             prop::option::of((
                 "[a-z0-9_-]{0,8}",
                 prop::option::of("[a-z0-9,]{0,12}"),
@@ -3501,7 +3536,7 @@ mod tests {
                     quorum,
                     kind: Default::default(),
                 });
-                let applies = probe_applies(&mut ha.borrow_mut(), mode, sync_state, None);
+                let applies = probe_applies(&mut ha.borrow_mut(), mode, sync_state);
                 prop_assert!(
                     !applies,
                     "mode {mode:?} must never reach the quorum executor"
@@ -3509,7 +3544,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        // Positive controls: a Quorum /sync, or the test-only mode, apply.
+        // Positive controls: a Quorum /sync applies in every mode (T7 / T9
+        // take it back); the real `quorum` setting applies without one.
         let mut ha = ha.into_inner();
         let quorum_sync = Some(SyncState {
             leader: "n0".into(),
@@ -3517,26 +3553,21 @@ mod tests {
             quorum: 0,
             kind: crate::cluster::SyncKind::Quorum,
         });
-        for mode in [None, Some(false), Some(true)] {
-            assert!(probe_applies(&mut ha, mode, quorum_sync.clone(), None));
-            assert!(probe_applies(
-                &mut ha,
-                mode,
-                None,
-                Some(quorum_sync::EffectiveSyncMode::Quorum)
-            ));
-            assert!(!probe_applies(
-                &mut ha,
-                mode,
-                None,
-                Some(quorum_sync::EffectiveSyncMode::Priority)
-            ));
+        for mode in [
+            None,
+            Some(SynchronousMode::Async),
+            Some(SynchronousMode::Sync),
+            Some(SynchronousMode::Quorum),
+        ] {
+            assert!(probe_applies(&mut ha, mode, quorum_sync.clone()));
         }
+        assert!(probe_applies(&mut ha, Some(SynchronousMode::Quorum), None));
+        assert!(!probe_applies(&mut ha, Some(SynchronousMode::Sync), None));
+        assert!(!probe_applies(&mut ha, Some(SynchronousMode::Async), None));
         let _ = std::fs::remove_dir_all(&dir);
     }
-
     #[test]
-    fn test_effective_sync_mode_is_priority_or_off_in_production() {
+    fn test_effective_sync_mode_reads_the_setting() {
         let (mut ha, dir) = identity_test_ha(
             "test_node",
             "pr3b-mode",
@@ -3545,9 +3576,10 @@ mod tests {
             false,
         );
         for (setting, expected) in [
-            (None, quorum_sync::EffectiveSyncMode::Off),
-            (Some(false), quorum_sync::EffectiveSyncMode::Off),
-            (Some(true), quorum_sync::EffectiveSyncMode::Priority),
+            (None, SynchronousMode::Async),
+            (Some(SynchronousMode::Async), SynchronousMode::Async),
+            (Some(SynchronousMode::Sync), SynchronousMode::Sync),
+            (Some(SynchronousMode::Quorum), SynchronousMode::Quorum),
         ] {
             ha.dynamic_config_state.apply_new_config(GlobalConfig {
                 synchronous_mode: setting,
@@ -3623,7 +3655,11 @@ mod tests {
         ha.cluster = leader_cluster("test_node", "node2");
         ha.is_leader = true;
         ha.quorum_exec = quorum_sync::QuorumExec::warmed_for_test();
-        for mode in [None, Some(false), Some(true)] {
+        for mode in [
+            None,
+            Some(SynchronousMode::Async),
+            Some(SynchronousMode::Sync),
+        ] {
             ha.dynamic_config_state.apply_new_config(GlobalConfig {
                 synchronous_mode: mode,
                 ..Default::default()
@@ -4921,6 +4957,9 @@ mod tests {
         /// `pg-ha-test.pg_ctl_calls` and succeeds (`promote -D <dir> -w`:
         /// `$3` is the data directory).
         PgCtlRecords,
+        /// As `PgCtlRecords`, and `promote` creates `pg_wal/00000003.history`
+        /// like a real promote of a timeline 2 standby (begin 0/3000).
+        PgCtlPromotes,
     }
 
     /// pg_rewind --target-pgdata <dir> ...: $2 is the data directory.
@@ -4929,7 +4968,7 @@ mod tests {
     const FAKE_PSQL_PRIMARY: &str = "echo f\nexit 0\n";
 
     impl FakeBin {
-        const ALL: [FakeBin; 14] = [
+        const ALL: [FakeBin; 15] = [
             FakeBin::ControldataInProduction,
             FakeBin::ControldataShutDownInRecovery,
             FakeBin::PgCtlStopOk,
@@ -4944,6 +4983,7 @@ mod tests {
             FakeBin::UncleanTarget,
             FakeBin::UncleanTargetSingleUserFails,
             FakeBin::PgCtlRecords,
+            FakeBin::PgCtlPromotes,
         ];
 
         fn dir_name(self) -> &'static str {
@@ -4962,6 +5002,7 @@ mod tests {
                 FakeBin::UncleanTarget => "unclean-target",
                 FakeBin::UncleanTargetSingleUserFails => "unclean-target-single-user-fails",
                 FakeBin::PgCtlRecords => "pg-ctl-records",
+                FakeBin::PgCtlPromotes => "pg-ctl-promotes",
             }
         }
 
@@ -5029,6 +5070,11 @@ mod tests {
                 FakeBin::PgCtlRecords => vec![(
                     "pg_ctl",
                     "echo \"$*\" >> \"$3/pg-ha-test.pg_ctl_calls\"\nexit 0\n",
+                )],
+                FakeBin::PgCtlPromotes => vec![(
+                    "pg_ctl",
+                    "echo \"$*\" >> \"$3/pg-ha-test.pg_ctl_calls\"\n\
+                     if [ \"$1\" = promote ]; then printf '2\\t0/3000\\tno recovery target specified\\n' > \"$3/pg_wal/00000003.history\"; fi\nexit 0\n",
                 )],
             }
         }
@@ -5901,6 +5947,264 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ─────────── SB-13 PR4: an invalid stored /config never means async ───────────
+
+    const OLD_BOOL_CONFIG: &str = r#"{"synchronous_mode": true}"#;
+
+    fn store_config(dcs: &MockDcs, raw: &str) {
+        *dcs.config_value.lock().unwrap() = Some(raw.to_string());
+    }
+
+    /// A leader that would clear `synchronous_standby_names` if it believed in
+    /// async: a fake PostgreSQL records every query.
+    async fn leader_on_fake_pg(label: &str) -> (Ha, PathBuf, Arc<MockDcs>, fake_pg::FakePg) {
+        let pg = fresh_primary_pg(&[("node2", "8192")]).await;
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir, _tx) = identity_test_ha_on_port(
+            "test_node",
+            label,
+            dcs.clone(),
+            Some(false),
+            false,
+            Some(fake_pg_bin(FakeBin::PgCtlRecords)),
+            pg.port,
+        );
+        ha.cluster = leader_cluster("test_node", "node2");
+        ha.is_leader = true;
+        (ha, dir, dcs, pg)
+    }
+
+    /// A stored `/config` that fails to parse, on a node with NO valid
+    /// baseline (restart / new node): before PR4 this read as async and the
+    /// leader cleared `synchronous_standby_names`. Now nothing is touched.
+    #[tokio::test]
+    async fn test_invalid_config_without_baseline_leaves_sync_replication_alone() {
+        let (mut ha, dir, dcs, pg) = leader_on_fake_pg("cfg-fresh-leader").await;
+        store_config(&dcs, OLD_BOOL_CONFIG);
+        ha.process_dynamic_config().await;
+        assert!(ha.dynamic_config_state.sync_config_unresolved());
+        let reason = ha
+            .dynamic_config_state
+            .invalid
+            .as_ref()
+            .unwrap()
+            .reason
+            .clone();
+        assert!(
+            reason.contains("synchronous_mode: invalid value true"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(r#"expected one of "async", "sync", "quorum" (lowercase)"#),
+            "{reason}"
+        );
+        assert!(!ha.dynamic_config_state.has_baseline);
+        ha.enforce_synchronous_replication().await;
+        assert!(pg.queries().is_empty(), "no query: {:?}", pg.queries());
+        assert!(pg_ctl_calls(&dir).is_empty());
+        assert!(dcs.sync_writes.lock().unwrap().is_empty());
+        assert_eq!(ha.applied_sync_standby_names, None);
+        // The control: the same leader with a VALID async config does clear it.
+        store_config(&dcs, r#"{"synchronous_mode": "async"}"#);
+        ha.process_dynamic_config().await;
+        assert!(!ha.dynamic_config_state.sync_config_unresolved());
+        ha.enforce_synchronous_replication().await;
+        assert!(
+            pg.queries()
+                .iter()
+                .any(|q| q.contains("synchronous_standby_names TO ''")),
+            "{:?}",
+            pg.queries()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A running node keeps its last valid configuration when the stored
+    /// document turns invalid (a hand edit).
+    #[tokio::test]
+    async fn test_invalid_config_keeps_the_last_valid_configuration() {
+        for good in [SynchronousMode::Sync, SynchronousMode::Quorum] {
+            let (mut ha, dir, dcs, pg) = leader_on_fake_pg("cfg-baseline").await;
+            store_config(
+                &dcs,
+                &format!(r#"{{"synchronous_mode": "{good}", "ttl": 40}}"#),
+            );
+            ha.process_dynamic_config().await;
+            assert_eq!(ha.dynamic_config_state.last_config.sync_mode(), good);
+            store_config(&dcs, r#"{"synchronous_mode": "Sync", "ttl": 50}"#);
+            ha.process_dynamic_config().await;
+            assert_eq!(ha.dynamic_config_state.last_config.sync_mode(), good);
+            assert_eq!(
+                ha.dynamic_config_state.last_config.ttl,
+                Some(40),
+                "not applied"
+            );
+            assert!(ha.dynamic_config_state.invalid.is_some());
+            assert!(!ha.dynamic_config_state.sync_config_unresolved());
+            assert_eq!(ha.effective_sync_mode(), good);
+            if good == SynchronousMode::Sync {
+                ha.enforce_synchronous_replication().await;
+                let q = pg.queries();
+                assert!(
+                    q.iter().all(|q| !q.contains("TO ''")),
+                    "synchronous_standby_names must not be cleared: {q:?}"
+                );
+                assert!(q.iter().any(|q| q.contains("FIRST 1")), "{q:?}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// With no baseline a leaderless node does not campaign and is not
+    /// "healthiest"; once the document is valid it behaves as before.
+    #[tokio::test]
+    async fn test_invalid_config_without_baseline_blocks_the_election() {
+        let build = |label: &str| {
+            let dcs = Arc::new(MockDcs::new());
+            let (mut ha, dir) = identity_test_ha("test_node", label, dcs.clone(), Some(true), true);
+            ha.cluster = Cluster {
+                timeline: rec(1),
+                leader: None,
+                members: vec![running_member("test_node", 1000)],
+                ..Default::default()
+            };
+            (ha, dir, dcs)
+        };
+        // Control: valid async config, the lone standby takes the lock.
+        let (mut ha, dir, dcs) = build("cfg-elect-valid");
+        store_config(&dcs, r#"{"synchronous_mode": "async"}"#);
+        ha.process_dynamic_config().await;
+        assert!(ha.is_healthiest_node());
+        let _ = ha.process_unhealthy_cluster().await;
+        assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Invalid, no baseline.
+        let (mut ha, dir, dcs) = build("cfg-elect-invalid");
+        store_config(&dcs, OLD_BOOL_CONFIG);
+        ha.process_dynamic_config().await;
+        assert!(!ha.is_healthiest_node());
+        assert!(!ha.has_switchover_successor());
+        let result = ha.process_unhealthy_cluster().await;
+        assert!(
+            matches!(result, CycleResult::Follower(ref m) if m.contains("invalid /config")),
+            "{result}"
+        );
+        assert_eq!(lock_held_by(&dcs), None, "no lock acquisition");
+        // Fixing the document recovers the node.
+        store_config(&dcs, r#"{"synchronous_mode": "quorum"}"#);
+        ha.process_dynamic_config().await;
+        assert!(!ha.dynamic_config_state.sync_config_unresolved());
+        assert!(ha.dynamic_config_state.invalid.is_none());
+        assert_eq!(ha.effective_sync_mode(), SynchronousMode::Quorum);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_config_without_baseline_rejects_failover_candidates() {
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        let (mut ha, dir, tx) = identity_test_ha_with_cmd(
+            "node1",
+            "cfg-candidate",
+            dcs.clone(),
+            Some(false),
+            false,
+            None,
+        );
+        ha.is_leader = true;
+        ha.cluster = leader_cluster("node1", "node2");
+        dcs.mirror_cluster(&ha.cluster);
+        store_config(&dcs, OLD_BOOL_CONFIG);
+        ha.process_dynamic_config().await;
+        let resp = send_cmd(
+            &mut ha,
+            &tx,
+            ManagementCommand::Failover {
+                candidate: Some("node2".into()),
+            },
+        )
+        .await;
+        assert_eq!(resp.status, CommandStatus::Rejected, "{}", resp.message);
+        assert!(
+            resp.message.contains("stored /config is invalid"),
+            "{}",
+            resp.message
+        );
+        assert!(dcs.last_failover_value.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No `/config` key at all is a legitimate async baseline.
+    #[tokio::test]
+    async fn test_absent_config_is_an_async_baseline() {
+        let (mut ha, dir, _dcs, pg) = leader_on_fake_pg("cfg-absent").await;
+        ha.process_dynamic_config().await;
+        assert!(ha.dynamic_config_state.has_baseline);
+        assert!(!ha.dynamic_config_state.sync_config_unresolved());
+        assert_eq!(ha.effective_sync_mode(), SynchronousMode::Async);
+        ha.enforce_synchronous_replication().await;
+        assert!(pg.queries().iter().any(|q| q.contains("TO ''")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PATCH-style runtime switching through the real setting reaches every
+    /// executor transition: async -> sync -> quorum -> sync -> async.
+    #[tokio::test]
+    async fn test_switching_the_setting_at_runtime_reaches_the_executor_transitions() {
+        let dcs = Arc::new(MockDcs::with_leader("test_node"));
+        let (mut ha, dir) = identity_test_ha("test_node", "sw-runtime", dcs, Some(false), false);
+        ha.is_leader = true;
+        let mut cluster = leader_cluster("test_node", "node2");
+        // A Priority /sync of this leader.
+        let prio = SyncState {
+            leader: "test_node".into(),
+            sync_standby: Some("node2".into()),
+            quorum: 1,
+            kind: Default::default(),
+        };
+        let quorum = SyncState {
+            kind: crate::cluster::SyncKind::Quorum,
+            ..prio.clone()
+        };
+        let set = |ha: &mut Ha, m: SynchronousMode| {
+            ha.dynamic_config_state.apply_new_config(GlobalConfig {
+                synchronous_mode: Some(m),
+                ..Default::default()
+            });
+        };
+        // (setting, /sync as stored, executor drives?)
+        let steps: [(SynchronousMode, Option<SyncState>, bool); 6] = [
+            (SynchronousMode::Async, None, false),
+            (SynchronousMode::Sync, Some(prio.clone()), false),
+            // T8: the setting says quorum over a Priority /sync.
+            (SynchronousMode::Quorum, Some(prio.clone()), true),
+            // quorum in force.
+            (SynchronousMode::Quorum, Some(quorum.clone()), true),
+            // T9: back to sync while /sync is still Quorum: the executor takes it back.
+            (SynchronousMode::Sync, Some(quorum.clone()), true),
+            // T7: async while /sync is still Quorum.
+            (SynchronousMode::Async, Some(quorum), true),
+        ];
+        for (mode, sync, drives) in steps {
+            set(&mut ha, mode);
+            cluster.sync_state = sync;
+            ha.cluster = cluster.clone();
+            assert_eq!(ha.effective_sync_mode(), mode);
+            assert_eq!(
+                ha.quorum_executor_applies(),
+                drives,
+                "{mode} {:?}",
+                ha.cluster.sync_state
+            );
+        }
+        // Once the Priority /sync is back, async and sync do not touch it.
+        for mode in [SynchronousMode::Sync, SynchronousMode::Async] {
+            set(&mut ha, mode);
+            ha.cluster.sync_state = Some(prio.clone());
+            assert!(!ha.quorum_executor_applies());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ─────────────────── SB-13 PR3c: the pre-promote write ───────────────────
     fn pg_ctl_calls(dir: &std::path::Path) -> Vec<String> {
         std::fs::read_to_string(dir.join("pg-ha-test.pg_ctl_calls"))
@@ -5911,16 +6215,28 @@ mod tests {
     fn promoting_ha(
         label: &str,
         dcs: Arc<MockDcs>,
-        mode: Option<bool>,
+        mode: Option<SynchronousMode>,
         sync: Option<SyncState>,
     ) -> (Ha, PathBuf) {
-        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+        promoting_ha_with(label, dcs, mode, sync, FakeBin::PgCtlRecords, 1)
+    }
+    /// `promoting_ha` with the pg_ctl double and the PostgreSQL port chosen.
+    fn promoting_ha_with(
+        label: &str,
+        dcs: Arc<MockDcs>,
+        mode: Option<SynchronousMode>,
+        sync: Option<SyncState>,
+        bin: FakeBin,
+        port: u16,
+    ) -> (Ha, PathBuf) {
+        let (mut ha, dir, _tx) = identity_test_ha_on_port(
             "test_node",
             label,
             dcs.clone(),
             Some(true),
             true,
-            Some(fake_pg_bin(FakeBin::PgCtlRecords)),
+            Some(fake_pg_bin(bin)),
+            port,
         );
         put_history(&dir, 2);
         ha.dynamic_config_state.apply_new_config(GlobalConfig {
@@ -5932,11 +6248,11 @@ mod tests {
         ha.cluster.sync_state = sync;
         (ha, dir)
     }
-    /// BEHAVIOURAL GOLDEN (Priority and Off): the observable calls of the
-    /// promote path up to `pg_ctl promote`, which is as far as a test without
-    /// a PostgreSQL server can go (`observe_recovery` needs a connection, so
-    /// the steps after it, `confirm_promote`, `touch_member` success and
-    /// `enforce_synchronous_replication`, stay an open item for PR4). The
+    /// BEHAVIOURAL GOLDEN (Priority and Off), part 1: the observable calls of
+    /// the promote path up to `pg_ctl promote` with no PostgreSQL server
+    /// behind the port (`observe_recovery` fails). Part 2,
+    /// `test_priority_promote_path_golden_past_promote`, answers the queries
+    /// with a fake server and follows the path to the end. The
     /// pre-promote write must add NOTHING here: one pending record in
     /// `/timeline`, exactly one `pg_ctl` call (`promote`), no `/sync` write,
     /// no `ALTER SYSTEM`, the lock kept.
@@ -5950,9 +6266,13 @@ mod tests {
         };
         let cases = [
             ("golden-off", None, None),
-            ("golden-off-false", Some(false), None),
-            ("golden-priority-nosync", Some(true), None),
-            ("golden-priority", Some(true), Some(priority_sync)),
+            ("golden-off-false", Some(SynchronousMode::Async), None),
+            ("golden-priority-nosync", Some(SynchronousMode::Sync), None),
+            (
+                "golden-priority",
+                Some(SynchronousMode::Sync),
+                Some(priority_sync),
+            ),
         ];
         for (label, mode, sync) in cases {
             let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
@@ -5986,6 +6306,234 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+    /// The queries of the promote path, answered like a freshly promoted
+    /// primary on timeline 3 with `replicas` streaming.
+    async fn fresh_primary_pg(replicas: &[(&str, &str)]) -> fake_pg::FakePg {
+        use fake_pg::Reply;
+        let wal = "000000030000000000000001".to_string();
+        fake_pg::FakePg::start(vec![
+            (
+                "pg_is_in_recovery",
+                Reply::Rows(vec!["pg_is_in_recovery"], vec![vec!["f".into()]]),
+            ),
+            (
+                "SELECT pg_walfile_name(",
+                Reply::Rows(vec!["pg_walfile_name"], vec![vec![wal.clone()]]),
+            ),
+            (
+                "pg_current_wal_lsn() - '0/0'",
+                Reply::Rows(
+                    vec!["lsn", "pg_walfile_name"],
+                    vec![vec!["8192".into(), wal]],
+                ),
+            ),
+            (
+                "FROM pg_stat_replication",
+                Reply::Rows(
+                    vec!["application_name", "lsn"],
+                    replicas
+                        .iter()
+                        .map(|(n, l)| vec![n.to_string(), l.to_string()])
+                        .collect(),
+                ),
+            ),
+            (
+                "pg_current_wal_flush_lsn()",
+                Reply::Rows(vec!["lsn"], vec![vec!["8192".into()]]),
+            ),
+            ("ALTER SYSTEM", Reply::Done("ALTER SYSTEM")),
+        ])
+        .await
+    }
+
+    /// BEHAVIOURAL GOLDEN (Priority and Off), part 2 (the PR3c open item):
+    /// the whole promote path past `pg_ctl promote` against a fake PostgreSQL
+    /// that speaks the simple query protocol: `observe_recovery`,
+    /// `confirm_promote` (the `/timeline` record), `touch_member` and
+    /// `enforce_synchronous_replication`, with the exact SQL in order, the
+    /// `pg_ctl` calls and the `/sync` writes.
+    #[tokio::test]
+    async fn test_priority_promote_path_golden_past_promote() {
+        let recovery = "SELECT pg_is_in_recovery()";
+        let timeline = "SELECT pg_walfile_name(pg_current_wal_lsn())";
+        let wal_status =
+            "SELECT pg_current_wal_lsn() - '0/0', pg_walfile_name(pg_current_wal_lsn())";
+        let repl = "SELECT application_name, flush_lsn - '0/0' FROM pg_stat_replication";
+        let flush = "SELECT pg_current_wal_flush_lsn() - '0/0'";
+        let node2 = || running_member("node2", 100);
+        let priority_sync = || SyncState {
+            leader: "old_leader".into(),
+            sync_standby: Some("node2,node3".into()),
+            quorum: 1,
+            kind: Default::default(),
+        };
+        // (label, mode, /sync, node2 is a member)
+        let cases = [
+            ("gp-off", None, None, false),
+            ("gp-async", Some(SynchronousMode::Async), None, true),
+            ("gp-sync-nosync", Some(SynchronousMode::Sync), None, true),
+            (
+                "gp-sync-priority",
+                Some(SynchronousMode::Sync),
+                Some(priority_sync()),
+                true,
+            ),
+        ];
+        for (label, mode, sync, with_node2) in cases {
+            let pg = fresh_primary_pg(&[("node2", "8192")]).await;
+            let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
+            let (mut ha, dir) = promoting_ha_with(
+                label,
+                dcs.clone(),
+                mode,
+                sync,
+                FakeBin::PgCtlPromotes,
+                pg.port,
+            );
+            if with_node2 {
+                ha.cluster.members.push(node2());
+            }
+            let result = ha.process_healthy_cluster().await;
+            assert!(
+                matches!(result, CycleResult::Leader(ref m) if m.starts_with("promoted to primary")),
+                "{label}: got {result}"
+            );
+            // Promoted and observed: Primary, out of recovery.
+            assert_eq!(
+                ha.postgresql().observed_in_recovery(),
+                Some(false),
+                "{label}"
+            );
+            assert_eq!(ha.postgresql().role(), &MemberRole::Primary, "{label}");
+            assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"), "{label}");
+            // `/timeline`: the pending record, then the confirmed one on timeline 3.
+            let writes = dcs.timeline_writes();
+            assert_eq!(writes.len(), 2, "{label}: pending, then confirmed");
+            assert!(writes[0].pending.is_some(), "{label}");
+            assert_eq!(
+                (
+                    writes[1].timeline,
+                    writes[1].begin,
+                    writes[1].pending.is_none()
+                ),
+                (3, 0x3000, true),
+                "{label}"
+            );
+            assert_eq!(writes[1].primary, "test_node", "{label}");
+            // `touch_member` wrote this node's member record.
+            assert_eq!(
+                dcs.touch_count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{label}: touch_member"
+            );
+            let sql = pg.queries();
+            let calls = pg_ctl_calls(&dir);
+            let promote = format!("promote -D {} -w", dir.display());
+            let reload = format!("reload -D {}", dir.display());
+            let sync_writes = dcs.sync_writes.lock().unwrap().clone();
+            match mode {
+                // Async: nothing synchronous; the empty value is installed once.
+                None | Some(SynchronousMode::Async) => {
+                    assert_eq!(
+                        sql,
+                        vec![
+                            recovery,
+                            timeline,
+                            recovery,
+                            wal_status,
+                            "ALTER SYSTEM SET synchronous_standby_names TO ''"
+                        ],
+                        "{label}"
+                    );
+                    assert_eq!(calls, vec![promote, reload], "{label}");
+                    assert!(sync_writes.is_empty(), "{label}: no /sync write");
+                }
+                // Sync: FIRST 1 (...) installed, then /sync grown (D10: the
+                // Priority wire form, `quorum` = N, no `kind` key).
+                Some(SynchronousMode::Sync) => {
+                    assert_eq!(
+                        sql,
+                        vec![
+                            recovery,
+                            timeline,
+                            recovery,
+                            wal_status,
+                            repl,
+                            flush,
+                            "ALTER SYSTEM SET synchronous_standby_names TO 'FIRST 1 (\"node2\")'"
+                        ],
+                        "{label}"
+                    );
+                    assert!(!sql.iter().any(|q| q.contains("ANY")), "{label}");
+                    assert_eq!(calls, vec![promote, reload], "{label}");
+                    assert_eq!(sync_writes.len(), 1, "{label}: one /sync write");
+                    let v: serde_json::Value = serde_json::from_str(&sync_writes[0]).unwrap();
+                    assert_eq!(v["leader"], "test_node", "{label}");
+                    assert_eq!(v["sync_standby"], "node2", "{label}");
+                    assert_eq!(v["quorum"], 1, "{label}: D10, quorum = N");
+                    assert!(
+                        v.get("kind").is_none(),
+                        "{label}: no kind on the Priority form"
+                    );
+                }
+                Some(SynchronousMode::Quorum) => unreachable!(),
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// `quorum` with a Priority or absent `/sync`: the promote path installs
+    /// nothing before `pg_ctl promote` (no pre-promote write), and the
+    /// executor's first cycle after it only reloads.
+    #[tokio::test]
+    async fn test_quorum_promote_path_with_a_non_quorum_sync_first_cycle() {
+        let priority_sync = SyncState {
+            leader: "old_leader".into(),
+            sync_standby: Some("node2,node3".into()),
+            quorum: 1,
+            kind: Default::default(),
+        };
+        for (label, sync) in [("gq-none", None), ("gq-priority", Some(priority_sync))] {
+            let pg = fresh_primary_pg(&[("node2", "8192")]).await;
+            let dcs = Arc::new(MockDcs::with_leader("test_node").with_timeline(2));
+            let (mut ha, dir) = promoting_ha_with(
+                label,
+                dcs.clone(),
+                Some(SynchronousMode::Quorum),
+                sync,
+                FakeBin::PgCtlPromotes,
+                pg.port,
+            );
+            ha.cluster.members.push(running_member("node2", 100));
+            let result = ha.process_healthy_cluster().await;
+            assert!(
+                matches!(result, CycleResult::Leader(ref m) if m.starts_with("promoted to primary")),
+                "{label}: got {result}"
+            );
+            let sql = pg.queries();
+            assert_eq!(
+                sql,
+                vec![
+                    "SELECT pg_is_in_recovery()",
+                    "SELECT pg_walfile_name(pg_current_wal_lsn())",
+                    "SELECT pg_is_in_recovery()",
+                    "SELECT pg_current_wal_lsn() - '0/0', pg_walfile_name(pg_current_wal_lsn())",
+                ],
+                "{label}: no ALTER SYSTEM and no replication query on the first cycle"
+            );
+            assert_eq!(
+                pg_ctl_calls(&dir),
+                vec![
+                    format!("promote -D {} -w", dir.display()),
+                    format!("reload -D {}", dir.display())
+                ],
+                "{label}"
+            );
+            assert!(dcs.sync_writes.lock().unwrap().is_empty(), "{label}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// Decision 3: when the pre-promote write fails, do NOT promote, give the
     /// lock back like the watchdog-arm failure, and record no pending promote.
     /// Here the failure is the PostgreSQL connection (port 1).
@@ -5998,10 +6546,13 @@ mod tests {
             quorum: 1,
             kind: crate::cluster::SyncKind::Quorum,
         };
-        let (mut ha, dir) = promoting_ha("pre-promote-fail", dcs.clone(), Some(true), Some(sync));
+        let (mut ha, dir) = promoting_ha(
+            "pre-promote-fail",
+            dcs.clone(),
+            Some(SynchronousMode::Quorum),
+            Some(sync),
+        );
         ha.is_leader = true;
-        let _guard =
-            quorum_sync::ModeOverrideGuard::set(Some(quorum_sync::EffectiveSyncMode::Quorum));
         let result = ha.process_healthy_cluster().await;
         assert!(
             matches!(result, CycleResult::Error(ref m)
@@ -9934,7 +10485,11 @@ mod tests {
                 ha.set_peer_probe(p);
             }
             ha.dynamic_config_state.apply_new_config(GlobalConfig {
-                synchronous_mode: Some(setup.sync_on),
+                synchronous_mode: Some(if setup.sync_on {
+                    SynchronousMode::Quorum
+                } else {
+                    SynchronousMode::Async
+                }),
                 maximum_lag_on_failover: setup.max_lag,
                 ..Default::default()
             });

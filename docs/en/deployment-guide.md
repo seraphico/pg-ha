@@ -372,7 +372,7 @@ bootstrap:
     loop_wait: <u64>
     ttl: <u64>
     maximum_lag_on_failover: <u64>   # election rejects candidates that lag the cluster's maximum wal_position by more than N bytes; None/omitted = off
-    synchronous_mode: <bool>       # synchronous replication switch (default: false)
+    synchronous_mode: <async|sync|quorum> # replication mode (default: async): async / sync (priority-based) / quorum (quorum-based); only these three lowercase strings are accepted, any other value (including true/false) fails startup; enabling quorum requires every node on the same pg-ha version
     synchronous_mode_strict: <bool># whether to block writes when there is no synchronous standby (default: false)
     synchronous_node_count: <u32>  # number of synchronous standbys (default: 1)
   post_init: [<string>]            # paths of SQL scripts to run after initialization

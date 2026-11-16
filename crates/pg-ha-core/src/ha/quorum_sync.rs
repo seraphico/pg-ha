@@ -3,8 +3,9 @@
 //! `QuorumExec::cycle` is the quorum counterpart of
 //! `Ha::enforce_synchronous_replication`. It decides which acknowledged commits
 //! can be lost, because it writes `synchronous_standby_names` and DCS `/sync`.
-//! It is only reached through `Ha::quorum_executor_applies`, which is false for
-//! every production input in PR3b (no user setting selects Quorum yet).
+//! It is only reached through `Ha::quorum_executor_applies`: when
+//! `synchronous_mode` is `"quorum"`, or while a `kind: Quorum` `/sync` still
+//! has to be taken back after a switch to `"sync"` or `"async"` (T7, T9).
 //!
 //! # Shape
 //!
@@ -88,23 +89,12 @@ use crate::sync::{SyncManager, SyncMode};
 use crate::sync_value::{
     ShapeKey, SyncKeyword, SyncValueShape, parse_sync_value, render_quorum_value,
 };
+use crate::synchronous_mode::SynchronousMode;
 
 /// Upper bound for each call the executor makes on PostgreSQL or the DCS.
 /// `Postgresql::set_synchronous_standby_names` connects without a connect
 /// timeout, so the executor bounds it from outside.
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The mode the HA loop wants, as the executor sees it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EffectiveSyncMode {
-    /// No synchronous replication.
-    Off,
-    /// Priority (`FIRST n`): the existing code.
-    Priority,
-    /// Quorum (`ANY n`). Not constructible from configuration in PR3b.
-    #[allow(dead_code)] // built only by the test override until PR4 wires the setting
-    Quorum,
-}
 
 /// Everything the executor does to PostgreSQL and the DCS.
 // async_trait boxes the future, which clippy flags as double_must_use.
@@ -182,7 +172,7 @@ impl SyncIo for RealIo<'_> {
 #[derive(Debug, Clone)]
 pub(crate) struct ExecInput {
     pub(crate) me: String,
-    pub(crate) mode: EffectiveSyncMode,
+    pub(crate) mode: SynchronousMode,
     /// `synchronous_node_count` as configured (the Priority hand-off writes it
     /// into `/sync.quorum` like the Priority code does).
     pub(crate) count: usize,
@@ -190,6 +180,8 @@ pub(crate) struct ExecInput {
     pub(crate) lag_threshold: Option<u64>,
     pub(crate) members: Vec<Member>,
     pub(crate) sync: Option<SyncState>,
+    /// The watchdog is configured (`watchdog.mode` is not `off`).
+    pub(crate) watchdog_on: bool,
 }
 
 /// What a cycle did.
@@ -224,6 +216,72 @@ pub(crate) struct QuorumExec {
     mark: Option<Mark>,
     reloaded_since_start: bool,
     pending: Option<PendingSet>,
+    /// The operator warnings last emitted and for how many cycles they held.
+    warned: Option<(Vec<QuorumWarning>, u32)>,
+    /// The unreadable `synchronous_standby_names` value last seen and for how
+    /// many consecutive cycles.
+    unreadable: Option<(String, u32)>,
+}
+
+/// How often a standing warning is repeated, in executor cycles (the same
+/// cadence as the pending-SHOW warning).
+const WARN_EVERY_CYCLES: u32 = 30;
+
+/// Something an operator should know about a `quorum` configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuorumWarning {
+    /// `synchronous_node_count` is 1 with 3 or more eligible voters: a
+    /// failover then needs almost every voter online (design D6).
+    CountOneWithManyVoters(usize),
+    /// No watchdog: a hung primary is not fenced (zombie primary, D12).
+    WatchdogOff,
+    /// Every eligible voter is tagged `nofailover`: they vote, none can be
+    /// elected.
+    AllVotersNofailover,
+}
+
+impl QuorumWarning {
+    fn text(&self) -> String {
+        match self {
+            QuorumWarning::CountOneWithManyVoters(n) => format!(
+                "synchronous_mode quorum: synchronous_node_count is 1 with {n} eligible voters; \
+                 a failover then needs almost every voter online (raise synchronous_node_count)"
+            ),
+            QuorumWarning::WatchdogOff => "synchronous_mode quorum without a watchdog \
+                 (watchdog.mode is off): a hung primary is not fenced (zombie-primary risk)"
+                .to_string(),
+            QuorumWarning::AllVotersNofailover => "synchronous_mode quorum: every eligible voter \
+                 is tagged nofailover; they vote but none of them can be elected"
+                .to_string(),
+        }
+    }
+}
+
+/// The operator warnings for this input. Active in `quorum` mode only. Pure.
+/// `target_voters` are the standbys the mode currently wants as voters.
+pub(crate) fn quorum_warnings(input: &ExecInput, target_voters: &Names) -> Vec<QuorumWarning> {
+    let mut out = Vec::new();
+    if input.mode != SynchronousMode::Quorum {
+        return out;
+    }
+    if input.count == 1 && target_voters.len() >= 3 {
+        out.push(QuorumWarning::CountOneWithManyVoters(target_voters.len()));
+    }
+    if !input.watchdog_on {
+        out.push(QuorumWarning::WatchdogOff);
+    }
+    if !target_voters.is_empty()
+        && target_voters.iter().all(|v| {
+            input
+                .members
+                .iter()
+                .find(|m| m.name.eq_ignore_ascii_case(v))
+                .is_some_and(|m| m.is_nofailover())
+        })
+    {
+        out.push(QuorumWarning::AllVotersNofailover);
+    }
+    out
 }
 
 /// What SHOW said, reduced to what the executor decides on.
@@ -233,6 +291,8 @@ struct Observed {
     key: ShapeKey,
     /// Describable by `(S, n)` and not wildcard/blocking/unparseable.
     reasonable: bool,
+    /// Why the value could not be read, when it could not.
+    unreadable: Option<String>,
 }
 
 fn observe_value(raw: &str) -> Observed {
@@ -244,10 +304,10 @@ fn observe_value(raw: &str) -> Observed {
                 key: shape.key(),
                 shape,
                 reasonable,
+                unreadable: None,
             }
         }
         Err(e) => {
-            warn!("synchronous_standby_names {raw:?} is not readable ({e}); replacing it");
             // A key no readable value can equal, so a mark is never kept across it.
             let key = ShapeKey {
                 quorum: false,
@@ -264,6 +324,7 @@ fn observe_value(raw: &str) -> Observed {
                 },
                 key,
                 reasonable: false,
+                unreadable: Some(e.to_string()),
             }
         }
     }
@@ -334,9 +395,9 @@ fn empty_target() -> QuorumTarget {
 /// (also strict mode with fewer eligible standbys than `N`, answer 2).
 fn build_target(input: &ExecInput, snapshot: &ReplicationSnapshot, voters: &Names) -> QuorumTarget {
     let mode = match input.mode {
-        EffectiveSyncMode::Off => return empty_target(),
-        EffectiveSyncMode::Priority => SyncMode::Priority,
-        EffectiveSyncMode::Quorum => SyncMode::Quorum,
+        SynchronousMode::Async => return empty_target(),
+        SynchronousMode::Sync => SyncMode::Priority,
+        SynchronousMode::Quorum => SyncMode::Quorum,
     };
     let current: Vec<String> = voters.iter().cloned().collect();
     let selection = SyncManager::new(mode, input.count, input.strict).select_sync_standbys(
@@ -417,6 +478,8 @@ impl QuorumExec {
             }),
             reloaded_since_start: true,
             pending: None,
+            warned: None,
+            unreadable: None,
         }
     }
 
@@ -424,6 +487,39 @@ impl QuorumExec {
     #[cfg(test)]
     pub(crate) fn is_fresh_for_test(&self) -> bool {
         self.mark.is_none() && !self.reloaded_since_start && self.pending.is_none()
+    }
+    /// Rate limit for the "unreadable value" warning: true on the first
+    /// sight of a value, when the text changes, and on every 30th consecutive
+    /// cycle; a readable value resets it. Pure.
+    fn note_unreadable(&mut self, obs: &Observed) -> bool {
+        if obs.unreadable.is_none() {
+            self.unreadable = None;
+            return false;
+        }
+        match &mut self.unreadable {
+            Some((raw, cycles)) if *raw == obs.raw => {
+                *cycles += 1;
+                *cycles % WARN_EVERY_CYCLES == 0
+            }
+            slot => {
+                *slot = Some((obs.raw.clone(), 1));
+                true
+            }
+        }
+    }
+    /// Rate limit for the operator warnings: true when the set is new and not
+    /// empty, and on every 30th cycle it stands. Pure.
+    fn should_emit_warnings(&mut self, set: &[QuorumWarning]) -> bool {
+        match &mut self.warned {
+            Some((prev, cycles)) if prev.as_slice() == set => {
+                *cycles += 1;
+                *cycles % WARN_EVERY_CYCLES == 0 && !set.is_empty()
+            }
+            slot => {
+                *slot = Some((set.to_vec(), 1));
+                !set.is_empty()
+            }
+        }
     }
 
     /// Run one cycle. See the module doc for the order of the phases.
@@ -462,6 +558,13 @@ impl QuorumExec {
             }
         };
         let obs = observe_value(&raw);
+        if self.note_unreadable(&obs) {
+            warn!(
+                "synchronous_standby_names {:?} is not readable ({}); replacing it",
+                obs.raw,
+                obs.unreadable.as_deref().unwrap_or_default()
+            );
+        }
         let me = input.me.as_str();
         let live = input.sync.as_ref().filter(|s| !s.is_empty());
 
@@ -559,7 +662,7 @@ impl QuorumExec {
         }
 
         // 5. T8: a Priority `/sync` of this leader becomes a Quorum one.
-        if input.mode == EffectiveSyncMode::Quorum
+        if input.mode == SynchronousMode::Quorum
             && !wrote
             && let Some(s) = live
             && s.kind == SyncKind::Priority
@@ -598,8 +701,14 @@ impl QuorumExec {
         let relax_blocked = relax_blocked(mark_was_current, obs.reasonable);
 
         // 7. Plan.
-        let strict = input.mode != EffectiveSyncMode::Off && input.strict;
+        let strict = input.mode != SynchronousMode::Async && input.strict;
         let target = build_target(input, &snapshot, &state.voters);
+        let warnings = quorum_warnings(input, &target.voters);
+        if self.should_emit_warnings(&warnings) {
+            for w in &warnings {
+                warn!("{}", w.text());
+            }
+        }
         let acts = match self.assemble(input, &obs, &state, &target, &caught, relax_blocked, strict)
         {
             Ok(acts) => acts,
@@ -730,7 +839,7 @@ impl QuorumExec {
                         gated = true;
                         break;
                     }
-                    let wire = if input.mode == EffectiveSyncMode::Off
+                    let wire = if input.mode == SynchronousMode::Async
                         && voters.is_empty()
                         && *quorum == 0
                     {
@@ -770,7 +879,7 @@ impl QuorumExec {
 
         // From here the planner has converged: S and V equal the target.
         match input.mode {
-            EffectiveSyncMode::Quorum => {
+            SynchronousMode::Quorum => {
                 // T8 left `FIRST n (S)` or a bare list: same (S, n), as `ANY`.
                 if !cur.pg_names.is_empty() && obs.shape.keyword != SyncKeyword::Any {
                     let text =
@@ -779,7 +888,7 @@ impl QuorumExec {
                     acts.push(Act::Pg(text));
                 }
             }
-            EffectiveSyncMode::Priority => {
+            SynchronousMode::Sync => {
                 // T9: V = S, |S| = n, q = 0: the Priority code can take over.
                 let done = cur.quorum == 0
                     && cur.voters == cur.pg_names
@@ -800,7 +909,7 @@ impl QuorumExec {
                     }
                 }
             }
-            EffectiveSyncMode::Off => {
+            SynchronousMode::Async => {
                 // T7: nothing left; hand the cluster back.
                 if cur.voters.is_empty()
                     && cur.pg_names.is_empty()
@@ -825,15 +934,6 @@ impl QuorumExec {
         }
         Ok(acts)
     }
-}
-
-// Test-only stand-in for the PR4 setting. A thread-local so that `Ha` itself
-// carries no `cfg(test)` field (the source-order tests in `ha/mod.rs` cut the
-// production text at the first `#[cfg(test)]`).
-#[cfg(test)]
-thread_local! {
-    static MODE_OVERRIDE: std::cell::Cell<Option<EffectiveSyncMode>> =
-        const { std::cell::Cell::new(None) };
 }
 
 // Test-only: a test about something else that happens to reach the promote
@@ -864,30 +964,11 @@ impl Drop for SkipPrePromoteGuard {
     }
 }
 
-/// Sets the test-only mode for this thread and clears it on drop.
-#[cfg(test)]
-pub(crate) struct ModeOverrideGuard;
-
-#[cfg(test)]
-impl ModeOverrideGuard {
-    pub(crate) fn set(mode: Option<EffectiveSyncMode>) -> Self {
-        MODE_OVERRIDE.with(|m| m.set(mode));
-        ModeOverrideGuard
-    }
-}
-
-#[cfg(test)]
-impl Drop for ModeOverrideGuard {
-    fn drop(&mut self) {
-        MODE_OVERRIDE.with(|m| m.set(None));
-    }
-}
-
 /// Does the quorum executor drive `/sync` and `synchronous_standby_names`?
 /// Only for the Quorum mode, or while a `kind: Quorum` `/sync` still has to be
 /// taken back (T7, T9). Pure.
-pub(crate) fn executor_applies(mode: EffectiveSyncMode, sync: Option<&SyncState>) -> bool {
-    mode == EffectiveSyncMode::Quorum || sync.is_some_and(|s| s.kind == SyncKind::Quorum)
+pub(crate) fn executor_applies(mode: SynchronousMode, sync: Option<&SyncState>) -> bool {
+    mode == SynchronousMode::Quorum || sync.is_some_and(|s| s.kind == SyncKind::Quorum)
 }
 
 /// How long the pre-promote write waits for SHOW to show the new value (the
@@ -911,7 +992,7 @@ pub(crate) const PRE_PROMOTE_CONFIRM_STEP: Duration = Duration::from_millis(100)
 /// shows the shape (a retry after a failed `pg_ctl promote`) nothing is written.
 pub(crate) async fn pre_promote_sync<IO: SyncIo>(
     io: &mut IO,
-    mode: EffectiveSyncMode,
+    mode: SynchronousMode,
     me: &str,
     sync: Option<&SyncState>,
 ) -> std::result::Result<(), String> {
@@ -973,23 +1054,9 @@ fn shows(raw: &str, key: &ShapeKey) -> bool {
 }
 
 impl Ha {
-    /// The mode the HA loop wants. PR3b can say `Priority` or `Off` only; the
-    /// `Quorum` answer exists for tests until PR4 adds the setting.
-    pub(super) fn effective_sync_mode(&self) -> EffectiveSyncMode {
-        #[cfg(test)]
-        if let Some(mode) = MODE_OVERRIDE.with(|m| m.get()) {
-            return mode;
-        }
-        if self
-            .dynamic_config_state
-            .last_config
-            .synchronous_mode
-            .unwrap_or(false)
-        {
-            EffectiveSyncMode::Priority
-        } else {
-            EffectiveSyncMode::Off
-        }
+    /// The mode the HA loop wants: the `synchronous_mode` setting.
+    pub(super) fn effective_sync_mode(&self) -> SynchronousMode {
+        self.dynamic_config_state.last_config.sync_mode()
     }
 
     /// Does the quorum executor drive `/sync` and `synchronous_standby_names`
@@ -1034,6 +1101,7 @@ impl Ha {
             lag_threshold: cfg.maximum_lag_on_syncnode,
             members: self.cluster.members.clone(),
             sync: self.cluster.sync_state.clone(),
+            watchdog_on: self.config.watchdog.mode != crate::config::WatchdogMode::Off,
         };
         let mut io = RealIo {
             pg: &self.postgresql,

@@ -37,16 +37,12 @@ impl Ha {
     /// Every failure is a refusal ("no leader rather than a lost commit"),
     /// never a cycle error.
     pub(super) async fn quorum_vote(&self) -> VoteGate {
-        let sync_on = self
-            .dynamic_config_state
-            .last_config
-            .synchronous_mode
-            .unwrap_or(false);
+        let sync_on = self.dynamic_config_state.last_config.sync_mode();
         let Some(state) = self
             .cluster
             .sync_state
             .as_ref()
-            .filter(|s| sync_on && s.kind == SyncKind::Quorum)
+            .filter(|s| sync_on.is_synchronous() && s.kind == SyncKind::Quorum)
         else {
             return VoteGate::NotApplicable;
         };
