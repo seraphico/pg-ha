@@ -48,7 +48,7 @@ impl SynchronousMode {
         }
     }
 
-    fn invalid(shown: &str) -> String {
+    pub(crate) fn invalid(shown: &str) -> String {
         format!(
             "synchronous_mode: invalid value {shown}; expected one of {}",
             Self::ACCEPTED
@@ -122,6 +122,16 @@ impl<'de> Deserialize<'de> for SynchronousMode {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         d.deserialize_any(ModeVisitor)
     }
+}
+
+/// `deserialize_with` for an `Option<SynchronousMode>` field. An absent key
+/// (`#[serde(default)]`) stays `None`; an explicit `null` is rejected like any
+/// other invalid value, because serde would otherwise turn it into `None` and
+/// silently mean `async`.
+pub fn deserialize_present<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<SynchronousMode>, D::Error> {
+    SynchronousMode::deserialize(d).map(Some)
 }
 
 #[cfg(test)]
@@ -198,8 +208,10 @@ mod tests {
     }
 
     #[test]
-    fn default_is_async_and_null_option_is_none() {
+    fn default_is_async_and_option_null_is_rejected() {
         assert_eq!(SynchronousMode::default(), SynchronousMode::Async);
+        // Option<SynchronousMode> without deserialize_present maps null to None;
+        // the config structs use deserialize_present so that never happens.
         let o: Option<SynchronousMode> = serde_json::from_value(json!(null)).unwrap();
         assert_eq!(o, None);
     }

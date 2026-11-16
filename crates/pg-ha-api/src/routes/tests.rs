@@ -709,11 +709,17 @@ async fn test_patch_config_accepts_the_three_strings() {
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["synchronous_mode"], mode);
     }
-    // PUT too, and null removes the key (back to the async default).
-    let (state, dcs) = config_state(r#"{"synchronous_mode":"quorum","ttl":15,"loop_wait":5}"#);
-    let (status, _) = send_config(state, "PATCH", r#"{"synchronous_mode":null}"#).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(stored_config(&dcs).get("synchronous_mode").is_none());
+    // An explicit null is rejected (PATCH and PUT): 400, nothing written. It
+    // would otherwise silently mean async.
+    for method in ["PATCH", "PUT"] {
+        let (state, dcs) = config_state(r#"{"synchronous_mode":"quorum","ttl":15,"loop_wait":5}"#);
+        let before = stored_config(&dcs);
+        let (status, resp) = send_config(state, method, r#"{"synchronous_mode":null}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}: {resp}");
+        assert!(resp.contains(r#"expected one of"#), "{method}: {resp}");
+        assert_eq!(stored_config(&dcs), before, "{method}: nothing written");
+    }
+    // PUT with a valid value.
     let (state, dcs) = config_state("{}");
     let (status, resp) = send_config(state, "PUT", r#"{"synchronous_mode":"quorum"}"#).await;
     assert_eq!(status, StatusCode::OK, "{resp}");

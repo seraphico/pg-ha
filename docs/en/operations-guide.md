@@ -530,7 +530,7 @@ node2 recovers → pg-ha marks it Running → the next HA cycle recomputes →
 
 | Parameter | Type | Default | Description |
 |------|------|--------|------|
-| `synchronous_mode` | string | `"async"` | Replication mode. Only three lowercase strings are accepted: `"async"` asynchronous (`synchronous_standby_names` is cleared), `"sync"` priority-based synchronous (`FIRST N (...)`), `"quorum"` quorum-based synchronous (`ANY N (...)`). Booleans (`true` / `false`), `"on"` / `"off"` and any other spelling or case (such as `"Sync"` or `"QUORUM"`) are rejected |
+| `synchronous_mode` | string | `"async"` | Replication mode. Only three lowercase strings are accepted: `"async"` asynchronous (`synchronous_standby_names` is cleared), `"sync"` priority-based synchronous (`FIRST N (...)`), `"quorum"` quorum-based synchronous (`ANY N (...)`). Booleans (`true` / `false`), `null` (an explicit null is not the same as leaving the key unset), `"on"` / `"off"` and any other spelling or case (such as `"Sync"` or `"QUORUM"`) are rejected |
 | `synchronous_mode_strict` | bool | `false` | What happens when no sync standby is available: `false` = fall back to asynchronous replication and keep writing; `true` = block all writes |
 | `synchronous_node_count` | u32 | `1` | How many synchronous standbys must acknowledge. This is N in `FIRST N` / `ANY N` |
 | `maximum_lag_on_syncnode` | u64 (bytes) | unset = off | When a standby lags the primary by more than this many bytes (the `flush_lsn` difference), do not count it as an eligible synchronous standby and do not add it to `/sync`. There is no "disabled" sentinel. `None` (unset, or PATCH to `null`) means off |

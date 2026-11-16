@@ -844,8 +844,6 @@ proxy:
         for v in ["async", "sync", "quorum", "\"quorum\""] {
             assert!(Config::from_yaml(&bootstrap_yaml(v)).is_ok(), "{v}");
         }
-        // Absent, and an explicit null (same as absent: PATCH null deletes the key), mean async.
-        assert!(Config::from_yaml(&bootstrap_yaml("null")).is_ok());
         let yaml = format!("{MINIMAL_YAML}\nbootstrap:\n  dcs:\n    ttl: 25");
         assert!(Config::from_yaml(&yaml).is_ok());
     }
@@ -866,6 +864,9 @@ proxy:
             "1",
             "0",
             "[]",
+            "null",
+            "~",
+            "",
         ] {
             let err = Config::from_yaml(&bootstrap_yaml(v))
                 .expect_err(&format!("synchronous_mode: {v} must be rejected"))

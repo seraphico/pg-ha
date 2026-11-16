@@ -528,7 +528,7 @@ node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `synchronous_mode` | string | `"async"` | 复制模式，只接受三个小写字符串：`"async"` 异步复制（`synchronous_standby_names` 被清空）、`"sync"` 同步复制(按优先级，`FIRST N (...)`)、`"quorum"` 法定人数同步复制（`ANY N (...)`）。布尔值（`true` / `false`）、`"on"` / `"off"` 和其它拼写或大小写（如 `"Sync"`、`"QUORUM"`）一律被拒绝 |
+| `synchronous_mode` | string | `"async"` | 复制模式，只接受三个小写字符串：`"async"` 异步复制（`synchronous_standby_names` 被清空）、`"sync"` 同步复制(按优先级，`FIRST N (...)`)、`"quorum"` 法定人数同步复制（`ANY N (...)`）。布尔值（`true` / `false`）、`null`（显式置空，不等于不设置）、`"on"` / `"off"` 和其它拼写或大小写（如 `"Sync"`、`"QUORUM"`）一律被拒绝 |
 | `synchronous_mode_strict` | bool | `false` | 无可用 sync standby 时的行为：`false` = 退化为异步继续写入；`true` = 阻塞所有写入 |
 | `synchronous_node_count` | u32 | `1` | 需要多少个同步备库确认。`FIRST N` / `ANY N` 中的 N |
 | `maximum_lag_on_syncnode` | u64（字节） | 不设 = 关闭 | 备库落后 Primary 超过这么多字节（`flush_lsn` 差值）时，不把它算作合格同步备库、不加进 `/sync`。没有「禁用」哨兵值，`None`（不设置或 PATCH 为 `null`）就是关闭 |

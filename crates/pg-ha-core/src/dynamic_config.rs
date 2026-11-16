@@ -47,7 +47,12 @@ pub struct GlobalConfig {
 
     /// Synchronous replication mode: `"async"` (default), `"sync"` or
     /// `"quorum"`. Anything else is rejected when the document is parsed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// An explicit `null` is rejected (it would silently mean `async`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::synchronous_mode::deserialize_present"
+    )]
     pub synchronous_mode: Option<SynchronousMode>,
 
     /// Strict synchronous mode (no async fallback)
@@ -384,6 +389,10 @@ pub fn patch_config(
     base: &GlobalConfig,
     patch: &serde_json::Value,
 ) -> Result<GlobalConfig, String> {
+    // `null` would delete the key below and silently mean `async`.
+    if patch.get("synchronous_mode").is_some_and(|v| v.is_null()) {
+        return Err(SynchronousMode::invalid("null"));
+    }
     // Serialize base to a JSON Value
     let mut base_value =
         serde_json::to_value(base).map_err(|e| format!("Failed to serialize base config: {e}"))?;
@@ -833,7 +842,7 @@ mod tests {
     const ACCEPTED_TEXT: &str = r#"expected one of "async", "sync", "quorum" (lowercase)"#;
 
     #[test]
-    fn test_synchronous_mode_parses_the_three_strings_and_absent_null() {
+    fn test_synchronous_mode_parses_the_three_strings_and_absent() {
         for (raw, want) in [
             (
                 r#"{"synchronous_mode":"async"}"#,
@@ -847,7 +856,6 @@ mod tests {
                 r#"{"synchronous_mode":"quorum"}"#,
                 Some(SynchronousMode::Quorum),
             ),
-            (r#"{"synchronous_mode":null}"#, None),
             (r#"{}"#, None),
         ] {
             let c: GlobalConfig = serde_json::from_str(raw).unwrap();
@@ -874,6 +882,7 @@ mod tests {
             r#"" sync""#,
             "[]",
             "{}",
+            "null",
         ] {
             let raw = format!(r#"{{"synchronous_mode":{v}}}"#);
             let err = serde_json::from_str::<GlobalConfig>(&raw)
@@ -898,6 +907,7 @@ mod tests {
             serde_json::json!("QUORUM"),
             serde_json::json!(""),
             serde_json::json!(2),
+            serde_json::Value::Null,
         ] {
             let err =
                 patch_config(&base, &serde_json::json!({ "synchronous_mode": bad })).unwrap_err();
@@ -909,8 +919,9 @@ mod tests {
             serde_json::to_value(&q).unwrap()["synchronous_mode"],
             serde_json::json!("quorum")
         );
-        let removed = patch_config(&q, &serde_json::json!({"synchronous_mode": null})).unwrap();
-        assert_eq!(removed.synchronous_mode, None);
+        // The operator who wants async sends "async"; null never deletes the key.
+        let a = patch_config(&q, &serde_json::json!({"synchronous_mode": "async"})).unwrap();
+        assert_eq!(a.synchronous_mode, Some(SynchronousMode::Async));
     }
 
     #[test]
