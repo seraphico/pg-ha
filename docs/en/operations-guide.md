@@ -24,6 +24,16 @@ The response comes from `CascadeManager::build_cascade_topology`. Roles are lowe
 }
 ```
 
+`/cluster` also has a `sync` field. Every request reads DCS `/sync` again:
+```json
+"sync": {"kind": "quorum", "voters": ["node2", "node3"], "quorum": 2, "n": 1, "settled": false}
+```
+- `kind`: `"priority"` or `"quorum"`, matching `synchronous_mode` `"sync"` / `"quorum"`. `sync` is `null` as a whole when there is no `/sync`.
+- `voters`: the names in `/sync` (in quorum mode the voter set V, without the leader).
+- `quorum`: `q`, the `/sync.quorum` value. `null` for `priority` (the field is a leftover there and has no effect).
+- `n`: the `ANY n` PostgreSQL enforces, as the leader's quorum executor read it from `SHOW synchronous_standby_names` in its last cycle. **Only the leader's `/cluster` has it.** It is `null` on other nodes, for `priority`, and before the leader has read SHOW.
+- `settled`: `q == |voters| - n` and `n >= 1` (voters exist but `n` is still 0 means PostgreSQL has not switched to `ANY` yet, which is also not settled). `false` means `q` has not been relaxed yet, and no candidate can win the vote (see the known limitation under "Synchronous replication"). `null` when `n` is unknown.
+A script that has to wait for quorum to settle polls the leader's `/cluster` until `sync.settled` is `true`.
 A node's own runtime state, timeline, WAL, lag, pause, and pending-restart flags are on **this node's** `/patroni`, not in `/cluster`:
 
 ```bash
@@ -548,6 +558,7 @@ node2 recovers → pg-ha marks it Running → the next HA cycle recomputes →
 | `"quorum"` | quorum-based synchronous | `ANY N (...)`, maintained by the quorum executor |
 
 Only the lowercase strings in the table are accepted. Any other value, including the old `true` / `false`, is rejected: `PATCH` / `PUT /config` returns **400** with an error that lists the accepted values, and nothing is written to the DCS.
+> ⚠ **Known limitation (quorum, tracked as SB-36)**: whenever a voter joins (quorum was just enabled, or a node rejoins after a failover or switchover), `q` in `/sync` first equals the number of voters |V|. It is relaxed to |V| − n only after the leader has confirmed the standby is in sync, about 15 to 20 seconds later. During that window a candidate can collect at most |V| − 1 votes, so nobody can win the vote and failover is impossible. In that window pg-ha **refuses a switchover and a failover with a `candidate`** (409, the lock is not released, no demotion, with a message like `quorum not settled: failover is impossible until q is relaxed (q=2, voters=2, n=1)`). It also refuses when fewer than `q` other voters are online (`not enough voters online for the candidate to win the vote`). If the primary dies by itself inside the window, nobody runs the executor to relax `q`, the cluster stays without a primary, and `/sync` has to be fixed by hand. Before an operation, check that `sync.settled` in `GET /cluster` (on the leader) is `true`. In the logs: the leader logs a WARN while `q` is not relaxed (`failover is not possible until q is relaxed`), and a refused candidate on a leaderless cluster logs an ERROR (`The cluster cannot elect a primary`). Both are rate limited.
 
 **An invalid configuration already stored in the DCS** (for example a leftover `synchronous_mode: true` in a development cluster, or a bad hand edit) is applied by no node and never falls back to `"async"`. A running node keeps its last valid configuration and logs an ERROR naming the key and the accepted values (at most once per 60 seconds for the same content). A node that starts with no valid configuration known leaves synchronous replication alone and does not take part in elections until a valid configuration is written with `PUT /config`. While the stored configuration is invalid, `PATCH` returns **409**. An invalid value in `bootstrap.dcs` makes the node fail at startup.
 

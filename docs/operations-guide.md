@@ -24,6 +24,16 @@ curl -s http://localhost:8008/cluster | jq .
 }
 ```
 
+`/cluster` 另有一个 `sync` 字段，每次请求都重新读 DCS `/sync`：
+```json
+"sync": {"kind": "quorum", "voters": ["node2", "node3"], "quorum": 2, "n": 1, "settled": false}
+```
+- `kind`：`"priority"` 或 `"quorum"`，和 `synchronous_mode` 的 `"sync"` / `"quorum"` 对应。没有 `/sync` 时整个 `sync` 为 `null`。
+- `voters`：`/sync` 里的名字（quorum 模式下是投票节点 V，不含 leader）。
+- `quorum`：`q`，即 `/sync.quorum`。`priority` 时为 `null`（该字段在 Priority 下是历史遗留，不起作用）。
+- `n`：PostgreSQL 实际生效的 `ANY n`（leader 的 Quorum 执行器上一轮从 `SHOW synchronous_standby_names` 读到）。**只有 leader 节点的 `/cluster` 有这个值**，其它节点、`priority`、leader 还没读过 SHOW 时为 `null`。
+- `settled`：`q == |voters| - n`，且 `n >= 1`（有投票节点而 `n` 还是 0，说明 PostgreSQL 还没切到 `ANY`，也算未就绪）。`false` 表示 `q` 还没放宽，此时没有候选能赢得投票（见「同步复制」的已知限制）。`n` 未知时为 `null`。
+脚本要等 quorum 就绪，就轮询 leader 的 `/cluster`，直到 `sync.settled` 为 `true`。
 节点自己的运行状态、timeline、WAL、lag、暂停和待重启标志在 **本节点** 的 `/patroni` 上，不在 `/cluster` 里：
 
 ```bash
@@ -546,6 +556,7 @@ node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
 | `"quorum"` | 法定人数同步复制 | `ANY N (...)`，由 Quorum 执行器维护 |
 
 只接受上表中的小写字符串，其它值（包括旧的 `true` / `false`）都会被拒绝：`PATCH` / `PUT /config` 返回 **400**，错误信息列出可接受的值，且不写入 DCS。
+> ⚠ **已知限制（quorum，SB-36 跟踪）**：每当有新的投票节点加入（刚启用 `quorum`，或某节点在 failover / switchover 之后重新加入），`/sync` 里的 `q` 先等于投票节点数 |V|，要等 leader 确认同步后（约 15–20 秒）才放宽到 |V| − n。这段时间内候选节点最多只能拿到 |V| − 1 票，没有节点能赢得投票，所以 failover 不可能发生。pg-ha 在这段时间内**拒绝 switchover 和带 `candidate` 的 failover**（409，不放锁、不 demote，信息形如 `quorum not settled: failover is impossible until q is relaxed (q=2, voters=2, n=1)`）；投票节点在线数不足 `q` 时也会拒绝（`not enough voters online for the candidate to win the vote`）。如果主库在这段时间内自己挂掉，没有 leader 就没有人去放宽 `q`，集群会一直没有主库，需要手工修正 `/sync`。操作前请看 `GET /cluster` 的 `sync.settled`（leader 节点）是否为 `true`。日志里：leader 在 `q` 未放宽期间打 WARN（`failover is not possible until q is relaxed`），无主时被拒的候选打 ERROR（`The cluster cannot elect a primary`），都有频率限制。
 
 **已存入 DCS 的无效配置**（例如开发集群里遗留的 `synchronous_mode: true`，或手工改坏）不会被任何节点应用，也不会退化成 `"async"`：运行中的节点保留上一份有效配置，并以 ERROR 级别记录出错的键和可接受的值（同一内容每 60 秒最多一条）；刚启动、还没有任何有效配置的节点不改动同步复制、不参与选举，直到用 `PUT /config` 写入有效配置。此时对已存无效配置做 `PATCH` 返回 **409**。`bootstrap.dcs` 里的无效值会使节点启动失败。
 
