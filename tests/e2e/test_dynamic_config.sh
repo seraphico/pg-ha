@@ -165,6 +165,7 @@ test_put_config
 test_config_propagation
 test_patch_restart_param
 test_patch_null_removes_key
+test_patch_invalid_synchronous_mode
 test_restore_defaults
 
 print_results
