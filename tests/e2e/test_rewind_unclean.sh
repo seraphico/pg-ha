@@ -18,6 +18,14 @@
 #   Expected (fixed): node3 ends `running` as a streaming replica on the new
 #   timeline, there is no pg-ha.rewind_failed, and its row count equals the new
 #   primary's (the unreplicated rows are discarded).
+#
+# REQUIRES synchronous_mode=async, and sets it itself at setup. The rows that
+# only node3 receives must never have been acknowledged as synchronous. Under
+# sync (or quorum) those commits are acknowledged through node3, and B (1000
+# rows) would lose them if promoted; node3 is nofailover, so the correct
+# outcome under sync is that nobody is promoted ("not the healthiest node,
+# waiting for election"). That is the expected safety behaviour, not a failure
+# of this suite's purpose.
 #   - control: a clean `docker stop -t 120` + start of node3 also ends as a
 #     running streaming replica with equal row counts.
 #
@@ -146,7 +154,16 @@ trap cleanup EXIT
 # --- Setup: node3 tagged nofailover, a lagging peer, P killed, B promoted ---
 setup_scenario() {
     wait_for_cluster_ready 120 || return 1
-    local n cur
+    local n cur pcode pnode i
+    pnode=$(get_primary)
+    pcode=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 15 -o /dev/null -w '%{http_code}' -X PATCH \
+        -H "Content-Type: application/json" -d '{"synchronous_mode":"async"}' "$pnode/config" 2>/dev/null || echo 000)
+    assert_eq "200" "$pcode" "PATCH /config synchronous_mode=async (the scenario requires async)" || return 1
+    for i in $(seq 1 30); do
+        [ -z "$(docker exec "$(node_url_to_container "$pnode")" psql -U "$PG_USER" -d postgres -Atc 'show synchronous_standby_names' 2>/dev/null)" ] && break
+        sleep 2
+    done
+    assert_eq "" "$(docker exec "$(node_url_to_container "$pnode")" psql -U "$PG_USER" -d postgres -Atc 'show synchronous_standby_names' 2>/dev/null)" "synchronous_standby_names is empty (async)" || return 1
     for n in node1 node2 node3; do
         eval "IMG_$n=\$(docker inspect \"pg-ha-$n\" --format '{{.Image}}')"
     done
