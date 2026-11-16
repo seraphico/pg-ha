@@ -10524,7 +10524,7 @@ mod tests {
         }
 
         /// The leader kept the lock, did not demote, and wrote no `/failover`.
-        fn assert_not_demoted(ha: &Ha, dir: &PathBuf, dcs: &MockDcs) {
+        fn assert_not_demoted(ha: &Ha, dir: &std::path::Path, dcs: &MockDcs) {
             assert!(dcs.last_failover_value.lock().unwrap().is_none());
             assert_eq!(lock_held_by(dcs).as_deref(), Some("node1"));
             assert!(ha.is_leader());
