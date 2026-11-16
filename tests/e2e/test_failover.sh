@@ -20,6 +20,9 @@ test_failover_on_kill() {
     # non-response at the exact moment of the probe would otherwise leave
     # old_primary empty and corrupt the rest of the test (killing the wrong /
     # no container).
+    # Under quorum a kill inside the q = |V| window leaves no primary: wait
+    # until q is relaxed first (no-op in other modes).
+    wait_quorum_settled_if_quorum
     local old_primary
     old_primary=$(wait_for_primary 60) || true
     assert_not_empty "$old_primary" "Primary exists before test"
