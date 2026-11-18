@@ -11,7 +11,7 @@ pg-ha is a Rust-based PostgreSQL HA solution aimed at the same job as [Patroni](
 - **No etcd/ZooKeeper/Consul** — embedded Raft consensus via [openraft](https://github.com/databendlabs/openraft)
 - **No HAProxy** — built-in TCP proxy with active health checking
 - **Single binary deployment** — one process per node, zero external services required
-- **TLS encrypted** — Raft RPC and the REST management API can both be secured with TLS. Set `raft.tls` / `restapi.tls` `cert` + `key` for server-auth HTTPS; add `ca_cert` + `require_client_cert: true` to enforce mutual TLS (client certificates verified against `ca_cert`). Omitting the `tls` block leaves that plane as plaintext (default). Basic Auth credentials on the REST API are only protected once REST TLS is enabled.
+- **TLS encrypted** — Raft RPC (2380) is always mutual TLS: `raft.tls` (`cert` + `key` + `ca_cert`) is required, and only certificates whose SAN matches a cluster member host are accepted (plaintext needs an explicit `allow_insecure_raft: true`, development only). The REST API is optional: set `restapi.tls` `cert` + `key` for HTTPS and add `ca_cert` + `require_client_cert: true` for mutual TLS; omitting it leaves REST as plaintext (default). Basic Auth credentials on the REST API are only protected once REST TLS is enabled.
 - **Graceful shutdown** — drain (renewing the leader lock), CHECKPOINT + stop bounded by the leader lease, lock release only after PostgreSQL stopped
 
 ## Documentation

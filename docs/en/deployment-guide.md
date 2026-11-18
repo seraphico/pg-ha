@@ -22,7 +22,7 @@
 **Network requirements:**
 
 - Latency between cluster nodes < 5ms (Raft consensus performance depends on low latency)
-- The following ports must be reachable between nodes: 2380 (Raft RPC; HTTPS when `raft.tls` is configured), 8008 (REST API; HTTPS when `restapi.tls` is configured, otherwise plaintext HTTP), 5432 (PostgreSQL replication)
+- The following ports must be reachable between nodes: 2380 (Raft RPC; HTTPS with mTLS, only nodes holding a member certificate can connect), 8008 (REST API; HTTPS when `restapi.tls` is configured, otherwise plaintext HTTP), 5432 (PostgreSQL replication)
 
 ---
 
@@ -174,12 +174,11 @@ raft:
     - "10.0.1.2:2380"         # the other two
     - "10.0.1.3:2380"
   data_dir: /var/lib/pg-ha/raft
-  tls:                              # omit it and Raft RPC is plaintext HTTP
-    cert: /etc/pg-ha/tls/server.crt
-    key: /etc/pg-ha/tls/server.key
-    ca_cert: /etc/pg-ha/tls/ca.crt
-    client_cert: /etc/pg-ha/tls/client.crt
-    client_key: /etc/pg-ha/tls/client.key
+  tls:                              # required. Raft RPC is always HTTPS + mTLS; without it validation fails and the node refuses to start
+    cert: /etc/pg-ha/tls/node1.crt  # this node's member certificate (one per node, SAN only lists this node's host)
+    key: /etc/pg-ha/tls/node1.key
+    ca_cert: /etc/pg-ha/tls/ca.crt  # required: CA that verifies peer certificates
+    # client_cert / client_key default to cert / key (the member certificate is both server and outbound client certificate)
 
 log_format: json                    # text (default) or json
 
@@ -322,13 +321,16 @@ raft:
   data_dir: <path>                 # persistence directory (optional). When set, writes raft_log.wal,
                                    # hard_state.json, state_machine.json, and membership.json
   node_id: <u64>                   # explicit node ID (optional; the default is the position after sorting the addresses, plus 1)
-  tls:                             # optional. When present, Raft RPC is HTTPS
-    cert: <path>                   # server certificate PEM (required if tls is enabled)
-    key: <path>                    # server private key PEM
-    ca_cert: <path>                # CA that verifies the peer certificate (optional)
-    client_cert: <path>            # outbound client certificate (optional)
-    client_key: <path>             # outbound client private key (optional)
-    require_client_cert: <bool>    # when true, the server forces mTLS and verifies client certificates against ca_cert (ca_cert must be set); default false is server-auth TLS only
+  allow_insecure_raft: <bool>      # default false. Takes effect only when there is no tls block: Raft RPC falls back to
+                                   # unauthenticated plaintext HTTP and logs a WARN at startup. Development/testing only.
+                                   # Ignored when a tls block exists (mTLS wins)
+  tls:                             # required (unless allow_insecure_raft: true). Raft RPC is always HTTPS + mTLS
+    cert: <path>                   # this node's member certificate PEM (required)
+    key: <path>                    # matching private key PEM (required)
+    ca_cert: <path>                # CA that verifies peer certificates (required; validation fails without it)
+    client_cert: <path>            # outbound client certificate (optional, defaults to cert; set together with client_key or omit both)
+    client_key: <path>             # outbound client private key (optional, defaults to key)
+    # require_client_cert was removed: mTLS is always on. An old config with true has no effect; false fails validation
 
 # ─── TCP Proxy configuration (required) ───
 proxy:
@@ -409,11 +411,12 @@ The Docker entrypoint `docker/entrypoint.sh` is a separate layer: it **generates
 | `PGDATA` / `PG_PORT` / `PG_HA_BIN_DIR` | data directory, port, and `bin_dir` (by default, probed from `PG_MAJOR` in the image) |
 | `PG_HA_API_PORT` / `PG_HA_PROXY_RW_PORT` / `PG_HA_PROXY_RO_PORT` | API and proxy ports |
 | `PG_HA_RAFT_SELF` / `PG_HA_RAFT_PARTNERS` | this node's address, and a comma-separated list of peers |
-| `PG_HA_RAFT_TLS_CERT` and `_KEY` / `_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | when `PG_HA_RAFT_TLS_CERT` is set, write `raft.tls` |
+| `PG_HA_RAFT_TLS_CERT` and `_KEY` / `_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | when `PG_HA_RAFT_TLS_CERT` is set, write `raft.tls` (Raft is always mTLS). `_CLIENT_CERT` / `_CLIENT_KEY` default to `_CERT` / `_KEY` |
+| `PG_HA_RAFT_ALLOW_INSECURE` | when `true` and `PG_HA_RAFT_TLS_CERT` is unset, write `raft.allow_insecure_raft: true` (plaintext Raft, development only). When neither is set, the entrypoint prints an error and exits |
 | `PG_HA_RESTAPI_TLS_CERT` and `_KEY` / `_CA_CERT` / `_REQUIRE_CLIENT_CERT` | when `PG_HA_RESTAPI_TLS_CERT` is set, write `restapi.tls` (REST API HTTPS/mTLS); leaving it unset, the default, means plaintext HTTP |
 | `PG_HA_TAG_NOFAILOVER` / `_NOLOADBALANCE` / `_NOCLONE` / `_NOSYNC` / `_NOSTREAM` / `_CLONEFROM` (`true` or `false`), `PG_HA_TAG_FAILOVER_PRIORITY` / `_SYNC_PRIORITY` (integer), `PG_HA_TAG_REPLICATEFROM` (member name) | each variable that is set is written as the matching key of the `tags:` section; when none is set no `tags:` section is written (the default). An invalid value stops the container at start |
 
-The development cluster `docker-compose.yml` sets Raft TLS and mounts `./docker/tls` at `/etc/pg-ha/tls`. REST API TLS is off by default (an empty `PG_HA_RESTAPI_TLS_CERT` means plaintext HTTP). The recommended way to switch is the Makefile toggle: `make up REST_TLS=off|tls|mtls` (default `off`; `make up-tls` / `make up-mtls` also work). It exports the `PG_HA_RESTAPI_TLS_*` variables below. `make status` and `tests/e2e/*.sh` read the same `REST_TLS` (an environment variable, default `off`; for `tls`/`mtls` they reach HTTPS with the CA and client certificate under `docker/tls`). A given port is either plaintext or TLS and cannot listen as both. To switch modes, run `make up REST_TLS=<new mode>` directly; `make down` is not required first. When the environment variables change, `docker compose up -d` recreates the three containers (the Raft/PGDATA volumes are kept), the entrypoint rewrites `/etc/pg-ha.yml` when the container starts, and the new mode takes effect (verified in Docker for off→tls and tls→mtls). Note that `make restart REST_TLS=...` does not switch the mode (it only restarts the existing containers and keeps the environment variables from when they were created). Use `make down` only when the data should be wiped as well. To enable it manually, set `PG_HA_RESTAPI_TLS_CERT=/etc/pg-ha/tls/server.crt`, and for mTLS also set `PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT=true` (`ca_cert` defaults to `/etc/pg-ha/tls/ca.crt`). The HA parameters generated by the entrypoint are `loop_wait: 5`, `ttl: 15`, and `retry_timeout: 5` (`watchdog.safety_margin` uses the default 5, which exactly satisfies `ttl >= loop_wait + retry_timeout + safety_margin`). REST authentication is `admin` / `secret`.
+The development cluster `docker-compose.yml` enables Raft mTLS by default (the member certificate is `docker/tls/server.crt`, whose SAN covers node1 to node5 and the container names, and which serves as both server and outbound client certificate; it is a shared development certificate, production needs one per node) and mounts `./docker/tls` at `/etc/pg-ha/tls`. REST API TLS is off by default (an empty `PG_HA_RESTAPI_TLS_CERT` means plaintext HTTP). The recommended way to switch is the Makefile toggle: `make up REST_TLS=off|tls|mtls` (default `off`; `make up-tls` / `make up-mtls` also work). It exports the `PG_HA_RESTAPI_TLS_*` variables below. `make status` and `tests/e2e/*.sh` read the same `REST_TLS` (an environment variable, default `off`; for `tls`/`mtls` they reach HTTPS with the CA and client certificate under `docker/tls`). A given port is either plaintext or TLS and cannot listen as both. To switch modes, run `make up REST_TLS=<new mode>` directly; `make down` is not required first. When the environment variables change, `docker compose up -d` recreates the three containers (the Raft/PGDATA volumes are kept), the entrypoint rewrites `/etc/pg-ha.yml` when the container starts, and the new mode takes effect (verified in Docker for off→tls and tls→mtls). Note that `make restart REST_TLS=...` does not switch the mode (it only restarts the existing containers and keeps the environment variables from when they were created). Use `make down` only when the data should be wiped as well. To enable it manually, set `PG_HA_RESTAPI_TLS_CERT=/etc/pg-ha/tls/server.crt`, and for mTLS also set `PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT=true` (`ca_cert` defaults to `/etc/pg-ha/tls/ca.crt`). The HA parameters generated by the entrypoint are `loop_wait: 5`, `ttl: 15`, and `retry_timeout: 5` (`watchdog.safety_margin` uses the default 5, which exactly satisfies `ttl >= loop_wait + retry_timeout + safety_margin`). REST authentication is `admin` / `secret`.
 
 ---
 
@@ -427,28 +430,21 @@ openssl genrsa -out ca.key 4096
 openssl req -new -x509 -days 3650 -key ca.key -out ca.crt \
   -subj "/CN=pg-ha-ca/O=pg-ha"
 
-# 2. Generate a server certificate (one per node)
-openssl genrsa -out server.key 2048
-openssl req -new -key server.key -out server.csr \
+# 2. Generate a member certificate for each node (one per node, SAN lists only that node's host)
+#    Shown for node1 / 10.0.1.1; repeat for node2 and node3 with their own host names and IPs
+openssl genrsa -out node1.key 2048
+openssl req -new -key node1.key -out node1.csr \
   -subj "/CN=node1/O=pg-ha"
 
-# Create a SAN extension file (including every node address)
-cat > san.ext << EOF
-[v3_req]
-subjectAltName = @alt_names
-[alt_names]
-DNS.1 = node1
-DNS.2 = node2
-DNS.3 = node3
-IP.1 = 10.0.1.1
-IP.2 = 10.0.1.2
-IP.3 = 10.0.1.3
+cat > node1.ext << EOF
+subjectAltName = DNS:node1, IP:10.0.1.1
+extendedKeyUsage = serverAuth, clientAuth
 EOF
 
-openssl x509 -req -days 365 -in server.csr -CA ca.crt -CAkey ca.key \
-  -CAcreateserial -out server.crt -extfile san.ext -extensions v3_req
+openssl x509 -req -days 365 -in node1.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -out node1.crt -extfile node1.ext
 
-# 3. Generate a client certificate (for mTLS)
+# 3. Generate a client certificate for REST / pg-ha-ctl / Prometheus (no member-host SAN; used for restapi mTLS)
 openssl genrsa -out client.key 2048
 openssl req -new -key client.key -out client.csr \
   -subj "/CN=pg-ha-client/O=pg-ha"
@@ -461,10 +457,8 @@ openssl x509 -req -days 365 -in client.csr -CA ca.crt -CAkey ca.key \
 ```
 /etc/pg-ha/tls/
 ├── ca.crt         # CA certificate (identical on every node)
-├── server.crt     # server certificate (may be shared by all nodes, or unique per node)
-├── server.key     # server private key
-├── client.crt     # client certificate (mTLS mode)
-└── client.key     # client private key (mTLS mode)
+├── node1.crt      # this node's member certificate (unique per node, SAN lists only this node's host)
+└── node1.key      # matching private key (mode 600, never copied to other nodes)
 ```
 
 Set permissions:
@@ -475,13 +469,29 @@ sudo chmod 600 /etc/pg-ha/tls/*.key
 sudo chmod 644 /etc/pg-ha/tls/*.crt
 ```
 
-Write the paths into `raft.tls` on each node (see the production YAML above). The server uses `cert` + `key` to turn 2380 into HTTPS. The outbound client verifies the peer with `ca_cert`, and presents a client certificate when both `client_cert` and `client_key` are provided.
+Write the paths into `raft.tls` on each node (see the production YAML above). Raft RPC (2380) is always HTTPS + mTLS, with no switch: the server requires the peer to present a client certificate, verifies the chain, validity and `clientAuth` usage against `ca_cert`, and then applies the member identity check below. A missing `raft.tls`, a missing `ca_cert`, or an old config that sets `require_client_cert: false` makes both `--validate-config` and startup fail. `client_cert` / `client_key` default to `cert` / `key`, so one member certificate serves as both the server certificate and the outbound client certificate.
 
-Set `require_client_cert` to `true` to enable server-side mTLS: the server requires the peer to present a client certificate, verifies it against the CA configured in `ca_cert`, and rejects connections that present no certificate or an untrusted certificate. `ca_cert` must be set; otherwise the process reports an error and exits at startup. The default `false` behaves as before: one-way TLS with server authentication only. After enabling it, make sure every node is configured with `client_cert` / `client_key`, or connections between nodes are rejected.
+**Member identity rule.** After the chain verifies, the leaf certificate's DNS or IP SAN must match at least one "member host" (SAN only, never CN), or the handshake is rejected. Member hosts are the union of the following, recomputed on every handshake:
+
+- the host part of `raft.self_addr` and `raft.partner_addrs` in the config;
+- the host part of every node address in the live Raft membership.
+
+Identity therefore follows membership: a new node's certificate is accepted as soon as the node is in the membership, and a removed node's certificate stops being accepted once it is neither in the config list nor in the membership. The config half keeps bootstrap working, when a fresh node does not know the membership yet. Startup also self-checks: the outbound certificate (`client_cert`, default `cert`) must carry a DNS/IP SAN equal to the host of this node's `self_addr`, otherwise peers would reject it and the process exits with an error.
+
+**Certificate requirements and cautions:**
+
+- One certificate per node, SAN listing only that node's host, EKU containing both `serverAuth` and `clientAuth`. A leaked node key then impersonates one node only.
+- A certificate that lists several node names (for example the development `docker/tls/server.crt`) is accepted if any SAN matches any member host, and cannot be tied to one node. That is acceptable for development (a private compose network, one trust domain) and not for production.
+- Do not use wildcard SANs (such as `*.db.example.com`): they match every member host under that domain.
+- The SAN must have the same form as the host written in `self_addr` / `partner_addrs` (an IP needs an IP SAN, a host name needs a DNS SAN).
+- Use a separate CA for Raft. REST, pg-ha-ctl and Prometheus certificates from the same CA are rejected by Raft as long as they carry no member-host SAN, but a REST server certificate that has a member SAN and the `clientAuth` usage would be accepted. If you share a CA, issue REST/ctl/Prometheus certificates without member SANs.
+- Adding a node: issue its certificate, add it to `partner_addrs` on the nodes, and join it to the membership as described in the [operations guide](operations-guide.md); its certificate is accepted once it is a member. Rotating certificates: they are loaded once at startup with no hot reload, so replace the files node by node and restart the process.
+
+**Development mode (development/testing only).** With no `raft.tls` and `raft.allow_insecure_raft: true` (`PG_HA_RAFT_ALLOW_INSECURE=true` in the container), Raft RPC is unauthenticated plaintext HTTP and a WARN is logged at startup. Do not use it in production.
 
 ### REST API TLS / mTLS (8008)
 
-The REST management API also supports built-in HTTPS. Its configuration shape matches the server side of `raft.tls` (the same field names), and the same CA and certificates can be reused:
+The REST management API also supports built-in HTTPS. Its configuration shape matches the server side of `raft.tls` (the same field names), and the same CA can be reused, though issuing separate certificates is better (see the member identity rule above):
 
 - Setting `cert` + `key` under `restapi.tls` switches 8008 from plaintext HTTP to HTTPS (server authentication only).
 - Also setting `ca_cert` and `require_client_cert` to `true` enables mTLS: the server requires the client to present a certificate issued by `ca_cert`, and rejects connections with no certificate (TLS alert 116 `certificate_required`) or a certificate from an external CA (TLS alert 48 `unknown_ca`). When `require_client_cert=true`, if `ca_cert` is missing, unreadable, or empty, the process reports an error and exits at startup (fail-fast).
@@ -499,7 +509,7 @@ Proxy probes of `/primary` and `/replica` use the same `restapi.tls`. When it is
 - The server certificate's SAN must cover the hostname used in `raft.self_addr` (probes connect using the hostname published by the member; verification fails when that hostname is not in the SAN).
 - An mTLS probe presents this node's REST server certificate as the client certificate, so that certificate's Extended Key Usage must also allow `clientAuth` (a CA that issues only `serverAuth` makes the probe handshake fail).
 
-`raft.tls` does not affect the REST API, and `restapi.tls` does not affect Raft RPC (2380). The two are configured independently.
+`raft.tls` does not affect the REST API, and `restapi.tls` does not affect Raft RPC (2380). The two are configured independently. REST `require_client_cert` is still optional; only Raft lost it.
 
 ---
 
@@ -541,11 +551,9 @@ services:
       PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node1:2380"
       PG_HA_RAFT_PARTNERS: "node2:2380,node3:2380"
-      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt   # member certificate; the client certificate defaults to it
       PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
       PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
-      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
-      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
       PG_HA_LOG_FORMAT: json
       RUST_LOG: "pg_ha=info"
     ports:
@@ -582,11 +590,9 @@ services:
       PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node2:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node3:2380"
-      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt   # member certificate; the client certificate defaults to it
       PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
       PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
-      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
-      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
       PG_HA_LOG_FORMAT: json
       RUST_LOG: "pg_ha=info"
     ports:
@@ -623,11 +629,9 @@ services:
       PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node3:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node2:2380"
-      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt   # member certificate; the client certificate defaults to it
       PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
       PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
-      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
-      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
       PG_HA_LOG_FORMAT: json
       RUST_LOG: "pg_ha=info"
     ports:
@@ -688,7 +692,7 @@ For the development cluster, run `make up` directly and do not use this example.
 |------|----------|-----------|---------|
 | 5432 | TCP | Inbound | PostgreSQL client connections (direct) |
 | 8008 | HTTP or HTTPS | Inbound | REST API (health checks and `GET /wal`, which quorum votes read, require no authentication; management endpoints require Basic Auth when `restapi.username` is set). `restapi.tls` can be set to enable HTTPS / mTLS; when unset, the API is plaintext HTTP |
-| 2380 | HTTP or HTTPS | Between nodes | Raft RPC. HTTP when `raft.tls` is not configured; HTTPS once it is configured |
+| 2380 | HTTPS (mTLS) | Between nodes | Raft RPC. Always mTLS; only certificates whose SAN matches a cluster member host are accepted. Falls back to plaintext HTTP only with `allow_insecure_raft: true` (development only) |
 | 6432 | TCP | Inbound | Proxy RW (routes to the Primary) |
 | 6433 | TCP | Inbound | Proxy RO (load-balances to Replicas) |
 
@@ -701,7 +705,18 @@ ufw allow 6433/tcp   # Proxy RO
 ufw allow 8008/tcp   # API (management network only)
 
 # Intra-cluster communication (between nodes)
-ufw allow from 10.0.1.0/24 to any port 2380  # Raft RPC
+ufw allow from 10.0.1.0/24 to any port 2380  # Raft RPC (mTLS; never open to the internet)
 ufw allow from 10.0.1.0/24 to any port 5432  # PG replication
 ufw allow from 10.0.1.0/24 to any port 8008  # Proxy health checks
 ```
+
+---
+
+## Security Notes
+
+**Never expose Raft port 2380 without mTLS.** A peer that can reach 2380 without authentication can write any DCS key (including the leader lock), inject entries into the Raft log, replace the whole state with a snapshot, and disrupt elections. That is full control of the cluster, including who is primary. Raft RPC therefore now enforces mTLS and checks member identity (see "TLS Configuration"); there is no optional one-way TLS and no plaintext default any more.
+
+- Use a firewall to allow 2380 only between cluster nodes, even with mTLS.
+- Use one certificate per node, a separate CA for Raft, and mode 600 on node private keys.
+- `allow_insecure_raft: true` is for development and testing only; seeing it in a production config is a defect.
+- Upgrade note: this is a breaking change. Old configs need `raft.tls` (with `ca_cert`) and member certificates, and must drop `require_client_cert`. Upgrade all nodes together (see the release note).

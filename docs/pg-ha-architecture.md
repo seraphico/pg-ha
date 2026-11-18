@@ -331,7 +331,7 @@ pg-ha (binary)
 
 ## TLS 加密通信
 
-Raft RPC 层使用 TLS 加密所有节点间通信，防止集群共识数据在网络上被窃取或篡改。REST 管理 API 同样支持内建 TLS（`restapi.tls`）：默认不配置时为明文 HTTP（与以往一致，仅在内部网络暴露），配置 `cert` + `key` 后为 HTTPS，再加 `ca_cert` + `require_client_cert: true` 即为 mTLS。两个平面共用同一套服务端 mTLS 机制与证书材料。
+Raft RPC 层强制使用 mTLS：加密所有节点间通信，并且握手时只接受证书 SAN 匹配集群成员主机的对端。否则任何能连上 2380 的人都能写入任意 DCS 键（含 leader 锁）、注入日志、用快照替换状态。REST 管理 API 同样支持内建 TLS（`restapi.tls`）：默认不配置时为明文 HTTP（与以往一致，仅在内部网络暴露），配置 `cert` + `key` 后为 HTTPS，再加 `ca_cert` + `require_client_cert: true` 即为 mTLS。REST 的 mTLS 是可选项，Raft 的 mTLS 是强制的，并另有成员身份校验；Raft 建议使用独立 CA 与每节点一份的证书。
 
 ```mermaid
 flowchart TB
@@ -367,13 +367,13 @@ flowchart TB
 
 | 组件 | 端口 | 协议 | 说明 |
 |------|------|------|------|
-| Raft RPC | 2380 | HTTPS (TLS 1.2+) | 节点间共识通信，支持 mTLS |
+| Raft RPC | 2380 | HTTPS (TLS 1.2+) | 节点间共识通信，强制 mTLS + 成员 SAN 校验（`allow_insecure_raft: true` 才退回明文，仅限开发） |
 | REST API | 8008 | HTTP（默认）/ HTTPS | `restapi.tls` 省略时明文 HTTP；设置 `cert`+`key` 为 HTTPS，加 `ca_cert`+`require_client_cert` 为 mTLS |
 | PostgreSQL | 5432 | TCP | PG 原生协议，可独立配置 `ssl` |
 | Proxy RW/RO | 6432/6433 | TCP | 透传 PG 连接 |
 
-- Raft RPC 启用 TLS 后，所有 `AppendEntries`、`RequestVote`、`InstallSnapshot` RPC 均通过加密通道传输
-- mTLS（双向 TLS）可选启用：每个节点同时验证对端证书，防止未授权节点加入集群
+- 所有 `AppendEntries`、`RequestVote`、`InstallSnapshot` RPC 均通过加密通道传输
+- Raft 的 mTLS 始终开启：每个节点验证对端证书链，并要求证书 SAN 匹配当前成员主机（配置列表 ∪ 实时 Raft 成员），防止未授权节点接入或写入集群
 - REST API 默认明文 HTTP，仅在内部网络暴露并由 Basic Auth 保护管理端点；需要加密时配置 `restapi.tls` 启用 HTTPS/mTLS。**Basic Auth 凭据只有在启用 REST TLS 后才在传输中受保护**
 
 ## 认证与安全

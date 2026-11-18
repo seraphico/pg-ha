@@ -21,8 +21,8 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 **已实现的关键能力**：
 
 - 自动 failover、手动 switchover / failover（同步复制开启时强制候选属于 DCS `/sync`）
-- Raft RPC TLS（`raft.tls`；开发用 `docker-compose.yml` 已挂载证书）。`require_client_cert: true` 时服务端强制校验客户端证书（针对 `ca_cert`），拒绝未提供或不受信任证书的连接；默认 `false` 为仅服务端认证 TLS
-- REST API TLS（`restapi.tls`，SB-03）：`cert` + `key` 启用 HTTPS，加 `ca_cert` + `require_client_cert: true` 启用 mTLS（fail-closed，拒绝无证书/外部 CA）；省略即明文 HTTP。与 Raft TLS 共用同一套服务端 mTLS 机制
+- Raft RPC TLS（`raft.tls`；开发用 `docker-compose.yml` 已挂载证书）。SB-39：`raft.tls`（含 `ca_cert`）为必填，2380 一律 mTLS，且只接受 SAN 匹配集群成员主机（配置列表 ∪ 当前 Raft 成员）的证书；`require_client_cert` 已从 Raft 移除。不配 `raft.tls` 须显式 `allow_insecure_raft: true`（仅限开发，启动 WARN）。破坏性变更，见发布说明
+- REST API TLS（`restapi.tls`，SB-03）：`cert` + `key` 启用 HTTPS，加 `ca_cert` + `require_client_cert: true` 启用 mTLS（fail-closed，拒绝无证书/外部 CA）；省略即明文 HTTP。与 Raft 同为 rustls 服务端 mTLS（Raft 另加成员身份校验）
 - Raft 日志 append-only WAL（`raft_log.wal`，超过 4 MiB 压缩）+ `hard_state.json` / `state_machine.json` / `membership.json`
 - Watchdog（Linux `/dev/watchdog`；仅可写主 + 有效租约时喂狗，超时 = TTL − `safety_margin`；默认 `mode: off`）
 - 优雅停机：等待 `shutdown.drain_timeout_secs`（期间续锁）→ Leader 上 CHECKPOINT + 停库（`-m fast`，失败再 `-m immediate`），受 leader 租约限制 → 停库后才释放 leader lock；停不掉时不退出
@@ -41,13 +41,13 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 
 ### 1. REST API TLS 支持 ✅ 已完成（SB-03）
 
-**已实现**：走路线 A（内建 HTTPS），`src/main.rs` 对 REST 的监听分支与 Raft 对称：`restapi.tls` 省略时保持 `axum::serve` 明文 HTTP（现有部署不受影响）；设置 `cert` + `key` 时用 `axum_server::bind_rustls` + `RustlsConfig::from_pem_file` 提供仅服务端认证的 HTTPS；再设置 `ca_cert` 并把 `require_client_cert` 设为 `true` 时走共享的 `build_mtls_server_config`（`WebPkiClientVerifier`，fail-closed），`require_client_cert=true` 而 `ca_cert` 缺失/不可读时启动即报错退出。`build_mtls_server_config` 已泛化为同时服务 Raft 与 REST 两个平面。配置形状与 `raft.tls` 的服务端字段一致（`cert`/`key`/`ca_cert`/`require_client_cert`）。
+**已实现**：走路线 A（内建 HTTPS），`src/main.rs` 对 REST 的监听分支与 Raft 对称：`restapi.tls` 省略时保持 `axum::serve` 明文 HTTP（现有部署不受影响）；设置 `cert` + `key` 时用 `axum_server::bind_rustls` + `RustlsConfig::from_pem_file` 提供仅服务端认证的 HTTPS；再设置 `ca_cert` 并把 `require_client_cert` 设为 `true` 时走共享的 `build_mtls_server_config`（`WebPkiClientVerifier`，fail-closed），`require_client_cert=true` 而 `ca_cert` 缺失/不可读时启动即报错退出。`build_mtls_server_config` 现仅服务 REST；Raft 使用 `crates/pg-ha-dcs/src/raft_tls.rs` 的 `build_raft_server_config`（在其上叠加成员 SAN 校验）。配置形状与 `raft.tls` 的服务端字段一致（`cert`/`key`/`ca_cert`/`require_client_cert`）。
 
 docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，默认关闭（空 cert = 明文）。文档见 [部署指南](deployment-guide.md) 的「REST API TLS / mTLS」。Docker 验收证据（含 mTLS alert 116 / 48）见命令中心任务目录的 `docker-evidence.md`。
 
 **已实现文件**：
 
-- `src/main.rs` — REST 与 Raft 的监听分支；共享的 `build_mtls_server_config`
+- `src/main.rs` — REST 与 Raft 的监听分支；REST 用 `build_mtls_server_config`，Raft 用 `raft_tls.rs`
 - `crates/pg-ha-core/src/config.rs` — `RestApiTlsConfig`、`RestApiConfig.tls`、`RaftTlsConfig`
 - `crates/pg-ha-api/src/lib.rs` — 路由组装，不含传输层（不变）
 
