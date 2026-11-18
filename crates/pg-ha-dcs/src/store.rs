@@ -985,15 +985,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
-    /// **Validates: Requirements 3.2**
-    ///
-    /// Property 2: Preservation - Raft State Persistence Integrity
-    ///
-    /// Verifies that the persist → reload cycle preserves all Raft state data:
-    /// - hard_state.json (vote + committed)
-    /// - raft_log.wal (last_purged + entries)
-    /// - state_machine.json (KvStateMachine)
-    /// - membership.json (last_applied_log + last_membership)
+    // **Validates: Requirements 3.2**
+    //
+    // Property 2: Preservation - Raft State Persistence Integrity
+    //
+    // Verifies that the persist → reload cycle preserves all Raft state data:
+    // - hard_state.json (vote + committed)
+    // - raft_log.wal (last_purged + entries)
+    // - state_machine.json (KvStateMachine)
+    // - membership.json (last_applied_log + last_membership)
 
     // ─── Strategies for generating random Raft state ───
 

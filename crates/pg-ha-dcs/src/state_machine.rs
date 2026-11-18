@@ -112,6 +112,7 @@ impl KvStateMachine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_set(
         &mut self,
         key: &str,
@@ -634,8 +635,8 @@ mod tests {
         let far_future = current_millis() + 100_000;
         sm.apply(&Request::ExpireKeys { now: far_future }, 3);
 
-        assert!(sm.data.get("/short").is_none());
-        assert!(sm.data.get("/permanent").is_some());
+        assert!(!sm.data.contains_key("/short"));
+        assert!(sm.data.contains_key("/permanent"));
     }
 
     #[test]
