@@ -22,7 +22,7 @@
 **网络要求：**
 
 - 集群节点间网络延迟 < 5ms（Raft 共识性能依赖低延迟）
-- 节点间以下端口互通：2380（Raft RPC，配置了 `raft.tls` 时为 HTTPS）、8008（REST API，配置了 `restapi.tls` 时为 HTTPS，否则明文 HTTP）、5432（PostgreSQL 复制）
+- 节点间以下端口互通：2380（Raft RPC，HTTPS + mTLS，仅持有成员证书的节点能连入）、8008（REST API，配置了 `restapi.tls` 时为 HTTPS，否则明文 HTTP）、5432（PostgreSQL 复制）
 
 ---
 
@@ -174,12 +174,11 @@ raft:
     - "10.0.1.2:2380"         # 其他两台
     - "10.0.1.3:2380"
   data_dir: /var/lib/pg-ha/raft
-  tls:                              # 省略则 Raft RPC 为明文 HTTP
-    cert: /etc/pg-ha/tls/server.crt
-    key: /etc/pg-ha/tls/server.key
-    ca_cert: /etc/pg-ha/tls/ca.crt
-    client_cert: /etc/pg-ha/tls/client.crt
-    client_key: /etc/pg-ha/tls/client.key
+  tls:                              # 必填。Raft RPC 一律是 HTTPS + mTLS；缺少时校验失败、拒绝启动
+    cert: /etc/pg-ha/tls/node1.crt  # 本节点的成员证书（每台一份，SAN 只含本节点主机）
+    key: /etc/pg-ha/tls/node1.key
+    ca_cert: /etc/pg-ha/tls/ca.crt  # 必填：校验对端证书的 CA
+    # client_cert / client_key 省略时沿用 cert / key（成员证书同时用于服务端和出站客户端）
 
 log_format: json                    # text（默认）或 json
 
@@ -322,13 +321,15 @@ raft:
   data_dir: <path>                 # 持久化目录 (可选)。设置后写入 raft_log.wal、
                                    # hard_state.json、state_machine.json、membership.json
   node_id: <u64>                   # 显式节点 ID (可选, 默认是地址排序后的位置 + 1)
-  tls:                             # 可选。存在则 Raft RPC 为 HTTPS
-    cert: <path>                   # 服务端证书 PEM (必填, 若启用 tls)
-    key: <path>                    # 服务端私钥 PEM
-    ca_cert: <path>                # 校验对端证书的 CA (可选)
-    client_cert: <path>            # 出站客户端证书 (可选)
-    client_key: <path>             # 出站客户端私钥 (可选)
-    require_client_cert: <bool>    # true 时服务端强制 mTLS，针对 ca_cert 校验客户端证书（需设置 ca_cert）；默认 false 为仅服务端认证 TLS
+  allow_insecure_raft: <bool>      # 默认 false。仅在没有 tls 块时才生效：Raft RPC 退回明文 HTTP 且无认证，
+                                   # 启动时记 WARN。仅限开发/测试，生产不要用。有 tls 块时忽略此项（mTLS 优先）
+  tls:                             # 必填（除非 allow_insecure_raft: true）。Raft RPC 一律是 HTTPS + mTLS
+    cert: <path>                   # 本节点成员证书 PEM (必填)
+    key: <path>                    # 对应私钥 PEM (必填)
+    ca_cert: <path>                # 校验对端证书的 CA (必填，缺失则校验失败)
+    client_cert: <path>            # 出站客户端证书 (可选，默认 = cert；必须与 client_key 同时设置或同时省略)
+    client_key: <path>             # 出站客户端私钥 (可选，默认 = key)
+    # require_client_cert 已移除：mTLS 始终开启。旧配置写 true 无效果，写 false 会校验失败
 
 # ─── TCP Proxy 配置 (必填) ───
 proxy:
@@ -409,11 +410,12 @@ Docker 入口 `docker/entrypoint.sh` 是另一层：它用下面这些变量**�
 | `PGDATA` / `PG_PORT` / `PG_HA_BIN_DIR` | 数据目录、端口、`bin_dir`（默认按镜像里的 `PG_MAJOR` 探测） |
 | `PG_HA_API_PORT` / `PG_HA_PROXY_RW_PORT` / `PG_HA_PROXY_RO_PORT` | API 与代理端口 |
 | `PG_HA_RAFT_SELF` / `PG_HA_RAFT_PARTNERS` | 本节点地址，以及逗号分隔的对端列表 |
-| `PG_HA_RAFT_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | 设置了 `PG_HA_RAFT_TLS_CERT` 就写入 `raft.tls` |
+| `PG_HA_RAFT_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | 设置了 `PG_HA_RAFT_TLS_CERT` 就写入 `raft.tls`（Raft 一律 mTLS）。`_CLIENT_CERT` / `_CLIENT_KEY` 省略时沿用 `_CERT` / `_KEY` |
+| `PG_HA_RAFT_ALLOW_INSECURE` | 设为 `true` 且未设置 `PG_HA_RAFT_TLS_CERT` 时写入 `raft.allow_insecure_raft: true`（明文 Raft，仅限开发）。两者都没设置时入口脚本报错并退出 |
 | `PG_HA_TAG_NOFAILOVER` / `_NOLOADBALANCE` / `_NOCLONE` / `_NOSYNC` / `_NOSTREAM` / `_CLONEFROM`（`true` 或 `false`）、`PG_HA_TAG_FAILOVER_PRIORITY` / `_SYNC_PRIORITY`（整数）、`PG_HA_TAG_REPLICATEFROM`（成员名） | 设置了的变量写成 `tags:` 段里对应的键；一个都没设就不写 `tags:` 段（默认）。值不合法时容器启动即退出 |
 | `PG_HA_RESTAPI_TLS_CERT` 及 `_KEY` / `_CA_CERT` / `_REQUIRE_CLIENT_CERT` | 设置了 `PG_HA_RESTAPI_TLS_CERT` 就写入 `restapi.tls`（REST API HTTPS/mTLS）；默认不设置即明文 HTTP |
 
-开发集群 `docker-compose.yml` 会设置 Raft TLS，并把 `./docker/tls` 挂到 `/etc/pg-ha/tls`。REST API TLS 默认关闭（`PG_HA_RESTAPI_TLS_CERT` 为空即明文 HTTP）。推荐用 Makefile 开关切换：`make up REST_TLS=off|tls|mtls`（默认 `off`；也可用 `make up-tls` / `make up-mtls`），它会导出下面的 `PG_HA_RESTAPI_TLS_*` 变量；`make status` 与 `tests/e2e/*.sh` 读取同一个 `REST_TLS`（环境变量，默认 `off`；`tls`/`mtls` 时用 `docker/tls` 下的 CA 与客户端证书访问 HTTPS）。同一个端口只能是明文或 TLS 之一，不能同时监听；切换模式直接 `make up REST_TLS=<新模式>` 即可，不必先 `make down`：环境变量变了，`docker compose up -d` 会重建三个容器（Raft/PGDATA 卷保留），入口脚本在容器启动时重写 `/etc/pg-ha.yml`，新模式随之生效（已在 Docker 中实测 off→tls、tls→mtls）。注意 `make restart REST_TLS=...` 不会切换模式（只是重启现有容器，沿用创建时的环境变量）。想连数据一起清空时才用 `make down`。手动启用时，设置 `PG_HA_RESTAPI_TLS_CERT=/etc/pg-ha/tls/server.crt`，mTLS 再加 `PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT=true`（`ca_cert` 默认 `/etc/pg-ha/tls/ca.crt`）。入口生成的 HA 参数是 `loop_wait: 5`、`ttl: 15`、`retry_timeout: 5`（`watchdog.safety_margin` 用默认 5，正好满足 `ttl >= loop_wait + retry_timeout + safety_margin`），REST 认证为 `admin` / `secret`。
+开发集群 `docker-compose.yml` 默认启用 Raft mTLS（成员证书是 `docker/tls/server.crt`，SAN 覆盖 node1–node5 与容器名，同时作为服务端证书和出站客户端证书；它是开发用的共享证书，生产必须每节点一份），并把 `./docker/tls` 挂到 `/etc/pg-ha/tls`。REST API TLS 默认关闭（`PG_HA_RESTAPI_TLS_CERT` 为空即明文 HTTP）。推荐用 Makefile 开关切换：`make up REST_TLS=off|tls|mtls`（默认 `off`；也可用 `make up-tls` / `make up-mtls`），它会导出下面的 `PG_HA_RESTAPI_TLS_*` 变量；`make status` 与 `tests/e2e/*.sh` 读取同一个 `REST_TLS`（环境变量，默认 `off`；`tls`/`mtls` 时用 `docker/tls` 下的 CA 与客户端证书访问 HTTPS）。同一个端口只能是明文或 TLS 之一，不能同时监听；切换模式直接 `make up REST_TLS=<新模式>` 即可，不必先 `make down`：环境变量变了，`docker compose up -d` 会重建三个容器（Raft/PGDATA 卷保留），入口脚本在容器启动时重写 `/etc/pg-ha.yml`，新模式随之生效（已在 Docker 中实测 off→tls、tls→mtls）。注意 `make restart REST_TLS=...` 不会切换模式（只是重启现有容器，沿用创建时的环境变量）。想连数据一起清空时才用 `make down`。手动启用时，设置 `PG_HA_RESTAPI_TLS_CERT=/etc/pg-ha/tls/server.crt`，mTLS 再加 `PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT=true`（`ca_cert` 默认 `/etc/pg-ha/tls/ca.crt`）。入口生成的 HA 参数是 `loop_wait: 5`、`ttl: 15`、`retry_timeout: 5`（`watchdog.safety_margin` 用默认 5，正好满足 `ttl >= loop_wait + retry_timeout + safety_margin`），REST 认证为 `admin` / `secret`。
 
 ---
 
@@ -427,28 +429,21 @@ openssl genrsa -out ca.key 4096
 openssl req -new -x509 -days 3650 -key ca.key -out ca.crt \
   -subj "/CN=pg-ha-ca/O=pg-ha"
 
-# 2. 生成服务端证书（每个节点一份）
-openssl genrsa -out server.key 2048
-openssl req -new -key server.key -out server.csr \
+# 2. 为每个节点生成成员证书（每个节点一份，SAN 只写该节点自己的主机）
+#    以 node1 / 10.0.1.1 为例；node2、node3 重复一遍，换成各自的主机名和 IP
+openssl genrsa -out node1.key 2048
+openssl req -new -key node1.key -out node1.csr \
   -subj "/CN=node1/O=pg-ha"
 
-# 创建 SAN 扩展文件（包含所有节点地址）
-cat > san.ext << EOF
-[v3_req]
-subjectAltName = @alt_names
-[alt_names]
-DNS.1 = node1
-DNS.2 = node2
-DNS.3 = node3
-IP.1 = 10.0.1.1
-IP.2 = 10.0.1.2
-IP.3 = 10.0.1.3
+cat > node1.ext << EOF
+subjectAltName = DNS:node1, IP:10.0.1.1
+extendedKeyUsage = serverAuth, clientAuth
 EOF
 
-openssl x509 -req -days 365 -in server.csr -CA ca.crt -CAkey ca.key \
-  -CAcreateserial -out server.crt -extfile san.ext -extensions v3_req
+openssl x509 -req -days 365 -in node1.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -out node1.crt -extfile node1.ext
 
-# 3. 生成客户端证书（用于 mTLS）
+# 3. 为 REST / pg-ha-ctl / Prometheus 生成客户端证书（不带任何成员主机的 SAN，用于 restapi mTLS）
 openssl genrsa -out client.key 2048
 openssl req -new -key client.key -out client.csr \
   -subj "/CN=pg-ha-client/O=pg-ha"
@@ -461,10 +456,8 @@ openssl x509 -req -days 365 -in client.csr -CA ca.crt -CAkey ca.key \
 ```
 /etc/pg-ha/tls/
 ├── ca.crt         # CA 证书（所有节点相同）
-├── server.crt     # 服务端证书（可所有节点共用或每节点独立）
-├── server.key     # 服务端私钥
-├── client.crt     # 客户端证书（mTLS 模式）
-└── client.key     # 客户端私钥（mTLS 模式）
+├── node1.crt      # 本节点的成员证书（每节点独立，SAN 只含本节点主机）
+└── node1.key      # 对应私钥（权限 600，不要拷到其它节点）
 ```
 
 设置权限：
@@ -475,13 +468,29 @@ sudo chmod 600 /etc/pg-ha/tls/*.key
 sudo chmod 644 /etc/pg-ha/tls/*.crt
 ```
 
-把路径写进每台节点的 `raft.tls`（见上面的生产 YAML）。服务端用 `cert` + `key` 把 2380 换成 HTTPS；出站客户端用 `ca_cert` 校验对端，并在同时提供 `client_cert` / `client_key` 时带上客户端证书。
+把路径写进每台节点的 `raft.tls`（见上面的生产 YAML）。Raft RPC（2380）一律是 HTTPS + mTLS，没有开关：服务端要求对端出示客户端证书，先针对 `ca_cert` 校验证书链、有效期和 `clientAuth` 用途，再做成员身份校验（见下）。`raft.tls` 缺失、`ca_cert` 缺失，或旧配置里写了 `require_client_cert: false`，`--validate-config` 和启动都会失败。`client_cert` / `client_key` 省略时沿用 `cert` / `key`，即同一份成员证书既当服务端证书也当出站客户端证书。
 
-把 `require_client_cert` 设为 `true` 即开启服务端 mTLS：服务端会要求对端出示客户端证书，并针对 `ca_cert` 配置的 CA 校验，拒绝未提供证书或证书不受信任的连接。此时必须设置 `ca_cert`，否则启动即报错退出。默认 `false` 时行为与以往一致，为仅服务端认证的单向 TLS。开启后请确保每个节点都配置了 `client_cert` / `client_key`，否则节点间互相连接会被拒绝。
+**成员身份规则。** 握手通过证书链校验后，叶证书的 DNS 或 IP SAN 必须匹配至少一个“成员主机”（只看 SAN，不看 CN），否则握手被拒绝。成员主机是下面两者的并集，每次握手都重新计算：
+
+- 配置里 `raft.self_addr` 与 `raft.partner_addrs` 的主机部分；
+- 当前 Raft 成员（membership）里每个节点地址的主机部分。
+
+因此身份跟着成员关系走：新节点在加入成员后，它的证书立刻被接受；节点既不在配置列表里、也退出了成员关系后，它的证书不再被接受。配置列表这一半保证引导阶段（新节点还不知道成员关系）也能连通。启动时还会自检：出站证书（`client_cert`，默认 `cert`）必须带有与本节点 `self_addr` 主机一致的 DNS/IP SAN，否则对端会拒绝它，进程直接报错退出。
+
+**证书要求与注意事项：**
+
+- 每个节点一份证书，SAN 只写本节点的主机，EKU 同时含 `serverAuth` 和 `clientAuth`。这样一把节点私钥泄露，只能冒充这一个节点。
+- 一份证书若列出多个节点的名字（例如开发用的 `docker/tls/server.crt`），只要任一 SAN 匹配任一成员主机就会被接受，无法绑定到某一个节点。开发环境（私有 compose 网络、同一信任域）可以接受，生产不要这样做。
+- 不要用通配符 SAN（如 `*.db.example.com`）：它匹配该域下的每个成员主机。
+- 证书的 SAN 要和 `self_addr` / `partner_addrs` 里写的主机形式一致（写 IP 就要 IP SAN，写主机名就要 DNS SAN）。
+- Raft 建议使用独立的 CA。同一个 CA 签发的 REST、pg-ha-ctl、Prometheus 证书，只要不带成员主机的 SAN 就会被 Raft 拒绝；但带有成员 SAN 且含 `clientAuth` 用途的 REST 服务端证书会被接受。若共用 CA，请给 REST/ctl/Prometheus 签发不含成员 SAN 的证书。
+- 扩容：为新节点签发证书（SAN 只写该节点的主机名），并把它的主机加入每个节点的 `partner_addrs`；主机出现在 `partner_addrs` 或实时 Raft 成员中后，它的证书即被接受。向运行中的集群添加节点的完整步骤目前还没有文档。换证书：证书启动时加载一次，没有热重载，逐个节点替换文件后重启进程。
+
+**开发模式（仅限开发/测试）。** 不配 `raft.tls`、并设置 `raft.allow_insecure_raft: true`（容器里是 `PG_HA_RAFT_ALLOW_INSECURE=true`）时，Raft RPC 为明文 HTTP 且无任何认证，启动时记一条 WARN。生产环境不要用。
 
 ### REST API TLS / mTLS（8008）
 
-REST 管理 API 也支持内建 HTTPS，配置形状与 `raft.tls` 的服务端部分一致（字段名相同），可复用同一套 CA 与证书：
+REST 管理 API 也支持内建 HTTPS，配置形状与 `raft.tls` 的服务端部分一致（字段名相同），可复用同一套 CA，但证书最好分开签发（见上面的成员身份规则）：
 
 - 在 `restapi.tls` 下设置 `cert` + `key` 即把 8008 从明文 HTTP 换成 HTTPS（仅服务端认证）。
 - 再设置 `ca_cert` 并把 `require_client_cert` 设为 `true`，即开启 mTLS：服务端要求客户端出示由 `ca_cert` 签发的证书，拒绝无证书（TLS alert 116 `certificate_required`）或外部 CA 证书（TLS alert 48 `unknown_ca`）的连接。`require_client_cert=true` 时若 `ca_cert` 缺失/不可读/为空，启动即报错退出（fail-fast）。
@@ -499,7 +508,7 @@ REST 管理 API 也支持内建 HTTPS，配置形状与 `raft.tls` 的服务端�
 - 服务器证书的 SAN 必须覆盖 `raft.self_addr` 里使用的主机名（探活用成员发布的主机名访问，主机名不在 SAN 里会校验失败）。
 - mTLS 探活出示本节点的 REST 服务端证书作为客户端证书，所以该证书的 Extended Key Usage 必须同时允许 `clientAuth`（只签发 `serverAuth` 的 CA 会让探活握手失败）。
 
-`raft.tls` 不影响 REST API，`restapi.tls` 也不影响 Raft RPC（2380），二者各自独立配置。
+`raft.tls` 不影响 REST API，`restapi.tls` 也不影响 Raft RPC（2380），二者各自独立配置。REST 的 `require_client_cert` 仍是可选项，只有 Raft 去掉了它。
 
 ---
 
@@ -541,11 +550,9 @@ services:
       PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node1:2380"
       PG_HA_RAFT_PARTNERS: "node2:2380,node3:2380"
-      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt   # 成员证书，客户端证书默认沿用它
       PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
       PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
-      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
-      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
       PG_HA_LOG_FORMAT: json
       RUST_LOG: "pg_ha=info"
     ports:
@@ -582,11 +589,9 @@ services:
       PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node2:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node3:2380"
-      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt   # 成员证书，客户端证书默认沿用它
       PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
       PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
-      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
-      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
       PG_HA_LOG_FORMAT: json
       RUST_LOG: "pg_ha=info"
     ports:
@@ -623,11 +628,9 @@ services:
       PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node3:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node2:2380"
-      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt   # 成员证书，客户端证书默认沿用它
       PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
       PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
-      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
-      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
       PG_HA_LOG_FORMAT: json
       RUST_LOG: "pg_ha=info"
     ports:
@@ -688,7 +691,7 @@ curl -s http://localhost:8008/cluster | jq .
 |------|------|------|------|
 | 5432 | TCP | 入站 | PostgreSQL 客户端连接（直连） |
 | 8008 | HTTP 或 HTTPS | 入站 | REST API（健康检查和 quorum 投票读取的 `GET /wal` 无需认证；管理端点在配置了 `restapi.username` 时要 Basic Auth）。可配置 `restapi.tls` 启用 HTTPS / mTLS，未配置时为明文 HTTP |
-| 2380 | HTTP 或 HTTPS | 节点间 | Raft RPC。未配置 `raft.tls` 时为 HTTP，配置后为 HTTPS |
+| 2380 | HTTPS（mTLS） | 节点间 | Raft RPC。一律 mTLS，只接受 SAN 匹配集群成员主机的证书。`allow_insecure_raft: true` 时才退回明文 HTTP（仅限开发） |
 | 6432 | TCP | 入站 | Proxy RW（路由到 Primary） |
 | 6433 | TCP | 入站 | Proxy RO（负载均衡到 Replica） |
 
@@ -701,7 +704,18 @@ ufw allow 6433/tcp   # Proxy RO
 ufw allow 8008/tcp   # API（仅管理网络）
 
 # 集群内通信（节点间）
-ufw allow from 10.0.1.0/24 to any port 2380  # Raft RPC
+ufw allow from 10.0.1.0/24 to any port 2380  # Raft RPC（mTLS；不要对外网开放）
 ufw allow from 10.0.1.0/24 to any port 5432  # PG 复制
 ufw allow from 10.0.1.0/24 to any port 8008  # Proxy 健康检查
 ```
+
+---
+
+## 安全说明
+
+**Raft 端口 2380 不要在没有 mTLS 的情况下暴露。** 一个能连上 2380 且不受认证约束的对端，可以写入任意 DCS 键（包括 leader 锁）、向 Raft 日志注入条目、用快照整体替换状态、干扰选举。这等于接管整个集群，包括决定谁是主库。因此 Raft RPC 现在强制 mTLS 并校验成员身份（见“TLS 配置”），不再有可选的单向 TLS 或明文默认值。
+
+- 用防火墙只允许集群节点之间访问 2380，即使有 mTLS 也建议如此。
+- 每个节点单独一份证书，Raft 使用独立 CA，节点私钥权限 600。
+- `allow_insecure_raft: true` 只用于开发和测试，生产配置里出现它就是缺陷。
+- 升级须知：这是破坏性变更，旧配置需补 `raft.tls`（含 `ca_cert`）和成员证书，并删除 `require_client_cert`，各节点需同时升级（见发布说明）。

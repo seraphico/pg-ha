@@ -55,6 +55,12 @@ if [ "${PG_HA_WATCHDOG_MODE:-off}" != "off" ] && [ -c "$WATCHDOG_DEVICE" ]; then
     chown postgres:postgres "$WATCHDOG_DEVICE"
 fi
 
+# Raft port requires mTLS unless explicitly opted out
+if [ -z "$PG_HA_RAFT_TLS_CERT" ] && [ "$PG_HA_RAFT_ALLOW_INSECURE" != "true" ]; then
+    echo "pg-ha entrypoint: Raft TLS is required: set PG_HA_RAFT_TLS_CERT/KEY/CA_CERT, or PG_HA_RAFT_ALLOW_INSECURE=true (insecure, dev only)" >&2
+    exit 1
+fi
+
 # Ensure Raft data directory exists with correct permissions
 RAFT_DATA_DIR="/var/lib/pg-ha/raft"
 mkdir -p "$RAFT_DATA_DIR"
@@ -155,8 +161,9 @@ cat << TLSEOF
     ca_cert: ${PG_HA_RAFT_TLS_CA_CERT}
     client_cert: ${PG_HA_RAFT_TLS_CLIENT_CERT}
     client_key: ${PG_HA_RAFT_TLS_CLIENT_KEY}
-    require_client_cert: ${PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT:-false}
 TLSEOF
+elif [ "$PG_HA_RAFT_ALLOW_INSECURE" = "true" ]; then
+echo "  allow_insecure_raft: true"
 fi)
 
 proxy:

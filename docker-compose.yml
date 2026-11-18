@@ -18,12 +18,11 @@ services:
       PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node1:2380"
       PG_HA_RAFT_PARTNERS: "node2:2380,node3:2380"
-      PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT: ${PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT:-false}
       PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
       PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
       PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
-      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
-      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
+      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/server.key
       # REST API TLS — default OFF (empty cert = plaintext HTTP, as before).
       # Set PG_HA_RESTAPI_TLS_CERT=/etc/pg-ha/tls/server.crt to enable HTTPS,
       # plus PG_HA_RESTAPI_TLS_REQUIRE_CLIENT_CERT=true for mTLS.
@@ -61,12 +60,11 @@ services:
       PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node2:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node3:2380"
-      PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT: ${PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT:-false}
       PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
       PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
       PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
-      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
-      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
+      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/server.key
       # REST API TLS — default OFF (empty cert = plaintext HTTP, as before).
       PG_HA_RESTAPI_TLS_CERT: ${PG_HA_RESTAPI_TLS_CERT:-}
       PG_HA_RESTAPI_TLS_KEY: ${PG_HA_RESTAPI_TLS_KEY:-/etc/pg-ha/tls/server.key}
@@ -100,12 +98,11 @@ services:
       PGDATA: /var/lib/postgresql/data
       PG_HA_RAFT_SELF: "node3:2380"
       PG_HA_RAFT_PARTNERS: "node1:2380,node2:2380"
-      PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT: ${PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT:-false}
       PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
       PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
       PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
-      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
-      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
+      PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/server.crt
+      PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/server.key
       # REST API TLS — default OFF (empty cert = plaintext HTTP, as before).
       PG_HA_RESTAPI_TLS_CERT: ${PG_HA_RESTAPI_TLS_CERT:-}
       PG_HA_RESTAPI_TLS_KEY: ${PG_HA_RESTAPI_TLS_KEY:-/etc/pg-ha/tls/server.key}

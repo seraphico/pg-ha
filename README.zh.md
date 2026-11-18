@@ -11,7 +11,7 @@ pg-ha 是用 Rust 写的 PostgreSQL 高可用方案，对标 [Patroni](https://g
 - **没有 etcd/ZooKeeper/Consul** — 用 [openraft](https://github.com/databendlabs/openraft) 做嵌入式 Raft
 - **没有 HAProxy** — 进程内 TCP 代理，带主动健康检查
 - **单二进制** — 每个节点一个进程，不依赖外部服务
-- **TLS** — Raft RPC 和 REST 都可以上 TLS。`raft.tls` / `restapi.tls` 的 `cert` + `key` 是服务端认证的 HTTPS；再加上 `ca_cert` 和 `require_client_cert: true` 才要求客户端证书。省略 `tls` 段则该平面保持明文（默认）。REST 的 Basic Auth 只有在 REST TLS 打开后才在传输中受保护
+- **TLS** — Raft RPC（2380）一律是双向 TLS：必须配置 `raft.tls`（`cert` + `key` + `ca_cert`），且只接受 SAN 匹配集群成员主机的证书（明文需显式设置 `allow_insecure_raft: true`，仅限开发）。REST 可选：`restapi.tls` 的 `cert` + `key` 是 HTTPS，再加 `ca_cert` 和 `require_client_cert: true` 才要求客户端证书；省略则 REST 保持明文（默认）。REST 的 Basic Auth 只有在 REST TLS 打开后才在传输中受保护
 - **优雅关停** — 排空期间续锁，CHECKPOINT 和停库受 leader 租约限制，PostgreSQL 停掉之后才释放锁
 
 ## 文档

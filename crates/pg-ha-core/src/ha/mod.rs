@@ -1862,6 +1862,7 @@ mod tests {
                 data_dir: None,
                 node_id: None,
                 tls: None,
+                allow_insecure_raft: true,
             },
             proxy: ProxyConfig {
                 rw_listen: "0.0.0.0".to_string(),

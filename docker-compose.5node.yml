@@ -16,19 +16,20 @@
 #   curl -s localhost:8008/cluster                           # REST ports 8008..8012
 #   docker compose -f docker-compose.5node.yml down -v       # wipe containers + volumes
 # TLS: the shared dev cert docker/tls/server.crt has SANs for node1..node5 (and the 3-node
-# container names), so one cert serves both compose files.
+# container names), so one cert serves both compose files. Raft port 2380 requires mTLS: this
+# cert is each node's member identity (server and client). docker/tls/client.crt has no member
+# SAN, so Raft rejects it (REST/ctl client cert only).
 # REST TLS defaults off (plain HTTP), same variables as docker-compose.yml.
 
 x-pg-ha-env: &pg-ha-env
   PG_HA_SCOPE: test-cluster
   POSTGRES_PASSWORD: secret
   PGDATA: /var/lib/postgresql/data
-  PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT: ${PG_HA_RAFT_TLS_REQUIRE_CLIENT_CERT:-false}
   PG_HA_RAFT_TLS_CERT: /etc/pg-ha/tls/server.crt
   PG_HA_RAFT_TLS_KEY: /etc/pg-ha/tls/server.key
   PG_HA_RAFT_TLS_CA_CERT: /etc/pg-ha/tls/ca.crt
-  PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/client.crt
-  PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/client.key
+  PG_HA_RAFT_TLS_CLIENT_CERT: /etc/pg-ha/tls/server.crt
+  PG_HA_RAFT_TLS_CLIENT_KEY: /etc/pg-ha/tls/server.key
   # REST API TLS: default OFF (empty cert = plaintext HTTP).
   PG_HA_RESTAPI_TLS_CERT: ${PG_HA_RESTAPI_TLS_CERT:-}
   PG_HA_RESTAPI_TLS_KEY: ${PG_HA_RESTAPI_TLS_KEY:-/etc/pg-ha/tls/server.key}

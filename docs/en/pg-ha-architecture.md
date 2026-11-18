@@ -331,7 +331,7 @@ pg-ha (binary)
 
 ## TLS-Encrypted Communication
 
-The Raft RPC layer uses TLS to encrypt all inter-node communication, so cluster consensus data cannot be stolen or tampered with on the network. The REST management API also supports built-in TLS (`restapi.tls`): when it is not configured, the API is plaintext HTTP (as before, exposed only on the internal network); with `cert` + `key` it is HTTPS, and adding `ca_cert` + `require_client_cert: true` makes it mTLS. The two planes share the same server-side mTLS mechanism and certificate material.
+The Raft RPC layer enforces mTLS: it encrypts all inter-node communication and, at the handshake, accepts only peers whose certificate SAN matches a cluster member host. Without that, anyone who can reach 2380 could write any DCS key (including the leader lock), inject log entries, or replace state with a snapshot. The REST management API also supports built-in TLS (`restapi.tls`): when it is not configured, the API is plaintext HTTP (as before, exposed only on the internal network); with `cert` + `key` it is HTTPS, and adding `ca_cert` + `require_client_cert: true` makes it mTLS. REST mTLS is optional, Raft mTLS is mandatory and adds a member identity check; use a separate CA and one certificate per node for Raft.
 
 ```mermaid
 flowchart TB
@@ -367,13 +367,13 @@ flowchart TB
 
 | Component | Port | Protocol | Notes |
 |------|------|------|------|
-| Raft RPC | 2380 | HTTPS (TLS 1.2+) | Inter-node consensus, mTLS supported |
+| Raft RPC | 2380 | HTTPS (TLS 1.2+) | Inter-node consensus, mandatory mTLS + member SAN check (plaintext only with `allow_insecure_raft: true`, development only) |
 | REST API | 8008 | HTTP (default) / HTTPS | Plaintext HTTP when `restapi.tls` is omitted; `cert`+`key` is HTTPS; adding `ca_cert`+`require_client_cert` is mTLS |
 | PostgreSQL | 5432 | TCP | PG native protocol; `ssl` can be configured independently |
 | Proxy RW/RO | 6432/6433 | TCP | Passthrough of PG connections |
 
-- Once Raft RPC TLS is enabled, all `AppendEntries`, `RequestVote`, and `InstallSnapshot` RPCs travel over the encrypted channel
-- mTLS (mutual TLS) can optionally be enabled: each node also verifies the peer certificate, preventing unauthorized nodes from joining the cluster
+- All `AppendEntries`, `RequestVote`, and `InstallSnapshot` RPCs travel over the encrypted channel
+- Raft mTLS is always on: each node verifies the peer certificate chain and requires the SAN to match a current member host (config list ∪ live Raft membership), preventing unauthorized nodes from connecting or writing to the cluster
 - The REST API is plaintext HTTP by default, exposed only on the internal network, with management endpoints protected by Basic Auth; when encryption is required, configure `restapi.tls` to enable HTTPS/mTLS. **Basic Auth credentials are protected in transit only after REST TLS is enabled**
 
 ## Authentication and Security

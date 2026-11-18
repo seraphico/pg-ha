@@ -26,6 +26,7 @@ restapi:
 
 raft:
   self_addr: "127.0.0.1:2380"
+  allow_insecure_raft: true
   partner_addrs:
     - "127.0.0.1:2381"
 

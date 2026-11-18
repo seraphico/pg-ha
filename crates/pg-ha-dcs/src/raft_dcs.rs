@@ -113,29 +113,14 @@ impl RaftDcs {
 
         // Build HTTP client for forward_to_leader — must use same TLS config as NetworkFactory
         let (http_client, tls_enabled) = match tls {
-            Some(tls_cfg) => {
-                let mut builder = reqwest::Client::builder()
-                    .pool_max_idle_per_host(3)
-                    .timeout(std::time::Duration::from_secs(10));
-                if let Some(ref ca_path) = tls_cfg.ca_cert
-                    && let Ok(ca_pem) = std::fs::read(ca_path)
-                    && let Ok(cert) = reqwest::tls::Certificate::from_pem(&ca_pem)
-                {
-                    builder = builder.add_root_certificate(cert);
-                }
-                if let (Some(cert_path), Some(key_path)) =
-                    (&tls_cfg.client_cert, &tls_cfg.client_key)
-                    && let (Ok(cert_pem), Ok(key_pem)) =
-                        (std::fs::read(cert_path), std::fs::read(key_path))
-                {
-                    let mut identity_pem = cert_pem;
-                    identity_pem.extend_from_slice(&key_pem);
-                    if let Ok(identity) = reqwest::tls::Identity::from_pem(&identity_pem) {
-                        builder = builder.identity(identity);
-                    }
-                }
-                (builder.build().unwrap_or_default(), true)
-            }
+            Some(tls_cfg) => (
+                crate::raft_tls::build_raft_http_client(
+                    tls_cfg,
+                    3,
+                    std::time::Duration::from_secs(10),
+                )?,
+                true,
+            ),
             None => {
                 let client = reqwest::Client::builder()
                     .pool_max_idle_per_host(3)

@@ -21,8 +21,8 @@ pg-ha is a PostgreSQL HA system written in Rust. It aims at the same job as Patr
 **Shipped:**
 
 - Automatic failover and manual switchover / failover (with synchronous replication on, the candidate must be in DCS `/sync`)
-- Raft RPC TLS (`raft.tls`; the dev `docker-compose.yml` mounts certificates). `require_client_cert: true` verifies client certificates against `ca_cert`. Default `false` is server-auth TLS only
-- REST TLS (`restapi.tls`, SB-03): `cert` + `key` enables HTTPS; adding `ca_cert` and `require_client_cert: true` enables mTLS (fail-closed). Omitting the block leaves plaintext HTTP. Same server mTLS machinery as Raft
+- Raft RPC TLS (`raft.tls`; the dev `docker-compose.yml` mounts certificates). SB-39: `raft.tls` (with `ca_cert`) is required and 2380 is always mTLS, accepting only certificates whose SAN matches a cluster member host (config list ∪ live Raft membership); `require_client_cert` was removed from Raft. Without `raft.tls`, `allow_insecure_raft: true` must be set explicitly (development only, WARN at startup). Breaking change, see the release note
+- REST TLS (`restapi.tls`, SB-03): `cert` + `key` enables HTTPS; adding `ca_cert` and `require_client_cert: true` enables mTLS (fail-closed). Omitting the block leaves plaintext HTTP. Same rustls server mTLS approach as Raft (Raft adds the member identity check)
 - Append-only Raft WAL (`raft_log.wal`, compacted above 4 MiB) plus `hard_state.json`, `state_machine.json`, `membership.json`
 - Watchdog (Linux `/dev/watchdog`; pet only a writable primary with a valid lease; timeout = TTL − `safety_margin`; default `mode: off`)
 - Graceful shutdown: wait `shutdown.drain_timeout_secs` while renewing the lock, then CHECKPOINT and stop on the leader (`-m fast`, then `-m immediate`), bounded by the leader lease, then release the lock only after PostgreSQL has stopped. If it cannot be stopped, the process does not exit
@@ -41,7 +41,7 @@ Items 13 and 14 in the old numbering are closed. Item 15 (password in `conn_url`
 
 ### 1. REST API TLS — done (SB-03)
 
-`src/main.rs` mirrors the Raft listener. No `restapi.tls` keeps plaintext `axum::serve`. `cert` + `key` serves HTTPS. `ca_cert` plus `require_client_cert: true` uses the shared `build_mtls_server_config` (`WebPkiClientVerifier`, fail-closed). Missing or unreadable `ca_cert` with `require_client_cert` aborts startup. Server fields match `raft.tls`: `cert`, `key`, `ca_cert`, `require_client_cert`.
+`src/main.rs` mirrors the Raft listener. No `restapi.tls` keeps plaintext `axum::serve`. `cert` + `key` serves HTTPS. `ca_cert` plus `require_client_cert: true` uses `build_mtls_server_config` (`WebPkiClientVerifier`, fail-closed). Missing or unreadable `ca_cert` with `require_client_cert` aborts startup. Server fields match `raft.tls`: `cert`, `key`, `ca_cert`, `require_client_cert`.
 
 `docker-compose.yml` and `docker/entrypoint.sh` take `PG_HA_RESTAPI_TLS_*`, default off (empty cert = plaintext). See the deployment guide, "REST API TLS / mTLS".
 
