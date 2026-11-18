@@ -276,6 +276,29 @@ When the target value is unchanged, skip the repeated `ALTER SYSTEM` + reload. T
 
 Current scope: synchronous replication configuration and status publication are implemented; when `synchronous_mode` is `"sync"` or `"quorum"`, Failover / Switchover require the candidate to belong to DCS `/sync.sync_standby` (S5). In `"quorum"` mode `/sync.kind` is quorum, and the election also checks the voters' live WAL positions before a candidate is considered safe (`ha/vote.rs`). Enabling `quorum` requires every node to run the same pg-ha version.
 
+### Quorum mode (SB-13)
+
+In `"quorum"` mode `/sync` holds `kind: quorum`, the voter set V (standbys only) and `q`; PostgreSQL holds `ANY n (V)`. The leader's quorum executor (`ha/quorum_sync.rs`) keeps `q = |V| − n` by planning single writes in a safe order (grow V and `q` first, relax `q` last and only behind the mark gate of `quorum/mark.rs`). A failover goes through a live vote before the leader lock is requested:
+
+```mermaid
+sequenceDiagram
+    participant C as Candidate
+    participant P as Voters
+    participant D as DCS
+    C->>C: read own live WAL position and timeline
+    C->>P: GET /wal (2 s per peer, 3 s per round)
+    P-->>C: timeline, wal_position, pg_in_recovery
+    C->>C: quorum_vote_decision (refuse, or granted)
+    C->>D: acquire leader lock (only after a granted vote)
+    C->>C: pre_promote_sync: ANY n' (V') confirmed by SHOW
+    C->>C: pg_ctl promote
+    C->>D: next cycle: write /sync (V', q)
+```
+
+- The vote reads the voters' live WAL positions through the open `GET /wal` endpoint (each call opens a superuser connection, so at most 8 run at once; the rest get 503). The pure rule is `quorum_vote_decision` in `quorum.rs`. Any failure is a refusal.
+- `pre_promote_sync` writes the new term's `ANY n' (V')` before `pg_ctl promote`, so a new primary never takes writes under a weaker setting. A failure means no promotion and the lock is given back.
+- Enabling from async writes `/sync` `(V, q = |V| − n)` before PostgreSQL `ANY n (V)` (SB-36). After a failover, or when a voter whose member record expired rejoins, `q` is temporarily `|V|` and nobody can win a vote. A primary lost in that window leaves the cluster without a primary and nothing relaxes `q`. The operator view and the open question are in the [Operations Guide](operations-guide.md#quorum-synchronous-replication).
+
 ## Module Dependencies
 
 ```
@@ -374,6 +397,7 @@ flowchart LR
         GET_METRICS["GET /metrics"]
         GET_PATRONI["GET /patroni"]
         GET_HISTORY["GET /history"]
+        GET_WAL["GET /wal (quorum vote)"]
         GET_STANDBY["GET /standby-leader"]
         GET_ROOT["GET / and /read-write"]
         GET_SYNC_ALIAS["GET /synchronous"]

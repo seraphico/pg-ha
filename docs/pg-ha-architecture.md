@@ -276,6 +276,29 @@ Primary 在持有 Leader Lock 时读取动态配置：
 
 当前范围：同步复制配置与状态发布已实现；Failover / Switchover 在 `synchronous_mode` 为 `"sync"` 或 `"quorum"` 时强制候选节点属于 DCS `/sync.sync_standby`（S5）。`"quorum"` 模式下 `/sync.kind` 为 quorum，选举前还会按投票节点的实时 WAL 位置判断候选是否安全（`ha/vote.rs`）；启用 `quorum` 要求所有节点运行相同版本的 pg-ha。
 
+### Quorum 模式（SB-13）
+
+`"quorum"` 模式下，`/sync` 里是 `kind: quorum`、投票节点集合 V（只含备库）和 `q`；PostgreSQL 里是 `ANY n (V)`。leader 上的 Quorum 执行器（`ha/quorum_sync.rs`）把变更拆成单步写入，并按安全顺序执行，使 `q = |V| − n`：先扩 V 和 `q`，最后才放宽 `q`，而且必须过 `quorum/mark.rs` 的 mark gate。failover 在申请 leader 锁之前要先过一次实时投票：
+
+```mermaid
+sequenceDiagram
+    participant C as 候选节点
+    participant P as 投票节点
+    participant D as DCS
+    C->>C: 读自己的实时 WAL 位置和 timeline
+    C->>P: GET /wal (每个节点 2 秒，整轮 3 秒)
+    P-->>C: timeline, wal_position, pg_in_recovery
+    C->>C: quorum_vote_decision (拒绝或通过)
+    C->>D: 申请 leader 锁（投票通过后才做）
+    C->>C: pre_promote_sync: ANY n' (V') 并经 SHOW 确认
+    C->>C: pg_ctl promote
+    C->>D: 下一周期写 /sync (V', q)
+```
+
+- 投票通过开放端点 `GET /wal` 读取各投票节点的实时 WAL 位置（每次调用会打开一个超级用户连接，所以同时最多 8 个，其余返回 503）。纯规则是 `quorum.rs` 的 `quorum_vote_decision`。任何失败都是拒绝。
+- `pre_promote_sync` 在 `pg_ctl promote` 之前先写入新一任的 `ANY n' (V')`，所以新主不会在更弱的设置下接收写入。失败就不晋升，并把锁还回去。
+- 从 async 启用时，先写 `/sync` 的 `(V, q = |V| − n)`，再写 PostgreSQL 的 `ANY n (V)`（SB-36）。failover 之后，或成员记录已过期的投票节点回来时，`q` 暂时等于 `|V|`，没有节点能赢得投票。主库在这个窗口内丢失，集群就没有主库，也没有任何东西去放宽 `q`。运维视角和待决问题见[运维指南](operations-guide.md#法定人数同步复制quorum)。
+
 ## 模块依赖关系
 
 ```
@@ -374,6 +397,7 @@ flowchart LR
         GET_METRICS["GET /metrics"]
         GET_PATRONI["GET /patroni"]
         GET_HISTORY["GET /history"]
+        GET_WAL["GET /wal（quorum 投票）"]
         GET_STANDBY["GET /standby-leader"]
         GET_ROOT["GET / 与 /read-write"]
         GET_SYNC_ALIAS["GET /synchronous"]

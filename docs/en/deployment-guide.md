@@ -380,7 +380,7 @@ bootstrap:
   post_bootstrap_sql: [<string>]   # SQL statements to run after bootstrap
 ```
 
-Tags related to synchronous replication: `tags.nosync` (exclude the node from synchronous standbys), `tags.sync_priority` (synchronous priority). Every node publishes its own `tags` in its DCS member record on each heartbeat, and `GET /patroni` reports them; peers use the published values for election, candidate validation, synchronous standby selection and the cascade topology. Synchronous replication can also be switched on or off at runtime with `PATCH /config`. See the [Operations Guide](operations-guide.md#synchronous-replication).
+Tags related to synchronous replication: `tags.nosync` (exclude the node from synchronous standbys), `tags.sync_priority` (synchronous priority). Every node publishes its own `tags` in its DCS member record on each heartbeat, and `GET /patroni` reports them; peers use the published values for election, candidate validation, synchronous standby selection and the cascade topology. Synchronous replication can also be switched on or off at runtime with `PATCH /config`. See the [Operations Guide](operations-guide.md#synchronous-replication). For `synchronous_mode: "quorum"` (requirements, enabling, known limitation) see [Quorum synchronous replication](operations-guide.md#quorum-synchronous-replication).
 
 ### Environment Variables
 
@@ -493,6 +493,7 @@ Proxy probes of `/primary` and `/replica` use the same `restapi.tls`. When it is
 
 **Every node's REST TLS mode must be the same**: all plaintext, all HTTPS (server-auth), or all mTLS. Mixed clusters are not supported. Each node's proxy probes every member with its own `restapi.tls`, and rewrites the scheme of the `api_url` published by the member to this node's scheme. If a member publishes a scheme that differs from this node, the log warns once for that member (`All nodes must use the same restapi.tls mode`), but behavior continues using this node's scheme. That does not make a mixed cluster actually usable.
 
+**Quorum votes use the same material.** With `synchronous_mode: "quorum"`, a failover candidate calls `GET /wal` on every voter over the same `restapi.tls` (HTTPS verified with `ca_cert`, and its own server certificate as the client certificate under mTLS). `GET /wal` needs no Basic Auth. Every node must therefore reach every other node's port 8008, and every node's certificate must be accepted by every other node (with mTLS, also usable for `clientAuth`). See the [Operations Guide](operations-guide.md#quorum-synchronous-replication).
 **Certificate requirements for proxy probes**:
 - `ca_cert` is also the CA that proxy probes use to trust server certificates. With only `cert` + `key` (server-auth TLS) and no `ca_cert`, probes trust only the system root certificates. When the certificate is issued by a private CA, every backend is marked DOWN, the proxy refuses all connections on 6432/6433, and leader election is unaffected. At startup there is one `restapi.tls is set without ca_cert` warning. The reason a probe failed (the URL and the reqwest error chain) is also logged as `Health probe failed` (at most one line every 60 seconds while the same backend keeps failing). Certificates issued by a public CA are not affected.
 - The server certificate's SAN must cover the hostname used in `raft.self_addr` (probes connect using the hostname published by the member; verification fails when that hostname is not in the SAN).
@@ -686,7 +687,7 @@ For the development cluster, run `make up` directly and do not use this example.
 | Port | Protocol | Direction | Purpose |
 |------|----------|-----------|---------|
 | 5432 | TCP | Inbound | PostgreSQL client connections (direct) |
-| 8008 | HTTP or HTTPS | Inbound | REST API (health checks require no authentication; management endpoints require Basic Auth when `restapi.username` is set). `restapi.tls` can be set to enable HTTPS / mTLS; when unset, the API is plaintext HTTP |
+| 8008 | HTTP or HTTPS | Inbound | REST API (health checks and `GET /wal`, which quorum votes read, require no authentication; management endpoints require Basic Auth when `restapi.username` is set). `restapi.tls` can be set to enable HTTPS / mTLS; when unset, the API is plaintext HTTP |
 | 2380 | HTTP or HTTPS | Between nodes | Raft RPC. HTTP when `raft.tls` is not configured; HTTPS once it is configured |
 | 6432 | TCP | Inbound | Proxy RW (routes to the Primary) |
 | 6433 | TCP | Inbound | Proxy RO (load-balances to Replicas) |

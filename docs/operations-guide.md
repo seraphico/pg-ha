@@ -32,7 +32,7 @@ curl -s http://localhost:8008/cluster | jq .
 - `voters`：`/sync` 里的名字（quorum 模式下是投票节点 V，不含 leader）。
 - `quorum`：`q`，即 `/sync.quorum`。`priority` 时为 `null`（该字段在 Priority 下是历史遗留，不起作用）。
 - `n`：PostgreSQL 实际生效的 `ANY n`（leader 的 Quorum 执行器上一轮从 `SHOW synchronous_standby_names` 读到）。**只有 leader 节点的 `/cluster` 有这个值**，其它节点、`priority`、leader 还没读过 SHOW 时为 `null`。
-- `settled`：`q == |voters| - n`，且 `n >= 1`（有投票节点而 `n` 还是 0，说明 PostgreSQL 还没切到 `ANY`，也算未就绪）。`false` 而 `n` 仍为 0 只表示 PostgreSQL 还没切到 `ANY`（刚启用 quorum 时），`/sync` 里已经是低的 `q`，候选能赢得投票；`false` 而 `n >= 1` 表示 `q` 还没放宽，此时没有候选能赢得投票（见「同步复制」的已知限制）。`n` 未知时为 `null`。
+- `settled`：`q == |voters| - n`，且 `n >= 1`（有投票节点而 `n` 还是 0，说明 PostgreSQL 还没切到 `ANY`，也算未就绪）。`false` 而 `n` 仍为 0 只表示 PostgreSQL 还没切到 `ANY`（刚启用 quorum 时），`/sync` 里已经是低的 `q`，候选能赢得投票；`false` 而 `n >= 1` 表示 `q` 还没放宽，此时没有候选能赢得投票（见「同步复制」的已知限制）。`n` 未知时为 `null`。只有 leader 会读 `n`，所以其它节点和没有 leader 的集群上 `settled` 都是 `null`，要自己比较 `quorum` 和 `voters` 的个数。
 脚本要等 quorum 就绪，就轮询 leader 的 `/cluster`，直到 `sync.settled` 为 `true`。
 节点自己的运行状态、timeline、WAL、lag、暂停和待重启标志在 **本节点** 的 `/patroni` 上，不在 `/cluster` 里：
 
@@ -59,7 +59,7 @@ curl -s http://localhost:8008/patroni | jq .
 
 `/patroni` 的 `role` / `state` 是 Rust Debug 写法（`Primary`、`Replica`、`Running`），和 `/cluster` 的小写角色不是同一套字符串。
 
-健康检查（`/primary`、`/replica`、`/health`、`/liveness`、`/sync`、`/async`、`/cluster`、`/patroni`、`/metrics`、`/history`）不要求认证。`/switchover`、`/failover`、`/restart`、`/reinitialize`、`/config` 在 YAML 里设置了 `restapi.username` 时要求 HTTP Basic Auth。Docker 入口默认用户名 `admin`、密码 `secret`。
+健康检查（`/primary`、`/replica`、`/health`、`/liveness`、`/sync`、`/async`、`/cluster`、`/patroni`、`/metrics`、`/history`）和 `/wal`（quorum 投票时节点之间读取的实时 WAL 位置，见「法定人数同步复制」）不要求认证。`/switchover`、`/failover`、`/restart`、`/reinitialize`、`/config` 在 YAML 里设置了 `restapi.username` 时要求 HTTP Basic Auth。Docker 入口默认用户名 `admin`、密码 `secret`。
 
 > **TLS / HTTPS**：下面的示例用 `http://`，是 REST API 的默认明文形态。配置了 `restapi.tls`（`cert` + `key`）后，REST API 改为 HTTPS，所有示例请把 `http://` 换成 `https://`，并用 `--cacert <ca.crt>` 提供信任根；开启 mTLS（`require_client_cert: true`）时还需 `--cert <client.crt> --key <client.key>`。代理探活 `/primary` 和 `/replica` 使用同一套材料：HTTPS 时信任 `ca_cert`，mTLS 时出示本节点自己的服务端证书。**Basic Auth 凭据只有在启用 TLS 后才在传输中受保护**——明文 HTTP 下凭据与管理命令都以明文传输，生产环境请为 REST API 启用 TLS（配置见部署指南的「REST API TLS / mTLS」）。
 
@@ -453,7 +453,7 @@ PostgreSQL 的异步复制中，Primary COMMIT 后立即返回客户端成功，
 pg-ha 通过 PostgreSQL 的 `synchronous_standby_names` 参数控制哪些节点是同步备库。这个参数的值有两种形式：
 
 ```
-FIRST 1 ("node2")              -- Priority：N 既是需要确认的个数，也是名单长度。运行路径只发这种
+FIRST 1 ("node2")              -- Priority：N 既是需要确认的个数，也是名单长度（`synchronous_mode` 为 `"sync"` 时使用）
 ANY 2 ("node1","node2","node3") -- Quorum：任意 2 个确认（`synchronous_mode` 为 `"quorum"` 时使用）
 ```
 
@@ -476,7 +476,7 @@ pg-ha 在每个 HA cycle 中（仅 Primary 执行）：
 - **实际正在流复制**：该成员必须出现在 Primary 的 `pg_stat_replication` 里（`application_name` = 成员名）。只在 DCS 里登记为 Running、但没有真正连上 Primary 的节点不算合格，不会被加进 `/sync`
 - 配置了 `maximum_lag_on_syncnode` 时，该备库的 lag（Primary 的 `flush_lsn` 减去备库 `flush_lsn`）必须不超过阈值
 
-**排序规则**：
+**排序规则**（仅 `"sync"`；`"quorum"` 模式下所有合格备库都是投票节点，不截断，见「法定人数同步复制」）：
 - `sync_priority` 标签值越大越靠前
 - 优先级相同时按节点名字字母序
 
@@ -532,6 +532,156 @@ node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
 2. node2 promote 后首个 cycle 计算 sync 列表
 3. node1（已崩溃）被过滤掉 → `'FIRST 1 ("node3")'`
 
+### 法定人数同步复制（quorum）
+
+本节讲 `synchronous_mode: "quorum"`。通用参数见下面的「配置参数」。
+
+#### 如何选择 async、sync、quorum
+
+| | `"async"` 异步复制 | `"sync"` 同步复制（按优先级） | `"quorum"` 法定人数同步复制 |
+|---|---|---|---|
+| COMMIT 何时返回 | Primary 本地写完 | `FIRST N` 名单里的 N 个备库确认 | 投票节点中任意 N 个确认（`ANY N`） |
+| 已确认的提交在 Primary 丢失后是否保留 | 不保证 | 保留：`/sync` 里每个名字都有这笔提交，且只有 `/sync` 成员能晋升 | 保留：候选节点必须按投票节点的实时 WAL 位置赢得投票 |
+| 某个备库慢或连不上 | 无影响 | 提交要等名单里的备库 | 只要还有 N 个投票节点跟得上，就无影响 |
+| 谁能成为新主 | 任何合格节点 | 只有 `/sync` 里的节点 | 只有赢得投票的投票节点 |
+| failover 需要什么 | 锁 | `/sync` 非空 | `q = \|V\| − N` 个其它投票节点在线并能应答 `GET /wal` |
+| 额外要求 | 无 | 无 | 所有节点相同版本的 pg-ha；节点之间能访问彼此的 REST 端口；建议配置看门狗 |
+
+可以接受主库故障时丢最后几秒提交，用 `"async"`。大多数集群用 `"sync"`（见下面「如何选择」）。要让一个慢备库不拖住写入，或者集群有 5 个及以上节点、希望 failover 时还能容忍多个节点同时故障，用 `"quorum"`（见「选择 `synchronous_node_count`」的表）。3 个节点且 `synchronous_node_count: 1` 时，quorum 只是不再被一个慢备库拖住，failover 时仍然不能再坏一个节点。
+
+#### 术语
+
+- **V**：投票节点集合，即 `/sync.sync_standby` 里的名字。只含备库，不含 leader。
+- **q**：`/sync.kind` 为 `quorum` 时的 `/sync.quorum`，候选节点必须拿到的其它投票节点数。
+- **n**：PostgreSQL 的 `synchronous_standby_names = 'ANY n (V)'` 里的 n。COMMIT 要等任意 `n` 个投票节点刷盘 WAL。
+- **就绪（settled）**：`q = |V| − n` 且 `n ≥ 1`。这时 failover 能赢得投票。
+
+为什么安全：已确认的提交至少在 `n` 个投票节点上，所以最多 `|V| − n = q` 个投票节点没有它。候选节点加上任意 `q` 个其它投票节点共 `q + 1` 个，其中至少一个有这笔提交。候选节点只要不落后于它问到的任何投票节点，它自己也有这笔提交。`quorum.rs` 的 `quorum_vote_decision` 就是这条规则。
+
+leader 上的 Quorum 执行器（`ha/quorum_sync.rs`）维护 V、q 和 n。V 是所有满足下列条件的备库：状态为 `Running`、角色为 Replica、没有 `nosync` 标签、正在流复制（出现在 Primary 的 `pg_stat_replication` 里），并且在设置了 `maximum_lag_on_syncnode` 时落后不超过该值。`n` 取 `synchronous_node_count`，非 strict 模式下不超过合格备库数。`synchronous_mode_strict: true` 且合格备库少于 `n` 时，执行器写入阻塞用的占位名单，写入会停住。
+
+#### failover 时发生什么
+
+节点申请 leader 锁之前，必须先赢得一次实时投票（`ha/vote.rs`、`quorum/round.rs`）：
+
+1. 候选节点从 PostgreSQL 读自己的 WAL 位置和 timeline，并向每个「状态为 `Running` 且有 API URL」的投票节点请求 `GET /wal`。单个请求最多 2 秒，整轮最多 3 秒。读自己的 WAL 与这一轮并发进行，所以整次投票最多 3 秒。
+2. 出现下列任一情况投票被拒：候选不在 V 里；任何应答的节点不在恢复中（说明有可写 Primary 存活）；有投票节点在更新的 timeline 上；同一 timeline 上有投票节点比候选更靠前；在候选 timeline 上应答的其它投票节点少于 `q` 个。在更旧 timeline 上的投票节点不计票。连不上的投票节点就是没有应答。
+3. 所有失败都是「拒绝」，不是错误。候选保持 follower，下个周期再试，不拿锁：宁可没有主库，也不丢提交。设置了 `maximum_lag_on_failover` 时，用同一批实时值再检查一次。
+4. 一个投票节点都联系不上时，日志输出 WARN，提示检查 `restapi.tls`、`ca_cert` 和客户端证书。
+5. 投票通过、拿到锁之后，新主先把 PostgreSQL 设为 `ANY n' (V')`，等 `SHOW synchronous_standby_names` 显示出来（最多 2 秒），然后才执行 `pg_ctl promote`。其中 `V' = (V 去掉新主) + 旧 leader`，`n' = |V| − q`。这一步失败就不晋升，并把锁还回去。之后再把 `/sync` 写成 `(V', q)`。所以新主不会在比旧主更弱的设置下接收写入。
+
+switchover 和带 `candidate` 的 failover 会用同样的输入在动作之前检查，旧 leader 不会为一个赢不了投票的候选放锁。409 的信息见下面的已知限制。
+
+#### `GET /wal`
+
+`GET /wal` 返回本节点的实时 WAL 位置，请求时从 PostgreSQL 现读（不是成员记录里发布的那份）：
+
+```json
+{"name": "node2", "scope": "prod-cluster", "timeline": 3, "wal_position": 83886080, "pg_in_recovery": true}
+```
+
+- 它的用途是让候选节点在投票时比较实时位置。成员记录里发布的 `wal_position` 每个 `loop_wait` 才刷新一次，可能过时：对优先级选举可以接受，对 quorum 不行。
+- **不需要认证**，和健康检查一样，这样节点之间不必共享 Basic Auth 凭据。它暴露节点名、集群 scope、timeline、WAL 位置和是否在恢复中。像其它开放端点一样，请用防火墙或网络策略把 REST 端口限制在集群节点和监控系统之内。
+- 每次调用都会打开一个 PostgreSQL 超级用户连接，所以同时最多处理 8 个。超过上限，或探测不可用、超时（1.8 秒）、失败、timeline 未知时，返回 `503`（`{"error": "..."}`，超限时为 `"busy"`）。503 只表示这个节点没有给出一票。
+- 启用 `restapi.tls` 时，节点之间用 HTTPS 调用，并信任 `ca_cert`。`require_client_cert: true` 时，调用方出示自己的服务端证书，所以每个节点的证书都要被其它每个节点的 CA 接受。
+- 每个节点必须能访问其它每个节点的 REST 端口（成员记录里的 `api_url`）。否则没人能赢得投票，failover 之后集群没有主库。
+
+#### mark 与 gate
+
+提高 `q` 和增加投票节点是立即、优先做的。降低 `q` 要过 gate，因为只有确认足够多的投票节点已经拿到旧设置下确认过的全部提交，降低 `q` 才安全。
+
+- leader 每次用 `SHOW` 看到 `synchronous_standby_names` 的形状变了，就记录一个 mark：此刻 Primary 的 flush LSN。旧形状下确认过的提交都不超过这个 mark。
+- 只有「还没刷盘到 mark 的投票节点数」不超过 `q'` 时，`q` 才降到 `q'`。判断是严格的：`flush_lsn >= mark`，没有 `maximum_lag_on_syncnode` 的余量。在 `pg_stat_replication` 里没有行的投票节点算没追上。
+- 本周期刚取得的 mark 不允许放宽，所以每次 PostgreSQL 改动之后还要多观察一个周期。当前生效的值读不成 `(S, n)`（无法解析、含 `*`、或会阻塞所有提交）时，`q` 也不降，执行器会把这种值换成自己的值。
+
+运维上看到的是：启用 quorum 或成员变化之后，leader 的 `GET /cluster` 会在几秒内显示 `sync.settled: false`（容器测试里 15 到 25 秒），之后变成 `true`。`q > |V| − n` 期间没有候选能赢得投票。
+
+#### 启用与关闭
+
+和其它模式一样，在任意节点上启用：
+
+```bash
+curl -u admin:secret -X PATCH http://localhost:8008/config \
+  -H 'Content-Type: application/json' \
+  -d '{"synchronous_mode": "quorum", "synchronous_node_count": 2}'
+```
+
+- 所有节点必须已经运行相同版本的 pg-ha（见下文）。先在每个节点上检查 `GET /wal`。
+- **从 async 启用时的写入顺序**（SB-36）：leader 先把 `/sync` 写成 `(V, q = |V| − n)`，再把 PostgreSQL 设为 `ANY n (V)`。切换后主库立刻挂掉，候选节点仍能赢得投票。两次写之间崩溃，只剩 PostgreSQL 这一步。（反过来的顺序会在 DCS 还不知道投票节点时就确认 quorum 提交。）从 `"sync"` 切过来时，执行器先用一次写入把 `/sync` 改成 `kind: quorum`，再把 `FIRST n (...)` 改写成 `ANY n (...)`。
+- 做计划内的破坏性操作（维护、switchover、停节点）之前，先等 leader 的 `GET /cluster` 显示 `sync.settled: true`。
+- **关闭**（`"async"` 或 `"sync"`）：只要 `/sync` 还是 `kind: quorum`，执行器就继续运行。切到 `"async"` 时，它先把 `q` 提到 `|V|`，这样 PostgreSQL 被清空期间没有节点能当选；然后清空 `synchronous_standby_names`；再过一两个周期（因为有 gate）清空 `/sync` 并按 priority 的形式写回。最后这次写入之前，`sync.settled` 为 `false`，failover 不可能发生。切到 `"sync"` 时，等 V 等于名单、名单长度等于 `n`、`q` 为 0 之后，交给 priority 的代码。请在业务低谷切换，不要和维护操作叠在一起。PostgreSQL 名单清空之后的提交是异步的，不在保证范围内。
+
+#### 选择 `synchronous_node_count`
+
+一次提交要等 `n` 个投票节点。failover 需要 `q = |V| − n` 个其它投票节点，所以其它投票节点最多可以坏 `n − 1` 个。V 是所有合格备库，所以 `|V|` 等于集群节点数减 1。
+
+| 集群 | `synchronous_node_count` | n | q | failover 时允许离线的其它投票节点数 |
+|---|---|---|---|---|
+| 3 节点（V = 2） | 1 | 1 | 1 | 0 |
+| 5 节点（V = 4） | 1 | 1 | 3 | 0（有 WARN，见下） |
+| 5 节点（V = 4） | 2 | 2 | 2 | 1 |
+| 5 节点（V = 4） | 3 | 3 | 1 | 2 |
+
+count 越大，提交延迟越高（取第 n 快的投票节点），也要有更多投票节点在流复制，提交才能继续。
+
+#### 标签
+
+- `nofailover: true`（以及 `failover_priority: 0`）：节点永远不会当选，但仍然是投票节点，照常确认提交、应答 `GET /wal`。
+- `nosync: true`：节点永远不是投票节点，离线时也不会被当作离线投票节点保留。
+- `sync_priority`：quorum 模式下不起作用，因为所有合格备库都是投票节点（`"sync"` 模式才用它）。
+- 标签从每个节点的成员记录里读取，所以改了标签要等该节点下一次心跳才生效。
+
+#### 日志 WARN
+
+quorum 模式下，leader 在下列情况出现时输出 WARN，情况持续时每 30 个执行器周期再输出一次：
+
+- `synchronous_node_count is 1 with <k> eligible voters; a failover then needs almost every voter online (raise synchronous_node_count)`：`n = 1` 且合格投票节点有 3 个或更多。
+- `synchronous_mode quorum without a watchdog (watchdog.mode is off): a hung primary is not fenced (zombie-primary risk)`：`watchdog.mode` 为 `off`（默认）。quorum 不要求必须有看门狗，没有看门狗也不会拒绝运行；见下面的僵尸主库警告。
+- `every eligible voter is tagged nofailover; they vote but none of them can be elected`：所有合格投票节点都带 `nofailover`。
+
+#### 保证覆盖什么
+
+- 保证从 quorum 生效时开始：PostgreSQL 的 `ANY n (V)` 已生效，且 `/sync` 里是对应的 `(V, q)`。在此之前、异步模式下提交的数据不在保证范围内。计划内的模式切换是人的操作，failover 是故障，这个保证针对的是后者。
+- 它覆盖已确认的提交：客户端收到 COMMIT 且没有警告。被取消等待的提交不在其内（见下一节）。
+- 它假定投票读取 WAL 位置时，旧主已经不能再确认提交（`quorum.rs` 的 SI-3）。HA 循环在运行时靠租约围栏保证（不变量 L5），循环停摆时靠看门狗。
+- `synchronous_mode_strict: false` 时，没有合格备库，执行器会退到空名单（异步）。这段时间的提交不在保证范围内，而且 `/sync` 为空时不会自动晋升任何节点。
+
+#### 僵尸主库或被隔离的旧主库
+
+旧 Primary 与投票节点失联，或进程卡住，而其它节点选出了新主，在被围栏之前它就是僵尸主库。
+
+- **围栏。** HA 循环还在运行时，续不上锁的主库会在租约结束前自己围栏（immediate stop），比其它节点等待的锁过期时间更早。进程卡住（SIGSTOP、虚拟机冻结、循环被阻塞）时它做不到，只有看门狗能重置主机。默认是 `watchdog.mode: off`，quorum 集群请配置 `automatic` 或 `required`。
+- **僵尸主库上的客户端会看到什么。** COMMIT 要等 `n` 个投票节点，没有人会应答，所以一直挂起。僵尸主库上的其它会话已经能读到这一行，因为 PostgreSQL 在等待结束之前就让提交在本地可见。如果客户端取消等待，或主库被关闭，PostgreSQL 会让 COMMIT 返回，并带警告 “The transaction has already committed locally, but might not have been replicated to the standby”，参见 PostgreSQL 社区对[同步复制边界情况](https://wiki.postgresql.org/wiki/PgCon_2020_Developer_Unconference/Edge_cases_of_synchronous_replication_in_HA_solutions)的讨论。这笔提交没有被投票节点确认，可能丢失。请把这个警告当作结果未知。僵尸主库上的读也可能看不到新主上的提交。
+- **为什么已确认的提交仍然有保证。** 这类提交只有在 `n` 个投票节点刷盘之后才算确认。新主当选的前提是候选节点看到 `q` 个不领先于它的投票节点，并且只要有应答的节点是可写 Primary，投票就被拒绝。按上面的交集论证，新主拥有所有已确认的提交。分裂之后僵尸主库写的提交，不可能被已经跟随新主的投票节点确认。
+- 唯一的缺口是看门狗要覆盖的情况：卡住的僵尸主库恢复运行，而某个投票节点仍在从它流复制，并在该节点被读取之后确认了一笔提交。
+
+#### 已知限制：failover 之后或节点迟到重新加入的窗口，以及恢复
+
+**`q` 暂时等于 `|V|` 的情况。** 有两种情况仍会把 `q` 提到 `|V|`，之后约 15 到 25 秒才放宽（容器测试里 5 节点约 24 秒）：
+
+1. failover 之后，幸存备库还没开始从新主流复制。新主这时没有合格备库，planner 把 `q` 写成 `|V|`，清空名单再重建。
+2. 成员记录已过期的投票节点回来。成员记录在节点最后一次心跳之后保留 `ttl` 秒。离线时间更短的投票节点留在 V 里，回来也不改变 `q`。记录过期后它被移出 V，回来时算「新增投票节点」，`q` 加 1。
+
+SB-36 已经关闭的情况不受影响：启用 quorum 和投票节点短暂离线，不再出现这个窗口。
+
+**leader 还在时**，pg-ha 拒绝 switchover 和带 `candidate` 的 failover（409，不放锁、不 demote），信息形如 `quorum not settled: failover is impossible until q is relaxed (q=2, voters=2, n=1)`。在线的其它投票节点少于 `q` 个时也拒绝：`not enough voters online for the candidate to win the vote`。`q > |V| − n` 期间 leader 输出 WARN `failover is not possible until q is relaxed`（每 30 个周期一次）。请看 leader 的 `GET /cluster` 里的 `sync.settled`，等它变成 `true`。
+
+**如果主库在窗口内丢失**，没有节点能赢得投票（候选最多拿到 `|V| − 1` 票），也没有人放宽 `q`，因为只有 leader 会写 `/sync`。集群一直没有主库。已确认的提交不会丢：各节点的数据都在，丢的只是可用性。
+
+如何发现：
+
+- 任意节点的 `GET /cluster` 里没有 role 为 `primary` 的成员，并且 `sync.kind` 为 `"quorum"`，`sync.quorum` 大于等于 `sync.voters` 里的名字数。非 leader 节点上 `sync.n` 和 `sync.settled` 都是 `null`（只有 leader 会读 `n`），所以要自己比较 `quorum` 和 `voters`。
+- 候选节点每 60 秒输出一条 ERROR：`The cluster cannot elect a primary: /sync has q=<q> with <v> voters (q >= |V|), so no candidate can collect enough votes, and nothing relaxes q while there is no leader`。被拒候选的周期结果是 `quorum vote refused: InsufficientVotes { got: .., need: .. }`。
+- 如果 `q < |V|`，原因不同：在线并能应答的投票节点少于 `q` 个。投票节点回来、彼此之间 `GET /wal` 通了之后会自己恢复。
+
+没用的操作（从代码得出，重启一项有容器测试佐证）：重启任意节点上的 pg-ha 或 PostgreSQL；重启旧主（容器测试里 214 秒后集群仍然没有主库，`/sync` 不变）；`POST /failover`（指定 candidate 时返回 409，不指定时投票仍然拒绝）；`POST /switchover`（需要 leader）；用 `PUT` / `PATCH /config` 改成别的 `synchronous_mode`（执行器只在 leader 上运行，而带投票节点的 quorum `/sync` 会让投票和成员规则一直生效，不管模式写什么）。`/sync` 只有 leader 会写（不变量 C2）。没有任何 REST 端点或 CLI 命令可以写 `/sync`。
+
+**手工恢复：目前没有受支持的步骤。** 代码里没有可以安全手工放宽 `q` 的办法，而安全的取值取决于已经挂掉的主库当时生效的 `n`，DCS 里不存这个值。不要手工修改 Raft 文件。这是留给维护者的待决问题（见 SB-36 的记录）。在此之前请避开这个窗口：每次 failover 或节点重新加入之后，先等新 leader 上 `sync.settled: true`，再做下一步有破坏性的操作，并保持足够多的健康投票节点。
+
+#### 要求：所有节点使用相同版本的 pg-ha
+
+启用 `"quorum"` 要求所有节点运行相同版本的 pg-ha，不支持混合版本，也不能滚动切换。旧版本不认识 `/sync` 的 `kind` 字段（缺省的 `kind` 表示 priority）、投票和 `GET /wal`。请先升级所有节点，在每个节点上检查 `GET /wal`，最后再 PATCH `synchronous_mode`。
+
 ### 配置参数
 
 #### 动态配置（存储在 DCS `/config`，运行时通过 API 修改）
@@ -556,16 +706,17 @@ node2 恢复 → pg-ha 标记为 Running → 下一个 HA cycle 重新计算 →
 | `"quorum"` | 法定人数同步复制 | `ANY N (...)`，由 Quorum 执行器维护 |
 
 只接受上表中的小写字符串，其它值（包括旧的 `true` / `false`）都会被拒绝：`PATCH` / `PUT /config` 返回 **400**，错误信息列出可接受的值，且不写入 DCS。
-> ⚠ **已知限制（quorum，SB-36 跟踪）**：刚启用 `quorum` 时，leader 先把 `/sync` 写成 (V, q = |V| − n)，再把 PostgreSQL 改成 `ANY n (V)`，所以启用时没有这段窗口；启用之前在异步模式下提交的数据不在「不丢」保证范围内。投票节点短暂离线后回来（成员记录还没过期）时，它一直留在 V 里，`q` 也不会被抬高。仍有窗口的情况：成员记录已过期的节点重新加入，或 failover 之后幸存节点还没重新开始流复制。这时 `/sync` 里的 `q` 先等于投票节点数 |V|，要等 leader 确认同步后（约 15–20 秒）才放宽到 |V| − n。这段时间内候选节点最多只能拿到 |V| − 1 票，没有节点能赢得投票，所以 failover 不可能发生。pg-ha 在这段时间内**拒绝 switchover 和带 `candidate` 的 failover**（409，不放锁、不 demote，信息形如 `quorum not settled: failover is impossible until q is relaxed (q=2, voters=2, n=1)`）；投票节点在线数不足 `q` 时也会拒绝（`not enough voters online for the candidate to win the vote`）。如果主库在这段时间内自己挂掉，没有 leader 就没有人去放宽 `q`，集群会一直没有主库，需要手工修正 `/sync`。操作前请看 `GET /cluster` 的 `sync.settled`（leader 节点）是否为 `true`。日志里：leader 在 `q` 未放宽期间打 WARN（`failover is not possible until q is relaxed`），无主时被拒的候选打 ERROR（`The cluster cannot elect a primary`），都有频率限制。
+> ⚠ **quorum**：投票、`GET /wal`、mark 与 gate 如何工作，如何启用和关闭，僵尸主库警告，以及仍然存在的已知限制（`q` 暂时等于 `|V|` 时丢了主库，集群会没有主库），见上面的「法定人数同步复制」。做有破坏性的操作之前，请看 leader 的 `GET /cluster` 里的 `sync.settled`。
 
 **已存入 DCS 的无效配置**（例如开发集群里遗留的 `synchronous_mode: true`，或手工改坏）不会被任何节点应用，也不会退化成 `"async"`：运行中的节点保留上一份有效配置，并以 ERROR 级别记录出错的键和可接受的值（同一内容每 60 秒最多一条）；刚启动、还没有任何有效配置的节点不改动同步复制、不参与选举，直到用 `PUT /config` 写入有效配置。此时对已存无效配置做 `PATCH` 返回 **409**。`bootstrap.dcs` 里的无效值会使节点启动失败。
 
-**启用 `"quorum"` 的要求**：集群里所有节点必须运行相同版本的 pg-ha，不支持混合版本。`quorum` 模式下日志会在以下情况输出 WARN：`synchronous_node_count` 为 1 而合格投票节点有 3 个或更多；未启用看门狗（存在僵尸主库风险）；所有合格投票节点都带 `nofailover` 标签（它们参与投票但不能被选为主）。
+**启用 `"quorum"` 的要求**：所有节点必须运行相同版本的 pg-ha，不支持混合版本；节点之间要能访问彼此的 REST 端口以读取 `GET /wal`；建议配置看门狗。详见「法定人数同步复制」。
 
 **如何选择**：
 - 大多数场景用 `synchronous_mode: "sync", strict: false, count: 1` — 正常时同步保护，极端时不停服务
 - 金融/订单场景用 `strict: true` — 宁可停服务也不丢数据
 - 5 节点集群可考虑 `count: 2` — 数据存 3 份才确认
+- 一个慢备库不应该拖住写入，或者有 5 个及以上节点、用 `count: 2` 或更大、希望 failover 时还能再坏一个节点，可以用 `synchronous_mode: "quorum"`。启用的前提是所有节点相同版本、配置了看门狗、节点之间能访问 `GET /wal`
 
 #### 节点标签（在 `pg-ha.yml` 中配置）
 
@@ -639,7 +790,8 @@ bootstrap:
 
 ### 当前范围与限制
 
-- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（`"sync"` 用 Priority / `FIRST N`，`"quorum"` 用 `ANY N`）、节点变动时自动更新、两阶段写入（DCS `/sync` 始终是 PG 名单的子集）、`maximum_lag_on_syncnode` lag 门槛、「实际正在流复制」筛选（必须出现在 `pg_stat_replication`）、strict 用不可满足的占位名单真正阻塞写入（不是 `'*'`）、发布 DCS `/sync`、`/sync` `/async` 健康检查、Failover / Switchover 时强制 `/sync` 成员资格
+- 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（`"sync"` 用 Priority / `FIRST N`，`"quorum"` 用 `ANY N`）、节点变动时自动更新、两阶段写入（DCS `/sync` 始终是 PG 名单的子集）、`maximum_lag_on_syncnode` lag 门槛、「实际正在流复制」筛选（必须出现在 `pg_stat_replication`）、strict 用不可满足的占位名单真正阻塞写入（不是 `'*'`）、发布 DCS `/sync`、`/sync` `/async` 健康检查、Failover / Switchover 时强制 `/sync` 成员资格、quorum 模式与 failover 时的实时 WAL 投票和 `GET /wal`（SB-13）
+- quorum 的限制：failover 之后，或成员记录已过期的投票节点回来时，`q` 暂时等于 `|V|`。此时丢了主库，集群就没有主库，目前还没有受支持的手工恢复步骤（见「法定人数同步复制」里的「已知限制」）
 - 尚未实现（登记在 [TODO.md](TODO.md)）：
   - `maximum_lag_on_failover`：选举会读（SB-11）。落后当轮合格候选里最大 `wal_position` 超过该字节数的节点不参选；`null` 或省略表示关闭
 

@@ -37,7 +37,7 @@ pg-ha is a PostgreSQL HA system written in Rust. It aims at the same job as Patr
 
 ## P0 — blocks production
 
-Items 13 and 14 in the old numbering are closed. Item 15 (password in `conn_url`) is closed by SB-07 Option A. Item 1 (REST TLS, SB-03) and item 2 are done; item 2 stays here because the Quorum documentation is still listed under it.
+Items 13 and 14 in the old numbering are closed. Item 15 (password in `conn_url`) is closed by SB-07 Option A. Item 1 (REST TLS, SB-03) and item 2 are done; item 2 stays here because the Quorum known limitation (SB-36 follow-up) is still listed under it.
 
 ### 1. REST API TLS — done (SB-03)
 
@@ -83,7 +83,7 @@ With `synchronous_mode` set to `"sync"` or `"quorum"`, automatic election and a 
 
 **Still open:**
 
-- Quorum operating documentation: `synchronous_mode: "quorum"` is selectable (SB-13 PR4); the full description of `/wal`, mark and gate semantics, the zombie-primary warning and recommended topologies is still to be written.
+- ~~Quorum operating documentation~~ done (SB-13 PR5): `/wal`, the mark and the gate, the zombie-primary warning, how to choose a mode and `synchronous_node_count` are in the [Operations Guide](operations-guide.md#quorum-synchronous-replication). Still open: after a failover, or when a voter whose member record expired rejoins, `q` is temporarily `|V|`; a primary lost then leaves the cluster without a primary, and there is no supported manual recovery yet (SB-36 follow-up).
 - **SB-11 done:** `maximum_lag_on_failover` is read by `is_healthiest_node`. The reference is the largest `wal_position` among candidates that already passed eligibility, running, and sync gates (including self). A candidate farther behind than the threshold, including self, does not campaign. Unknown `wal_position` is excluded. `None` (default) turns the check off.
 - **SB-10 done:** `timeline`, `wal_position`, and `replication_lag` on `/patroni`, `/primary`, `/replica`, and `/metrics` come from the cycle's `wal_status` via `ApiSnapshot` (no extra query). Lag is the leader's last published position minus this node's, in bytes, minimum 0. It can under-count by about one `loop_wait` of WAL under heavy write, and it measures received WAL, not applied WAL. The primary reports 0. Unknown is `null` and the metric line is omitted. `/replica?lag=` fails open when lag is unknown.
 
