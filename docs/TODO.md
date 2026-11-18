@@ -37,7 +37,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 
 ## P0 — 阻塞上线（必须在生产部署前完成）
 
-编号 13、14 仍开放；编号 15（成员 `conn_url` 含密码）已由 SB-07 Option A 闭合。编号 1（REST API TLS，SB-03）与编号 2 已完成；编号 2 留在这里是因为同步复制的 Quorum 已知限制（SB-36 后续）、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
+编号 13、14（旧编号）已闭合；编号 15（成员 `conn_url` 含密码）已由 SB-07 Option A 闭合。编号 1（REST API TLS，SB-03）与编号 2 已完成；编号 2 留在这里是因为同步复制的 Quorum 已知限制（SB-36 后续）、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
 
 ### 1. REST API TLS 支持 ✅ 已完成（SB-03）
 
