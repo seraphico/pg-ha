@@ -23,18 +23,30 @@ pub struct RaftTlsConfig {
     pub cert: PathBuf,
     /// Server private key file path (PEM)
     pub key: PathBuf,
-    /// CA certificate path for verifying peer certificates
+    /// CA certificate path for verifying peer certificates (required)
     #[serde(default)]
     pub ca_cert: Option<PathBuf>,
-    /// Client certificate path (for mTLS outbound connections)
+    /// Client certificate path for outbound connections (defaults to `cert`)
     #[serde(default)]
     pub client_cert: Option<PathBuf>,
-    /// Client private key path (for mTLS outbound connections)
+    /// Client private key path for outbound connections (defaults to `key`)
     #[serde(default)]
     pub client_key: Option<PathBuf>,
-    /// Whether to require client certificates (server-side mTLS verification)
-    #[serde(default)]
-    pub require_client_cert: bool,
+    /// Removed: mTLS is always on when `raft.tls` is set. Kept only so old
+    /// configs still parse. `false` is rejected by validation; `true` is a no-op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_client_cert: Option<bool>,
+}
+
+impl RaftTlsConfig {
+    /// Certificate and key this node presents on outbound Raft connections.
+    /// Falls back to the server `cert`/`key` (one member cert per node).
+    pub fn client_identity(&self) -> (&Path, &Path) {
+        (
+            self.client_cert.as_deref().unwrap_or(&self.cert),
+            self.client_key.as_deref().unwrap_or(&self.key),
+        )
+    }
 }
 
 /// REST management API TLS configuration.
@@ -227,6 +239,27 @@ pub struct RaftConfig {
     /// TLS configuration (if absent, plain HTTP is used)
     #[serde(default)]
     pub tls: Option<RaftTlsConfig>,
+    /// Allow Raft RPC over plaintext HTTP with no authentication. Only honored
+    /// when `tls` is absent. Anyone who can reach the port can then write any
+    /// DCS key, so use it for local development only.
+    #[serde(default)]
+    pub allow_insecure_raft: bool,
+}
+
+impl RaftConfig {
+    /// Warning text to log at startup when Raft RPC runs unauthenticated.
+    pub fn insecure_transport_warning(&self) -> Option<String> {
+        if self.tls.is_none() && self.allow_insecure_raft {
+            Some(format!(
+                "raft.allow_insecure_raft is set and raft.tls is absent: Raft RPC on {} is \
+                 plaintext and unauthenticated; any host that can reach it can modify the \
+                 cluster state. Do not use outside local development.",
+                self.self_addr
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 /// TCP proxy configuration (replaces HAProxy)
@@ -626,6 +659,36 @@ impl Config {
                 "raft.partner_addrs must contain at least one peer address".into(),
             ));
         }
+        match &self.raft.tls {
+            None if !self.raft.allow_insecure_raft => {
+                return Err(crate::Error::Config(
+                    "raft.tls is required: the Raft RPC port must use mutual TLS. Configure \
+                     raft.tls (cert, key, ca_cert), or set raft.allow_insecure_raft: true \
+                     for local development only"
+                        .into(),
+                ));
+            }
+            None => {}
+            Some(tls) => {
+                if tls.ca_cert.is_none() {
+                    return Err(crate::Error::Config(
+                        "raft.tls.ca_cert is required to verify peer certificates".into(),
+                    ));
+                }
+                if tls.require_client_cert == Some(false) {
+                    return Err(crate::Error::Config(
+                        "raft.tls.require_client_cert: false is no longer supported; mutual \
+                         TLS is mandatory for the Raft RPC port. Remove the option"
+                            .into(),
+                    ));
+                }
+                if tls.client_cert.is_some() != tls.client_key.is_some() {
+                    return Err(crate::Error::Config(
+                        "raft.tls.client_cert and raft.tls.client_key must be set together".into(),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -684,7 +747,15 @@ impl Config {
                 partner_addrs: vec!["node2:2380".to_string(), "node3:2380".to_string()],
                 data_dir: Some(PathBuf::from("/var/lib/pg-ha/raft")),
                 node_id: None,
-                tls: None,
+                tls: Some(RaftTlsConfig {
+                    cert: PathBuf::from("/etc/pg-ha/tls/server.crt"),
+                    key: PathBuf::from("/etc/pg-ha/tls/server.key"),
+                    ca_cert: Some(PathBuf::from("/etc/pg-ha/tls/ca.crt")),
+                    client_cert: None,
+                    client_key: None,
+                    require_client_cert: None,
+                }),
+                allow_insecure_raft: false,
             },
             proxy: ProxyConfig {
                 rw_listen: "0.0.0.0".to_string(),
@@ -741,6 +812,7 @@ restapi:
   port: 8008
 raft:
   self_addr: "127.0.0.1:2380"
+  allow_insecure_raft: true
   partner_addrs:
     - "127.0.0.2:2380"
     - "127.0.0.3:2380"
@@ -918,6 +990,59 @@ proxy:
         let result = Config::from_yaml(&yaml);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("partner_addrs"));
+    }
+
+    fn with_raft_tls(extra: &str) -> String {
+        MINIMAL_YAML.replace(
+            "  allow_insecure_raft: true\n",
+            &format!("  tls:\n    cert: /t/server.crt\n    key: /t/server.key\n{extra}"),
+        )
+    }
+
+    #[test]
+    fn test_raft_tls_required_without_insecure_opt_in() {
+        let yaml = MINIMAL_YAML.replace("  allow_insecure_raft: true\n", "");
+        let err = Config::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("raft.tls is required"), "{err}");
+    }
+
+    #[test]
+    fn test_raft_insecure_opt_in_passes_with_warning() {
+        let config = Config::from_yaml(MINIMAL_YAML).unwrap();
+        let warning = config.raft.insecure_transport_warning().unwrap();
+        assert!(warning.contains("unauthenticated"), "{warning}");
+    }
+
+    #[test]
+    fn test_raft_tls_requires_ca_cert() {
+        let err = Config::from_yaml(&with_raft_tls(""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ca_cert"), "{err}");
+    }
+
+    #[test]
+    fn test_raft_tls_rejects_require_client_cert_false() {
+        let yaml = with_raft_tls("    ca_cert: /t/ca.crt\n    require_client_cert: false\n");
+        let err = Config::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(err.contains("require_client_cert"), "{err}");
+    }
+
+    #[test]
+    fn test_raft_tls_with_ca_cert_passes_and_has_no_warning() {
+        let yaml = with_raft_tls("    ca_cert: /t/ca.crt\n    require_client_cert: true\n");
+        let config = Config::from_yaml(&yaml).unwrap();
+        assert!(config.raft.insecure_transport_warning().is_none());
+        let tls = config.raft.tls.unwrap();
+        let (c, k) = tls.client_identity();
+        assert_eq!(c, Path::new("/t/server.crt"));
+        assert_eq!(k, Path::new("/t/server.key"));
+    }
+
+    #[test]
+    fn test_raft_tls_client_cert_without_key_rejected() {
+        let yaml = with_raft_tls("    ca_cert: /t/ca.crt\n    client_cert: /t/c.crt\n");
+        assert!(Config::from_yaml(&yaml).is_err());
     }
 
     #[test]

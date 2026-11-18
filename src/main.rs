@@ -135,30 +135,23 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Start Raft RPC server — TLS or plain HTTP depending on config
+    // Start Raft RPC server: mutual TLS with a member certificate, or plain HTTP
+    // only when raft.allow_insecure_raft is set (Config::validate enforces this).
     if let Some(ref tls_cfg) = config.raft.tls {
         use axum_server::tls_rustls::RustlsConfig;
         // Install rustls crypto provider (required by rustls 0.23+)
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let rustls_config = if tls_cfg.require_client_cert {
-            // mTLS: require and verify client certificates against the configured CA.
-            let server_config = build_mtls_server_config(
-                &tls_cfg.cert,
-                &tls_cfg.key,
-                tls_cfg.ca_cert.as_deref(),
-                "raft.tls",
-            )
+        pg_ha_dcs::raft_tls::check_own_identity(
+            tls_cfg,
+            &pg_ha_dcs::raft_tls::host_of(&config.raft.self_addr),
+        )
+        .map_err(|e| anyhow::anyhow!("Raft mTLS config error: {e}"))?;
+        let members =
+            pg_ha_dcs::raft_tls::MemberHosts::with_raft_metrics(&all_addrs, dcs.raft().metrics());
+        let server_config = pg_ha_dcs::raft_tls::build_raft_server_config(tls_cfg, members)
             .map_err(|e| anyhow::anyhow!("Raft mTLS config error: {e}"))?;
-            info!(%raft_addr, "Raft RPC listening (mTLS: client certificate required)");
-            RustlsConfig::from_config(Arc::new(server_config))
-        } else {
-            // Server-auth-only TLS (default): no client certificate verification.
-            let cfg = RustlsConfig::from_pem_file(&tls_cfg.cert, &tls_cfg.key)
-                .await
-                .map_err(|e| anyhow::anyhow!("Raft TLS config error: {e}"))?;
-            info!(%raft_addr, "Raft RPC listening (TLS)");
-            cfg
-        };
+        info!(%raft_addr, "Raft RPC listening (mTLS: member certificate required)");
+        let rustls_config = RustlsConfig::from_config(Arc::new(server_config));
         tokio::spawn(async move {
             if let Err(e) = axum_server::bind_rustls(raft_addr, rustls_config)
                 .serve(raft_router.into_make_service())
@@ -169,8 +162,12 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     } else {
+        let Some(warning) = config.raft.insecure_transport_warning() else {
+            anyhow::bail!("raft.tls is required unless raft.allow_insecure_raft is set");
+        };
+        warn!("{warning}");
         let raft_listener = tokio::net::TcpListener::bind(raft_addr).await?;
-        info!(%raft_addr, "Raft RPC listening");
+        info!(%raft_addr, "Raft RPC listening (plaintext, insecure)");
         tokio::spawn(async move {
             if let Err(e) = axum::serve(raft_listener, raft_router).await {
                 error!("Raft RPC server fatal error: {e}");
@@ -1361,7 +1358,7 @@ mod tests {
             ca_cert: None,
             client_cert: None,
             client_key: None,
-            require_client_cert: true,
+            require_client_cert: Some(true),
         };
         let err = build_mtls_server_config(
             &tls_cfg.cert,
@@ -1385,7 +1382,7 @@ mod tests {
             ca_cert: Some(PathBuf::from("/nonexistent/ca.crt")),
             client_cert: None,
             client_key: None,
-            require_client_cert: true,
+            require_client_cert: Some(true),
         };
         let err = build_mtls_server_config(
             &tls_cfg.cert,
@@ -1529,7 +1526,7 @@ mod tests {
             ca_cert: Some(dir.join("client-ca.crt")),
             client_cert: None,
             client_key: None,
-            require_client_cert: true,
+            require_client_cert: Some(true),
         };
         let server_config = build_mtls_server_config(
             &tls_cfg.cert,

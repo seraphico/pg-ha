@@ -8,11 +8,13 @@
 //! - `store`: openraft storage (log + state machine + snapshot)
 //! - `network`: HTTP client for Raft RPCs to other nodes
 //! - `raft_server`: HTTP server endpoints receiving Raft RPCs
+//! - `raft_tls`: mutual TLS and member identity check for the Raft RPC port
 //! - `raft_dcs`: DcsAdapter implementation bridging HA engine to Raft
 
 pub mod network;
 pub mod raft_dcs;
 pub mod raft_server;
+pub mod raft_tls;
 pub mod state_machine;
 pub mod store;
 pub mod wal;

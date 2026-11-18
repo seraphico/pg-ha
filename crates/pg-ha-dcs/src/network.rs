@@ -39,41 +39,13 @@ impl NetworkFactory {
         }
     }
 
-    /// Create a NetworkFactory with TLS enabled (HTTPS, optional mTLS)
+    /// Create a NetworkFactory with mutual TLS enabled (HTTPS)
     pub fn with_tls(tls_cfg: &pg_ha_core::config::RaftTlsConfig) -> anyhow::Result<Self> {
-        let mut builder = reqwest::Client::builder()
-            .pool_max_idle_per_host(5)
-            .timeout(std::time::Duration::from_secs(10));
-
-        // Add custom CA certificate for verifying the server
-        if let Some(ref ca_path) = tls_cfg.ca_cert {
-            let ca_pem = std::fs::read(ca_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read CA cert '{}': {e}", ca_path.display())
-            })?;
-            let ca_cert = reqwest::tls::Certificate::from_pem(&ca_pem)
-                .map_err(|e| anyhow::anyhow!("Invalid CA cert: {e}"))?;
-            builder = builder.add_root_certificate(ca_cert);
-        }
-
-        // Add client identity for mTLS
-        if let (Some(cert_path), Some(key_path)) = (&tls_cfg.client_cert, &tls_cfg.client_key) {
-            let cert_pem = std::fs::read(cert_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read client cert '{}': {e}", cert_path.display())
-            })?;
-            let key_pem = std::fs::read(key_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read client key '{}': {e}", key_path.display())
-            })?;
-            let mut identity_pem = cert_pem;
-            identity_pem.extend_from_slice(&key_pem);
-            let identity = reqwest::tls::Identity::from_pem(&identity_pem)
-                .map_err(|e| anyhow::anyhow!("Invalid client identity: {e}"))?;
-            builder = builder.identity(identity);
-        }
-
-        let client = builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build TLS HTTP client: {e}"))?;
-
+        let client = crate::raft_tls::build_raft_http_client(
+            tls_cfg,
+            5,
+            std::time::Duration::from_secs(10),
+        )?;
         Ok(Self {
             client,
             tls_enabled: true,
