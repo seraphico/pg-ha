@@ -747,11 +747,11 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-    /// **Validates: Requirements 3.5, 3.6**
-    ///
-    /// Property 2: Preservation - Normal Startup Flow
-    /// For all valid IP:port inputs, `resolve_addr` returns `Some(valid_addr)` matching the input.
-    /// This captures the baseline behavior of the normal startup path.
+    // **Validates: Requirements 3.5, 3.6**
+    //
+    // Property 2: Preservation - Normal Startup Flow
+    // For all valid IP:port inputs, `resolve_addr` returns `Some(valid_addr)` matching the input.
+    // This captures the baseline behavior of the normal startup path.
 
     // Strategy: generate valid IPv4 addresses and ports
     fn ipv4_addr_strategy() -> impl Strategy<Value = (Ipv4Addr, u16)> {
@@ -1572,7 +1572,7 @@ mod tests {
                 server.write_tls(&mut buf2).ok();
                 if !buf2.is_empty() {
                     client.read_tls(&mut buf2.as_slice()).unwrap();
-                    client.process_new_packets().map_err(|e| e)?;
+                    client.process_new_packets()?;
                 }
                 if !client.is_handshaking() && !server.is_handshaking() {
                     return Ok(());

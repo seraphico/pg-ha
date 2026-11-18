@@ -878,8 +878,8 @@ mod tests {
             ],
         };
         let replicas = state.replicas();
-        assert_eq!(replicas[0 % 2].name, "node2");
-        assert_eq!(replicas[1 % 2].name, "node3");
+        assert_eq!(replicas[0].name, "node2");
+        assert_eq!(replicas[1].name, "node3");
         assert_eq!(replicas[2 % 2].name, "node2");
     }
 

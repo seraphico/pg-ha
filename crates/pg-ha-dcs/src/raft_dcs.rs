@@ -70,6 +70,7 @@ impl RaftDcs {
     /// `retry_timeout`: upper bound in seconds for every DCS write (at least 1)
     /// `data_dir`: optional directory for persisting Raft state to disk
     /// `tls`: optional TLS configuration for Raft RPC connections
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         node_id: NodeId,
         node_name: String,
@@ -116,24 +117,21 @@ impl RaftDcs {
                 let mut builder = reqwest::Client::builder()
                     .pool_max_idle_per_host(3)
                     .timeout(std::time::Duration::from_secs(10));
-                if let Some(ref ca_path) = tls_cfg.ca_cert {
-                    if let Ok(ca_pem) = std::fs::read(ca_path) {
-                        if let Ok(cert) = reqwest::tls::Certificate::from_pem(&ca_pem) {
-                            builder = builder.add_root_certificate(cert);
-                        }
-                    }
+                if let Some(ref ca_path) = tls_cfg.ca_cert
+                    && let Ok(ca_pem) = std::fs::read(ca_path)
+                    && let Ok(cert) = reqwest::tls::Certificate::from_pem(&ca_pem)
+                {
+                    builder = builder.add_root_certificate(cert);
                 }
                 if let (Some(cert_path), Some(key_path)) =
                     (&tls_cfg.client_cert, &tls_cfg.client_key)
-                {
-                    if let (Ok(cert_pem), Ok(key_pem)) =
+                    && let (Ok(cert_pem), Ok(key_pem)) =
                         (std::fs::read(cert_path), std::fs::read(key_path))
-                    {
-                        let mut identity_pem = cert_pem;
-                        identity_pem.extend_from_slice(&key_pem);
-                        if let Ok(identity) = reqwest::tls::Identity::from_pem(&identity_pem) {
-                            builder = builder.identity(identity);
-                        }
+                {
+                    let mut identity_pem = cert_pem;
+                    identity_pem.extend_from_slice(&key_pem);
+                    if let Ok(identity) = reqwest::tls::Identity::from_pem(&identity_pem) {
+                        builder = builder.identity(identity);
                     }
                 }
                 (builder.build().unwrap_or_default(), true)
@@ -862,16 +860,19 @@ mod tests {
             lsn: Some(32),
         };
         let mut sm = KvStateMachine::new();
-        let create = history_write_request(hkey.into(), &[entry.clone()], None, 1_000).unwrap();
+        let create =
+            history_write_request(hkey.into(), std::slice::from_ref(&entry), None, 1_000).unwrap();
         assert!(matches!(sm.apply(&create, 3), Response::Ok { .. }));
         let stored = sm.get(hkey).unwrap();
         assert_eq!(stored.expire_at, None, "the key has no TTL");
         assert_eq!(History::from_json(&stored.value).entries().len(), 1);
         // A writer that read the key before it existed loses.
-        let again = history_write_request(hkey.into(), &[entry.clone()], None, 1_000).unwrap();
+        let again =
+            history_write_request(hkey.into(), std::slice::from_ref(&entry), None, 1_000).unwrap();
         assert!(matches!(sm.apply(&again, 4), Response::NotChanged));
         // A writer with the current version wins; a stale one does not.
-        let ok = history_write_request(hkey.into(), &[entry.clone()], Some(3), 1_000).unwrap();
+        let ok = history_write_request(hkey.into(), std::slice::from_ref(&entry), Some(3), 1_000)
+            .unwrap();
         assert!(matches!(sm.apply(&ok, 5), Response::Ok { .. }));
         let stale = history_write_request(hkey.into(), &[entry], Some(3), 1_000).unwrap();
         assert!(matches!(sm.apply(&stale, 6), Response::NotChanged));

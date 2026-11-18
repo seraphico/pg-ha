@@ -234,14 +234,12 @@ impl WalWriter {
 
             if let Some(log_id) = last_purged {
                 let purge = PurgePayload { log_id };
-                let payload = bincode::serialize(&purge)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let payload = bincode::serialize(&purge).map_err(io::Error::other)?;
                 write_record_bytes(&mut tmp_writer, RecordType::Purge, &payload)?;
             }
 
             for entry in log.values() {
-                let payload = bincode::serialize(entry)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let payload = bincode::serialize(entry).map_err(io::Error::other)?;
                 write_record_bytes(&mut tmp_writer, RecordType::Append, &payload)?;
             }
 
