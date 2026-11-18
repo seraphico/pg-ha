@@ -174,6 +174,53 @@ pub enum Step {
 /// then tighten `n`; when `n` must drop, raise `q` first; shrink `S` before
 /// `V`; relax `q` last and only behind the SI-4 gate. Every step keeps SI-1.
 pub fn next_step(state: &QuorumState, target: &QuorumTarget, caught_up: &Names) -> Option<Step> {
+    next_step_with(state, target, caught_up, true)
+}
+/// The planner without the enabling rule (the behavior before SB-36); see
+/// [`plan_without_enabling`].
+pub(crate) fn next_step_legacy(
+    state: &QuorumState,
+    target: &QuorumTarget,
+    caught_up: &Names,
+) -> Option<Step> {
+    next_step_with(state, target, caught_up, false)
+}
+/// Enabling rule (SB-36 fix 1). From an empty `S` (asynchronous) with voters to
+/// enable: write DCS `(V*, q*)` first, with `q* = |V*| - n*`, and only then
+/// `ANY n* (V*)` in PostgreSQL, so a primary lost right after the switch
+/// still leaves a quorum that can win the vote. After a crash between the two
+/// writes only the PG step is left.
+pub fn enabling_step(state: &QuorumState, target: &QuorumTarget) -> Option<Step> {
+    if !state.pg_names.is_empty() || target.voters.is_empty() {
+        return None;
+    }
+    let quorum = target.quorum();
+    if state.voters != target.voters || state.quorum != quorum {
+        return Some(Step::SetDcs {
+            voters: target.voters.clone(),
+            quorum,
+        });
+    }
+    Some(Step::SetPg {
+        names: target.voters.clone(),
+        n: target.n,
+    })
+}
+/// `S` empty, `/sync` already `(V*, q*)` with `q* < |V|`: the state between the
+/// two enabling writes. SI-1 does not hold here by design (nothing in PG yet).
+pub fn in_enabling_window(state: &QuorumState, target: &QuorumTarget) -> bool {
+    state.pg_names.is_empty()
+        && !target.voters.is_empty()
+        && state.voters == target.voters
+        && state.quorum == target.quorum()
+        && state.quorum < state.voters.len()
+}
+fn next_step_with(
+    state: &QuorumState,
+    target: &QuorumTarget,
+    caught_up: &Names,
+    enabling: bool,
+) -> Option<Step> {
     let union_len = state.voters.union(&state.pg_names).count();
 
     if target.voters.is_empty() {
@@ -201,6 +248,9 @@ pub fn next_step(state: &QuorumState, target: &QuorumTarget, caught_up: &Names) 
         return None;
     }
 
+    if enabling && let Some(step) = enabling_step(state, target) {
+        return Some(step);
+    }
     // A. Add voters: V grows and q grows with it (T1: DCS first).
     let to_add: Vec<&String> = target.voters.difference(&state.voters).collect();
     if !to_add.is_empty() {
@@ -294,11 +344,20 @@ pub fn plan(
     caught_up: &Names,
     max_steps: usize,
 ) -> Vec<Step> {
+    plan_with(state, target, caught_up, max_steps, next_step)
+}
+fn plan_with(
+    state: &QuorumState,
+    target: &QuorumTarget,
+    caught_up: &Names,
+    max_steps: usize,
+    next: fn(&QuorumState, &QuorumTarget, &Names) -> Option<Step>,
+) -> Vec<Step> {
     let mut state = state.clone();
     let mut caught_up = caught_up.clone();
     let mut steps = Vec::new();
     while steps.len() < max_steps {
-        let Some(step) = next_step(&state, target, &caught_up) else {
+        let Some(step) = next(&state, target, &caught_up) else {
             break;
         };
         state.apply(&step);
@@ -310,6 +369,17 @@ pub fn plan(
     steps
 }
 
+/// [`plan`] without the enabling rule: used for a PostgreSQL value that is
+/// not really asynchronous although it reads as `S = {}` (a wildcard), and by
+/// the model tests to pin the old world.
+pub(crate) fn plan_without_enabling(
+    state: &QuorumState,
+    target: &QuorumTarget,
+    caught_up: &Names,
+    max_steps: usize,
+) -> Vec<Step> {
+    plan_with(state, target, caught_up, max_steps, next_step_legacy)
+}
 /// The state a node must install BEFORE `pg_ctl promote` (design T10, section
 /// 1.3): the old leader takes the promoted node's seat, and `q` is kept.
 ///
@@ -467,8 +537,16 @@ mod tests {
                 break;
             }
             for s in &steps {
+                let enabling = in_enabling_window(
+                    &{
+                        let mut next = st.clone();
+                        next.apply(s);
+                        next
+                    },
+                    tgt,
+                );
                 assert!(
-                    {
+                    enabling || {
                         let mut next = st.clone();
                         next.apply(s);
                         next.si1_holds()
@@ -583,14 +661,13 @@ mod tests {
         let st = QuorumState::new::<[&str; 0], [&str; 0], _, _>([], 0, [], 0);
         let tgt = QuorumTarget::new(["a", "b"], 1);
         let steps = plan(&st, &tgt, &Names::new(), 16);
-        // Voters are published with q = |V| (nobody electable), then PG, then
-        // q relaxes in a later cycle behind the gate.
+        // SB-36: `/sync` is written with the settled q* = |V| - n first, then PG.
         assert_eq!(
             steps,
             vec![
                 Step::SetDcs {
                     voters: n(&["a", "b"]),
-                    quorum: 2
+                    quorum: 1
                 },
                 Step::SetPg {
                     names: n(&["a", "b"]),
@@ -598,6 +675,39 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn enabling_writes_dcs_before_pg_and_resumes_after_a_crash() {
+        let st = QuorumState::new::<[&str; 0], [&str; 0], _, _>([], 0, [], 0);
+        let tgt = QuorumTarget::new(["a", "b", "c"], 2);
+        let steps = plan(&st, &tgt, &Names::new(), 2);
+        assert_eq!(
+            steps,
+            vec![
+                Step::SetDcs {
+                    voters: n(&["a", "b", "c"]),
+                    quorum: 1
+                },
+                Step::SetPg {
+                    names: n(&["a", "b", "c"]),
+                    n: 2
+                },
+            ]
+        );
+        // Crash between the two writes: only the PG step is left.
+        let mut mid = st.clone();
+        mid.apply(&steps[0]);
+        assert!(in_enabling_window(&mid, &tgt));
+        assert_eq!(plan(&mid, &tgt, &Names::new(), 4), vec![steps[1].clone()]);
+        // Never PG first, and the window closes once PG is set.
+        mid.apply(&steps[1]);
+        assert!(!in_enabling_window(&mid, &tgt));
+        assert!(plan(&mid, &tgt, &n(&["a", "b", "c"]), 4).is_empty());
+        // Not in the window: S non-empty, q = |V|, or no voters.
+        assert!(!in_enabling_window(&st, &tgt));
+        let stuck = QuorumState::new(["a", "b", "c"], 3, [] as [&str; 0], 0);
+        assert!(!in_enabling_window(&stuck, &tgt));
     }
 
     #[test]

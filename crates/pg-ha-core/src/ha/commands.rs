@@ -281,11 +281,7 @@ impl Ha {
             self.publish_not_primary().await;
             let result = self.postgresql.stop("fast").await;
             self.publish_not_primary().await;
-            if result.is_err() {
-                self.stop_pending = true;
-            } else {
-                self.stop_pending = false;
-            }
+            self.stop_pending = result.is_err();
             result
         } else {
             // Prepare the standby start before touching PostgreSQL; if that

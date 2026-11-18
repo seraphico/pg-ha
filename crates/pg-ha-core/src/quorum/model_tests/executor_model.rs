@@ -324,6 +324,12 @@ fn sem(text: &str) -> (Names, usize) {
     }
     (shape.names_folded(), shape.n)
 }
+/// The value acknowledges nothing as a quorum commit: asynchronous (empty)
+/// or the strict placeholder, which the executor reads as `S = {}` too.
+fn reads_as_no_quorum(text: &str) -> bool {
+    let shape = parse_sync_value(text).expect("the model only holds readable values");
+    shape.is_empty() || shape.strict_hold
+}
 
 impl Core {
     fn leader_name(&self) -> String {
@@ -383,10 +389,22 @@ impl Core {
                     }
                 }
                 if !self.blind_open && !self.pg_standby {
+                    // SB-36 enabling window: PostgreSQL acknowledges nothing yet
+                    // (asynchronous or the strict placeholder) and `/sync`
+                    // already holds the settled `q < |V|`. SI-1 is false there
+                    // by design; the guarantee starts with PG.
+                    let async_now = reads_as_no_quorum(&self.pg.effective);
                     for (which, text) in
                         [("effective", &self.pg.effective), ("file", &self.pg.file)]
                     {
                         let (names, n) = sem(text);
+                        if async_now
+                            && reads_as_no_quorum(text)
+                            && !self.dcs.voters.is_empty()
+                            && self.dcs.quorum < self.dcs.voters.len()
+                        {
+                            continue;
+                        }
                         let st = QuorumState {
                             voters: self.dcs.voters.clone(),
                             quorum: self.dcs.quorum,
@@ -653,6 +671,16 @@ impl Core {
                 self.x.relax_after_restart += 1;
             }
         }
+        if s.kind == SyncKind::Quorum
+            && reads_as_no_quorum(&self.pg.effective)
+            && !voters.is_empty()
+            && new_q < voters.len()
+        {
+            // SB-36 enabling write: the guarantee starts again when quorum is in
+            // force in PG (as `World::run_planner` models it); what was
+            // acknowledged before this enable is not covered.
+            self.w.acked.clear();
+        }
         if self.dcs.present && self.dcs.kind == SyncKind::Priority && s.kind == SyncKind::Quorum {
             self.x.t8_done += 1;
         }
@@ -680,7 +708,11 @@ impl Core {
 
 impl XWorld {
     fn new(standbys: usize, n0: usize, steady: bool) -> XWorld {
-        let w = World::new(standbys, n0, steady);
+        let mut w = World::new(standbys, n0, steady);
+        // The real executor has both SB-36 fixes: commits made while PostgreSQL
+        // is asynchronous are not covered (`refresh_acks`).
+        w.fix.enable_dcs_first = true;
+        w.fix.keep_offline = true;
         let names: Names = (1..=standbys).map(name).collect();
         let (dcs, text, mode) = if steady {
             let n = n0.min(standbys).max(1);

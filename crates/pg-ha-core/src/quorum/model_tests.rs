@@ -617,7 +617,8 @@ impl World {
     /// settled `|V*| - n*` of `QuorumTarget::quorum`; everything after that is
     /// the unchanged planner.
     fn plan_steps(&mut self, target: &QuorumTarget, caught: &Names) -> Vec<Step> {
-        if self.fix.enabling() && self.st.pg_names.is_empty() && !target.voters.is_empty() {
+        let mutated = self.fix.enable_pg_first || self.fix.enable_q_too_low;
+        if mutated && self.st.pg_names.is_empty() && !target.voters.is_empty() {
             let q = target
                 .quorum()
                 .saturating_sub(usize::from(self.fix.enable_q_too_low));
@@ -642,7 +643,11 @@ impl World {
             }
             return steps;
         }
-        plan(&self.st, target, caught, 16)
+        if self.fix.enable_dcs_first {
+            plan(&self.st, target, caught, 16)
+        } else {
+            plan_without_enabling(&self.st, target, caught, 16)
+        }
     }
 
     fn elect(&mut self, c: usize, reach: u8, late: u8, fail: u8) -> Result<(), String> {
@@ -1142,7 +1147,7 @@ proptest! {
             // Everyone listed anywhere is caught up, except that the gate is
             // still checked for the reduced sets below.
             let caught: Names = st.voters.union(&st.pg_names).chain(target.voters.iter()).cloned().collect();
-            let steps = plan(&st, &target, &caught, 16);
+            let steps = plan_without_enabling(&st, &target, &caught, 16);
             if steps.is_empty() { break; }
             for step in &steps {
                 let before = st.clone();
@@ -1173,7 +1178,7 @@ proptest! {
         let target = if tv.is_empty() { QuorumTarget { voters: tv, n: 0 } } else { QuorumTarget { voters: tv, n: tn } };
         let mut cur = st.clone();
         let mut gate_set = caught.clone();
-        for step in plan(&st, &target, &caught, 16) {
+        for step in plan_without_enabling(&st, &target, &caught, 16) {
             let before = cur.clone();
             cur.apply(&step);
             match &step {

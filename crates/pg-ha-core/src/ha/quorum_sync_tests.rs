@@ -432,7 +432,7 @@ fn t6_off_to_quorum_writes_dcs_then_pg_and_stops() {
     assert_eq!(o, ExecOutcome::Progressed);
     assert_eq!(
         io.writes(),
-        strs(&["dcs:n0:n1,n2:2:Quorum", "set:ANY 1 (\"n1\",\"n2\")"])
+        strs(&["dcs:n0:n1,n2:1:Quorum", "set:ANY 1 (\"n1\",\"n2\")"])
     );
 }
 
@@ -841,7 +841,7 @@ fn lease_lost_between_the_dcs_write_and_the_pg_change_stops_before_set_pg() {
     io.lease_false_from = Some(1);
     let o = cycle(&mut ready(), &mut io, &inp);
     assert!(matches!(o, ExecOutcome::Failed(_)));
-    assert_eq!(io.writes(), strs(&["dcs:n0:n1,n2:2:Quorum"]));
+    assert_eq!(io.writes(), strs(&["dcs:n0:n1,n2:1:Quorum"]));
 }
 
 #[test]
@@ -1560,4 +1560,121 @@ fn the_window_warning_fires_on_open_and_every_30th_cycle_and_resets_on_close() {
     // Closed: silent, and the next window warns at once again.
     assert!(!exec.note_window(false));
     assert!(exec.note_window(true));
+}
+
+// ───────────────────────────── SB-36 ─────────────────────────────
+
+/// Fix 1: an async cluster turned to quorum writes `/sync` with the settled
+/// `q = |V| - n` first, then PostgreSQL, in the same cycle.
+#[test]
+fn sb36_enable_writes_settled_q_before_the_pg_value() {
+    let inp = input(Q, 2, &three(), None);
+    let mut io = FakeIo::new("", &ALL);
+    assert_eq!(cycle(&mut ready(), &mut io, &inp), ExecOutcome::Progressed);
+    assert_eq!(
+        io.writes(),
+        strs(&[
+            "dcs:n0:n1,n2,n3:1:Quorum",
+            "set:ANY 2 (\"n1\",\"n2\",\"n3\")"
+        ])
+    );
+}
+
+/// A crash between the two enabling writes: the next cycle does not raise `q`
+/// and only sets PostgreSQL.
+#[test]
+fn sb36_enabling_window_is_not_undone_and_only_pg_follows() {
+    let inp = input(
+        Q,
+        2,
+        &three(),
+        Some(sync("n0", "n1,n2,n3", 1, SyncKind::Quorum)),
+    );
+    let mut io = FakeIo::new("", &ALL);
+    cycle(&mut ready(), &mut io, &inp);
+    assert_eq!(io.writes(), strs(&["set:ANY 2 (\"n1\",\"n2\",\"n3\")"]));
+}
+
+/// A `/sync` stuck at `q = |V|` with PostgreSQL asynchronous is not lowered
+/// before the SI-4 gate (fresh mark).
+#[test]
+fn sb36_stuck_q_is_not_lowered_before_the_gate() {
+    let inp = input(
+        Q,
+        2,
+        &three(),
+        Some(sync("n0", "n1,n2,n3", 3, SyncKind::Quorum)),
+    );
+    let mut io = FakeIo::new("", &ALL);
+    cycle(&mut ready(), &mut io, &inp);
+    assert_never_lowers_q(&io, 3);
+    assert!(io.pg_sets.is_empty(), "{:?}", io.calls);
+}
+
+/// Fix 2: a voter that stops streaming but keeps its member record stays in
+/// `V`, so nothing is written while it is away nor when it comes back.
+#[test]
+fn sb36_briefly_offline_voter_is_kept_and_its_return_raises_nothing() {
+    let show = "ANY 1 (\"n1\",\"n2\")";
+    let inp = input(
+        Q,
+        1,
+        &["n1", "n2"],
+        Some(sync("n0", "n1,n2", 1, SyncKind::Quorum)),
+    );
+    let mut exec = ready_with_mark(show, 500);
+    let mut io = FakeIo::new(show, &[("n1", 1000)]);
+    assert_eq!(cycle(&mut exec, &mut io, &inp), ExecOutcome::NoChange);
+    assert!(io.writes().is_empty(), "{:?}", io.calls);
+    // Rejoin.
+    let mut io = FakeIo::new(show, &ALL);
+    assert_eq!(cycle(&mut exec, &mut io, &inp), ExecOutcome::NoChange);
+    assert!(io.writes().is_empty(), "{:?}", io.calls);
+}
+
+/// Once the voter's member record expired (or it is `nosync`), the usual
+/// removal applies: `S` shrinks first and `q` is kept.
+#[test]
+fn sb36_expired_or_nosync_offline_voter_is_removed_as_before() {
+    let show = "ANY 1 (\"n1\",\"n2\")";
+    let mut nosync = input(
+        Q,
+        1,
+        &["n1"],
+        Some(sync("n0", "n1,n2", 1, SyncKind::Quorum)),
+    );
+    let expired = nosync.clone();
+    nosync.members.push(member("n2", true));
+    for inp in [expired, nosync] {
+        let mut io = FakeIo::new(show, &[("n1", 1000)]);
+        cycle(&mut ready_with_mark(show, 500), &mut io, &inp);
+        assert_eq!(io.writes(), strs(&["set:ANY 1 (\"n1\")"]));
+        assert_never_lowers_q(&io, 1);
+    }
+}
+
+#[test]
+fn sb36_keep_offline_voters_rule() {
+    let names = |v: &[&str]| -> Names { v.iter().map(|s| s.to_string()).collect() };
+    let members = vec![
+        member("n1", false),
+        member("n2", false),
+        member("n3", true),
+        member("n0", false),
+    ];
+    let snap = snapshot(1000, &[("n1", 1000)]);
+    let current = names(&["n0", "n1", "n2", "n3", "n4"]);
+    let target = QuorumTarget::new(["n1"], 1);
+    let kept = keep_offline_voters(target, &current, &members, &snap, "n0");
+    // n2 is kept (record present); n3 is nosync, n4 has no record, n0 is me.
+    assert_eq!(kept.voters, names(&["n1", "n2"]));
+    assert_eq!(kept.n, 1);
+    // An empty selection stays empty.
+    let empty = keep_offline_voters(empty_target(), &current, &members, &snap, "n0");
+    assert!(empty.voters.is_empty() && empty.n == 0);
+    // A voter that streams but was not selected (lagging) is not kept.
+    let snap = snapshot(1000, &[("n1", 1000), ("n2", 10)]);
+    let target = QuorumTarget::new(["n1"], 1);
+    let kept = keep_offline_voters(target, &current, &members, &snap, "n0");
+    assert_eq!(kept.voters, names(&["n1"]));
 }

@@ -84,7 +84,10 @@ use crate::error::{Error, Result};
 use crate::postgresql::{Postgresql, ReplicationSnapshot};
 use crate::quorum::derive::{Derived, Phase, derive_state};
 use crate::quorum::mark::{Mark, caught_up, observe_mark};
-use crate::quorum::{Names, QuorumState, QuorumTarget, Step, plan, post_promotion_state};
+use crate::quorum::{
+    Names, QuorumState, QuorumTarget, Step, in_enabling_window, plan, plan_without_enabling,
+    post_promotion_state,
+};
 use crate::sync::{SyncManager, SyncMode};
 use crate::sync_value::{
     ShapeKey, SyncKeyword, SyncValueShape, parse_sync_value, render_quorum_value,
@@ -420,6 +423,38 @@ fn build_target(input: &ExecInput, snapshot: &ReplicationSnapshot, voters: &Name
     if target.voters.is_empty() || target.n < 1 || target.n > target.voters.len() {
         return empty_target();
     }
+    keep_offline_voters(target, voters, &input.members, snapshot, &input.me)
+}
+/// SB-36 fix 2: a voter that is not streaming (briefly offline) stays in `V*`
+/// while its member record is still in the DCS (and is not tagged `nosync`),
+/// so its return does not make the planner add it again and raise `q` to
+/// `|V|`. A name with no member record has expired and is dropped. An empty
+/// target stays empty.
+fn keep_offline_voters(
+    mut target: QuorumTarget,
+    current_voters: &Names,
+    members: &[Member],
+    snapshot: &ReplicationSnapshot,
+    me: &str,
+) -> QuorumTarget {
+    if target.voters.is_empty() {
+        return target;
+    }
+    for v in current_voters {
+        let streaming = snapshot
+            .replicas
+            .iter()
+            .any(|r| r.application_name.eq_ignore_ascii_case(v));
+        if v.eq_ignore_ascii_case(me) || target.voters.contains(v) || streaming {
+            continue;
+        }
+        if members
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case(v) && !m.is_nosync())
+        {
+            target.voters.insert(v.clone());
+        }
+    }
     target
 }
 
@@ -665,8 +700,13 @@ impl QuorumExec {
         self.observed_n = Some(n_now);
         let quorum_kind = live.is_some_and(|s| s.kind == SyncKind::Quorum);
         let (v_now, q_now) = (state.voters.len(), state.quorum);
-        let window_open =
-            quorum_kind && v_now > 0 && !crate::cluster::quorum_is_settled(v_now, q_now, n_now);
+        // The SB-36 enabling window is transient (PG follows in this cycle).
+        let enabling = obs.reasonable
+            && in_enabling_window(&state, &build_target(input, &snapshot, &state.voters));
+        let window_open = quorum_kind
+            && v_now > 0
+            && !enabling
+            && !crate::cluster::quorum_is_settled(v_now, q_now, n_now);
         if self.note_window(window_open) {
             warn!(
                 "quorum sync: q={q_now} is above |V| - n ({v_now} - {n_now}); failover is not possible until q is relaxed (a primary lost now would leave the cluster without a leader)"
@@ -857,7 +897,9 @@ impl QuorumExec {
         let mut cur = state.clone();
 
         // Keep SI-1 true in the state the planner starts from (raise only).
-        if !cur.si1_holds() {
+        // Not in the enabling window (SB-36): there `/sync` is already settled
+        // and PostgreSQL is about to follow; raising q would undo that.
+        if !cur.si1_holds() && !(obs.reasonable && in_enabling_window(&cur, target)) {
             let quorum = needed_quorum(&cur);
             acts.push(Act::Dcs {
                 voters: cur.voters.clone(),
@@ -884,7 +926,14 @@ impl QuorumExec {
 
         let mut has_pg = false;
         let mut gated = false;
-        for step in plan(&cur.clone(), target, caught, 4) {
+        // An unreadable value is not asynchronous, whatever the planner is told:
+        // no enabling rule for it (it must be replaced with q kept high).
+        let steps = if obs.reasonable {
+            plan(&cur, target, caught, 4)
+        } else {
+            plan_without_enabling(&cur, target, caught, 4)
+        };
+        for step in steps {
             match &step {
                 Step::SetDcs { voters, quorum } => {
                     if *quorum < cur.quorum && relax_blocked {

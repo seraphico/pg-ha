@@ -622,6 +622,40 @@ mod sync_failover_tests {
         ));
     }
 
+    /// SB-36 enabling window: `/sync` is Quorum with `V` of 3 and the settled
+    /// `q = 1` while PostgreSQL is still asynchronous. The election and the
+    /// vote read `/sync` as stored, so a voter can win with `q` votes.
+    #[test]
+    fn enabling_window_sync_state_lets_a_voter_win_with_q_votes() {
+        use crate::quorum::{Names, VoteDecision, WalPosition, quorum_vote_decision};
+        let s = quorum_sync(Some("node2,node3,node4"));
+        assert_eq!(s.quorum, 1);
+        for mode in [SynchronousMode::Async, SynchronousMode::Quorum] {
+            assert!(sync_failover_allowed("node2", mode, Some(&s)), "{mode}");
+            assert!(!sync_failover_allowed("node5", mode, Some(&s)), "{mode}");
+        }
+        let voters: Names = s
+            .sync_standby_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let pos = |name: &str| WalPosition {
+            name: name.to_string(),
+            in_recovery: true,
+            timeline: 1,
+            lsn: 100,
+        };
+        let one_peer = [pos("node3")];
+        assert_eq!(
+            quorum_vote_decision(&pos("node2"), &voters, s.quorum as usize, &one_peer),
+            VoteDecision::Granted { votes: 1 }
+        );
+        assert!(matches!(
+            quorum_vote_decision(&pos("node2"), &voters, 2, &one_peer),
+            VoteDecision::Refused(_)
+        ));
+    }
+
     #[test]
     fn sync_on_missing_state_denies() {
         assert!(!sync_failover_allowed("node2", SynchronousMode::Sync, None));
