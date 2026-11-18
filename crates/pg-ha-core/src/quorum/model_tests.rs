@@ -68,6 +68,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod executor_model;
+mod sb36_fixes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
@@ -135,6 +136,32 @@ struct Stats {
     generations: usize,
     /// Promotions where `/sync.leader` differed from the real previous leader.
     stale_promotions: usize,
+    /// SB-36 fix 1: enabling DCS writes (V, |V|-n) made while `S` was empty.
+    enable_writes: usize,
+    /// SB-36 fix 1: granted elections while the enabling window was open.
+    granted_in_enable_window: usize,
+    /// SB-36 fix 2: planner runs where an offline voter was kept in the target.
+    kept_offline: usize,
+}
+
+/// SB-36 switches. All off = the model of the code before the fixes, so every
+/// existing test is unchanged. The mutation tests flip them the wrong way.
+#[derive(Debug, Clone, Copy, Default)]
+struct Fixes {
+    /// Fix 1: from an empty `S`, write DCS `(V*, |V*|-n*)` first, then PG.
+    enable_dcs_first: bool,
+    /// Mutation (a) of fix 1: PG `ANY n* (V*)` first, then DCS.
+    enable_pg_first: bool,
+    /// Mutation of fix 1: the enabling `q` is one too low.
+    enable_q_too_low: bool,
+    /// Fix 2: an offline voter whose member record has not expired stays in `V*`.
+    keep_offline: bool,
+}
+
+impl Fixes {
+    fn enabling(&self) -> bool {
+        self.enable_dcs_first || self.enable_pg_first
+    }
 }
 
 impl Stats {
@@ -154,6 +181,9 @@ impl Stats {
         self.refused_with_acked_missing += o.refused_with_acked_missing;
         self.generations += o.generations;
         self.stale_promotions += o.stale_promotions;
+        self.enable_writes += o.enable_writes;
+        self.granted_in_enable_window += o.granted_in_enable_window;
+        self.kept_offline += o.kept_offline;
     }
 }
 
@@ -219,6 +249,10 @@ struct World {
     hold_promotion: bool,
     granted: Option<usize>,
     stats: Stats,
+    /// SB-36 switches (all off outside `sb36_fixes`).
+    fix: Fixes,
+    /// Bit `i % 8`: node `i` is offline and its member record has expired.
+    expired: u8,
 }
 
 fn name(i: usize) -> String {
@@ -268,7 +302,19 @@ impl World {
             hold_promotion: false,
             granted: None,
             stats: Stats::default(),
+            fix: Fixes::default(),
+            expired: 0,
         }
+    }
+
+    /// SB-36: `S` is empty while `V` is non-empty with `q < |V|`. The cluster
+    /// is asynchronous, quorum is not in force in PG yet, and commits here are
+    /// not covered (maintainer decision).
+    fn enabling_window(&self) -> bool {
+        self.fix.enabling()
+            && self.st.pg_names.is_empty()
+            && !self.st.voters.is_empty()
+            && self.st.quorum < self.st.voters.len()
     }
 
     fn idx(&self, x: usize) -> usize {
@@ -326,7 +372,19 @@ impl World {
                 &voters,
             )
             .expect("quorum mode is never Off");
-        QuorumTarget::from_selection(&sel)
+        let mut target = QuorumTarget::from_selection(&sel);
+        if self.fix.keep_offline && !target.voters.is_empty() {
+            // Fix 2: a voter that is offline but whose member record is still
+            // there stays in V*; only expiry (or being alive) lets it go.
+            for v in &self.st.voters {
+                let i: usize = v[1..].parse().unwrap();
+                let offline = !(self.nodes[i].alive && self.nodes[i].attached);
+                if i != self.leader && offline && self.expired & (1 << (i % 8)) == 0 {
+                    target.voters.insert(v.clone());
+                }
+            }
+        }
+        target
     }
 
     fn caught_up(&self) -> Names {
@@ -346,6 +404,12 @@ impl World {
 
     fn refresh_acks(&mut self) {
         if !self.leader_alive() {
+            return;
+        }
+        if self.fix.enabling() && self.st.pg_names.is_empty() {
+            // Asynchronous: nothing committed now is covered by the guarantee,
+            // which starts when quorum is in force in PG.
+            self.waiting.clear();
             return;
         }
         let n = self.st.effective_n();
@@ -371,6 +435,15 @@ impl World {
     }
 
     fn check(&self, ctx: &str) -> Result<(), String> {
+        if self.enabling_window() {
+            return Ok(());
+        }
+        if self.fix.enabling() && self.st.effective_n() > 0 && self.st.voters.is_empty() {
+            return Err(format!(
+                "quorum in force in PG while DCS /sync has no voters {ctx}: {:?}",
+                self.st
+            ));
+        }
         let leader = name(self.leader);
         if !self.st.si1_holds_excluding(&leader) {
             return Err(format!(
@@ -470,6 +543,7 @@ impl World {
                 let i = self.idx(*i);
                 if i != self.leader {
                     self.nodes[i].alive = true;
+                    self.expired &= !(1 << (i % 8));
                 }
             }
             Action::KillLeader => {
@@ -502,10 +576,26 @@ impl World {
         }
         self.finalize_dcs()?;
         let target = self.target();
+        if self.fix.keep_offline
+            && target.voters.iter().any(|v| {
+                let i: usize = v[1..].parse().unwrap();
+                !(self.nodes[i].alive && self.nodes[i].attached)
+            })
+        {
+            self.stats.kept_offline += 1;
+        }
         let caught = self.caught_up();
-        let steps = plan(&self.st, &target, &caught, 16);
+        let steps = self.plan_steps(&target, &caught);
         for step in steps.into_iter().take(limit) {
             let before = self.st.clone();
+            if self.fix.enabling()
+                && before.pg_names.is_empty()
+                && matches!(step, Step::SetDcs { .. })
+            {
+                // The guarantee restarts when quorum is in force in PG.
+                self.acked.clear();
+                self.stats.enable_writes += 1;
+            }
             self.st.apply(&step);
             self.stats.plan_steps += 1;
             match &step {
@@ -519,6 +609,45 @@ impl World {
             self.check(&format!("after step {step:?} from {before:?}"))?;
         }
         Ok(())
+    }
+
+    /// The planner, plus the SB-36 enabling rule when a fix switch is on.
+    /// From an empty `S` (asynchronous) with something to enable, the first two
+    /// steps are `SetDcs (V*, q*)` and `SetPg (V*, n*)` where `q*` is the
+    /// settled `|V*| - n*` of `QuorumTarget::quorum`; everything after that is
+    /// the unchanged planner.
+    fn plan_steps(&mut self, target: &QuorumTarget, caught: &Names) -> Vec<Step> {
+        let mutated = self.fix.enable_pg_first || self.fix.enable_q_too_low;
+        if mutated && self.st.pg_names.is_empty() && !target.voters.is_empty() {
+            let q = target
+                .quorum()
+                .saturating_sub(usize::from(self.fix.enable_q_too_low));
+            let dcs = Step::SetDcs {
+                voters: target.voters.clone(),
+                quorum: q,
+            };
+            let pg = Step::SetPg {
+                names: target.voters.clone(),
+                n: target.n,
+            };
+            let dcs_done = self.st.voters == target.voters && self.st.quorum == q;
+            let mut steps = Vec::new();
+            if self.fix.enable_pg_first {
+                steps.push(pg);
+                steps.push(dcs);
+            } else {
+                if !dcs_done {
+                    steps.push(dcs);
+                }
+                steps.push(pg);
+            }
+            return steps;
+        }
+        if self.fix.enable_dcs_first {
+            plan(&self.st, target, caught, 16)
+        } else {
+            plan_without_enabling(&self.st, target, caught, 16)
+        }
     }
 
     fn elect(&mut self, c: usize, reach: u8, late: u8, fail: u8) -> Result<(), String> {
@@ -623,6 +752,9 @@ impl World {
             }
             VoteDecision::Granted { .. } => {
                 self.stats.elections_granted += 1;
+                if self.enabling_window() {
+                    self.stats.granted_in_enable_window += 1;
+                }
                 if let Some(&lost) = self.acked.iter().find(|&&x| !self.nodes[c].holds(x)) {
                     return Err(format!(
                         "LOST ACKNOWLEDGED COMMIT {lost}: candidate {} granted by the vote rule \
@@ -1015,7 +1147,7 @@ proptest! {
             // Everyone listed anywhere is caught up, except that the gate is
             // still checked for the reduced sets below.
             let caught: Names = st.voters.union(&st.pg_names).chain(target.voters.iter()).cloned().collect();
-            let steps = plan(&st, &target, &caught, 16);
+            let steps = plan_without_enabling(&st, &target, &caught, 16);
             if steps.is_empty() { break; }
             for step in &steps {
                 let before = st.clone();
@@ -1046,7 +1178,7 @@ proptest! {
         let target = if tv.is_empty() { QuorumTarget { voters: tv, n: 0 } } else { QuorumTarget { voters: tv, n: tn } };
         let mut cur = st.clone();
         let mut gate_set = caught.clone();
-        for step in plan(&st, &target, &caught, 16) {
+        for step in plan_without_enabling(&st, &target, &caught, 16) {
             let before = cur.clone();
             cur.apply(&step);
             match &step {

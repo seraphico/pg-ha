@@ -64,6 +64,8 @@ impl Watchdog {
 
     /// Pet (keepalive) the watchdog. Must be called every HA loop cycle
     /// while this node is the primary.
+    // Off Linux the cfg block below is gone and the early return looks needless.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::needless_return))]
     pub fn keepalive(&self) {
         if !self.is_active {
             return;
