@@ -413,7 +413,7 @@ On the node that holds the lock, PostgreSQL restarts in its original role. On a 
 ttl >= loop_wait + retry_timeout + watchdog.safety_margin, and retry_timeout >= 1
 ```
 
-Reason: if the lock holder has not successfully renewed again within `ttl` − `safety_margin` seconds of the moment **before** the last renewal **started**, it stops PostgreSQL itself (the leader lease; see [invariants.md](invariants.md) 1a "Leader lease"). A healthy primary must finish one HA cycle (`loop_wait`) and one renewal write (each DCS write waits at most `retry_timeout` seconds) inside that window. The defaults satisfy 30 ≥ 10 + 10 + 5; the docker development cluster satisfies 15 ≥ 5 + 5 + 5.
+Reason: if the lock holder has not successfully renewed again within `ttl` − `safety_margin` seconds of the moment **before** the last renewal **started**, it stops PostgreSQL itself (the leader lease; see [invariants.md](invariants.md) 1a "Leader lease"). A healthy primary must finish one HA cycle (`loop_wait`) and one renewal write (each DCS write waits at most `retry_timeout` seconds, including the wait for a new Raft leader) inside that window. The defaults satisfy 30 ≥ 10 + 10 + 5; the docker development cluster satisfies 15 ≥ 5 + 5 + 5.
 
 - When static configuration (`pg-ha.yml`, environment-variable overrides, `bootstrap.dcs`) does not satisfy this, pg-ha refuses to start, and `--validate-config` reports the same error:
   ```text
@@ -432,6 +432,7 @@ Reason: if the lock holder has not successfully renewed again within `ttl` − `
 | Log | Meaning |
 |------|------|
 | WARN `DCS write timed out after <n>s (retry_timeout); treating it as failed` | A DCS write did not finish within `retry_timeout` (for example this node is the Raft leader that lost the majority) and is treated as a failed write. The write may still commit afterward; that is safe ([invariants.md](invariants.md) 1a) |
+| DEBUG `DCS write retry <n>: ...`, INFO `DCS write succeeded after <n> retries in <ms> ms` | While the Raft leader is unknown or gone, the write is retried every 250 ms. A primary that used to log `DCS error during lock renewal: ... Forward to leader failed` and demote during a Raft-leader restart or stop now keeps the lock if a new leader appears within `retry_timeout`; the error still appears if it does not |
 | ERROR `Leader lease expired before the lock renewal completed; fencing PostgreSQL (immediate stop) without waiting for the DCS` | The lease expired, this HA cycle is abandoned, and PostgreSQL is stopped in `immediate` mode |
 | ERROR `Leader lease expired before pg_ctl promote; fencing PostgreSQL (immediate stop)` / `Leader lease expired before reporting the leader role; fencing PostgreSQL (immediate stop)` | Renewal returned success, but the lease had already expired by the time it returned (the renewal write was too slow). Do not promote, do not report the primary role, and fence as if the lock had been lost |
 | ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)` | The lease had already expired at shutdown; fence and stop PostgreSQL directly |

@@ -327,11 +327,52 @@ impl RaftDcs {
     /// A write that times out may still commit later. That is safe: every
     /// lock write is a CAS ordered in the Raft log, so a late renewal either
     /// fails against a newer holder or extends a lock nobody else took.
+    ///
+    /// Inside that bound a missing or gone Raft leader is waited for (see
+    /// `propose_unbounded`).
     async fn propose(&self, request: Request) -> Result<Response> {
         bounded_write(self.write_timeout(), self.propose_unbounded(request)).await
     }
 
+    /// The retry loop behind `propose`. A write that did not reach a Raft
+    /// leader (no leader known, the old leader's port refused the connection,
+    /// or it answered `ForwardToLeader`) is repeated every
+    /// `FORWARD_RETRY_INTERVAL`: local `client_write` first, then a forward to
+    /// the leader named by the current metrics. A write whose outcome is
+    /// unknown (the request may have been appended) is repeated only when
+    /// `repeat_is_harmless`. The loop has no bound of its own; `propose` cuts
+    /// it at `retry_timeout`, which is safe because every await is cancel-safe.
     async fn propose_unbounded(&self, request: Request) -> Result<Response> {
+        let started = tokio::time::Instant::now();
+        let mut retries = 0u32;
+        loop {
+            let reason = match self.attempt_once(&request).await {
+                Attempt::Done(resp) => {
+                    if retries > 0 {
+                        info!(
+                            "DCS write succeeded after {retries} retries in {} ms",
+                            started.elapsed().as_millis()
+                        );
+                    }
+                    return Ok(resp);
+                }
+                Attempt::Failed(e) => return Err(e),
+                Attempt::NotApplied(reason) => reason,
+                Attempt::Unknown(e) => {
+                    if !repeat_is_harmless(&request) {
+                        return Err(e);
+                    }
+                    e.to_string()
+                }
+            };
+            retries += 1;
+            debug!("DCS write retry {retries}: {reason}");
+            tokio::time::sleep(FORWARD_RETRY_INTERVAL).await;
+        }
+    }
+    /// One write attempt: local `client_write`, then a forward to the leader
+    /// named by the metrics when this node is not the leader.
+    async fn attempt_once(&self, request: &Request) -> Attempt {
         // Stamp only the copy this node appends. A forwarded request is stamped
         // again by the leader in `handle_client_write`, so a follower's clock
         // never becomes the log entry's `now`.
@@ -340,27 +381,19 @@ impl RaftDcs {
             .client_write(stamp_leader_time(request.clone(), current_millis()))
             .await;
         match result {
-            Ok(resp) => Ok(resp.data),
-            Err(e) => {
-                // Check if we need to forward to the Raft leader
-                let err_str = format!("{e}");
-                if err_str.contains("forward") || err_str.contains("ForwardToLeader") {
-                    // Extract leader info and forward via HTTP
-                    let current_leader = {
-                        let metrics = self.raft.metrics().borrow().clone();
-                        metrics.current_leader
-                    };
-                    if let Some(leader_id) = current_leader {
-                        return self.forward_to_leader(leader_id, &request).await;
-                    }
+            Ok(resp) => Attempt::Done(resp.data),
+            Err(e) if Self::is_forward_to_leader(&e) => {
+                let current_leader = self.raft.metrics().borrow().current_leader;
+                match current_leader {
+                    Some(leader_id) => self.forward_to_leader(leader_id, request).await,
+                    None => Attempt::NotApplied("no Raft leader".into()),
                 }
-                Err(Error::Dcs(format!("Raft write failed: {e}")))
             }
+            Err(e) => Attempt::Failed(Error::Dcs(format!("Raft write failed: {e}"))),
         }
     }
-
     /// Forward a write request to the current Raft leader via HTTP
-    async fn forward_to_leader(&self, leader_id: NodeId, request: &Request) -> Result<Response> {
+    async fn forward_to_leader(&self, leader_id: NodeId, request: &Request) -> Attempt {
         // Get leader's address from Raft membership
         let leader_node = {
             let metrics = self.raft.metrics().borrow().clone();
@@ -371,7 +404,6 @@ impl RaftDcs {
                 .find(|(id, _)| **id == leader_id)
                 .map(|(_, node)| node.clone())
         };
-
         let leader_addr = match leader_node {
             Some(node) => {
                 if node.addr.starts_with("http") {
@@ -382,32 +414,73 @@ impl RaftDcs {
                     format!("http://{}", node.addr)
                 }
             }
-            None => return Err(Error::Dcs("Cannot find Raft leader address".into())),
+            None => return Attempt::NotApplied("Cannot find Raft leader address".into()),
         };
-
         // POST the request to leader's /raft/client-write endpoint
         let url = format!("{leader_addr}/raft/client-write");
-        let resp = self
-            .http_client
-            .post(&url)
-            .json(request)
-            .send()
-            .await
-            .map_err(|e| Error::Dcs(format!("Forward to leader failed: {e}")))?;
-
+        let resp = match self.http_client.post(&url).json(request).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err = Error::Dcs(format!("Forward to leader failed: {e}"));
+                // A refused connection means the request never left.
+                return if e.is_connect() {
+                    Attempt::NotApplied(err.to_string())
+                } else {
+                    Attempt::Unknown(err)
+                };
+            }
+        };
         if resp.status().is_success() {
-            let response: Response = resp
-                .json()
-                .await
-                .map_err(|e| Error::Dcs(format!("Parse leader response: {e}")))?;
-            Ok(response)
+            match resp.json::<Response>().await {
+                Ok(response) => Attempt::Done(response),
+                Err(e) => Attempt::Unknown(Error::Dcs(format!("Parse leader response: {e}"))),
+            }
         } else {
+            let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            Err(Error::Dcs(format!("Leader rejected write: {text}")))
+            let err = Error::Dcs(format!("Leader rejected write: {text}"));
+            if is_not_leader_rejection(status, &text) {
+                Attempt::NotApplied(err.to_string())
+            } else {
+                Attempt::Unknown(err)
+            }
         }
     }
 }
-
+/// Pause between write attempts while no Raft leader accepts the write.
+const FORWARD_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+/// Result of one write attempt in `propose_unbounded`.
+enum Attempt {
+    /// Committed and applied.
+    Done(Response),
+    /// Definitely not appended (no leader, connection refused, the contacted
+    /// node answered `ForwardToLeader`). Any request may be repeated.
+    NotApplied(String),
+    /// The request may have been appended. Repeat only if harmless.
+    Unknown(Error),
+    /// A local Raft error that a retry does not cure.
+    Failed(Error),
+}
+/// A repeat of an already committed write must give the same answer. True for
+/// unconditional sets and for `prev_value` renewals (lock renewal, member
+/// touch, sync/failover/config). False for existence or version CAS
+/// (acquire, initialize, timeline, history) and deletes: a repeat after a
+/// commit returns `NotChanged`, which callers read as "someone else won".
+fn repeat_is_harmless(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Set {
+            prev_exist: None,
+            prev_version: None,
+            ..
+        }
+    )
+}
+/// The contacted node is not the Raft leader (its `ForwardToLeader`), so it
+/// appended nothing.
+fn is_not_leader_rejection(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE && body.contains("forward")
+}
 #[async_trait::async_trait]
 impl DcsAdapter for RaftDcs {
     async fn get_cluster(&self) -> Result<Cluster> {
@@ -1112,6 +1185,198 @@ mod tests {
         );
     }
 
+    type TestCluster = (Vec<Arc<RaftDcs>>, Vec<tokio::task::JoinHandle<()>>);
+    /// Three in-process Raft nodes with a bootstrapped cluster and a leader.
+    async fn three_node_cluster(retry_timeout: u64) -> TestCluster {
+        let mut listeners = Vec::new();
+        let mut members = Vec::new();
+        for id in 1..=3u64 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            members.push((id, listener.local_addr().unwrap().to_string()));
+            listeners.push(listener);
+        }
+        let mut nodes = Vec::new();
+        let mut servers = Vec::new();
+        for (listener, (id, _)) in listeners.into_iter().zip(&members) {
+            let dcs = RaftDcs::new(
+                *id,
+                format!("node{id}"),
+                "sb34".into(),
+                "service".into(),
+                30,
+                10,
+                retry_timeout,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let router = crate::raft_router(dcs.raft().clone());
+            servers.push(tokio::spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            }));
+            nodes.push(Arc::new(dcs));
+        }
+        nodes[0].bootstrap_cluster(&members).await.unwrap();
+        nodes[0].wait_for_leader(20).await.unwrap();
+        (nodes, servers)
+    }
+    /// Index of the Raft leader once every node agrees on it.
+    async fn raft_leader_index(nodes: &[Arc<RaftDcs>]) -> usize {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let ids: Vec<_> = nodes
+                .iter()
+                .map(|n| n.raft().metrics().borrow().current_leader)
+                .collect();
+            if let Some(id) = ids[0]
+                && ids.iter().all(|i| *i == Some(id))
+            {
+                return (id - 1) as usize;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no Raft leader");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    async fn kill(nodes: &[Arc<RaftDcs>], servers: &[tokio::task::JoinHandle<()>], i: usize) {
+        servers[i].abort();
+        nodes[i].raft().shutdown().await.unwrap();
+    }
+    /// SB-34: the lock holder is a follower. The Raft leader dies and the
+    /// renewal, issued at once, waits for the new leader inside `retry_timeout`
+    /// instead of failing on the first forward.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn renewal_on_a_follower_survives_raft_leader_loss() {
+        use std::time::Duration;
+        let (nodes, servers) = three_node_cluster(15).await;
+        let l = raft_leader_index(&nodes).await;
+        let f = (l + 1) % 3;
+        assert!(nodes[f].attempt_to_acquire_leader().await.unwrap());
+        let lock = Leader {
+            name: nodes[f].node_name.clone(),
+            version: 0,
+        };
+        kill(&nodes, &servers, l).await;
+        let start = std::time::Instant::now();
+        let renewed = nodes[f].update_leader(&lock).await;
+        let elapsed = start.elapsed();
+        assert!(matches!(renewed, Ok(true)), "{renewed:?} after {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "no election was needed? {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+        let new_leader = nodes[f].raft().metrics().borrow().current_leader;
+        assert_ne!(new_leader, Some(l as u64 + 1));
+        assert!(new_leader.is_some());
+    }
+    /// After the bound the result is the same as before the fix: no leader
+    /// appears, the write ends in `Error::Timeout` (demotion / lease fence).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn renewal_after_the_bound_still_fails_when_no_leader_appears() {
+        use std::time::Duration;
+        const RETRY_TIMEOUT: u64 = 2;
+        let (nodes, servers) = three_node_cluster(RETRY_TIMEOUT).await;
+        let l = raft_leader_index(&nodes).await;
+        let f = (l + 1) % 3;
+        assert!(nodes[f].attempt_to_acquire_leader().await.unwrap());
+        let lock = Leader {
+            name: nodes[f].node_name.clone(),
+            version: 0,
+        };
+        for i in 0..3 {
+            if i != f {
+                kill(&nodes, &servers, i).await;
+            }
+        }
+        let start = std::time::Instant::now();
+        let renewed = nodes[f].update_leader(&lock).await;
+        let elapsed = start.elapsed();
+        assert!(matches!(renewed, Err(Error::Timeout(_))), "{renewed:?}");
+        assert!(elapsed >= Duration::from_secs(RETRY_TIMEOUT), "{elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(RETRY_TIMEOUT + 1),
+            "{elapsed:?}"
+        );
+    }
+    /// Acquire does retry when the write definitely did not reach a leader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acquire_waits_for_a_new_raft_leader() {
+        let (nodes, servers) = three_node_cluster(15).await;
+        let l = raft_leader_index(&nodes).await;
+        let f = (l + 1) % 3;
+        kill(&nodes, &servers, l).await;
+        let acquired = nodes[f].attempt_to_acquire_leader().await;
+        assert!(matches!(acquired, Ok(true)), "{acquired:?}");
+        // The follower's store applies the commit slightly after the leader's.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let holder = nodes[f].get_cluster().await.unwrap().leader;
+            if let Some(holder) = holder {
+                assert_eq!(holder.name, nodes[f].node_name);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "lock not visible");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    fn set(
+        prev_exist: Option<bool>,
+        prev_value: Option<&str>,
+        prev_version: Option<u64>,
+    ) -> Request {
+        Request::Set {
+            key: "/k".into(),
+            value: "v".into(),
+            ttl: None,
+            prev_exist,
+            prev_value: prev_value.map(String::from),
+            prev_version,
+            now: 1,
+        }
+    }
+    #[test]
+    fn repeat_is_harmless_only_for_idempotent_sets() {
+        assert!(
+            repeat_is_harmless(&set(None, Some("node1"), None)),
+            "renewal"
+        );
+        assert!(repeat_is_harmless(&set(None, None, None)), "plain set");
+        assert!(
+            !repeat_is_harmless(&set(Some(false), None, None)),
+            "acquire"
+        );
+        assert!(
+            !repeat_is_harmless(&set(None, None, Some(3))),
+            "version CAS"
+        );
+        let timeline = timeline_write_request("/t".into(), &record(1), Some(2), 1).unwrap();
+        assert!(!repeat_is_harmless(&timeline));
+        let first = timeline_write_request("/t".into(), &record(1), None, 1).unwrap();
+        assert!(!repeat_is_harmless(&first));
+        let history = history_write_request("/h".into(), &[], Some(2), 1).unwrap();
+        assert!(!repeat_is_harmless(&history));
+        let delete = Request::Delete {
+            key: "/k".into(),
+            prev_value: Some("node1".into()),
+            recursive: false,
+        };
+        assert!(!repeat_is_harmless(&delete));
+    }
+    #[test]
+    fn only_a_forward_to_leader_503_counts_as_not_applied() {
+        use reqwest::StatusCode;
+        let body = "client write error: has to forward request to: Some(1)";
+        assert!(is_not_leader_rejection(
+            StatusCode::SERVICE_UNAVAILABLE,
+            body
+        ));
+        assert!(!is_not_leader_rejection(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "client write error: fatal"
+        ));
+        assert!(!is_not_leader_rejection(StatusCode::BAD_REQUEST, body));
+    }
     #[test]
     fn timeline_key_survives_expiry_and_reload() {
         let mut sm = KvStateMachine::new();
