@@ -32,7 +32,7 @@ curl -s http://localhost:8008/cluster | jq .
 - `voters`：`/sync` 里的名字（quorum 模式下是投票节点 V，不含 leader）。
 - `quorum`：`q`，即 `/sync.quorum`。`priority` 时为 `null`（该字段在 Priority 下是历史遗留，不起作用）。
 - `n`：PostgreSQL 实际生效的 `ANY n`（leader 的 Quorum 执行器上一轮从 `SHOW synchronous_standby_names` 读到）。**只有 leader 节点的 `/cluster` 有这个值**，其它节点、`priority`、leader 还没读过 SHOW 时为 `null`。
-- `settled`：`q == |voters| - n`，且 `n >= 1`（有投票节点而 `n` 还是 0，说明 PostgreSQL 还没切到 `ANY`，也算未就绪）。`false` 表示 `q` 还没放宽，此时没有候选能赢得投票（见「同步复制」的已知限制）。`n` 未知时为 `null`。
+- `settled`：`q == |voters| - n`，且 `n >= 1`（有投票节点而 `n` 还是 0，说明 PostgreSQL 还没切到 `ANY`，也算未就绪）。`false` 而 `n` 仍为 0 只表示 PostgreSQL 还没切到 `ANY`（刚启用 quorum 时），`/sync` 里已经是低的 `q`，候选能赢得投票；`false` 而 `n >= 1` 表示 `q` 还没放宽，此时没有候选能赢得投票（见「同步复制」的已知限制）。`n` 未知时为 `null`。
 脚本要等 quorum 就绪，就轮询 leader 的 `/cluster`，直到 `sync.settled` 为 `true`。
 节点自己的运行状态、timeline、WAL、lag、暂停和待重启标志在 **本节点** 的 `/patroni` 上，不在 `/cluster` 里：
 

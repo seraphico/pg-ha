@@ -32,7 +32,7 @@ The response comes from `CascadeManager::build_cascade_topology`. Roles are lowe
 - `voters`: the names in `/sync` (in quorum mode the voter set V, without the leader).
 - `quorum`: `q`, the `/sync.quorum` value. `null` for `priority` (the field is a leftover there and has no effect).
 - `n`: the `ANY n` PostgreSQL enforces, as the leader's quorum executor read it from `SHOW synchronous_standby_names` in its last cycle. **Only the leader's `/cluster` has it.** It is `null` on other nodes, for `priority`, and before the leader has read SHOW.
-- `settled`: `q == |voters| - n` and `n >= 1` (voters exist but `n` is still 0 means PostgreSQL has not switched to `ANY` yet, which is also not settled). `false` means `q` has not been relaxed yet, and no candidate can win the vote (see the known limitation under "Synchronous replication"). `null` when `n` is unknown.
+- `settled`: `q == |voters| - n` and `n >= 1` (voters exist but `n` is still 0 means PostgreSQL has not switched to `ANY` yet, which is also not settled). `false` with `n` still 0 only means PostgreSQL has not switched to `ANY` yet (right after enabling quorum); `/sync` already holds the low `q` and a candidate can win the vote. `false` with `n >= 1` means `q` has not been relaxed yet, and no candidate can win the vote (see the known limitation under "Synchronous replication"). `null` when `n` is unknown.
 A script that has to wait for quorum to settle polls the leader's `/cluster` until `sync.settled` is `true`.
 A node's own runtime state, timeline, WAL, lag, pause, and pending-restart flags are on **this node's** `/patroni`, not in `/cluster`:
 
