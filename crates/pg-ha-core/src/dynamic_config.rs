@@ -8,10 +8,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::config::LeaseTiming;
 use crate::standby_cluster::StandbyClusterConfig;
+use crate::synchronous_mode::SynchronousMode;
 
 /// Dynamic cluster-wide configuration stored in DCS /config key.
 ///
@@ -43,9 +45,15 @@ pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_lag_on_syncnode: Option<u64>,
 
-    /// Enable synchronous replication mode
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub synchronous_mode: Option<bool>,
+    /// Synchronous replication mode: `"async"` (default), `"sync"` or
+    /// `"quorum"`. Anything else is rejected when the document is parsed.
+    /// An explicit `null` is rejected (it would silently mean `async`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::synchronous_mode::deserialize_present"
+    )]
+    pub synchronous_mode: Option<SynchronousMode>,
 
     /// Strict synchronous mode (no async fallback)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -259,7 +267,29 @@ pub struct DynamicConfigState {
 
     /// Parameters that triggered the pending restart
     pub pending_restart_params: HashMap<String, String>,
+
+    /// True once a valid `/config` (or a legitimately absent one) was seen.
+    /// Without a baseline `last_config` is only the type default, not
+    /// something the operator chose.
+    pub has_baseline: bool,
+
+    /// The stored `/config` that failed to parse, if it is still invalid.
+    pub invalid: Option<InvalidConfig>,
+    /// The last read of `/config` failed (a DCS error, not a parse error) and
+    /// no valid configuration is known. Holds when it was last logged.
+    read_error: Option<Instant>,
 }
+
+/// A stored `/config` that could not be parsed, and when it was last logged.
+#[derive(Debug, Clone)]
+pub struct InvalidConfig {
+    pub reason: String,
+    raw_fingerprint: u64,
+    last_logged: Option<Instant>,
+}
+
+/// How often the same invalid `/config` is logged again.
+pub const CONFIG_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 impl DynamicConfigState {
     pub fn new() -> Self {
@@ -267,12 +297,81 @@ impl DynamicConfigState {
             last_config: GlobalConfig::default(),
             pending_restart: false,
             pending_restart_params: HashMap::new(),
+            has_baseline: false,
+            invalid: None,
+            read_error: None,
         }
+    }
+    /// Record that reading `/config` failed. Returns true when the caller
+    /// should log it now (the first time and every `CONFIG_ERROR_LOG_INTERVAL`)
+    /// and only when there is no baseline: with a baseline `last_config` stays
+    /// in force and nothing becomes unresolved, so this returns false and the
+    /// caller keeps its per-cycle warning.
+    pub fn note_read_error(&mut self, now: Instant) -> bool {
+        if self.has_baseline {
+            return false;
+        }
+        let log_now = self
+            .read_error
+            .is_none_or(|t| now.duration_since(t) >= CONFIG_ERROR_LOG_INTERVAL);
+        if log_now {
+            self.read_error = Some(now);
+        }
+        log_now
+    }
+
+    /// Record that the stored `/config` (`raw`) does not parse. Returns true
+    /// when the caller should log it now: the first time, when the stored text
+    /// changed, and every `CONFIG_ERROR_LOG_INTERVAL`. `last_config` is not
+    /// touched, so the last valid configuration stays in force.
+    pub fn note_invalid(&mut self, raw: &str, reason: String, now: Instant) -> bool {
+        // The read itself worked.
+        self.read_error = None;
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        raw.hash(&mut h);
+        let fp = h.finish();
+        let log_now = match &self.invalid {
+            Some(i) if i.raw_fingerprint == fp => i
+                .last_logged
+                .is_none_or(|t| now.duration_since(t) >= CONFIG_ERROR_LOG_INTERVAL),
+            _ => true,
+        };
+        let last_logged = if log_now {
+            Some(now)
+        } else {
+            self.invalid.as_ref().and_then(|i| i.last_logged)
+        };
+        self.invalid = Some(InvalidConfig {
+            reason,
+            raw_fingerprint: fp,
+            last_logged,
+        });
+        log_now
+    }
+
+    /// The stored `/config` is absent: that is the default (async) baseline.
+    pub fn note_absent(&mut self) {
+        self.has_baseline = true;
+        self.invalid = None;
+        self.read_error = None;
+    }
+
+    /// True when the stored `/config` is invalid or could not be read and no
+    /// valid one was ever applied: nothing says whether synchronous
+    /// replication is wanted. The defaults in `last_config` must not be used.
+    pub fn sync_config_unresolved(&self) -> bool {
+        !self.has_baseline && (self.invalid.is_some() || self.read_error.is_some())
     }
 
     /// Process a new config from DCS. Returns the detected changes.
     /// Caller is responsible for acting on the changes (reload PG, etc.)
     pub fn apply_new_config(&mut self, new_config: GlobalConfig) -> ConfigChanges {
+        if self.invalid.take().is_some() {
+            info!("stored /config is valid again; applying it");
+        }
+        self.read_error = None;
+        self.has_baseline = true;
         let changes = detect_changes(&self.last_config, &new_config);
 
         if changes.has_changes() {
@@ -316,6 +415,10 @@ pub fn patch_config(
     base: &GlobalConfig,
     patch: &serde_json::Value,
 ) -> Result<GlobalConfig, String> {
+    // `null` would delete the key below and silently mean `async`.
+    if patch.get("synchronous_mode").is_some_and(|v| v.is_null()) {
+        return Err(SynchronousMode::invalid("null"));
+    }
     // Serialize base to a JSON Value
     let mut base_value =
         serde_json::to_value(base).map_err(|e| format!("Failed to serialize base config: {e}"))?;
@@ -328,6 +431,11 @@ pub fn patch_config(
 }
 
 impl GlobalConfig {
+    /// The effective synchronous mode (`async` when the key is absent).
+    pub fn sync_mode(&self) -> SynchronousMode {
+        self.synchronous_mode.unwrap_or_default()
+    }
+
     /// Lease timing with this configuration's `ttl`, `loop_wait` and
     /// `retry_timeout` over a node's static values (`base`).
     pub fn lease_timing(&self, base: LeaseTiming) -> LeaseTiming {
@@ -396,7 +504,7 @@ mod tests {
             retry_timeout: Some(10),
             maximum_lag_on_failover: Some(1048576),
             maximum_lag_on_syncnode: Some(8388608),
-            synchronous_mode: Some(false),
+            synchronous_mode: Some(SynchronousMode::Async),
             synchronous_mode_strict: None,
             synchronous_node_count: Some(1),
             failsafe_mode: Some(true),
@@ -755,5 +863,178 @@ mod tests {
         // A non-object patch doesn't change anything, the base is returned as-is
         let result = patch_config(&base, &patch).unwrap();
         assert_eq!(result, base);
+    }
+
+    const ACCEPTED_TEXT: &str = r#"expected one of "async", "sync", "quorum" (lowercase)"#;
+
+    #[test]
+    fn test_synchronous_mode_parses_the_three_strings_and_absent() {
+        for (raw, want) in [
+            (
+                r#"{"synchronous_mode":"async"}"#,
+                Some(SynchronousMode::Async),
+            ),
+            (
+                r#"{"synchronous_mode":"sync"}"#,
+                Some(SynchronousMode::Sync),
+            ),
+            (
+                r#"{"synchronous_mode":"quorum"}"#,
+                Some(SynchronousMode::Quorum),
+            ),
+            (r#"{}"#, None),
+        ] {
+            let c: GlobalConfig = serde_json::from_str(raw).unwrap();
+            assert_eq!(c.synchronous_mode, want, "{raw}");
+        }
+        assert_eq!(GlobalConfig::default().sync_mode(), SynchronousMode::Async);
+    }
+
+    #[test]
+    fn test_synchronous_mode_rejects_every_other_value() {
+        for v in [
+            "true",
+            "false",
+            "1",
+            "0",
+            "1.5",
+            r#""on""#,
+            r#""off""#,
+            r#""true""#,
+            r#""Sync""#,
+            r#""QUORUM""#,
+            r#""Async""#,
+            r#""""#,
+            r#"" sync""#,
+            "[]",
+            "{}",
+            "null",
+        ] {
+            let raw = format!(r#"{{"synchronous_mode":{v}}}"#);
+            let err = serde_json::from_str::<GlobalConfig>(&raw)
+                .expect_err(&raw)
+                .to_string();
+            assert!(
+                err.contains("synchronous_mode: invalid value"),
+                "{raw}: {err}"
+            );
+            assert!(err.contains(ACCEPTED_TEXT), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_patch_config_synchronous_mode() {
+        let base = GlobalConfig::default();
+        for bad in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!("on"),
+            serde_json::json!("Sync"),
+            serde_json::json!("QUORUM"),
+            serde_json::json!(""),
+            serde_json::json!(2),
+            serde_json::Value::Null,
+        ] {
+            let err =
+                patch_config(&base, &serde_json::json!({ "synchronous_mode": bad })).unwrap_err();
+            assert!(err.contains(ACCEPTED_TEXT), "{bad}: {err}");
+        }
+        let q = patch_config(&base, &serde_json::json!({"synchronous_mode": "quorum"})).unwrap();
+        assert_eq!(q.synchronous_mode, Some(SynchronousMode::Quorum));
+        assert_eq!(
+            serde_json::to_value(&q).unwrap()["synchronous_mode"],
+            serde_json::json!("quorum")
+        );
+        // The operator who wants async sends "async"; null never deletes the key.
+        let a = patch_config(&q, &serde_json::json!({"synchronous_mode": "async"})).unwrap();
+        assert_eq!(a.synchronous_mode, Some(SynchronousMode::Async));
+    }
+
+    #[test]
+    fn test_detect_changes_flags_a_sync_to_quorum_switch() {
+        let sync = GlobalConfig {
+            synchronous_mode: Some(SynchronousMode::Sync),
+            ..Default::default()
+        };
+        let quorum = GlobalConfig {
+            synchronous_mode: Some(SynchronousMode::Quorum),
+            ..Default::default()
+        };
+        assert!(detect_changes(&sync, &quorum).ha_params_changed);
+        assert!(!detect_changes(&quorum, &quorum.clone()).ha_params_changed);
+    }
+
+    #[test]
+    fn test_note_invalid_rate_limits_the_error_log() {
+        let mut st = DynamicConfigState::new();
+        let t0 = Instant::now();
+        assert!(st.note_invalid("raw-a", "why".into(), t0));
+        assert!(!st.note_invalid("raw-a", "why".into(), t0 + Duration::from_secs(5)));
+        assert!(!st.note_invalid("raw-a", "why".into(), t0 + Duration::from_secs(59)));
+        // The stored text changed: log at once.
+        assert!(st.note_invalid("raw-b", "why".into(), t0 + Duration::from_secs(6)));
+        assert!(!st.note_invalid("raw-b", "why".into(), t0 + Duration::from_secs(7)));
+        // 60 s after the last log of the same text.
+        assert!(st.note_invalid("raw-b", "why".into(), t0 + Duration::from_secs(66)));
+        // Nothing here touched the applied config.
+        assert_eq!(st.last_config, GlobalConfig::default());
+        assert!(!st.has_baseline);
+        assert!(st.sync_config_unresolved());
+    }
+
+    #[test]
+    fn test_a_valid_config_clears_the_invalid_state() {
+        let mut st = DynamicConfigState::new();
+        st.note_invalid("x", "why".into(), Instant::now());
+        assert!(st.sync_config_unresolved());
+        st.apply_new_config(GlobalConfig::default());
+        assert!(st.invalid.is_none());
+        assert!(st.has_baseline);
+        assert!(!st.sync_config_unresolved());
+        // With a baseline, a later invalid document is not "unresolved".
+        st.note_invalid("y", "why".into(), Instant::now());
+        assert!(!st.sync_config_unresolved());
+        st.note_absent();
+        assert!(st.invalid.is_none() && st.has_baseline);
+    }
+
+    #[test]
+    fn read_error_without_baseline_is_unresolved_and_rate_limited() {
+        let t0 = Instant::now();
+        let mut st = DynamicConfigState::new();
+        assert!(!st.sync_config_unresolved(), "nothing read yet");
+        assert!(st.note_read_error(t0), "first failure logs");
+        assert!(st.sync_config_unresolved());
+        assert!(!st.note_read_error(t0 + Duration::from_secs(30)));
+        assert!(!st.note_read_error(t0 + Duration::from_secs(59)));
+        assert!(st.note_read_error(t0 + CONFIG_ERROR_LOG_INTERVAL));
+        assert!(!st.note_read_error(t0 + CONFIG_ERROR_LOG_INTERVAL + Duration::from_secs(1)));
+        // A successful read clears it, whatever it says.
+        st.note_absent();
+        assert!(!st.sync_config_unresolved());
+        let mut st = DynamicConfigState::new();
+        st.note_read_error(t0);
+        st.apply_new_config(GlobalConfig::default());
+        assert!(!st.sync_config_unresolved());
+        let mut st = DynamicConfigState::new();
+        st.note_read_error(t0);
+        st.note_invalid("{}", "bad".into(), t0);
+        assert!(
+            st.sync_config_unresolved(),
+            "invalid document: still unresolved"
+        );
+    }
+
+    #[test]
+    fn read_error_with_baseline_changes_nothing() {
+        let mut st = DynamicConfigState::new();
+        st.apply_new_config(GlobalConfig {
+            synchronous_mode: Some(SynchronousMode::Quorum),
+            ..Default::default()
+        });
+        assert!(!st.note_read_error(Instant::now()));
+        assert!(!st.sync_config_unresolved());
+        assert!(st.has_baseline);
+        assert_eq!(st.last_config.sync_mode(), SynchronousMode::Quorum);
     }
 }

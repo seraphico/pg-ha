@@ -266,12 +266,15 @@ flowchart LR
 
 While holding the Leader Lock, the primary reads the dynamic configuration:
 
-- `synchronous_mode=false` (default): clear `synchronous_standby_names`, write an empty `/sync`
-- `synchronous_mode=true`: select synchronous standbys by `sync_priority` / `nosync`, set `FIRST N (...)`, and write `/sync`
+- `synchronous_mode="async"` (asynchronous, default): clear `synchronous_standby_names`, write an empty `/sync`
+- `synchronous_mode="sync"` (priority-based synchronous): select synchronous standbys by `sync_priority` / `nosync`, set `FIRST N (...)`, and write `/sync`
+- `synchronous_mode="quorum"` (quorum-based synchronous): set `ANY N (...)`, write `/sync` with `kind: quorum`, maintained by the quorum executor
+
+Only these three lowercase strings are accepted; any other value (including `true` / `false`) is rejected and never falls back to `async`.
 
 When the target value is unchanged, skip the repeated `ALTER SYSTEM` + reload. The `/sync` and `/async` health checks read `/sync.sync_standby` to decide the node role.
 
-Current scope: synchronous replication configuration and status publication are implemented; when `synchronous_mode` is enabled, Failover / Switchover require the candidate to belong to DCS `/sync.sync_standby` (S5). Election / switchover constraints in quorum mode are not yet implemented.
+Current scope: synchronous replication configuration and status publication are implemented; when `synchronous_mode` is `"sync"` or `"quorum"`, Failover / Switchover require the candidate to belong to DCS `/sync.sync_standby` (S5). In `"quorum"` mode `/sync.kind` is quorum, and the election also checks the voters' live WAL positions before a candidate is considered safe (`ha/vote.rs`). Enabling `quorum` requires every node to run the same pg-ha version.
 
 ## Module Dependencies
 

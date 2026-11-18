@@ -210,8 +210,8 @@
 | H2 | `GET /replica` 返回 200 ⟺ 本节点为健康 Replica（可选 `lag` 阈值满足时；lag 未知时按通过处理，fail-open），且**无** `pg-ha.rewind_check` 标记。 | 持有 |
 | H3 | 同一时刻，集群中至多一个节点对 `/primary` 返回 200。 | 持有 |
 | H4 | TCP Proxy：RW 端口健康探测依赖 `/primary`；RO 依赖 `/replica`（及文档规定的 fallback）。 | 持有 |
-| H5 | 当 `synchronous_mode` 为 false，或 DCS `/sync` 为空（等价未启用同步名单）时：所有健康 Replica 对 `/async` 为 200、对 `/sync` 为 503；Primary 对二者均为 503。 | 持有 |
-| H6 | 当 `synchronous_mode` 为 true 且 `/sync` 已发布时：`/sync` 返回 200 的节点集合 = `/sync.sync_standby` 解析结果与健康 Replica 的交集；其余健康 Replica 对 `/async` 为 200。 | 持有 |
+| H5 | 当 `synchronous_mode` 为 `"async"`，或 DCS `/sync` 为空（等价未启用同步名单）时：所有健康 Replica 对 `/async` 为 200、对 `/sync` 为 503；Primary 对二者均为 503。 | 持有 |
+| H6 | 当 `synchronous_mode` 为 `"sync"` 或 `"quorum"` 且 `/sync` 已发布时：`/sync` 返回 200 的节点集合 = `/sync.sync_standby` 解析结果与健康 Replica 的交集；其余健康 Replica 对 `/async` 为 200。 | 持有 |
 | H7 | Switchover / Failover 完成后，在约定时限内（建议：≤ `2 * loop_wait` + promote/重配耗时）重新满足 H1–H4；若启用同步复制，同时满足 H6。 | 持有 |
 
 **H1 / H2 的逐条判定**（`crates/pg-ha-api/src/state.rs`，数据最多滞后一个 HA cycle）：
@@ -237,7 +237,7 @@
 | S2 | **Failover**：在 lock 过期或主库确认不可用后，仅合格候选参与选举；胜出者 promote 并写入 lock；完成后 L\* 与 H\* 成立。 | 持有 |
 | S3 | 切换完成后，`GET /cluster`、成员 role/state 与真实拓扑一致；`GET /history`（DCS `/history`）**尽力而为**地记下这次 failover / switchover：新主在抢到锁时只在内存里记一条待写条目（事件类型、旧主、原因），之后第一个 Hold 周期把它 CAS 追加进 `/history`（有界超时，版本冲突最多重试 3 次，失败则下一轮重试）。promote 路径不写 DCS，历史写入失败不改变周期结果、不降级、不围栏。因此新主在抢锁到追加之间崩溃会丢这一条；集群初次 bootstrap 不记录；standby cluster 的 standby leader 不记录。历史不是审计日志。 | 持有（尽力而为） |
 | S4 | 旧 Primary 回归：不得形成双主；须走检测 → rewind / basebackup / rejoin 故事，最终成为指向当前 leader 的 Replica（或维护态）。 | 持有 |
-| S5 | **DCS `/sync` 始终是 PG `synchronous_standby_names` 的子集**：发布进 `/sync` 的名字必在 PG 当前的同步名单内，且已确认追上（`flush_lsn` 达到 PG 名单变更时记录的 Primary flush LSN，在 `maximum_lag_on_syncnode` 之内）、实际在 `pg_stat_replication` 中流复制。两次写有对称顺序保证子集在 cycle 被打断时也成立：**加入**——先扩 PG 名单、确认追上，再扩 `/sync`；**移除**——先缩 `/sync`，再缩 PG 名单。当 `synchronous_mode` 启用时，Failover / Switchover 候选必须属于 `/sync.sync_standby`；`/sync` 缺失、空或为不可满足的 strict 占位时任何节点均不得晋升。存在**过渡窗口**：新 promote 的主库先发布空/仅自身的 `/sync`、备库追上后再补入，期间 `/sync` 可能短暂收缩甚至为空，此时无节点可晋升（failover 暂时禁止但安全）。`synchronous_mode_strict` 仅影响写阻塞（用不可满足的占位名单，不是 `*`），不参与选举。仅 Priority（`FIRST N`）模式接入运行路径。 | 持有 |
+| S5 | **DCS `/sync` 始终是 PG `synchronous_standby_names` 的子集**：发布进 `/sync` 的名字必在 PG 当前的同步名单内，且已确认追上（`flush_lsn` 达到 PG 名单变更时记录的 Primary flush LSN，在 `maximum_lag_on_syncnode` 之内）、实际在 `pg_stat_replication` 中流复制。两次写有对称顺序保证子集在 cycle 被打断时也成立：**加入**——先扩 PG 名单、确认追上，再扩 `/sync`；**移除**——先缩 `/sync`，再缩 PG 名单。当 `synchronous_mode` 为 `"sync"` 或 `"quorum"` 时，Failover / Switchover 候选必须属于 `/sync.sync_standby`；`/sync` 缺失、空或为不可满足的 strict 占位时任何节点均不得晋升。存在**过渡窗口**：新 promote 的主库先发布空/仅自身的 `/sync`、备库追上后再补入，期间 `/sync` 可能短暂收缩甚至为空，此时无节点可晋升（failover 暂时禁止但安全）。`synchronous_mode_strict` 仅影响写阻塞（用不可满足的占位名单，不是 `*`），不参与选举。仅 Priority（`FIRST N`）模式接入运行路径。 | 持有 |
 
 **无 candidate 的 switchover**（S1）：`/failover` 为 `{"leader": "<旧主>", "candidate": null}`。旧主停库后以备库启动，WAL 往往最高，且 timeline 仍等于 `/timeline`，rewind 检查标记不会把它排除在选举之外。因此选举不按 WAL 把锁还给它：`failover.leader` 不抢锁（日志 `Not taking part in the election: this node is the leader switchover asked to step down`），其他节点比较「谁最健康」时跳过它。指定了 candidate 且该 candidate 仍可参选时，只有 candidate 抢锁，不额外排除。手动 failover 不写 `leader`，不排除任何人。没有其他合格节点时 `POST /switchover` 在降级之前拒绝（409，`No other running member can take over; refusing switchover without a candidate`），不写 `/failover`、不停库。`/failover` 只在有人抢到锁之后清除；没有合格节点却已经写下 key 时（例如受理之后唯一的副本停了），集群暂时无主。
 
@@ -253,8 +253,8 @@
 |----|------|------|
 | C1 | DCS `/config` 的变更按文档「生效规则」被 HA cycle 消费（HA 参数下一 cycle；PG reload / restart pending 分类正确）。 | 持有 |
 | C2 | 仅**持有 leader lock 的 Primary** 将同步复制计算结果应用到 PG，并写入 DCS `/sync`。 | 持有 |
-| C3 | `synchronous_mode=false`：Primary 使 `synchronous_standby_names` 为空（或等价禁用），且 `/sync` 为空语义。 | 持有 |
-| C4 | `synchronous_mode=true`：`SyncManager` 输出、PG `synchronous_standby_names`、DCS `/sync` 三者语义一致；目标未变则不重复 `ALTER SYSTEM` + reload。 | 持有 |
+| C3 | `synchronous_mode="async"`：Primary 使 `synchronous_standby_names` 为空（或等价禁用），且 `/sync` 为空语义。 | 持有 |
+| C4 | `synchronous_mode="sync"`（`"quorum"` 同理，名单为 `ANY N`）：`SyncManager` 输出、PG `synchronous_standby_names`、DCS `/sync` 三者语义一致；目标未变则不重复 `ALTER SYSTEM` + reload。 | 持有 |
 | C5 | 需 restart 才生效的 PG 参数：只设置 `pending_restart`（或等价标志），不得对外表现为「已生效」。 | 持有 |
 
 **相关**：架构「动态配置流程」「同步复制数据流」；运维「动态配置变更」「同步复制」。
@@ -337,7 +337,7 @@
 [ ] Switchover
 [ ] Failover
 [ ] 旧主回归
-[ ] 开关 synchronous_mode
+[ ] 切换 synchronous_mode（async / sync / quorum）
 [ ] 其它：________
 ```
 

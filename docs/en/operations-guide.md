@@ -24,6 +24,16 @@ The response comes from `CascadeManager::build_cascade_topology`. Roles are lowe
 }
 ```
 
+`/cluster` also has a `sync` field. Every request reads DCS `/sync` again:
+```json
+"sync": {"kind": "quorum", "voters": ["node2", "node3"], "quorum": 2, "n": 1, "settled": false}
+```
+- `kind`: `"priority"` or `"quorum"`, matching `synchronous_mode` `"sync"` / `"quorum"`. `sync` is `null` as a whole when there is no `/sync`.
+- `voters`: the names in `/sync` (in quorum mode the voter set V, without the leader).
+- `quorum`: `q`, the `/sync.quorum` value. `null` for `priority` (the field is a leftover there and has no effect).
+- `n`: the `ANY n` PostgreSQL enforces, as the leader's quorum executor read it from `SHOW synchronous_standby_names` in its last cycle. **Only the leader's `/cluster` has it.** It is `null` on other nodes, for `priority`, and before the leader has read SHOW.
+- `settled`: `q == |voters| - n` and `n >= 1` (voters exist but `n` is still 0 means PostgreSQL has not switched to `ANY` yet, which is also not settled). `false` means `q` has not been relaxed yet, and no candidate can win the vote (see the known limitation under "Synchronous replication"). `null` when `n` is unknown.
+A script that has to wait for quorum to settle polls the leader's `/cluster` until `sync.settled` is `true`.
 A node's own runtime state, timeline, WAL, lag, pause, and pending-restart flags are on **this node's** `/patroni`, not in `/cluster`:
 
 ```bash
@@ -146,7 +156,7 @@ Failsafe does not apply under pg-ha's embedded RaftDcs and has been removed (SB-
 
 A switchover is a planned primary/standby switch that does not lose data. It requires the current primary to be healthy and reachable.
 
-> ⚠️ **Synchronous replication**: If `synchronous_mode` is enabled, the specified `candidate` must be on the current DCS `/sync.sync_standby` list; otherwise the response is **409** (no demote, and the failover key is not written). Confirm the candidate first with each node's `GET /sync` (200 = a healthy replica that is on the list). See "Synchronous replication" below.
+> ⚠️ **Synchronous replication**: If `synchronous_mode` is `"sync"` or `"quorum"`, the specified `candidate` must be on the current DCS `/sync.sync_standby` list; otherwise the response is **409** (no demote, and the failover key is not written). Confirm the candidate first with each node's `GET /sync` (200 = a healthy replica that is on the list). See "Synchronous replication" below.
 
 ```bash
 # Specify the leader and the candidate
@@ -254,7 +264,7 @@ A normal switchover has no divergence, and pg_rewind reports `no rewind required
 
 Failover is the emergency switch used when the primary is unreachable. The current primary does not need to take part.
 
-> ⚠️ **Synchronous replication**: When `synchronous_mode` is enabled, a specified `candidate` must likewise belong to the `/sync` list; otherwise **409**. When no candidate is specified, after the election request is written only nodes on the list acquire the lock. If the list is empty, the cluster may have no primary for a long time (acknowledged transactions are preserved). See "Synchronous replication".
+> ⚠️ **Synchronous replication**: When `synchronous_mode` is `"sync"` or `"quorum"`, a specified `candidate` must likewise belong to the `/sync` list; otherwise **409**. When no candidate is specified, after the election request is written only nodes on the list acquire the lock. If the list is empty, the cluster may have no primary for a long time (acknowledged transactions are preserved). See "Synchronous replication".
 
 ```bash
 # Specify a candidate
@@ -342,19 +352,19 @@ curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
   -d '{"pause": false}'
 
-# Enable synchronous replication (off by default)
+# Enable synchronous replication (default "async"; "sync" = priority-based, "quorum" = quorum-based)
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
   -d '{
-    "synchronous_mode": true,
+    "synchronous_mode": "sync",
     "synchronous_mode_strict": false,
     "synchronous_node_count": 1
   }'
 
-# Disable synchronous replication
+# Disable synchronous replication (back to asynchronous)
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
-  -d '{"synchronous_mode": false}'
+  -d '{"synchronous_mode": "async"}'
 ```
 
 ### Full replacement (PUT)
@@ -444,7 +454,7 @@ pg-ha controls which nodes are synchronous standbys through PostgreSQL's `synchr
 
 ```
 FIRST 1 ("node2")              -- Priority: N is both the number of acknowledgements required and the length of the list. The running path emits only this form
-ANY 2 ("node1","node2","node3") -- Quorum: any 2 acknowledgements. The code can generate this, but the running path has no switch that selects it
+ANY 2 ("node1","node2","node3") -- Quorum: any 2 acknowledgements (used when `synchronous_mode` is `"quorum"`)
 ```
 
 Names are always double-quoted. When `synchronous_node_count = 1`, the list contains only one name. It is not written as `FIRST 1 (node2,node3)`.
@@ -530,20 +540,33 @@ node2 recovers → pg-ha marks it Running → the next HA cycle recomputes →
 
 | Parameter | Type | Default | Description |
 |------|------|--------|------|
-| `synchronous_mode` | bool | `false` | Whether synchronous replication is enabled. When it is off, `synchronous_standby_names` is cleared |
+| `synchronous_mode` | string | `"async"` | Replication mode. Only three lowercase strings are accepted: `"async"` asynchronous (`synchronous_standby_names` is cleared), `"sync"` priority-based synchronous (`FIRST N (...)`), `"quorum"` quorum-based synchronous (`ANY N (...)`). Booleans (`true` / `false`), `null` (an explicit null is not the same as leaving the key unset), `"on"` / `"off"` and any other spelling or case (such as `"Sync"` or `"QUORUM"`) are rejected |
 | `synchronous_mode_strict` | bool | `false` | What happens when no sync standby is available: `false` = fall back to asynchronous replication and keep writing; `true` = block all writes |
-| `synchronous_node_count` | u32 | `1` | How many synchronous standbys must acknowledge. This is N in `FIRST N` (Priority mode only; see below) |
+| `synchronous_node_count` | u32 | `1` | How many synchronous standbys must acknowledge. This is N in `FIRST N` / `ANY N` |
 | `maximum_lag_on_syncnode` | u64 (bytes) | unset = off | When a standby lags the primary by more than this many bytes (the `flush_lsn` difference), do not count it as an eligible synchronous standby and do not add it to `/sync`. There is no "disabled" sentinel. `None` (unset, or PATCH to `null`) means off |
 
 **How to choose `maximum_lag_on_syncnode`**: this is the lag threshold for a **synchronous standby**. Lag is computed live from the primary's `pg_stat_replication` (unit: bytes). Pick a value clearly above the normal peak lag. Set too small, and standbys are kicked out of `/sync` often during write spikes, which opens the two-phase transition window. Set too large, and the threshold stops meaning anything. First watch the real lag in normal and peak periods with `SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn) FROM pg_stat_replication;`, then take an order of magnitude above the peak (for example, a 10 MB peak means set 64 MB). If you are not sure, leave it unset (off) and rely only on the "actually streaming" filter.
 
-**Failover / switchover:** once `synchronous_mode` is enabled, only a node on the current `/sync` list can become the new primary. Specifying a `candidate` that is not on the list returns 409. When the list is empty (including while `/sync` has temporarily shrunk to empty inside the two-phase transition window), there is no automatic promotion (acknowledged transactions are preserved).
+**Failover / switchover:** when `synchronous_mode` is `"sync"` or `"quorum"`, only a node on the current `/sync` list can become the new primary. Specifying a `candidate` that is not on the list returns 409. When the list is empty (including while `/sync` has temporarily shrunk to empty inside the two-phase transition window), there is no automatic promotion (acknowledged transactions are preserved).
 
-**Priority (`FIRST N`) mode only**: the HA loop always uses `SyncMode::Priority`, so it generates only `FIRST N (...)`. Quorum (`ANY N`) **is not wired into the running path** — `SyncManager` can generate `ANY N (...)`, but no dynamic configuration item selects it. Do not expect configuration to switch the cluster to Quorum.
+**The three values**:
+
+| Value | Name | `synchronous_standby_names` |
+|-------|------|------------------------------|
+| `"async"` (default) | asynchronous | empty, no synchronous standby |
+| `"sync"` | priority-based synchronous | `FIRST N (...)`, standbys chosen by `sync_priority` / `nosync` |
+| `"quorum"` | quorum-based synchronous | `ANY N (...)`, maintained by the quorum executor |
+
+Only the lowercase strings in the table are accepted. Any other value, including the old `true` / `false`, is rejected: `PATCH` / `PUT /config` returns **400** with an error that lists the accepted values, and nothing is written to the DCS.
+> ⚠ **Known limitation (quorum, tracked as SB-36)**: whenever a voter joins (quorum was just enabled, or a node rejoins after a failover or switchover), `q` in `/sync` first equals the number of voters |V|. It is relaxed to |V| − n only after the leader has confirmed the standby is in sync, about 15 to 20 seconds later. During that window a candidate can collect at most |V| − 1 votes, so nobody can win the vote and failover is impossible. In that window pg-ha **refuses a switchover and a failover with a `candidate`** (409, the lock is not released, no demotion, with a message like `quorum not settled: failover is impossible until q is relaxed (q=2, voters=2, n=1)`). It also refuses when fewer than `q` other voters are online (`not enough voters online for the candidate to win the vote`). If the primary dies by itself inside the window, nobody runs the executor to relax `q`, the cluster stays without a primary, and `/sync` has to be fixed by hand. Before an operation, check that `sync.settled` in `GET /cluster` (on the leader) is `true`. In the logs: the leader logs a WARN while `q` is not relaxed (`failover is not possible until q is relaxed`), and a refused candidate on a leaderless cluster logs an ERROR (`The cluster cannot elect a primary`). Both are rate limited.
+
+**An invalid configuration already stored in the DCS** (for example a leftover `synchronous_mode: true` in a development cluster, or a bad hand edit) is applied by no node and never falls back to `"async"`. A running node keeps its last valid configuration and logs an ERROR naming the key and the accepted values (at most once per 60 seconds for the same content). A node that starts with no valid configuration known leaves synchronous replication alone and does not take part in elections until a valid configuration is written with `PUT /config`. While the stored configuration is invalid, `PATCH` returns **409**. An invalid value in `bootstrap.dcs` makes the node fail at startup.
+
+**Requirements for enabling `"quorum"`**: every node in the cluster must run the same pg-ha version; mixed versions are not supported. In `quorum` mode the log carries a WARN when `synchronous_node_count` is 1 with 3 or more eligible voters, when no watchdog is configured (zombie-primary risk), and when every eligible voter is tagged `nofailover` (they vote but cannot be elected).
 
 **How to choose**:
 
-- Most cases use `synchronous_mode: true, strict: false, count: 1` — synchronous protection in normal operation, and the service keeps running in the extreme case
+- Most cases use `synchronous_mode: "sync", strict: false, count: 1` — synchronous protection in normal operation, and the service keeps running in the extreme case
 - Financial and order workloads use `strict: true` — stop the service rather than lose data
 - A 5-node cluster may use `count: 2` — acknowledge only after the data is stored in 3 copies
 
@@ -577,7 +600,7 @@ tags:
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
   -d '{
-    "synchronous_mode": true,
+    "synchronous_mode": "sync",
     "synchronous_mode_strict": false,
     "synchronous_node_count": 1
   }'
@@ -601,7 +624,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8010/async  # async st
 # 5. Disable synchronous replication
 curl -u admin:secret -X PATCH http://localhost:8008/config \
   -H 'Content-Type: application/json' \
-  -d '{"synchronous_mode": false}'
+  -d '{"synchronous_mode": "async"}'
 ```
 
 ### Bootstrap preset
@@ -611,7 +634,7 @@ The `bootstrap.dcs` section of `pg-ha.yml` can preset the synchronous configurat
 ```yaml
 bootstrap:
   dcs:
-    synchronous_mode: true
+    synchronous_mode: "sync"
     synchronous_mode_strict: false
     synchronous_node_count: 1
 ```
@@ -620,9 +643,8 @@ This configuration is written to the DCS only on the cluster's first bootstrap, 
 
 ### Current scope and limits
 
-- Implemented: turning it on and off dynamically; automatic computation of `synchronous_standby_names` (the HA loop always uses Priority / `FIRST N`); automatic updates when nodes change; two-phase writes (DCS `/sync` is always a subset of the PostgreSQL list); the `maximum_lag_on_syncnode` lag threshold; the "actually streaming" filter (the member must appear in `pg_stat_replication`); strict mode really blocking writes with an unsatisfiable placeholder list (not `'*'`); publishing DCS `/sync`; the `/sync` and `/async` health checks; enforcing `/sync` membership on failover / switchover
+- Implemented: turning it on and off dynamically; automatic computation of `synchronous_standby_names` (`"sync"` uses Priority / `FIRST N`, `"quorum"` uses `ANY N`); automatic updates when nodes change; two-phase writes (DCS `/sync` is always a subset of the PostgreSQL list); the `maximum_lag_on_syncnode` lag threshold; the "actually streaming" filter (the member must appear in `pg_stat_replication`); strict mode really blocking writes with an unsatisfiable placeholder list (not `'*'`); publishing DCS `/sync`; the `/sync` and `/async` health checks; enforcing `/sync` membership on failover / switchover
 - Not yet implemented (tracked in [TODO.md](TODO.md)):
-  - Quorum mode: `SyncMode::Quorum` can generate `ANY N (...)`, but the running path has no configuration item that selects it (only Priority is available)
   - `maximum_lag_on_failover`: the election reads it (SB-11). A node that lags, by more than this many bytes, the largest `wal_position` among the eligible candidates of that round does not take part. `null` or omitted means off
 
 ---

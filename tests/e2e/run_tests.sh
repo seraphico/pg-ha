@@ -6,6 +6,10 @@
 #   ./tests/e2e/run_tests.sh bootstrap    # Run only bootstrap tests
 #   ./tests/e2e/run_tests.sh --no-build   # Skip build step
 #   ./tests/e2e/run_tests.sh --no-setup   # Skip build + cluster setup (assumes running)
+#   SYNC_MODE=quorum ./tests/e2e/run_tests.sh failover
+#                                         # PATCH synchronous_mode (async|sync|quorum) after
+#                                         # setup and before every suite; for quorum, wait
+#                                         # until q is relaxed (GET /cluster sync.settled)
 #
 # Requires: docker, docker compose, jq, curl, psql (libpq client)
 
@@ -25,6 +29,8 @@ BUILD=${BUILD:-true}
 SETUP=${SETUP:-true}
 TEARDOWN=${TEARDOWN:-true}
 SPECIFIC_TEST=""
+# async | sync | quorum. Empty: leave the cluster's mode alone.
+SYNC_MODE=${SYNC_MODE:-}
 
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
@@ -68,6 +74,9 @@ while [[ $# -gt 0 ]]; do
             echo "  ha_full          Full HA lifecycle tests"
             echo ""
             echo "If no test name is given, all tests run in order."
+            echo ""
+            echo "Environment:"
+            echo "  SYNC_MODE=async|sync|quorum   set synchronous_mode before each suite (quorum waits until q is relaxed)"
             exit 0
             ;;
         *)
@@ -174,6 +183,23 @@ setup_cluster() {
     log_pass "Cluster is up and ready"
 }
 
+# --- Synchronous mode (SYNC_MODE) ---
+# Sets synchronous_mode when SYNC_MODE is given and the cluster is not in it
+# (a suite that PUTs /config drops the key). Entering quorum waits until q is
+# relaxed: a kill or switchover inside the q = |V| window leaves no primary.
+ensure_sync_mode() {
+    [ -n "$SYNC_MODE" ] || return 0
+    case "$SYNC_MODE" in
+        async|sync|quorum) ;;
+        *) log_fail "invalid SYNC_MODE='$SYNC_MODE' (expected async|sync|quorum)"; exit 2 ;;
+    esac
+    if [ "$(get_sync_mode)" != "$SYNC_MODE" ]; then
+        log_info "Setting synchronous_mode=$SYNC_MODE"
+        set_sync_mode "$SYNC_MODE" || log_warn "Could not set synchronous_mode=$SYNC_MODE"
+    fi
+    wait_quorum_settled_if_quorum
+}
+
 # --- Cluster Teardown ---
 teardown_cluster() {
     if [ "$TEARDOWN" = "false" ]; then
@@ -244,6 +270,7 @@ run_all_tests() {
         # barrier between suites rather than a blind fixed sleep.
         log_info "Ensuring cluster is ready before: $name"
         wait_for_cluster_ready 120 || log_warn "Cluster not fully ready before '$name', continuing..."
+        ensure_sync_mode
 
         # Reset counters for each test file
         TESTS_RUN=0
@@ -297,6 +324,7 @@ main() {
     preflight
     build
     setup_cluster
+    ensure_sync_mode
 
     local exit_code=0
 

@@ -603,6 +603,20 @@ impl Config {
             if let Some(problem) = initial.violation() {
                 return Err(crate::Error::Config(format!("bootstrap.dcs: {problem}")));
             }
+            // The whole block is written to /config, and the HA loop rejects a
+            // /config that does not parse as a whole. Refuse to start rather
+            // than ship a document every node will refuse (for example an old
+            // `synchronous_mode: true`).
+            let as_object: serde_json::Map<String, serde_json::Value> = bootstrap
+                .dcs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if let Err(e) = serde_json::from_value::<crate::dynamic_config::GlobalConfig>(
+                serde_json::Value::Object(as_object),
+            ) {
+                return Err(crate::Error::Config(format!("bootstrap.dcs: {e}")));
+            }
         }
         if self.raft.self_addr.is_empty() {
             return Err(crate::Error::Config("raft.self_addr is required".into()));
@@ -819,6 +833,50 @@ proxy:
         // Missing keys fall back to the top-level values (here 10 / 10 / 5).
         let yaml = format!("{MINIMAL_YAML}\nbootstrap:\n  dcs:\n    ttl: 25");
         assert!(Config::from_yaml(&yaml).is_ok());
+    }
+
+    fn bootstrap_yaml(value: &str) -> String {
+        format!("{MINIMAL_YAML}\nbootstrap:\n  dcs:\n    synchronous_mode: {value}")
+    }
+
+    #[test]
+    fn test_bootstrap_dcs_synchronous_mode_accepts_the_three_strings() {
+        for v in ["async", "sync", "quorum", "\"quorum\""] {
+            assert!(Config::from_yaml(&bootstrap_yaml(v)).is_ok(), "{v}");
+        }
+        let yaml = format!("{MINIMAL_YAML}\nbootstrap:\n  dcs:\n    ttl: 25");
+        assert!(Config::from_yaml(&yaml).is_ok());
+    }
+
+    #[test]
+    fn test_bootstrap_dcs_synchronous_mode_rejects_everything_else() {
+        for v in [
+            "true",
+            "false",
+            "on",
+            "off",
+            "yes",
+            "Sync",
+            "QUORUM",
+            "Async",
+            "\"\"",
+            "\" sync\"",
+            "1",
+            "0",
+            "[]",
+            "null",
+            "~",
+            "",
+        ] {
+            let err = Config::from_yaml(&bootstrap_yaml(v))
+                .expect_err(&format!("synchronous_mode: {v} must be rejected"))
+                .to_string();
+            assert!(err.contains("bootstrap.dcs"), "{v}: {err}");
+            assert!(
+                err.contains(r#"expected one of "async", "sync", "quorum" (lowercase)"#),
+                "{v}: {err}"
+            );
+        }
     }
 
     /// The defaults and the docker / test configs satisfy the constraint.

@@ -28,16 +28,16 @@ pg-ha is a PostgreSQL HA system written in Rust. It aims at the same job as Patr
 - Graceful shutdown: wait `shutdown.drain_timeout_secs` while renewing the lock, then CHECKPOINT and stop on the leader (`-m fast`, then `-m immediate`), bounded by the leader lease, then release the lock only after PostgreSQL has stopped. If it cannot be stopped, the process does not exit
 - Prometheus metrics, text or JSON logs (`log_format` or `PG_HA_LOG_FORMAT`)
 - Docker Compose 3-node dev cluster, `make up` / `make test`
-- Dynamic synchronous replication (Priority mode), `/sync` and `/async` health checks, cascading replication (`tags.replicatefrom`)
+- Dynamic synchronous replication (`async` / `sync` / `quorum`), `/sync` and `/async` health checks, cascading replication (`tags.replicatefrom`)
 - Standby cluster: dynamic `standby_cluster` follows a remote primary. `Ha::cascade_promote` has no REST or CLI entry
 
-**Not on the running path:** Quorum sync mode. (`GET /history` is wired by SB-09: DCS `/history`, appended best-effort on a later Hold cycle after promote. Raft snapshots are on disk as `snapshot.json` and reloaded on restart, SB-06, item 14. A non-empty `/failover` intent expires with the cluster `ttl`, SB-05, item 13. Member `conn_url` no longer contains the password, SB-07 Option A. Failsafe was decided NO-GO and the surface was removed, SB-04, item 4.) `maximum_lag_on_syncnode`, `maximum_lag_on_failover` (SB-11), and REST `replication_lag` (SB-10) are wired.
+**Not on the running path:** (`GET /history` is wired by SB-09: DCS `/history`, appended best-effort on a later Hold cycle after promote. Raft snapshots are on disk as `snapshot.json` and reloaded on restart, SB-06, item 14. A non-empty `/failover` intent expires with the cluster `ttl`, SB-05, item 13. Member `conn_url` no longer contains the password, SB-07 Option A. Failsafe was decided NO-GO and the surface was removed, SB-04, item 4.) `maximum_lag_on_syncnode`, `maximum_lag_on_failover` (SB-11), and REST `replication_lag` (SB-10) are wired.
 
 ---
 
 ## P0 — blocks production
 
-Items 13 and 14 in the old numbering are closed. Item 15 (password in `conn_url`) is closed by SB-07 Option A. Item 1 (REST TLS, SB-03) and item 2 are done; item 2 stays here because Quorum mode is still listed under it.
+Items 13 and 14 in the old numbering are closed. Item 15 (password in `conn_url`) is closed by SB-07 Option A. Item 1 (REST TLS, SB-03) and item 2 are done; item 2 stays here because the Quorum documentation is still listed under it.
 
 ### 1. REST API TLS — done (SB-03)
 
@@ -77,13 +77,13 @@ The snapshot is stored in `snapshot.json` and loaded by `new_persistent` togethe
 
 ### 2. Synchronous-replication failover constraint — done (S5)
 
-With `synchronous_mode` on, automatic election and a named Failover/Switchover candidate must be in DCS `/sync.sync_standby`. A missing, empty, or unsatisfiable strict placeholder promotes nobody. An ineligible candidate gets 409 `rejected`. `synchronous_mode_strict` only blocks commits; it does not vote.
+With `synchronous_mode` set to `"sync"` or `"quorum"`, automatic election and a named Failover/Switchover candidate must be in DCS `/sync.sync_standby`. A missing, empty, or unsatisfiable strict placeholder promotes nobody. An ineligible candidate gets 409 `rejected`. `synchronous_mode_strict` only blocks commits; it does not vote.
 
 **SB-01 (sync side):** `maximum_lag_on_syncnode` (bytes, `None` = off) is read from `pg_stat_replication`. Only a standby that is actually streaming and inside the lag is added to `/sync`. Two-phase writes keep `/sync` a subset of `synchronous_standby_names`. Strict mode uses an unsatisfiable placeholder, not `'*'`.
 
 **Still open:**
 
-- Quorum: `SyncMode::Quorum` can emit `ANY N (...)`, but `enforce_synchronous_replication` hardcodes `SyncMode::Priority`. There is no config switch. Only Priority / `FIRST N` runs.
+- Quorum operating documentation: `synchronous_mode: "quorum"` is selectable (SB-13 PR4); the full description of `/wal`, mark and gate semantics, the zombie-primary warning and recommended topologies is still to be written.
 - **SB-11 done:** `maximum_lag_on_failover` is read by `is_healthiest_node`. The reference is the largest `wal_position` among candidates that already passed eligibility, running, and sync gates (including self). A candidate farther behind than the threshold, including self, does not campaign. Unknown `wal_position` is excluded. `None` (default) turns the check off.
 - **SB-10 done:** `timeline`, `wal_position`, and `replication_lag` on `/patroni`, `/primary`, `/replica`, and `/metrics` come from the cycle's `wal_status` via `ApiSnapshot` (no extra query). Lag is the leader's last published position minus this node's, in bytes, minimum 0. It can under-count by about one `loop_wait` of WAL under heavy write, and it measures received WAL, not applied WAL. The primary reports 0. Unknown is `null` and the metric line is omitted. `/replica?lag=` fails open when lag is unknown.
 

@@ -484,12 +484,19 @@ async fn test_history_reads_the_dcs() {
 struct ConfigDcs {
     config: std::sync::Mutex<Option<String>>,
     history: std::sync::Mutex<Vec<pg_ha_core::history::HistoryEntry>>,
+    /// Number of `set_config_value` calls.
+    writes: std::sync::atomic::AtomicUsize,
+    /// The `/sync` value `get_cluster` reports.
+    sync: std::sync::Mutex<Option<pg_ha_core::cluster::SyncState>>,
 }
 
 #[async_trait::async_trait]
 impl pg_ha_core::dcs::DcsAdapter for ConfigDcs {
     async fn get_cluster(&self) -> pg_ha_core::Result<pg_ha_core::cluster::Cluster> {
-        Ok(Default::default())
+        Ok(pg_ha_core::cluster::Cluster {
+            sync_state: self.sync.lock().unwrap().clone(),
+            ..Default::default()
+        })
     }
     async fn attempt_to_acquire_leader(&self) -> pg_ha_core::Result<bool> {
         Ok(false)
@@ -513,6 +520,8 @@ impl pg_ha_core::dcs::DcsAdapter for ConfigDcs {
         Ok(true)
     }
     async fn set_config_value(&self, value: &str) -> pg_ha_core::Result<bool> {
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.config.lock().unwrap() = Some(value.to_string());
         Ok(true)
     }
@@ -551,6 +560,8 @@ fn config_state(stored: &str) -> (AppState, std::sync::Arc<ConfigDcs>) {
     let dcs = std::sync::Arc::new(ConfigDcs {
         config: std::sync::Mutex::new(Some(stored.to_string())),
         history: std::sync::Mutex::new(Vec::new()),
+        writes: std::sync::atomic::AtomicUsize::new(0),
+        sync: std::sync::Mutex::new(None),
     });
     let state = AppState::with_dcs(
         "node1".into(),
@@ -640,6 +651,113 @@ async fn test_config_accepts_timing_that_meets_lease_requirement() {
     let (status, body) = send_config(state, "PATCH", r#"{"pause":true}"#).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(stored_config(&dcs)["pause"], true);
+}
+
+const ACCEPTED: &str = r#"expected one of \"async\", \"sync\", \"quorum\" (lowercase)"#;
+
+fn config_writes(dcs: &ConfigDcs) -> usize {
+    dcs.writes.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Invalid `synchronous_mode` values are a 400 naming the accepted values,
+/// and nothing reaches the DCS (PATCH and PUT).
+#[tokio::test]
+async fn test_config_rejects_invalid_synchronous_mode_and_writes_nothing() {
+    let stored = r#"{"loop_wait":5,"ttl":15,"synchronous_mode":"sync"}"#;
+    for bad in [
+        "true",
+        "false",
+        r#""on""#,
+        r#""off""#,
+        r#""Sync""#,
+        r#""QUORUM""#,
+        r#""""#,
+        "1",
+        "[]",
+    ] {
+        for (method, body) in [
+            ("PATCH", format!(r#"{{"synchronous_mode":{bad}}}"#)),
+            (
+                "PUT",
+                format!(r#"{{"loop_wait":5,"ttl":15,"synchronous_mode":{bad}}}"#),
+            ),
+        ] {
+            let (state, dcs) = config_state(stored);
+            let (status, resp) = send_config(state, method, &body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {bad}: {resp}");
+            assert!(
+                resp.contains("synchronous_mode: invalid value"),
+                "{method} {bad}: {resp}"
+            );
+            assert!(resp.contains(ACCEPTED), "{method} {bad}: {resp}");
+            assert_eq!(config_writes(&dcs), 0, "{method} {bad}: nothing written");
+            assert_eq!(dcs.config.lock().unwrap().as_deref(), Some(stored));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_patch_config_accepts_the_three_strings() {
+    for mode in ["async", "sync", "quorum"] {
+        let (state, dcs) = config_state(r#"{"loop_wait":5,"ttl":15}"#);
+        let (status, resp) = send_config(
+            state.clone(),
+            "PATCH",
+            &format!(r#"{{"synchronous_mode":"{mode}"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{mode}: {resp}");
+        assert_eq!(stored_config(&dcs)["synchronous_mode"], mode);
+        assert_eq!(stored_config(&dcs)["ttl"], 15, "other keys kept");
+        // GET /config returns the string form.
+        let (status, resp) = body_text(state, "/config").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["synchronous_mode"], mode);
+    }
+    // An explicit null is rejected (PATCH and PUT): 400, nothing written. It
+    // would otherwise silently mean async.
+    for method in ["PATCH", "PUT"] {
+        let (state, dcs) = config_state(r#"{"synchronous_mode":"quorum","ttl":15,"loop_wait":5}"#);
+        let before = stored_config(&dcs);
+        let (status, resp) = send_config(state, method, r#"{"synchronous_mode":null}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}: {resp}");
+        assert!(resp.contains(r#"expected one of"#), "{method}: {resp}");
+        assert_eq!(stored_config(&dcs), before, "{method}: nothing written");
+    }
+    // PUT with a valid value.
+    let (state, dcs) = config_state("{}");
+    let (status, resp) = send_config(state, "PUT", r#"{"synchronous_mode":"quorum"}"#).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(stored_config(&dcs)["synchronous_mode"], "quorum");
+}
+
+/// A stored document that does not parse (an old `synchronous_mode: true`) is
+/// never patched on top of the defaults: 409, nothing written. PUT repairs it.
+#[tokio::test]
+async fn test_patch_config_refuses_an_invalid_stored_document() {
+    let stored = r#"{"synchronous_mode":true,"synchronous_node_count":2,"ttl":15,"loop_wait":5}"#;
+    let (state, dcs) = config_state(stored);
+    let (status, resp) = send_config(state.clone(), "PATCH", r#"{"pause":true}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{resp}");
+    assert!(resp.contains("stored /config is invalid"), "{resp}");
+    assert!(resp.contains(ACCEPTED), "{resp}");
+    assert_eq!(config_writes(&dcs), 0);
+    assert_eq!(dcs.config.lock().unwrap().as_deref(), Some(stored));
+    // Even a PATCH that carries a valid value for the bad key is refused:
+    // the operator sees the whole document and replaces it.
+    let (status, _) = send_config(state.clone(), "PATCH", r#"{"synchronous_mode":"sync"}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(config_writes(&dcs), 0);
+    let (status, resp) = send_config(
+        state,
+        "PUT",
+        r#"{"synchronous_mode":"sync","synchronous_node_count":2,"ttl":15,"loop_wait":5}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(stored_config(&dcs)["synchronous_mode"], "sync");
+    assert_eq!(config_writes(&dcs), 1);
 }
 
 async fn body_text(state: AppState, uri: &str) -> (StatusCode, String) {
@@ -886,4 +1004,121 @@ async fn test_default_own_tags_keep_replica_200_and_report_defaults() {
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["tags"]["nofailover"], false);
     assert_eq!(json["tags"]["noloadbalance"], false);
+}
+
+// ─── GET /cluster: the `sync` object (SB-13) ───
+
+fn sync_value(
+    voters: Option<&str>,
+    quorum: u32,
+    kind: pg_ha_core::cluster::SyncKind,
+) -> pg_ha_core::cluster::SyncState {
+    pg_ha_core::cluster::SyncState {
+        leader: "node1".into(),
+        sync_standby: voters.map(Into::into),
+        quorum,
+        kind,
+    }
+}
+
+async fn cluster_sync(
+    sync: Option<pg_ha_core::cluster::SyncState>,
+    quorum_n: Option<usize>,
+) -> serde_json::Value {
+    let (state, dcs) = config_state("{}");
+    *dcs.sync.lock().unwrap() = sync;
+    state.update(|s| s.quorum_n = quorum_n).await;
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/cluster")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["scope"], "test-cluster");
+    json
+}
+
+#[tokio::test]
+async fn cluster_sync_is_null_without_a_sync_state() {
+    let json = cluster_sync(None, None).await;
+    assert!(json.as_object().unwrap().contains_key("sync"));
+    assert!(json["sync"].is_null());
+}
+
+#[tokio::test]
+async fn cluster_sync_reports_an_unrelaxed_quorum_window() {
+    use pg_ha_core::cluster::SyncKind;
+    let json = cluster_sync(
+        Some(sync_value(Some("node2,node3"), 2, SyncKind::Quorum)),
+        Some(1),
+    )
+    .await;
+    assert_eq!(
+        json["sync"],
+        serde_json::json!({
+            "kind": "quorum",
+            "voters": ["node2", "node3"],
+            "quorum": 2,
+            "n": 1,
+            "settled": false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn cluster_sync_reports_a_settled_quorum() {
+    use pg_ha_core::cluster::SyncKind;
+    let json = cluster_sync(
+        Some(sync_value(Some("node2,node3"), 1, SyncKind::Quorum)),
+        Some(1),
+    )
+    .await;
+    assert_eq!(json["sync"]["quorum"], 1);
+    assert_eq!(json["sync"]["settled"], true);
+}
+
+#[tokio::test]
+async fn cluster_sync_has_null_n_and_settled_when_this_node_does_not_know_n() {
+    use pg_ha_core::cluster::SyncKind;
+    // A replica, or a leader before its first read: kind, voters and q only.
+    let json = cluster_sync(
+        Some(sync_value(Some("node2,node3"), 2, SyncKind::Quorum)),
+        None,
+    )
+    .await;
+    assert_eq!(json["sync"]["kind"], "quorum");
+    assert_eq!(
+        json["sync"]["voters"],
+        serde_json::json!(["node2", "node3"])
+    );
+    assert_eq!(json["sync"]["quorum"], 2);
+    assert!(json["sync"]["n"].is_null());
+    assert!(json["sync"]["settled"].is_null());
+}
+
+#[tokio::test]
+async fn cluster_sync_for_priority_hides_the_legacy_quorum_field() {
+    use pg_ha_core::cluster::SyncKind;
+    // Even with an `n` left over from a quorum period: not a quorum `/sync`.
+    let json = cluster_sync(
+        Some(sync_value(Some("node2"), 1, SyncKind::Priority)),
+        Some(1),
+    )
+    .await;
+    assert_eq!(
+        json["sync"],
+        serde_json::json!({
+            "kind": "priority",
+            "voters": ["node2"],
+            "quorum": null,
+            "n": null,
+            "settled": null,
+        })
+    );
 }

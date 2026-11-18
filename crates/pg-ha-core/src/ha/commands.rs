@@ -67,13 +67,18 @@ impl Ha {
     }
 
     fn reject_if_sync_ineligible_candidate(&self, candidate: &str) -> Option<CommandResponse> {
-        let sync_mode = self
-            .dynamic_config_state
-            .last_config
-            .synchronous_mode
-            .unwrap_or(false);
+        if self.sync_config_unresolved() {
+            return Some(CommandResponse::rejected(format!(
+                "Candidate '{candidate}' rejected: the stored /config is invalid and no valid configuration is known (fix it with PUT /config)"
+            )));
+        }
+        let sync_mode = self.dynamic_config_state.last_config.sync_mode();
         if sync_failover_allowed(candidate, sync_mode, self.cluster.sync_state.as_ref()) {
-            return None;
+            // SB-13: under a quorum `/sync`, a candidate that cannot win the
+            // vote is refused here, before the leader gives up the lock.
+            return self
+                .quorum_win_refusal(candidate)
+                .map(CommandResponse::rejected);
         }
         Some(CommandResponse::rejected(format!(
             "Candidate '{candidate}' is not a synchronous standby (sync mode requires /sync membership)"
@@ -146,6 +151,9 @@ impl Ha {
         // other member may campaign would leave the cluster with no primary
         // and a /failover key that only a successful acquisition clears.
         if candidate.is_none() && !self.has_switchover_successor() {
+            if let Some(why) = self.switchover_quorum_refusal() {
+                return CommandResponse::rejected(why);
+            }
             return CommandResponse::rejected(
                 "No other running member can take over; refusing switchover without a candidate",
             );

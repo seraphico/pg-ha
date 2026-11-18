@@ -334,26 +334,31 @@ wait_for_role() {
     done
 }
 
+# wait_for_primary / wait_for_new_primary are used as `x=$(wait_for_...)` and
+# then tested with `[ -n "$x" ]`, so stdout carries ONLY the primary URL, and
+# only on success. Every log line goes to stderr. (Before, the log lines were
+# on stdout: a timeout left "[FAIL] No new primary..." in the variable, the
+# `-n` check passed, and two false passes were recorded.)
 wait_for_primary() {
     # Wait for any node to become primary
     local timeout="${1:-60}"
     local start=$SECONDS
 
-    log_info "Waiting for a primary to appear (timeout: ${timeout}s)..."
+    log_info "Waiting for a primary to appear (timeout: ${timeout}s)..." >&2
 
     while true; do
         local primary
         primary=$(get_primary)
         if [ -n "$primary" ]; then
             local elapsed=$((SECONDS - start))
-            log_info "Primary found at $primary in ${elapsed}s"
+            log_info "Primary found at $primary in ${elapsed}s" >&2
             echo "$primary"
             return 0
         fi
 
         local elapsed=$((SECONDS - start))
         if [ "$elapsed" -ge "$timeout" ]; then
-            log_fail "No primary found after ${timeout}s"
+            log_fail "No primary found after ${timeout}s" >&2
             return 1
         fi
 
@@ -367,26 +372,134 @@ wait_for_new_primary() {
     local timeout="${2:-60}"
     local start=$SECONDS
 
-    log_info "Waiting for a new primary (not $old_primary, timeout: ${timeout}s)..."
+    log_info "Waiting for a new primary (not $old_primary, timeout: ${timeout}s)..." >&2
 
     while true; do
         local primary
         primary=$(get_primary)
         if [ -n "$primary" ] && [ "$primary" != "$old_primary" ]; then
             local elapsed=$((SECONDS - start))
-            log_info "New primary at $primary in ${elapsed}s"
+            log_info "New primary at $primary in ${elapsed}s" >&2
             echo "$primary"
             return 0
         fi
 
         local elapsed=$((SECONDS - start))
         if [ "$elapsed" -ge "$timeout" ]; then
-            log_fail "No new primary after ${timeout}s"
+            log_fail "No new primary after ${timeout}s" >&2
             return 1
         fi
 
         sleep 1
     done
+}
+
+# --- Synchronous mode / quorum helpers ---
+# All of these log to stderr (they may run inside $(...) captures).
+
+get_sync_mode() {
+    # async | sync | quorum, as stored in the dynamic config; empty when no
+    # primary answers. An unset key is async (the default).
+    local primary
+    primary=$(get_primary) || true
+    [ -n "$primary" ] || { echo ""; return 1; }
+    http_get "$primary/config" | jq -r '.synchronous_mode // "async"' 2>/dev/null
+}
+
+wait_quorum_settled() {
+    # Wait until q is relaxed to |V| - n (SB-13). After a voter is added
+    # (quorum just enabled, or a node rejoined) /sync holds q = |V| for about
+    # 20 s, nobody can win a vote then, and a kill or switchover inside that
+    # window leaves the cluster without a primary. Signal: the leader's
+    # GET /cluster, sync.settled == true (and kind quorum). Because "settled"
+    # is also true briefly before a rejoining node is added to V, also wait
+    # until V has at least `expected_voters` names (default: nodes answering
+    # /patroni, minus the primary). Usage: wait_quorum_settled [timeout] [expected_voters]
+    local timeout="${1:-120}"
+    local expected="${2:-}"
+    local start=$SECONDS
+    log_info "Waiting for quorum to settle (leader /cluster sync.settled, timeout: ${timeout}s)..." >&2
+    while true; do
+        local primary
+        primary=$(get_primary) || true
+        if [ -n "$primary" ]; then
+            local want="$expected"
+            if [ -z "$want" ]; then
+                local up=0 node
+                for node in "${ALL_NODES[@]}"; do
+                    [ "$(http_get_status "$node/patroni")" = "200" ] && up=$((up + 1))
+                done
+                want=$((up - 1))
+            fi
+            local state
+            state=$(http_get "$primary/cluster" | jq -r --argjson want "$want" \
+                'if (.sync.kind == "quorum" and .sync.settled == true and ((.sync.voters | length) >= $want)) then "settled" else "waiting" end' 2>/dev/null || true)
+            if [ "$state" = "settled" ]; then
+                log_info "Quorum settled in $((SECONDS - start))s" >&2
+                return 0
+            fi
+        fi
+        if [ "$((SECONDS - start))" -ge "$timeout" ]; then
+            log_fail "Quorum not settled after ${timeout}s (sync: $(http_get "${primary:-$NODE1_API}/cluster" | jq -c .sync 2>/dev/null))" >&2
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+wait_quorum_settled_if_quorum() {
+    # No-op unless synchronous_mode is quorum. Never fails the caller: a
+    # timeout is logged, and the test that follows shows the real symptom.
+    [ "$(get_sync_mode)" = "quorum" ] || return 0
+    wait_quorum_settled "${1:-120}" || log_warn "Quorum did not settle; continuing" >&2
+    return 0
+}
+
+set_sync_mode() {
+    # PATCH synchronous_mode (async|sync|quorum). For quorum, wait until q is
+    # relaxed before returning. Usage: set_sync_mode <mode>
+    local mode="$1"
+    local primary code
+    primary=$(wait_for_primary 60) || return 1
+    code=$(curl "${CURL_OPTS[@]}" "${REST_AUTH[@]}" --max-time 10 -o /dev/null -w '%{http_code}' \
+        -X PATCH -H "Content-Type: application/json" \
+        -d "{\"synchronous_mode\":\"$mode\"}" "$primary/config" 2>/dev/null || echo 000)
+    if [ "$code" != "200" ]; then
+        log_fail "PATCH /config synchronous_mode=$mode returned HTTP $code" >&2
+        return 1
+    fi
+    log_info "synchronous_mode set to $mode" >&2
+    if [ "$mode" = "quorum" ]; then
+        wait_quorum_settled 120
+    fi
+}
+
+wait_for_switchover_candidate() {
+    # Wait until a node can take a switchover. async: a healthy replica
+    # (/replica 200). sync and quorum: the node must also be in /sync, and
+    # GET /sync answers 200 only for a healthy replica that is on that list
+    # (/replica 200 is true earlier, from a stale published state, and the
+    # switchover is then refused with 409 'not a synchronous standby').
+    # Usage: wait_for_switchover_candidate <node_url> [timeout]
+    local node_url="$1"
+    local timeout="${2:-90}"
+    local mode
+    mode=$(get_sync_mode)
+    if [ "$mode" != "sync" ] && [ "$mode" != "quorum" ]; then
+        wait_for_role "$node_url" "replica" "$timeout"
+        return
+    fi
+    local start=$SECONDS
+    log_info "Waiting for $(node_url_to_container "$node_url") to answer /sync 200 (mode: $mode, timeout: ${timeout}s)..." >&2
+    while [ "$((SECONDS - start))" -lt "$timeout" ]; do
+        if [ "$(http_get_status "$node_url/sync")" = "200" ]; then
+            log_info "Node answers /sync 200 after $((SECONDS - start))s" >&2
+            return 0
+        fi
+        sleep 1
+    done
+    log_fail "Node did not answer /sync 200 after ${timeout}s" >&2
+    return 1
 }
 
 # --- Docker helpers ---
@@ -474,6 +587,15 @@ measure_failover_time() {
     fi
 
     local container
+    container=$(node_url_to_container "$primary_url")
+
+    # Under quorum a kill inside the q = |V| window leaves no primary.
+    wait_quorum_settled_if_quorum
+    primary_url=$(get_primary)
+    if [ -z "$primary_url" ]; then
+        echo "-1"
+        return 1
+    fi
     container=$(node_url_to_container "$primary_url")
 
     local start=$SECONDS

@@ -31,14 +31,15 @@ post_with_status() {
     [ "$code" = "$out" ] && body=""
     echo "${code:-000} $body"
 }
-# wait_for_* print their log lines on stdout too; keep only the URL line.
-url_only() {
-    grep -E '^https?://[^ ]+$' | tail -n 1
-}
+# wait_for_primary / wait_for_new_primary print only the URL on stdout (their
+# log lines go to stderr), so $(...) is empty on a timeout.
 
 # --- Test: Switchover to specific candidate ---
 test_switchover_to_candidate() {
     log_info "Identifying current primary and a replica candidate..."
+    # Under quorum a switchover inside the q = |V| window is refused (409) or,
+    # before that guard, left the cluster without a primary.
+    wait_quorum_settled_if_quorum
 
     local primary_url
     primary_url=$(get_primary)
@@ -134,6 +135,7 @@ test_cluster_healthy_after_switchover() {
 # --- Test: Switchover without candidate (auto-select) ---
 test_switchover_auto_candidate() {
     log_info "Testing switchover without specifying candidate..."
+    wait_quorum_settled_if_quorum
 
     local primary_url
     primary_url=$(get_primary)
@@ -164,8 +166,9 @@ test_switchover_auto_candidate() {
 # --- Test: Switchover right after a failover (SB-29) ---
 test_switchover_after_failover() {
     log_info "Testing switchover right after a failover..."
+    wait_quorum_settled_if_quorum
     local old_primary
-    old_primary=$(wait_for_primary 60 | url_only)
+    old_primary=$(wait_for_primary 60) || true
     assert_not_empty "$old_primary" "Primary exists before the failover"
     [ -z "$old_primary" ] && return
     local old_container
@@ -174,7 +177,7 @@ test_switchover_after_failover() {
     since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     docker_kill "$old_container" > /dev/null 2>&1
     local new_primary
-    new_primary=$(wait_for_new_primary "$old_primary" 90 | url_only)
+    new_primary=$(wait_for_new_primary "$old_primary" 90) || true
     assert_not_empty "$new_primary" "New primary elected after killing $old_container"
     if [ -z "$new_primary" ]; then
         docker_start "$old_container" > /dev/null 2>&1
@@ -195,7 +198,8 @@ test_switchover_after_failover() {
     #    primary. The candidate may legitimately be restarting PostgreSQL to
     #    follow the new primary at this moment, so a true "is not running" 409
     #    is a correct answer; a 500 or any other code is not.
-    local response code
+    local response code mode
+    mode=$(get_sync_mode)
     response=$(post_with_status "$new_primary/switchover" "{\"candidate\": \"$candidate_name\"}")
     code="${response%% *}"
     log_info "Immediate switchover to $candidate_name via $new_container: $response"
@@ -203,21 +207,39 @@ test_switchover_after_failover() {
         log_pass "Immediate switchover right after the failover was accepted (HTTP 200)"
     elif [ "$code" = "409" ] && [[ "$response" == *"is not running"* ]]; then
         log_pass "Immediate switchover right after the failover was rejected with a true 'not running' (HTTP 409), not a 500"
+    elif [ "$code" = "409" ] && [ "$mode" != "async" ] && [[ "$response" == *"is not a synchronous standby"* ]]; then
+        # sync and quorum: /sync names the candidate only after the new primary
+        # has rewritten it (about 14 s after the kill); until then the refusal
+        # is correct.
+        log_pass "Immediate switchover right after the failover was rejected because /sync does not name the candidate yet (HTTP 409), not a 500"
+    elif [ "$code" = "409" ] && [ "$mode" = "quorum" ] && [[ "$response" == *"not enough voters online"* || "$response" == *"quorum not settled"* ]]; then
+        # quorum: with the killed node still down the candidate cannot win the
+        # vote, so the switchover is refused before the lock is released.
+        log_pass "Immediate switchover right after the failover was refused because the candidate could not win the quorum vote (HTTP 409), not a 500"
     else
-        log_fail "Immediate switchover right after the failover returned '$response' (expected 200, or 409 'is not running'; never 500)"
+        log_fail "Immediate switchover right after the failover returned '$response' (expected 200, or a true 409 refusal; never 500)"
     fi
     if [ "$code" != "200" ]; then
         # The new primary must still be leading after the rejection.
         assert_eq "200" "$(http_get_status "$new_primary/primary")" "$new_container is still primary after the rejected switchover"
-        # 2) What an operator does next: wait until the candidate is a healthy
-        #    replica, then switch over. This must be accepted.
-        wait_for_role "$candidate_url" "replica" 90 || true
+        # 2) What an operator does next: wait until the candidate can take a
+        #    switchover, then switch over. This must be accepted. async: a
+        #    healthy replica. sync and quorum: GET /sync answers 200 (healthy
+        #    replica AND in /sync); /replica is 200 earlier and the switchover
+        #    would still be refused. quorum: the killed node must be back as a
+        #    voter and q relaxed, or the candidate cannot win the vote.
+        if [ "$mode" = "quorum" ]; then
+            docker_start "$old_container" > /dev/null 2>&1
+            wait_for_cluster_ready 180 || log_warn "Cluster not ready after restarting $old_container"
+            wait_quorum_settled_if_quorum
+        fi
+        wait_for_switchover_candidate "$candidate_url" 90 || true
         response=$(post_with_status "$new_primary/switchover" "{\"candidate\": \"$candidate_name\"}")
         log_info "Switchover to $candidate_name once it is a healthy replica: $response"
         assert_eq "200" "${response%% *}" "Switchover after the failover returns HTTP 200 once the candidate is a healthy replica"
     fi
     local after
-    after=$(wait_for_new_primary "$new_primary" 60 | url_only)
+    after=$(wait_for_new_primary "$new_primary" 60) || true
     assert_not_empty "$after" "A primary is available within 60s after the switchover"
     # The clean demotion of an accepted switchover writes a "pg_controldata
     # reports 'shut down'" marker when the node restarts as a replica; that is

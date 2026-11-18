@@ -203,7 +203,7 @@ fn sync(leader: &str, voters: &str, quorum: u32, kind: SyncKind) -> SyncState {
     }
 }
 
-fn input(mode: EffectiveSyncMode, count: usize, names: &[&str], s: Option<SyncState>) -> ExecInput {
+fn input(mode: SynchronousMode, count: usize, names: &[&str], s: Option<SyncState>) -> ExecInput {
     ExecInput {
         me: "n0".into(),
         mode,
@@ -212,11 +212,12 @@ fn input(mode: EffectiveSyncMode, count: usize, names: &[&str], s: Option<SyncSt
         lag_threshold: None,
         members: names.iter().map(|n| member(n, false)).collect(),
         sync: s,
+        watchdog_on: true,
     }
 }
 
 const ALL: [(&str, u64); 3] = [("n1", 1000), ("n2", 1000), ("n3", 1000)];
-const Q: EffectiveSyncMode = EffectiveSyncMode::Quorum;
+const Q: SynchronousMode = SynchronousMode::Quorum;
 
 fn ready() -> QuorumExec {
     QuorumExec {
@@ -233,6 +234,7 @@ fn ready_with_mark(show: &str, lsn: u64) -> QuorumExec {
             lsn,
         }),
         pending: None,
+        ..Default::default()
     }
 }
 
@@ -860,7 +862,7 @@ fn dcs_ok_false_and_err_stop_the_cycle_before_the_pg_change() {
 fn t7_off_ends_with_the_exact_priority_off_value() {
     let show = "ANY 1 (\"n1\",\"n2\")";
     let mut inp = input(
-        EffectiveSyncMode::Off,
+        SynchronousMode::Async,
         1,
         &["n1", "n2"],
         Some(sync("n0", "n1,n2", 1, SyncKind::Quorum)),
@@ -966,7 +968,7 @@ fn t9_quorum_back_to_priority_ends_with_the_priority_value_and_a_hand_off() {
     // V = S = {n1,n2,n3}, n = 2, q = 1; Priority wants N = 2.
     let show = "ANY 2 (\"n1\",\"n2\",\"n3\")";
     let mut inp = input(
-        EffectiveSyncMode::Priority,
+        SynchronousMode::Sync,
         2,
         &three(),
         Some(sync("n0", "n1,n2,n3", 1, SyncKind::Quorum)),
@@ -1004,7 +1006,7 @@ fn t9_quorum_back_to_priority_ends_with_the_priority_value_and_a_hand_off() {
 #[test]
 fn t9_with_nobody_eligible_hands_off_with_the_empty_value() {
     let mut inp = input(
-        EffectiveSyncMode::Priority,
+        SynchronousMode::Sync,
         1,
         &[],
         Some(sync("n0", "", 0, SyncKind::Quorum)),
@@ -1077,7 +1079,7 @@ fn paused_rt() -> tokio::runtime::Runtime {
 
 fn pre<IO: SyncIo>(
     io: &mut IO,
-    mode: EffectiveSyncMode,
+    mode: SynchronousMode,
     me: &str,
     s: Option<&SyncState>,
 ) -> std::result::Result<(), String> {
@@ -1105,9 +1107,9 @@ fn pre_promote_writes_the_post_promotion_value_then_confirms_with_show() {
 fn pre_promote_is_also_used_while_the_mode_is_priority_but_the_sync_is_quorum() {
     // T7 / T9 window: the executor still applies, so a promotion installs it.
     for mode in [
-        EffectiveSyncMode::Off,
-        EffectiveSyncMode::Priority,
-        EffectiveSyncMode::Quorum,
+        SynchronousMode::Async,
+        SynchronousMode::Sync,
+        SynchronousMode::Quorum,
     ] {
         let mut io = FakeIo::new("", &ALL);
         io.set_pg_applies = true;
@@ -1268,8 +1270,8 @@ proptest::proptest! {
     #[test]
     fn pre_promote_is_zero_io_for_every_priority_and_off_input(
         mode in proptest::prelude::prop_oneof![
-            proptest::prelude::Just(EffectiveSyncMode::Off),
-            proptest::prelude::Just(EffectiveSyncMode::Priority),
+            proptest::prelude::Just(SynchronousMode::Async),
+            proptest::prelude::Just(SynchronousMode::Sync),
         ],
         sync_in in proptest::prelude::prop::option::of((
             "[a-zA-Z0-9_-]{0,6}",
@@ -1354,6 +1356,7 @@ fn finalization_after_the_pre_promote_write_installs_v_prime_and_without_it_rese
             .map(|n| member(n, false))
             .collect(),
         sync: Some(sync.clone()),
+        watchdog_on: true,
     };
     // With the write.
     let mut io = FakeIo::new("", &ALL);
@@ -1376,4 +1379,185 @@ fn finalization_after_the_pre_promote_write_installs_v_prime_and_without_it_rese
         Some("dcs:n1::0:Quorum"),
         "no pre-promote value in force: reset to an empty voter set"
     );
+}
+
+// ─────────────── SB-13 PR4: operator warnings and their rate limit ───────────────
+
+fn nofailover(mut m: Member) -> Member {
+    m.tags
+        .insert("nofailover".to_string(), serde_json::json!(true));
+    m
+}
+
+fn voters(names: &[&str]) -> Names {
+    names.iter().map(|n| n.to_string()).collect()
+}
+
+#[test]
+fn warning_count_one_with_three_or_more_voters() {
+    let w = |mode, count, n: &[&str]| quorum_warnings(&input(mode, count, n, None), &voters(n));
+    assert!(w(Q, 1, &["n1", "n2", "n3"]).contains(&QuorumWarning::CountOneWithManyVoters(3)));
+    assert!(w(Q, 1, &["n1", "n2", "n3", "n4"]).contains(&QuorumWarning::CountOneWithManyVoters(4)));
+    for (count, n) in [
+        (1, vec!["n1", "n2"]),
+        (1, vec!["n1"]),
+        (2, vec!["n1", "n2", "n3"]),
+    ] {
+        assert!(
+            !w(Q, count, &n)
+                .iter()
+                .any(|x| matches!(x, QuorumWarning::CountOneWithManyVoters(_))),
+            "count {count} voters {n:?}"
+        );
+    }
+    // Never outside the quorum mode.
+    for mode in [SynchronousMode::Sync, SynchronousMode::Async] {
+        assert!(w(mode, 1, &["n1", "n2", "n3"]).is_empty());
+    }
+}
+
+#[test]
+fn warning_watchdog_off_only_in_quorum_mode() {
+    let mut inp = input(Q, 2, &["n1", "n2", "n3"], None);
+    assert!(quorum_warnings(&inp, &voters(&["n1", "n2", "n3"])).is_empty());
+    inp.watchdog_on = false;
+    assert_eq!(
+        quorum_warnings(&inp, &voters(&["n1", "n2", "n3"])),
+        vec![QuorumWarning::WatchdogOff]
+    );
+    for mode in [SynchronousMode::Sync, SynchronousMode::Async] {
+        inp.mode = mode;
+        assert!(quorum_warnings(&inp, &voters(&["n1", "n2", "n3"])).is_empty());
+    }
+}
+
+#[test]
+fn warning_all_voters_nofailover() {
+    let mut inp = input(Q, 2, &["n1", "n2", "n3"], None);
+    inp.members = vec![
+        nofailover(member("n1", false)),
+        nofailover(member("n2", false)),
+        nofailover(member("n3", false)),
+    ];
+    assert_eq!(
+        quorum_warnings(&inp, &voters(&["n1", "n2", "n3"])),
+        vec![QuorumWarning::AllVotersNofailover]
+    );
+    // One electable voter: no warning.
+    inp.members[2] = member("n3", false);
+    assert!(quorum_warnings(&inp, &voters(&["n1", "n2", "n3"])).is_empty());
+    // Nobody eligible: nothing to say.
+    assert!(quorum_warnings(&inp, &voters(&[])).is_empty());
+}
+
+#[test]
+fn warnings_are_emitted_on_change_and_every_30th_cycle() {
+    let mut exec = QuorumExec::default();
+    let a = [QuorumWarning::WatchdogOff];
+    assert!(exec.should_emit_warnings(&a));
+    for _ in 1..29 {
+        assert!(!exec.should_emit_warnings(&a));
+    }
+    assert!(exec.should_emit_warnings(&a), "30th cycle");
+    assert!(!exec.should_emit_warnings(&a));
+    // A changed set is emitted at once.
+    let b = [
+        QuorumWarning::WatchdogOff,
+        QuorumWarning::AllVotersNofailover,
+    ];
+    assert!(exec.should_emit_warnings(&b));
+    // Nothing to say, nothing emitted, ever.
+    assert!(!exec.should_emit_warnings(&[]));
+    for _ in 0..60 {
+        assert!(!exec.should_emit_warnings(&[]));
+    }
+    assert!(
+        exec.should_emit_warnings(&a),
+        "a new set after a quiet period"
+    );
+}
+
+fn unreadable_obs(raw: &str) -> Observed {
+    observe_value(raw)
+}
+
+#[test]
+fn unreadable_value_warning_is_rate_limited_like_the_pending_warning() {
+    let mut exec = QuorumExec::default();
+    let bad = unreadable_obs("ANY (");
+    assert!(bad.unreadable.is_some());
+    assert!(exec.note_unreadable(&bad), "first sight");
+    for _ in 1..29 {
+        assert!(!exec.note_unreadable(&bad), "same text, silent");
+    }
+    assert!(exec.note_unreadable(&bad), "30th consecutive cycle");
+    assert!(!exec.note_unreadable(&bad));
+    // A different unreadable text warns at once.
+    assert!(exec.note_unreadable(&unreadable_obs("FIRST (")));
+    // A readable value resets: the same bad text warns again.
+    let good = unreadable_obs("ANY 1 (\"n1\")");
+    assert!(good.unreadable.is_none());
+    assert!(!exec.note_unreadable(&good));
+    assert!(exec.note_unreadable(&bad));
+}
+
+/// The warnings change nothing the executor writes or plans: the same cycle
+/// with and without a watchdog (the only difference that warns) writes the same.
+#[test]
+fn warnings_do_not_change_what_a_cycle_does() {
+    let run = |watchdog_on: bool| {
+        let mut inp = input(
+            Q,
+            1,
+            &three(),
+            Some(sync("n0", "n1,n2,n3", 1, SyncKind::Quorum)),
+        );
+        inp.watchdog_on = watchdog_on;
+        let show = "ANY 1 (\"n1\",\"n2\",\"n3\")";
+        let mut io = FakeIo::new(show, &ALL);
+        io.set_pg_applies = true;
+        let mut exec = ready_with_mark(show, 1000);
+        let out = cycle(&mut exec, &mut io, &inp);
+        (
+            out,
+            io.pg_sets.clone(),
+            io.dcs_writes.iter().map(dcs_desc).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(run(true), run(false));
+}
+// ───────────────────────── q-not-relaxed window (observability) ─────────────────────────
+#[test]
+fn the_executor_records_n_from_show_each_cycle() {
+    let two = "ANY 1 (\"n1\",\"n2\")";
+    let inp = input(
+        Q,
+        1,
+        &["n1", "n2"],
+        Some(sync("n0", "n1,n2", 2, SyncKind::Quorum)),
+    );
+    let mut exec = ready_with_mark(two, 500);
+    assert_eq!(exec.observed_n(), None);
+    let mut io = FakeIo::new(two, &[("n1", 1000), ("n2", 1000)]);
+    cycle(&mut exec, &mut io, &inp);
+    assert_eq!(exec.observed_n(), Some(1));
+    // An empty list is asynchronous: n = 0.
+    let mut exec = ready();
+    let mut io = FakeIo::new("", &[("n1", 1000), ("n2", 1000)]);
+    cycle(&mut exec, &mut io, &inp);
+    assert_eq!(exec.observed_n(), Some(0));
+}
+#[test]
+fn the_window_warning_fires_on_open_and_every_30th_cycle_and_resets_on_close() {
+    let mut exec = QuorumExec::default();
+    assert!(!exec.note_window(false));
+    assert!(exec.note_window(true), "first cycle of the window");
+    for _ in 1..29 {
+        assert!(!exec.note_window(true));
+    }
+    assert!(exec.note_window(true), "30th cycle");
+    assert!(!exec.note_window(true));
+    // Closed: silent, and the next window warns at once again.
+    assert!(!exec.note_window(false));
+    assert!(exec.note_window(true));
 }

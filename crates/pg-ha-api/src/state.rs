@@ -73,6 +73,9 @@ pub struct NodeState {
     pub shutting_down: bool,
     /// `pg-ha.rewind_check` present: may hold forked history; `/replica` is 503.
     pub rewind_check: bool,
+    /// SB-13: `n` of `synchronous_standby_names` as this node's quorum
+    /// executor last read it. Only set while this node leads; `None` else.
+    pub quorum_n: Option<usize>,
 }
 
 impl AppState {
@@ -98,6 +101,7 @@ impl AppState {
                 pg_in_recovery: None,
                 shutting_down: false,
                 rewind_check: false,
+                quorum_n: None,
             })),
             dcs: None,
             lease_timing: None,
@@ -137,6 +141,7 @@ impl AppState {
                 pg_in_recovery: None,
                 shutting_down: false,
                 rewind_check: false,
+                quorum_n: None,
             })),
             dcs: Some(dcs),
             lease_timing: Some(lease_timing),
@@ -207,6 +212,7 @@ impl NodeState {
         self.timeline = snapshot.timeline;
         self.wal_position = snapshot.wal_position;
         self.replication_lag = snapshot.replication_lag;
+        self.quorum_n = snapshot.quorum_n;
     }
 
     /// H1: `/primary` is 200 exactly when this node holds the leader lock,
@@ -281,6 +287,7 @@ mod tests {
             timeline: Some(4),
             wal_position: Some(2000),
             replication_lag: Some(500),
+            quorum_n: Some(1),
         }
     }
 
@@ -294,8 +301,10 @@ mod tests {
                 (s.timeline, s.wal_position, s.replication_lag),
                 (Some(4), Some(2000), Some(500))
             );
+            assert_eq!(s.quorum_n, Some(1));
         }
         let mut unknown = snapshot();
+        unknown.quorum_n = None;
         unknown.timeline = None;
         unknown.wal_position = None;
         unknown.replication_lag = None;
@@ -305,5 +314,6 @@ mod tests {
             (s.timeline, s.wal_position, s.replication_lag),
             (None, None, None)
         );
+        assert_eq!(s.quorum_n, None);
     }
 }

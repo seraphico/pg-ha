@@ -3,7 +3,8 @@
 
 use tracing::{error, info, warn};
 
-use crate::cluster::SyncState;
+use crate::cluster::{SyncKind, SyncState};
+use crate::synchronous_mode::SynchronousMode;
 
 use super::helpers::OwnEligibility;
 use super::identity::{self, ElectionStance, PgIdentity, election_stance};
@@ -12,16 +13,26 @@ use super::vote::VoteGate;
 use super::{CycleResult, Ha};
 use crate::timeline_files::ACCEPT_TIMELINE_LOSS_FILE;
 
+/// Does `/sync` say that acknowledged commits live only on a voter quorum
+/// (`kind: quorum` with at least one voter)? Keyed on the stored state, not on
+/// the configured mode: after `quorum -> async` (T7) `/sync` keeps the voters
+/// until the executor has taken it back, and a leader lost in that window left
+/// commits acknowledged under `ANY n` on some voters only.
+pub(crate) fn quorum_sync_in_force(sync_state: Option<&SyncState>) -> bool {
+    sync_state.is_some_and(|s| s.kind == SyncKind::Quorum && !s.sync_standby_names().is_empty())
+}
+
 /// Whether `name` may acquire the leader lock under current sync settings.
 ///
-/// When sync mode is off, always true. When on, only names listed in
-/// `/sync.sync_standby` are allowed; missing/empty/`*` means nobody.
+/// When sync mode is `async` and `/sync` is not a quorum one with voters,
+/// always true. Otherwise only names listed in `/sync.sync_standby` are
+/// allowed; missing/empty/`*` means nobody.
 pub(crate) fn sync_failover_allowed(
     name: &str,
-    sync_mode_enabled: bool,
+    mode: SynchronousMode,
     sync_state: Option<&SyncState>,
 ) -> bool {
-    if !sync_mode_enabled {
+    if !mode.is_synchronous() && !quorum_sync_in_force(sync_state) {
         return true;
     }
     let Some(state) = sync_state else {
@@ -38,12 +49,27 @@ pub(crate) fn sync_failover_allowed(
 }
 
 impl Ha {
+    /// The stored `/config` is invalid and no valid one was ever applied, so
+    /// whether synchronous replication is wanted is unknown. Every
+    /// synchronous-replication and election decision waits for a fix.
+    pub(super) fn sync_config_unresolved(&self) -> bool {
+        self.dynamic_config_state.sync_config_unresolved()
+    }
+
     /// Cluster has no leader — run election
     pub(super) async fn process_unhealthy_cluster(&mut self) -> CycleResult {
         if self.is_paused {
             return CycleResult::Follower("no action in pause mode (cluster has no leader)".into());
         }
 
+        // No valid /config was ever applied and the stored one is invalid:
+        // nobody knows whether synchronous replication is wanted, so no
+        // election (a promotion without the /sync gate could lose commits).
+        if self.sync_config_unresolved() {
+            return CycleResult::Follower(
+                "invalid /config in DCS and no valid configuration known: not campaigning".into(),
+            );
+        }
         // D6 / 2A first: data of an older history generation never
         // campaigns, and is never rebuilt by rewinding it (D5 Rebuild).
         if let Some(r) = self.enforce_generation().await {
@@ -199,10 +225,7 @@ impl Ha {
             if candidate == self.config.name {
                 let allowed = sync_failover_allowed(
                     &self.config.name,
-                    self.dynamic_config_state
-                        .last_config
-                        .synchronous_mode
-                        .unwrap_or(false),
+                    self.dynamic_config_state.last_config.sync_mode(),
                     self.cluster.sync_state.as_ref(),
                 );
                 if allowed {
@@ -234,6 +257,7 @@ impl Ha {
         // runs before the lease anchor is read, so a slow vote never shortens
         // the lease. Priority clusters get `NotApplicable` without any I/O.
         if should_attempt && let VoteGate::Refuse(why) = self.quorum_vote().await {
+            self.note_unelectable_quorum(&why);
             self.is_leader = false;
             return CycleResult::Follower(why);
         }
@@ -332,14 +356,35 @@ impl Ha {
     /// other than this node who is allowed to campaign? Checked before
     /// demotion: the stepped-down leader is excluded, so "no" means the
     /// cluster would be left with no one who may take the lock.
+    ///
+    /// SB-13: under a quorum `/sync` the successor must also be able to win
+    /// the vote (`quorum_win_refusal`), or the demotion would strand the cluster.
     pub(super) fn has_switchover_successor(&self) -> bool {
-        let sync_mode = self
-            .dynamic_config_state
-            .last_config
-            .synchronous_mode
-            .unwrap_or(false);
-        self.cluster.members.iter().any(|member| {
-            member.name != self.config.name
+        self.switchover_successors()
+            .any(|member| self.quorum_win_refusal(&member.name).is_none())
+    }
+
+    /// Why a no-candidate switchover has no successor, when members would
+    /// qualify but none can win the quorum vote. `None` otherwise.
+    pub(super) fn switchover_quorum_refusal(&self) -> Option<String> {
+        let mut first = None;
+        for member in self.switchover_successors() {
+            match self.quorum_win_refusal(&member.name) {
+                None => return None,
+                refusal => first = first.or(refusal),
+            }
+        }
+        first
+    }
+
+    /// Members that may campaign after a no-candidate switchover, ignoring the
+    /// quorum vote.
+    fn switchover_successors(&self) -> impl Iterator<Item = &crate::cluster::Member> {
+        let unresolved = self.sync_config_unresolved();
+        let sync_mode = self.dynamic_config_state.last_config.sync_mode();
+        self.cluster.members.iter().filter(move |member| {
+            !unresolved
+                && member.name != self.config.name
                 && !member.is_nofailover()
                 && member.failover_priority() != 0
                 && member.state == crate::cluster::MemberState::Running
@@ -373,12 +418,11 @@ impl Ha {
         if !self.postgresql.is_running() {
             return false;
         }
+        if self.sync_config_unresolved() {
+            return false;
+        }
 
-        let sync_mode = self
-            .dynamic_config_state
-            .last_config
-            .synchronous_mode
-            .unwrap_or(false);
+        let sync_mode = self.dynamic_config_state.last_config.sync_mode();
         if !sync_failover_allowed(
             &self.config.name,
             sync_mode,
@@ -507,6 +551,7 @@ impl Ha {
 mod sync_failover_tests {
     use super::sync_failover_allowed;
     use crate::cluster::SyncState;
+    use crate::synchronous_mode::SynchronousMode;
 
     fn sync(leader: &str, standbys: Option<&str>) -> SyncState {
         SyncState {
@@ -519,29 +564,79 @@ mod sync_failover_tests {
 
     #[test]
     fn sync_off_allows_anyone() {
-        assert!(sync_failover_allowed("node3", false, None));
+        assert!(sync_failover_allowed("node3", SynchronousMode::Async, None));
         assert!(sync_failover_allowed(
             "node3",
-            false,
+            SynchronousMode::Async,
             Some(&sync("node1", Some("node2")))
+        ));
+    }
+
+    fn quorum_sync(standbys: Option<&str>) -> SyncState {
+        SyncState {
+            kind: crate::cluster::SyncKind::Quorum,
+            ..sync("old", standbys)
+        }
+    }
+
+    /// SB-13 PR4 gap 1: a `kind: quorum` `/sync` with voters restricts the
+    /// election whatever the configured mode says (quorum -> async, T7 not
+    /// done; quorum -> sync, T9 not done).
+    #[test]
+    fn quorum_sync_state_restricts_every_mode() {
+        let s = quorum_sync(Some("node2,node3"));
+        for mode in [
+            SynchronousMode::Async,
+            SynchronousMode::Sync,
+            SynchronousMode::Quorum,
+        ] {
+            assert!(sync_failover_allowed("node2", mode, Some(&s)), "{mode}");
+            assert!(sync_failover_allowed("NODE3", mode, Some(&s)), "{mode}");
+            assert!(!sync_failover_allowed("node4", mode, Some(&s)), "{mode}");
+        }
+    }
+
+    /// Async clusters are unaffected: no `/sync`, an empty one, or a quorum
+    /// one without voters.
+    #[test]
+    fn async_mode_ignores_a_quorum_sync_state_without_voters() {
+        let a = SynchronousMode::Async;
+        assert!(sync_failover_allowed("node4", a, None));
+        assert!(sync_failover_allowed("node4", a, Some(&quorum_sync(None))));
+        assert!(sync_failover_allowed(
+            "node4",
+            a,
+            Some(&quorum_sync(Some("")))
+        ));
+        assert!(sync_failover_allowed(
+            "node4",
+            a,
+            Some(&quorum_sync(Some(" , ")))
+        ));
+        // Pinned: a Priority `/sync` that still names a sync standby does not
+        // restrict async mode (open item, see the PR4 gap-fix commit).
+        assert!(sync_failover_allowed(
+            "node4",
+            a,
+            Some(&sync("old", Some("node2")))
         ));
     }
 
     #[test]
     fn sync_on_missing_state_denies() {
-        assert!(!sync_failover_allowed("node2", true, None));
+        assert!(!sync_failover_allowed("node2", SynchronousMode::Sync, None));
     }
 
     #[test]
     fn sync_on_empty_standby_denies() {
         assert!(!sync_failover_allowed(
             "node2",
-            true,
+            SynchronousMode::Sync,
             Some(&sync("node1", None))
         ));
         assert!(!sync_failover_allowed(
             "node2",
-            true,
+            SynchronousMode::Sync,
             Some(&sync("node1", Some("")))
         ));
     }
@@ -550,12 +645,12 @@ mod sync_failover_tests {
     fn sync_on_star_placeholder_denies_all() {
         assert!(!sync_failover_allowed(
             "node2",
-            true,
+            SynchronousMode::Sync,
             Some(&sync("node1", Some("*")))
         ));
         assert!(!sync_failover_allowed(
             "*",
-            true,
+            SynchronousMode::Sync,
             Some(&sync("node1", Some("*")))
         ));
     }
@@ -563,8 +658,20 @@ mod sync_failover_tests {
     #[test]
     fn sync_on_listed_member_allowed() {
         let state = sync("node1", Some("node2,node3"));
-        assert!(sync_failover_allowed("node2", true, Some(&state)));
-        assert!(sync_failover_allowed("NODE3", true, Some(&state))); // case-insensitive via matches
-        assert!(!sync_failover_allowed("node4", true, Some(&state)));
+        assert!(sync_failover_allowed(
+            "node2",
+            SynchronousMode::Sync,
+            Some(&state)
+        ));
+        assert!(sync_failover_allowed(
+            "NODE3",
+            SynchronousMode::Sync,
+            Some(&state)
+        )); // case-insensitive via matches
+        assert!(!sync_failover_allowed(
+            "node4",
+            SynchronousMode::Sync,
+            Some(&state)
+        ));
     }
 }
