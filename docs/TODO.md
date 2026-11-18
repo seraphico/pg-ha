@@ -37,7 +37,7 @@ pg-ha 是一个用 Rust 编写的 PostgreSQL 高可用方案，对标 Patroni �
 
 ## P0 — 阻塞上线（必须在生产部署前完成）
 
-编号 13、14 仍开放；编号 15（成员 `conn_url` 含密码）已由 SB-07 Option A 闭合。编号 1（REST API TLS，SB-03）与编号 2 已完成；编号 2 留在这里是因为同步复制的 Quorum 运维文档、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
+编号 13、14 仍开放；编号 15（成员 `conn_url` 含密码）已由 SB-07 Option A 闭合。编号 1（REST API TLS，SB-03）与编号 2 已完成；编号 2 留在这里是因为同步复制的 Quorum 已知限制（SB-36 后续）、选举延迟阈值和 `replication_lag` 还挂在它下面。13–15 使用文末编号，避免打乱已经写在别处的「TODO #1」。
 
 ### 1. REST API TLS 支持 ✅ 已完成（SB-03）
 
@@ -94,7 +94,7 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 
 **仍开放**：
 
-- Quorum 模式的运维文档：`synchronous_mode: "quorum"` 已可选（SB-13 PR4）；`/wal`、mark 与 gate 语义、僵尸主库警告和推荐拓扑的完整说明仍待补写
+- ~~Quorum 模式的运维文档~~ ✅ 已补（SB-13 PR5）：`/wal`、mark 与 gate、僵尸主库警告、选型和 `synchronous_node_count` 取值见[运维指南](operations-guide.md#法定人数同步复制quorum)。仍开放：failover 之后或成员记录已过期的投票节点回来时 `q` 暂时等于 `|V|`，此时丢了主库集群会一直没有主库，还没有受支持的手工恢复步骤（SB-36 后续）
 - ~~**SB-11**~~ ✅ 已完成：`maximum_lag_on_failover` 已接入 `is_healthiest_node`——参照是当轮已通过资格/running/sync 闸门的候选集合（含自身）里最大的 `wal_position`，落后超阈值的候选（含自身）不参选，`wal_position` 未知者保守排除；阈值 `None`（默认）功能关闭、与接入前逐字节等价（与同步侧的 `maximum_lag_on_syncnode` 一致）
 - ~~**SB-10**~~ ✅ 已完成：`/patroni`、`/primary`、`/replica` 和 `/metrics` 的 `timeline`、`wal_position`、`replication_lag` 由 HA 循环经 `ApiSnapshot` 填充（复用 `touch_member` 的 `wal_status`，不多一次查询）。lag = leader 最后发布的位置减本节点位置（字节，最小 0，近似：写入重时最多少约一个 `loop_wait`，衡量已收到而非已应用）；主库为 0，未知为 `null` / 指标省略；`/replica?lag=` 对未知 fail-open
 

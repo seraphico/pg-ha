@@ -380,7 +380,7 @@ bootstrap:
   post_bootstrap_sql: [<string>]   # bootstrap 后执行的 SQL 语句
 ```
 
-同步复制相关标签：`tags.nosync`（排除同步备库）、`tags.sync_priority`（同步优先级）。每个节点在每次心跳时把自己的 `tags` 写进 DCS 成员记录，`GET /patroni` 也会返回它们；其他节点用发布出来的值做选举、候选校验、同步备库选择和级联拓扑。运行时也可通过 `PATCH /config` 开关同步复制，详见 [运维指南](operations-guide.md#同步复制)。
+同步复制相关标签：`tags.nosync`（排除同步备库）、`tags.sync_priority`（同步优先级）。每个节点在每次心跳时把自己的 `tags` 写进 DCS 成员记录，`GET /patroni` 也会返回它们；其他节点用发布出来的值做选举、候选校验、同步备库选择和级联拓扑。运行时也可通过 `PATCH /config` 开关同步复制，详见 [运维指南](operations-guide.md#同步复制)。`synchronous_mode: "quorum"` 的要求、启用方法和已知限制见[法定人数同步复制](operations-guide.md#法定人数同步复制quorum)。
 
 ### 环境变量
 
@@ -491,6 +491,7 @@ REST 管理 API 也支持内建 HTTPS，配置形状与 `raft.tls` 的服务端�
 
 代理对 `/primary`、`/replica` 的探活使用同一套 `restapi.tls`。未配置时走明文 `http://`。配置了 `cert` + `key` 后探活改为 `https://`，并用 `ca_cert` 校验服务器证书。`require_client_cert: true` 时，探活出示本节点自己的 REST 服务端证书。
 
+**quorum 投票用同一套材料。** `synchronous_mode: "quorum"` 时，failover 候选节点用同一份 `restapi.tls` 向每个投票节点请求 `GET /wal`（HTTPS 用 `ca_cert` 校验；mTLS 下出示自己的服务端证书作为客户端证书）。`GET /wal` 不要求 Basic Auth。因此每个节点都必须能访问其它每个节点的 8008 端口，且每个节点的证书都要被其它每个节点接受（mTLS 下证书还要允许 `clientAuth`）。详见[运维指南](operations-guide.md#法定人数同步复制quorum)。
 **所有节点的 REST TLS 模式必须一致**：要么全部明文，要么全部 HTTPS（server-auth），要么全部 mTLS。不支持混合集群。每个节点的代理都用自己的 `restapi.tls` 去探测所有成员，并把成员发布的 `api_url` 协议改写成本节点的协议；如果某个成员发布的协议与本节点不一致，日志里会对该成员告警一次（`All nodes must use the same restapi.tls mode`），但行为仍按本节点的协议继续，不会让混合集群真正可用。
 
 **代理探活的证书要求**：
@@ -686,7 +687,7 @@ curl -s http://localhost:8008/cluster | jq .
 | 端口 | 协议 | 方向 | 用途 |
 |------|------|------|------|
 | 5432 | TCP | 入站 | PostgreSQL 客户端连接（直连） |
-| 8008 | HTTP 或 HTTPS | 入站 | REST API（健康检查无需认证；管理端点在配置了 `restapi.username` 时要 Basic Auth）。可配置 `restapi.tls` 启用 HTTPS / mTLS，未配置时为明文 HTTP |
+| 8008 | HTTP 或 HTTPS | 入站 | REST API（健康检查和 quorum 投票读取的 `GET /wal` 无需认证；管理端点在配置了 `restapi.username` 时要 Basic Auth）。可配置 `restapi.tls` 启用 HTTPS / mTLS，未配置时为明文 HTTP |
 | 2380 | HTTP 或 HTTPS | 节点间 | Raft RPC。未配置 `raft.tls` 时为 HTTP，配置后为 HTTPS |
 | 6432 | TCP | 入站 | Proxy RW（路由到 Primary） |
 | 6433 | TCP | 入站 | Proxy RO（负载均衡到 Replica） |
