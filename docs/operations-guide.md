@@ -413,7 +413,7 @@ curl -u admin:secret -X POST http://localhost:8008/restart
 ttl >= loop_wait + retry_timeout + watchdog.safety_margin，且 retry_timeout >= 1
 ```
 
-原因：锁持有者在最后一次续锁**开始前**的时刻 + `ttl` − `safety_margin` 秒内没有再次续锁成功，就自己停掉 PostgreSQL（leader 租约，见 [invariants.md](invariants.md) 1a「leader 租约」）；健康的主库要在这段时间里完成一轮 HA 周期（`loop_wait`）和一次续锁写（每次 DCS 写最多等 `retry_timeout` 秒）。默认值 30 ≥ 10 + 10 + 5，docker 开发集群 15 ≥ 5 + 5 + 5。
+原因：锁持有者在最后一次续锁**开始前**的时刻 + `ttl` − `safety_margin` 秒内没有再次续锁成功，就自己停掉 PostgreSQL（leader 租约，见 [invariants.md](invariants.md) 1a「leader 租约」）；健康的主库要在这段时间里完成一轮 HA 周期（`loop_wait`）和一次续锁写（每次 DCS 写最多等 `retry_timeout` 秒，其中包含等待新的 Raft leader）。默认值 30 ≥ 10 + 10 + 5，docker 开发集群 15 ≥ 5 + 5 + 5。
 
 - 静态配置（`pg-ha.yml`、环境变量覆盖、`bootstrap.dcs`）不满足时 pg-ha 拒绝启动，`--validate-config` 同样报错：
   ```text
@@ -432,6 +432,7 @@ ttl >= loop_wait + retry_timeout + watchdog.safety_margin，且 retry_timeout >=
 | 日志 | 含义 |
 |------|------|
 | WARN `DCS write timed out after <n>s (retry_timeout); treating it as failed` | 一次 DCS 写在 `retry_timeout` 内没有完成（例如本节点是失去多数派的 Raft leader），按写失败处理。这次写之后仍可能提交，这是安全的（[invariants.md](invariants.md) 1a） |
+| DEBUG `DCS write retry <n>: ...`，INFO `DCS write succeeded after <n> retries in <ms> ms` | Raft leader 未知或已消失时，写每 250 毫秒重试。Raft leader 重启或停止期间，主库以前会记 `DCS error during lock renewal: ... Forward to leader failed` 并降级；现在新 leader 在 `retry_timeout` 内出现就保住锁，没出现时该错误照旧 |
 | ERROR `Leader lease expired before the lock renewal completed; fencing PostgreSQL (immediate stop) without waiting for the DCS` | 租约到期，本轮 HA 周期被放弃，PostgreSQL 以 `immediate` 模式停库 |
 | ERROR `Leader lease expired before pg_ctl promote; fencing PostgreSQL (immediate stop)` / `Leader lease expired before reporting the leader role; fencing PostgreSQL (immediate stop)` | 续锁返回成功，但返回时租约已经到期（续锁写太慢），不 promote、不报告主库，按失去锁围栏 |
 | ERROR `Leader lease already expired at shutdown; skipping drain, CHECKPOINT and lock release, fencing PostgreSQL (immediate stop)` | 关停时租约已到期，直接围栏停库 |
