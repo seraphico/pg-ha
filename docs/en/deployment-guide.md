@@ -485,7 +485,7 @@ Identity therefore follows membership: a new node's certificate is accepted as s
 - Do not use wildcard SANs (such as `*.db.example.com`): they match every member host under that domain.
 - The SAN must have the same form as the host written in `self_addr` / `partner_addrs` (an IP needs an IP SAN, a host name needs a DNS SAN).
 - Use a separate CA for Raft. REST, pg-ha-ctl and Prometheus certificates from the same CA are rejected by Raft as long as they carry no member-host SAN, but a REST server certificate that has a member SAN and the `clientAuth` usage would be accepted. If you share a CA, issue REST/ctl/Prometheus certificates without member SANs.
-- Adding a node: issue its certificate, add it to `partner_addrs` on the nodes, and join it to the membership as described in the [operations guide](operations-guide.md); its certificate is accepted once it is a member. Rotating certificates: they are loaded once at startup with no hot reload, so replace the files node by node and restart the process.
+- Adding a node: issue its certificate (SAN = that node's host only) and add the host to `partner_addrs` on every node; a certificate is accepted once its host is in `partner_addrs` or in the live Raft membership. A step-by-step procedure for adding a node to a running cluster is not documented yet. Rotating certificates: they are loaded once at startup with no hot reload, so replace the files node by node and restart the process.
 
 **Development mode (development/testing only).** With no `raft.tls` and `raft.allow_insecure_raft: true` (`PG_HA_RAFT_ALLOW_INSECURE=true` in the container), Raft RPC is unauthenticated plaintext HTTP and a WARN is logged at startup. Do not use it in production.
 

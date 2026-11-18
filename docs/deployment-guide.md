@@ -484,7 +484,7 @@ sudo chmod 644 /etc/pg-ha/tls/*.crt
 - 不要用通配符 SAN（如 `*.db.example.com`）：它匹配该域下的每个成员主机。
 - 证书的 SAN 要和 `self_addr` / `partner_addrs` 里写的主机形式一致（写 IP 就要 IP SAN，写主机名就要 DNS SAN）。
 - Raft 建议使用独立的 CA。同一个 CA 签发的 REST、pg-ha-ctl、Prometheus 证书，只要不带成员主机的 SAN 就会被 Raft 拒绝；但带有成员 SAN 且含 `clientAuth` 用途的 REST 服务端证书会被接受。若共用 CA，请给 REST/ctl/Prometheus 签发不含成员 SAN 的证书。
-- 扩容：为新节点签发证书，把它加入各节点的 `partner_addrs`，并按[运维指南](operations-guide.md)加入成员；加入成员后它的证书即被接受。换证书：证书启动时加载一次，没有热重载，逐个节点替换文件后重启进程。
+- 扩容：为新节点签发证书（SAN 只写该节点的主机名），并把它的主机加入每个节点的 `partner_addrs`；主机出现在 `partner_addrs` 或实时 Raft 成员中后，它的证书即被接受。向运行中的集群添加节点的完整步骤目前还没有文档。换证书：证书启动时加载一次，没有热重载，逐个节点替换文件后重启进程。
 
 **开发模式（仅限开发/测试）。** 不配 `raft.tls`、并设置 `raft.allow_insecure_raft: true`（容器里是 `PG_HA_RAFT_ALLOW_INSECURE=true`）时，Raft RPC 为明文 HTTP 且无任何认证，启动时记一条 WARN。生产环境不要用。
 
