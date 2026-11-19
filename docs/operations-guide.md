@@ -59,7 +59,7 @@ curl -s http://localhost:8008/patroni | jq .
 
 `/patroni` 的 `role` / `state` 是 Rust Debug 写法（`Primary`、`Replica`、`Running`），和 `/cluster` 的小写角色不是同一套字符串。
 
-健康检查（`/primary`、`/replica`、`/health`、`/liveness`、`/sync`、`/async`、`/cluster`、`/patroni`、`/metrics`、`/history`）和 `/wal`（quorum 投票时节点之间读取的实时 WAL 位置，见「法定人数同步复制」）不要求认证。`/switchover`、`/failover`、`/restart`、`/reinitialize`、`/config` 在 YAML 里设置了 `restapi.username` 时要求 HTTP Basic Auth。Docker 入口默认用户名 `admin`、密码 `secret`。
+健康检查（`/primary`、`/replica`、`/health`、`/liveness`、`/sync`、`/async`、`/cluster`、`/patroni`、`/metrics`、`/history`）和 `/wal`（quorum 投票时节点之间读取的实时 WAL 位置，见「法定人数同步复制」）不要求认证。`/switchover`、`/failover`、`/restart`、`/reinitialize`、`/config` 以及 `POST /vote`（quorum 投票请求，节点之间用本节点的 REST 凭据发送）在 YAML 里设置了 `restapi.username` 时要求 HTTP Basic Auth。Docker 入口默认用户名 `admin`、密码 `secret`。
 
 > **TLS / HTTPS**：下面的示例用 `http://`，是 REST API 的默认明文形态。配置了 `restapi.tls`（`cert` + `key`）后，REST API 改为 HTTPS，所有示例请把 `http://` 换成 `https://`，并用 `--cacert <ca.crt>` 提供信任根；开启 mTLS（`require_client_cert: true`）时还需 `--cert <client.crt> --key <client.key>`。代理探活 `/primary` 和 `/replica` 使用同一套材料：HTTPS 时信任 `ca_cert`，mTLS 时出示本节点自己的服务端证书。**Basic Auth 凭据只有在启用 TLS 后才在传输中受保护**——明文 HTTP 下凭据与管理命令都以明文传输，生产环境请为 REST API 启用 TLS（配置见部署指南的「REST API TLS / mTLS」）。
 
@@ -578,7 +578,7 @@ switchover 和带 `candidate` 的 failover 会用同样的输入在动作之前�
 候选节点向投票节点要的不是一次普通读取。投票节点收到 `POST /vote` 之后依次做：从 `postgresql.auto.conf` 去掉 `primary_conninfo`（重启后仍然有效）并 reload；等 `pg_stat_wal_receiver` 没有行、生效的 `primary_conninfo` 为空，确认它已不再从旧主复制；这时才读自己的 WAL 位置，读完再确认一次；最后返回和 `GET /wal` 相同的 JSON，另加 `"fenced": true`。
 
 - 任何一步不能确认（超时、PostgreSQL 低于 13 因而无法 reload `primary_conninfo`、DCS 不可用、并发已满）都返回 `503`，候选节点按没有这一票处理。没有被确认的投票节点不计票，所以确认不了的投票节点太多时不会 failover（没有主库，也不丢提交）。
-- 只有 DCS 里 leader 锁空闲时才处理；锁被持有时返回 `409`。因为它会改配置。和 `/wal` 一样不需要认证，并发上限与 `/wal` 共用。
+- 只有 DCS 里 leader 锁空闲时才处理；锁被持有时返回 `409`。因为它会改配置。并发上限与 `/wal` 共用。和 `/wal` 不同，它会改状态，所以与 `/switchover` 受同样的保护：配置了 `restapi.username` 和 `restapi.password` 时要求 HTTP Basic Auth（否则返回 `401`），启用 REST mTLS 时调用方必须出示客户端证书。候选节点会带上本节点自己的 `restapi` 凭据和客户端证书，所以所有节点必须使用相同的 REST 凭据和 CA。如果对端返回 `401` 或 `403`，候选节点会在日志里记录指明该节点的错误；请修正凭据，否则没有投票能成功，也就没有 failover。没有配置 REST 认证时，`/vote` 和其它修改类端点一样是开放的。
 - 候选节点不重试这个请求。
 - 被围栏的投票节点由跟随循环指向下一个持锁者（缺少 `primary_conninfo` 视为上游已变）。新主当选后它们重新跟随新主；如果旧主在锁过期之后又回来了，它们会改回跟随旧主，每次改动重启一次 PostgreSQL（受 `is_recently_reconfigured` 限流）。在有 leader 持锁之前，被围栏的投票节点不复制。
 

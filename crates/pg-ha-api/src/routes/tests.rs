@@ -1188,6 +1188,51 @@ mod vote_endpoint {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
+    fn auth_app() -> (axum::Router, Arc<AtomicUsize>) {
+        let (f, calls) = fencer(Script::Ok);
+        let app = build_router_with_commands(
+            test_state().with_vote_fencer(f),
+            None,
+            AuthConfig {
+                username: Some("u".into()),
+                password: Some("p".into()),
+            },
+        );
+        (app, calls)
+    }
+
+    async fn post_vote_with(app: axum::Router, authorization: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().method("POST").uri("/vote");
+        if let Some(value) = authorization {
+            req = req.header("authorization", value);
+        }
+        app.oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn requires_basic_auth_when_configured() {
+        let (app, calls) = auth_app();
+        assert_eq!(
+            post_vote_with(app.clone(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // base64("u:wrong")
+        assert_eq!(
+            post_vote_with(app.clone(), Some("Basic dTp3cm9uZw==")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no fence without auth");
+        // base64("u:p")
+        assert_eq!(
+            post_vote_with(app, Some("Basic dTpw")).await,
+            StatusCode::OK
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn without_fencer_is_503() {
         let (status, _) = post_vote(build_router(test_state())).await;

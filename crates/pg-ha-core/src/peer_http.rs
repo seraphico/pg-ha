@@ -83,14 +83,22 @@ struct WalBody {
 /// Every failure is returned as a value; none aborts the election cycle.
 pub struct ReqwestPeerWalProbe {
     client: reqwest::Client,
+    /// REST Basic Auth credentials; `/vote` requires them when configured.
+    basic_auth: Option<(String, String)>,
 }
 
 impl ReqwestPeerWalProbe {
     /// `tls` is this node's own REST TLS material, used to verify the peer
-    /// (CA) and, with mTLS, to present a client certificate.
-    pub fn new(tls: Option<&RestApiTlsConfig>) -> anyhow::Result<Self> {
+    /// (CA) and, with mTLS, to present a client certificate. `basic_auth` is
+    /// this node's `restapi` username/password, sent on every vote request
+    /// (peers share the same REST credentials).
+    pub fn new(
+        tls: Option<&RestApiTlsConfig>,
+        basic_auth: Option<(String, String)>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             client: build_peer_client(tls, PEER_REQUEST_TIMEOUT, "vote client")?,
+            basic_auth,
         })
     }
 }
@@ -107,13 +115,21 @@ fn map_reqwest_error(err: reqwest::Error) -> PeerProbeError {
 impl PeerWalProbe for ReqwestPeerWalProbe {
     async fn read(&self, target: &PeerTarget) -> Result<WalPosition, PeerProbeError> {
         let url = format!("{}/vote", target.api_url.trim_end_matches('/'));
-        let response = self
-            .client
-            .post(&url)
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
+        let mut request = self.client.post(&url);
+        if let Some((user, pass)) = &self.basic_auth {
+            request = request.basic_auth(user, Some(pass));
+        }
+        let response = request.send().await.map_err(map_reqwest_error)?;
         let status = response.status();
+        if matches!(status.as_u16(), 401 | 403) {
+            tracing::error!(
+                peer = %target.name,
+                url = %url,
+                status = status.as_u16(),
+                "peer rejected POST /vote credentials; check restapi.username/password and REST mTLS \
+                 on every node, otherwise no vote can succeed and quorum cannot be reached"
+            );
+        }
         if status != reqwest::StatusCode::OK {
             return Err(PeerProbeError::Status(status.as_u16()));
         }
@@ -177,7 +193,7 @@ mod tests {
 
     async fn read_from(reply: String, name: &str) -> Result<WalPosition, PeerProbeError> {
         let api_url = serve_once(reply).await;
-        let probe = ReqwestPeerWalProbe::new(None).unwrap();
+        let probe = ReqwestPeerWalProbe::new(None, None).unwrap();
         probe
             .read(&PeerTarget {
                 name: name.into(),
@@ -209,7 +225,7 @@ mod tests {
             let _ = sock.shutdown().await;
             String::from_utf8_lossy(&buf[..n]).to_string()
         });
-        let probe = ReqwestPeerWalProbe::new(None).unwrap();
+        let probe = ReqwestPeerWalProbe::new(None, None).unwrap();
         probe
             .read(&PeerTarget {
                 name: "node2".into(),
@@ -220,6 +236,60 @@ mod tests {
         let request = seen.await.unwrap();
         assert!(request.starts_with("POST /vote "), "{request}");
     }
+    /// Capture the raw request of one `POST /vote` sent by a probe built with `auth`.
+    async fn captured_request(auth: Option<(String, String)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).await.unwrap();
+            let _ = sock
+                .write_all(http("401 Unauthorized", "{}").as_bytes())
+                .await;
+            let _ = sock.shutdown().await;
+            String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase()
+        });
+        let got = ReqwestPeerWalProbe::new(None, auth)
+            .unwrap()
+            .read(&PeerTarget {
+                name: "node2".into(),
+                api_url: format!("http://{addr}"),
+            })
+            .await;
+        assert_eq!(got.unwrap_err(), PeerProbeError::Status(401));
+        seen.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn vote_request_carries_basic_auth_header() {
+        let request = captured_request(Some(("alice".into(), "secret".into()))).await;
+        // base64("alice:secret")
+        assert!(
+            request.contains("authorization: basic ywxpy2u6c2vjcmv0"),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vote_request_without_credentials_has_no_auth_header() {
+        let request = captured_request(None).await;
+        assert!(!request.contains("authorization:"), "{request}");
+    }
+
+    #[test]
+    fn vote_client_with_mtls_loads_the_client_certificate() {
+        // require_client_cert makes the vote client read cert+key; missing
+        // files prove the identity path is taken.
+        let cfg = tls(None, true, "/nonexistent/pg-ha-test/server.key");
+        let err = ReqwestPeerWalProbe::new(Some(&cfg), None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("failed to read REST certificate"), "{err}");
+    }
+
     #[tokio::test]
     async fn probe_maps_503_to_status() {
         let got = read_from(http("503 Service Unavailable", "{}"), "node2").await;
@@ -258,7 +328,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let probe = ReqwestPeerWalProbe::new(None).unwrap();
+        let probe = ReqwestPeerWalProbe::new(None, None).unwrap();
         let got = probe
             .read(&PeerTarget {
                 name: "node2".into(),

@@ -230,6 +230,10 @@ async fn main() -> anyhow::Result<()> {
     let (mut ha, cmd_tx) = Ha::new(config.clone(), dcs.clone(), postgresql);
     ha.set_peer_probe(Arc::new(pg_ha_core::peer_http::ReqwestPeerWalProbe::new(
         config.restapi.tls.as_ref(),
+        match (&config.restapi.username, &config.restapi.password) {
+            (Some(u), Some(p)) => Some((u.clone(), p.clone())),
+            _ => None,
+        },
     )?));
 
     // ─── Initialize REST API ───

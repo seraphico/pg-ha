@@ -68,8 +68,7 @@ pub fn build_router_with_commands(
         .route("/cluster", get(get_cluster))
         .route("/metrics", get(get_metrics))
         .route("/history", get(get_history))
-        .route("/wal", get(wal_endpoint))
-        .route("/vote", post(vote_endpoint));
+        .route("/wal", get(wal_endpoint));
 
     // Management endpoints (protected by Basic Auth if configured)
     let mgmt_routes = Router::new()
@@ -78,6 +77,7 @@ pub fn build_router_with_commands(
             post(post_switchover).delete(delete_switchover),
         )
         .route("/failover", post(post_failover))
+        .route("/vote", post(vote_endpoint))
         .route("/restart", post(post_restart))
         .route("/reinitialize", post(post_reinitialize))
         .route(

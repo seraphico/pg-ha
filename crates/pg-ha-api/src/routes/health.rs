@@ -308,8 +308,9 @@ pub(crate) async fn wal_endpoint(State(state): State<RouterState>) -> impl IntoR
 /// Any failure is a 503, which the candidate counts as "no vote".
 ///
 /// It changes configuration, so it is only served while the leader lock is
-/// free in the DCS (a candidate asks only then). Open like `/wal`, because
-/// peers do not carry Basic Auth credentials.
+/// free in the DCS (a candidate asks only then). It is a mutating endpoint, so
+/// it sits behind the same Basic Auth as `/switchover` (open when no REST
+/// credentials are configured); `GET /wal` stays open.
 pub(crate) async fn vote_endpoint(State(state): State<RouterState>) -> impl IntoResponse {
     let refuse = |status: StatusCode, msg: String| (status, Json(json!({ "error": msg })));
     let Some(fencer) = state.app.vote_fencer().cloned() else {
