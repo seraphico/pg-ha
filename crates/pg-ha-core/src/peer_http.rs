@@ -67,7 +67,7 @@ pub fn align_api_scheme(url: &str, https: bool) -> String {
     format!("{scheme}://{rest}")
 }
 
-/// Body of a peer's `GET /wal` answer.
+/// Body of a peer's `POST /vote` answer (same fields as `GET /wal`).
 #[derive(Debug, Deserialize)]
 struct WalBody {
     name: String,
@@ -76,7 +76,9 @@ struct WalBody {
     pg_in_recovery: bool,
 }
 
-/// Reads a peer's live WAL position from its REST `GET /wal` endpoint.
+/// Asks a peer for its vote at `POST /vote` (SB-40): the peer stops streaming
+/// from its upstream, confirms that, and answers with its live WAL position.
+/// The request is never retried: it is not a plain read.
 ///
 /// Every failure is returned as a value; none aborts the election cycle.
 pub struct ReqwestPeerWalProbe {
@@ -104,10 +106,10 @@ fn map_reqwest_error(err: reqwest::Error) -> PeerProbeError {
 #[async_trait]
 impl PeerWalProbe for ReqwestPeerWalProbe {
     async fn read(&self, target: &PeerTarget) -> Result<WalPosition, PeerProbeError> {
-        let url = format!("{}/wal", target.api_url.trim_end_matches('/'));
+        let url = format!("{}/vote", target.api_url.trim_end_matches('/'));
         let response = self
             .client
-            .get(&url)
+            .post(&url)
             .send()
             .await
             .map_err(map_reqwest_error)?;
@@ -193,6 +195,31 @@ mod tests {
         assert!(got.in_recovery);
     }
 
+    #[tokio::test]
+    async fn probe_asks_with_post_vote() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"name":"node2","timeline":3,"wal_position":1,"pg_in_recovery":true}"#;
+            let _ = sock.write_all(http("200 OK", body).as_bytes()).await;
+            let _ = sock.shutdown().await;
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        let probe = ReqwestPeerWalProbe::new(None).unwrap();
+        probe
+            .read(&PeerTarget {
+                name: "node2".into(),
+                api_url: format!("http://{addr}"),
+            })
+            .await
+            .unwrap();
+        let request = seen.await.unwrap();
+        assert!(request.starts_with("POST /vote "), "{request}");
+    }
     #[tokio::test]
     async fn probe_maps_503_to_status() {
         let got = read_from(http("503 Service Unavailable", "{}"), "node2").await;

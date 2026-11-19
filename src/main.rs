@@ -226,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ─── Initialize HA engine ───
     let wal_probe = Arc::new(postgresql.live_wal_probe());
+    let vote_fencer = Arc::new(postgresql.live_wal_probe());
     let (mut ha, cmd_tx) = Ha::new(config.clone(), dcs.clone(), postgresql);
     ha.set_peer_probe(Arc::new(pg_ha_core::peer_http::ReqwestPeerWalProbe::new(
         config.restapi.tls.as_ref(),
@@ -239,7 +240,8 @@ async fn main() -> anyhow::Result<()> {
         dcs.clone(),
         config.lease_timing(),
     )
-    .with_wal_probe(wal_probe);
+    .with_wal_probe(wal_probe)
+    .with_vote_fencer(vote_fencer);
     app_state.update(|s| s.set_own_tags(&config.tags)).await;
     let auth_config = AuthConfig {
         username: config.restapi.username.clone(),

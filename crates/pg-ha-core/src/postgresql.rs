@@ -31,6 +31,23 @@ pub fn redact_connstr(connstr: &str) -> String {
 /// Timeout for spawned PG connection futures.
 /// If PG is unresponsive, the task will be cancelled after this duration.
 const PG_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest the voter's fence (config write, reload, confirmation) may take.
+/// With the WAL read (`LIVE_WAL_READ_TIMEOUT`) it stays inside the 2 s a
+/// candidate waits for one voter.
+pub const VOTE_FENCE_TIMEOUT: Duration = Duration::from_millis(900);
+const FENCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// `primary_conninfo` takes effect on reload only from PostgreSQL 13.
+pub(crate) fn fence_supported(server_version_num: u32) -> bool {
+    server_version_num >= 130_000
+}
+
+/// The fence holds when no walreceiver row exists and the live
+/// `primary_conninfo` is empty. An unreadable receiver count is not confirmed.
+pub(crate) fn fence_confirmed(receiver_rows: Option<u64>, primary_conninfo: &str) -> bool {
+    receiver_rows == Some(0) && primary_conninfo.trim().is_empty()
+}
 /// Bound for one `SHOW synchronous_standby_names` (connect plus query).
 const SHOW_SYNC_NAMES_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -192,6 +209,8 @@ pub struct Postgresql {
 /// [`Postgresql::live_wal_probe`].
 pub struct PgLiveWalProbe {
     pg: Postgresql,
+    /// One vote fence at a time (each rewrites `postgresql.auto.conf`).
+    fence_lock: tokio::sync::Mutex<()>,
 }
 #[async_trait::async_trait]
 impl crate::live_wal::LiveWalProbe for PgLiveWalProbe {
@@ -204,6 +223,14 @@ impl crate::live_wal::LiveWalProbe for PgLiveWalProbe {
             .await
     }
 }
+#[async_trait::async_trait]
+impl crate::live_wal::VoteFencer for PgLiveWalProbe {
+    async fn fence_and_read(&self) -> Result<WalStatus> {
+        let _one_at_a_time = self.fence_lock.lock().await;
+        self.pg.fence_upstream_and_read().await
+    }
+}
+
 /// Internal PostgreSQL process state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgState {
@@ -1328,13 +1355,130 @@ impl Postgresql {
             Err(_) => Err(Error::Postgres("live WAL read timed out".into())),
         }
     }
+    // ───────────────── SB-40: the voter's fence ─────────────────
+
+    /// Open a connection to the local PostgreSQL (the connection task is
+    /// bounded like the other probes).
+    async fn connect_local(&self) -> Result<tokio_postgres::Client> {
+        let connstr = self.connection_string();
+        let (client, connection) = tokio_postgres::connect(&connstr, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| Error::Postgres(format!("Connection failed: {e}")))?;
+        tokio::spawn(async move {
+            match tokio::time::timeout(PG_CONNECTION_TIMEOUT, connection).await {
+                Ok(Err(e)) => debug!("Connection closed: {e}"),
+                Err(_) => warn!("PG connection task timed out after {PG_CONNECTION_TIMEOUT:?}"),
+                Ok(Ok(())) => {}
+            }
+        });
+        Ok(client)
+    }
+
+    /// First column of the first row of a simple query.
+    async fn first_value(client: &tokio_postgres::Client, sql: &str) -> Result<Option<String>> {
+        let rows = client
+            .simple_query(sql)
+            .await
+            .map_err(|e| Error::Postgres(format!("Query failed: {e}")))?;
+        for msg in rows {
+            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
+                return Ok(row.get(0).map(str::to_owned));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Is this node streaming from nobody? True when `pg_stat_wal_receiver`
+    /// has no row and the live `primary_conninfo` is empty.
+    async fn upstream_fenced(client: &tokio_postgres::Client) -> Result<bool> {
+        let rows = Self::first_value(client, "SELECT count(*) FROM pg_stat_wal_receiver").await?;
+        let conninfo = Self::first_value(client, "SELECT current_setting('primary_conninfo')")
+            .await?
+            .unwrap_or_default();
+        let receivers = rows.and_then(|v| v.parse::<u64>().ok());
+        Ok(fence_confirmed(receivers, &conninfo))
+    }
+
+    /// SB-40 voter fence: stop streaming from the current upstream, confirm it,
+    /// and only then read the WAL position.
+    ///
+    /// A standby removes `primary_conninfo` from `postgresql.auto.conf` (a
+    /// durable change: a walreceiver that is merely terminated reconnects,
+    /// and a restart keeps the fence), reloads, and waits until
+    /// `pg_stat_wal_receiver` is empty and the live `primary_conninfo` is
+    /// empty. The position is read after that, and the fence is checked once
+    /// more after the read, so an entry that arrived in between cannot be
+    /// reported as missing. Any failure is an error (no vote). A node that is
+    /// not in recovery has nothing to fence. The follow loop points the node
+    /// at the lock owner again (a missing `primary_conninfo` counts as a
+    /// changed upstream).
+    pub async fn fence_upstream_and_read(&self) -> Result<WalStatus> {
+        match tokio::time::timeout(VOTE_FENCE_TIMEOUT, self.fence_upstream()).await {
+            Ok(result) => result?,
+            Err(_) => return Err(Error::Postgres("vote fence timed out".into())),
+        }
+        let status = self
+            .wal_status_bounded(crate::live_wal::LIVE_WAL_READ_TIMEOUT)
+            .await?;
+        if status.in_recovery {
+            let client = tokio::time::timeout(VOTE_FENCE_TIMEOUT, self.connect_local())
+                .await
+                .map_err(|_| Error::Postgres("vote fence re-check timed out".into()))??;
+            if !Self::upstream_fenced(&client).await? {
+                return Err(Error::Postgres(
+                    "vote fence lost before the WAL read finished".into(),
+                ));
+            }
+        }
+        Ok(status)
+    }
+
+    async fn fence_upstream(&self) -> Result<()> {
+        if !self.is_running() {
+            return Err(Error::Postgres("PostgreSQL is not running".into()));
+        }
+        let client = self.connect_local().await?;
+        if Self::first_value(&client, "SELECT pg_is_in_recovery()")
+            .await?
+            .as_deref()
+            != Some("t")
+        {
+            return Ok(());
+        }
+        let version = Self::first_value(&client, "SHOW server_version_num")
+            .await?
+            .and_then(|v| v.parse::<u32>().ok());
+        if !version.is_some_and(fence_supported) {
+            return Err(Error::Postgres(format!(
+                "vote fence needs PostgreSQL 13 or newer (primary_conninfo is reloadable); server_version_num={version:?}"
+            )));
+        }
+        let data_dir = self.config.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::standby_config::write_standby_config(&data_dir, None)
+        })
+        .await
+        .map_err(|e| Error::Postgres(format!("fence write task failed: {e}")))?
+        .map_err(|e| Error::Postgres(format!("fence write failed: {e}")))?;
+        Self::first_value(&client, "SELECT pg_reload_conf()::text").await?;
+        loop {
+            if Self::upstream_fenced(&client).await? {
+                return Ok(());
+            }
+            tokio::time::sleep(FENCE_POLL_INTERVAL).await;
+        }
+    }
+
     /// A lightweight handle for live WAL reads that shares this instance's
     /// remembered receiver pair (so the timeline of a replica whose receiver
     /// already exited stays exact).
     pub fn live_wal_probe(&self) -> PgLiveWalProbe {
         let mut handle = Postgresql::new(self.config.clone());
         handle.last_received_wal = std::sync::Arc::clone(&self.last_received_wal);
-        PgLiveWalProbe { pg: handle }
+        PgLiveWalProbe {
+            pg: handle,
+            fence_lock: tokio::sync::Mutex::new(()),
+        }
     }
     /// Primary-side replication snapshot: each standby's flushed LSN keyed by
     /// `application_name` (= member name), plus the primary's current flush
@@ -3121,6 +3265,35 @@ mod tests {
         let pg = Postgresql::new(cfg);
         let res = pg.wal_status_bounded(Duration::from_secs(5)).await;
         assert!(res.is_err());
+    }
+    #[test]
+    fn fence_needs_pg13_and_confirmation_is_strict() {
+        assert!(!fence_supported(120_015));
+        assert!(fence_supported(130_000));
+        assert!(fence_supported(160_002));
+        assert!(fence_confirmed(Some(0), ""));
+        assert!(fence_confirmed(Some(0), "  "));
+        assert!(!fence_confirmed(Some(1), ""));
+        assert!(!fence_confirmed(Some(0), "host=old port=5432"));
+        assert!(!fence_confirmed(None, ""));
+    }
+    #[tokio::test]
+    async fn vote_fence_not_running_is_err_and_writes_nothing() {
+        use crate::live_wal::VoteFencer;
+        let dir = std::env::temp_dir().join(format!("pg-ha-sb40-fence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = test_config();
+        cfg.data_dir = dir.clone();
+        let pg = Postgresql::new(cfg);
+        let err = pg
+            .live_wal_probe()
+            .fence_and_read()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not running"), "{err}");
+        assert!(!dir.join("postgresql.auto.conf").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[tokio::test]
     async fn live_probe_not_running_is_err() {

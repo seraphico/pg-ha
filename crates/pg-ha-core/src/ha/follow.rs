@@ -552,6 +552,19 @@ pub(super) fn needs_upstream_reconfig(current: Option<&str>, expected_host: &str
 mod tests {
     use super::*;
 
+    /// SB-40: a voter that fenced has no `primary_conninfo`. Whoever holds the
+    /// lock next (a different winner, or the old leader back) is followed again.
+    #[test]
+    fn fenced_voter_follows_whoever_holds_the_lock() {
+        let fenced = crate::standby_config::rewrite_auto_conf(
+            "# pg-ha managed standby configuration\nprimary_conninfo = 'host=old port=5432'\nrecovery_target_timeline = 'latest'\n",
+            None,
+        );
+        assert!(!fenced.contains("primary_conninfo"));
+        for holder in ["new-leader", "old"] {
+            assert!(needs_upstream_reconfig(None, holder));
+        }
+    }
     #[test]
     fn needs_upstream_reconfig_table() {
         let table = [

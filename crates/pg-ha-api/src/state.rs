@@ -5,7 +5,7 @@
 use pg_ha_core::cluster::{MemberRole, MemberState};
 use pg_ha_core::config::LeaseTiming;
 use pg_ha_core::dcs::DcsAdapter;
-use pg_ha_core::{ApiSnapshot, LiveWalProbe};
+use pg_ha_core::{ApiSnapshot, LiveWalProbe, VoteFencer};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -20,6 +20,8 @@ pub struct AppState {
     lease_timing: Option<LeaseTiming>,
     /// Live WAL reader behind the open `GET /wal` endpoint (peer vote probes)
     wal_probe: Option<Arc<dyn LiveWalProbe>>,
+    /// SB-40: what `POST /vote` does (fence the upstream, then read the WAL)
+    vote_fencer: Option<Arc<dyn VoteFencer>>,
     /// Caps concurrent `/wal` probes: each one opens a superuser connection
     wal_permits: Arc<tokio::sync::Semaphore>,
     /// Outer bound for one `/wal` probe
@@ -106,6 +108,7 @@ impl AppState {
             dcs: None,
             lease_timing: None,
             wal_probe: None,
+            vote_fencer: None,
             wal_permits: Arc::new(tokio::sync::Semaphore::new(WAL_MAX_CONCURRENT)),
             wal_timeout: WAL_ENDPOINT_TIMEOUT,
         }
@@ -146,6 +149,7 @@ impl AppState {
             dcs: Some(dcs),
             lease_timing: Some(lease_timing),
             wal_probe: None,
+            vote_fencer: None,
             wal_permits: Arc::new(tokio::sync::Semaphore::new(WAL_MAX_CONCURRENT)),
             wal_timeout: WAL_ENDPOINT_TIMEOUT,
         }
@@ -156,6 +160,17 @@ impl AppState {
         self.wal_probe = Some(probe);
         self
     }
+    /// Install the voter fence that serves `POST /vote`
+    pub fn with_vote_fencer(mut self, fencer: Arc<dyn VoteFencer>) -> Self {
+        self.vote_fencer = Some(fencer);
+        self
+    }
+
+    /// The voter fence, if installed
+    pub fn vote_fencer(&self) -> Option<&Arc<dyn VoteFencer>> {
+        self.vote_fencer.as_ref()
+    }
+
     /// Test seam: shrink the outer `/wal` timeout (the crate has no paused-clock support)
     #[cfg(test)]
     pub(crate) fn with_wal_timeout(mut self, d: std::time::Duration) -> Self {

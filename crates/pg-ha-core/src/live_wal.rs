@@ -20,3 +20,14 @@ pub const LIVE_WAL_READ_TIMEOUT: Duration = Duration::from_millis(1500);
 pub trait LiveWalProbe: Send + Sync {
     async fn probe(&self) -> Result<WalStatus>;
 }
+
+/// SB-40: what a voter does when a candidate asks for its vote in quorum mode.
+///
+/// It must stop streaming from its upstream, confirm that the stop took
+/// effect, and only then read its WAL position. An error means "no vote".
+// async_trait boxes the future, which clippy flags as double_must_use.
+#[allow(clippy::double_must_use)]
+#[async_trait]
+pub trait VoteFencer: Send + Sync {
+    async fn fence_and_read(&self) -> Result<WalStatus>;
+}
