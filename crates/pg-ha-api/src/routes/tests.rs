@@ -488,6 +488,8 @@ struct ConfigDcs {
     writes: std::sync::atomic::AtomicUsize,
     /// The `/sync` value `get_cluster` reports.
     sync: std::sync::Mutex<Option<pg_ha_core::cluster::SyncState>>,
+    /// The leader `get_cluster` reports (SB-40: `POST /vote` needs it empty).
+    leader: std::sync::Mutex<Option<pg_ha_core::cluster::Leader>>,
 }
 
 #[async_trait::async_trait]
@@ -495,6 +497,7 @@ impl pg_ha_core::dcs::DcsAdapter for ConfigDcs {
     async fn get_cluster(&self) -> pg_ha_core::Result<pg_ha_core::cluster::Cluster> {
         Ok(pg_ha_core::cluster::Cluster {
             sync_state: self.sync.lock().unwrap().clone(),
+            leader: self.leader.lock().unwrap().clone(),
             ..Default::default()
         })
     }
@@ -562,6 +565,7 @@ fn config_state(stored: &str) -> (AppState, std::sync::Arc<ConfigDcs>) {
         history: std::sync::Mutex::new(Vec::new()),
         writes: std::sync::atomic::AtomicUsize::new(0),
         sync: std::sync::Mutex::new(None),
+        leader: std::sync::Mutex::new(None),
     });
     let state = AppState::with_dcs(
         "node1".into(),
@@ -1121,4 +1125,183 @@ async fn cluster_sync_for_priority_hides_the_legacy_quorum_field() {
             "settled": null,
         })
     );
+}
+
+// ───────────────────────── POST /vote (SB-40) ─────────────────────────
+mod vote_endpoint {
+    use super::*;
+    use async_trait::async_trait;
+    use pg_ha_core::error::{Error, Result as CoreResult};
+    use pg_ha_core::{VoteFencer, WalStatus};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    enum Script {
+        Ok,
+        Fail,
+        Hang,
+    }
+    struct FakeFencer {
+        script: Script,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl VoteFencer for FakeFencer {
+        async fn fence_and_read(&self) -> CoreResult<WalStatus> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.script {
+                Script::Ok => Ok(WalStatus {
+                    timeline: Some(3),
+                    wal_position: 777,
+                    in_recovery: true,
+                }),
+                Script::Fail => Err(Error::Postgres("fence not confirmed".into())),
+                Script::Hang => std::future::pending().await,
+            }
+        }
+    }
+    fn fencer(script: Script) -> (Arc<dyn VoteFencer>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(FakeFencer {
+                script,
+                calls: calls.clone(),
+            }),
+            calls,
+        )
+    }
+    async fn post_vote(app: axum::Router) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn auth_app() -> (axum::Router, Arc<AtomicUsize>) {
+        let (f, calls) = fencer(Script::Ok);
+        let app = build_router_with_commands(
+            test_state().with_vote_fencer(f),
+            None,
+            AuthConfig {
+                username: Some("u".into()),
+                password: Some("p".into()),
+            },
+        );
+        (app, calls)
+    }
+
+    async fn post_vote_with(app: axum::Router, authorization: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().method("POST").uri("/vote");
+        if let Some(value) = authorization {
+            req = req.header("authorization", value);
+        }
+        app.oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn requires_basic_auth_when_configured() {
+        let (app, calls) = auth_app();
+        assert_eq!(
+            post_vote_with(app.clone(), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // base64("u:wrong")
+        assert_eq!(
+            post_vote_with(app.clone(), Some("Basic dTp3cm9uZw==")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no fence without auth");
+        // base64("u:p")
+        assert_eq!(
+            post_vote_with(app, Some("Basic dTpw")).await,
+            StatusCode::OK
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn without_fencer_is_503() {
+        let (status, _) = post_vote(build_router(test_state())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn ok_answers_after_the_fence_and_is_not_a_get() {
+        let (f, calls) = fencer(Script::Ok);
+        let app = build_router(test_state().with_vote_fencer(f));
+        let (status, body) = post_vote(app.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["name"], "node1");
+        assert_eq!(body["timeline"], 3);
+        assert_eq!(body["wal_position"], 777);
+        assert_eq!(body["fenced"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // A GET (the plain read) never fences.
+        let resp = app
+            .oneshot(Request::builder().uri("/vote").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_fence_is_503_and_gives_no_position() {
+        let (f, _) = fencer(Script::Fail);
+        let (status, body) = post_vote(build_router(test_state().with_vote_fencer(f))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body["error"].as_str().unwrap().contains("fence"));
+        assert!(body.get("wal_position").is_none());
+    }
+
+    #[tokio::test]
+    async fn hanging_fence_times_out_503() {
+        let (f, _) = fencer(Script::Hang);
+        let state = test_state()
+            .with_vote_fencer(f)
+            .with_wal_timeout(std::time::Duration::from_millis(20));
+        let (status, body) = post_vote(build_router(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body["error"].as_str().unwrap().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn refused_while_the_leader_lock_is_held() {
+        let (state, dcs) = config_state("{}");
+        *dcs.leader.lock().unwrap() = Some(pg_ha_core::cluster::Leader {
+            name: "node9".into(),
+            version: 1,
+        });
+        let (f, calls) = fencer(Script::Ok);
+        let (status, _) = post_vote(build_router(state.with_vote_fencer(f))).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no fence while a leader holds the lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_when_the_lock_is_free() {
+        let (state, _dcs) = config_state("{}");
+        let (f, calls) = fencer(Script::Ok);
+        let (status, _) = post_vote(build_router(state.with_vote_fencer(f))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 }

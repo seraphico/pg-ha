@@ -300,3 +300,68 @@ pub(crate) async fn wal_endpoint(State(state): State<RouterState>) -> impl IntoR
         })),
     )
 }
+
+/// POST /vote
+/// SB-40: a quorum candidate asks for this node's vote. Before answering, the
+/// node stops streaming from its upstream and confirms it (see
+/// [`pg_ha_core::VoteFencer`]); the answer has the same body as `GET /wal`.
+/// Any failure is a 503, which the candidate counts as "no vote".
+///
+/// It changes configuration, so it is only served while the leader lock is
+/// free in the DCS (a candidate asks only then). It is a mutating endpoint, so
+/// it sits behind the same Basic Auth as `/switchover` (open when no REST
+/// credentials are configured); `GET /wal` stays open.
+pub(crate) async fn vote_endpoint(State(state): State<RouterState>) -> impl IntoResponse {
+    let refuse = |status: StatusCode, msg: String| (status, Json(json!({ "error": msg })));
+    let Some(fencer) = state.app.vote_fencer().cloned() else {
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "vote fence not available".into(),
+        );
+    };
+    if let Some(dcs) = state.app.dcs() {
+        match dcs.get_cluster().await {
+            Ok(cluster) if cluster.leader.is_some() => {
+                return refuse(StatusCode::CONFLICT, "leader lock is held".into());
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return refuse(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("DCS unavailable: {err}"),
+                );
+            }
+        }
+    }
+    let Some(_permit) = state.app.try_wal_permit() else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "busy".into());
+    };
+    let wal = match tokio::time::timeout(state.app.wal_timeout(), fencer.fence_and_read()).await {
+        Ok(Ok(wal)) => wal,
+        Ok(Err(err)) => return refuse(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+        Err(_) => {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "vote fence timed out".into(),
+            );
+        }
+    };
+    if wal.timeline.is_none() {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "timeline unknown".into());
+    }
+    let (name, scope) = {
+        let s = state.app.read().await;
+        (s.name.clone(), s.scope.clone())
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "name": name,
+            "scope": scope,
+            "timeline": wal.timeline,
+            "wal_position": wal.wal_position,
+            "pg_in_recovery": wal.in_recovery,
+            "fenced": true,
+        })),
+    )
+}

@@ -59,7 +59,7 @@ curl -s http://localhost:8008/patroni | jq .
 
 The `role` / `state` on `/patroni` use Rust Debug formatting (`Primary`, `Replica`, `Running`), which is not the same set of strings as the lowercase roles on `/cluster`.
 
-Health checks (`/primary`, `/replica`, `/health`, `/liveness`, `/sync`, `/async`, `/cluster`, `/patroni`, `/metrics`, `/history`) and `/wal` (the live WAL position peers read during a quorum vote, see "Quorum synchronous replication") do not require authentication. `/switchover`, `/failover`, `/restart`, `/reinitialize`, and `/config` require HTTP Basic Auth when `restapi.username` is set in the YAML. The Docker entrypoint defaults to username `admin` and password `secret`.
+Health checks (`/primary`, `/replica`, `/health`, `/liveness`, `/sync`, `/async`, `/cluster`, `/patroni`, `/metrics`, `/history`) and `/wal` (the live WAL position peers read during a quorum vote, see "Quorum synchronous replication") do not require authentication. `/switchover`, `/failover`, `/restart`, `/reinitialize`, `/config`, and `POST /vote` (the quorum vote request, which peers send with this node's REST credentials) require HTTP Basic Auth when `restapi.username` is set in the YAML. The Docker entrypoint defaults to username `admin` and password `secret`.
 
 > **TLS / HTTPS**: The examples below use `http://`, which is the REST API's default cleartext form. After `restapi.tls` (`cert` + `key`) is configured, the REST API switches to HTTPS. In every example, replace `http://` with `https://` and supply the trust root with `--cacert <ca.crt>`. When mTLS is on (`require_client_cert: true`), also pass `--cert <client.crt> --key <client.key>`. Proxy probes of `/primary` and `/replica` use the same material: on HTTPS they trust `ca_cert`, and on mTLS they present this node's own server certificate. **Basic Auth credentials are protected in transit only after TLS is enabled** — on cleartext HTTP, credentials and management commands are both sent in the clear. In production, enable TLS for the REST API (see "REST API TLS / mTLS" in the deployment guide).
 
@@ -547,8 +547,8 @@ This section covers `synchronous_mode: "quorum"`. The general parameters are und
 | An acknowledged commit survives losing the primary | no guarantee | yes: every name in `/sync` holds it, and only `/sync` members may be promoted | yes: a candidate has to win a live vote against the voters' WAL positions |
 | A slow or unreachable standby | no effect | commits wait for the standbys on the list | no effect while N voters keep up |
 | Who may become primary | any eligible node | only nodes in `/sync` | only voters that win the vote |
-| What failover needs | the lock | a non-empty `/sync` | `q = \|V\| − N` other voters online and answering `GET /wal` |
-| Extra requirements | none | none | the same pg-ha version on every node; peers reach each other's REST port; a watchdog is advised |
+| What failover needs | the lock | a non-empty `/sync` | `q = \|V\| − N` other voters online and answering `POST /vote` |
+| Extra requirements | none | none | the same pg-ha version on every node; peers reach each other's REST port (`POST /vote`); a watchdog is advised |
 
 Pick `"async"` when losing the last seconds of commits on a primary failure is acceptable. Pick `"sync"` for most clusters (see "How to choose" below). Pick `"quorum"` when one slow standby must not stall writes, or when the cluster has 5 or more nodes and should tolerate several failures during a failover (see the table in "Choosing `synchronous_node_count`"). With 3 nodes and `synchronous_node_count: 1`, quorum only removes the stall from one slow standby. It does not let a failover survive another failed node.
 
@@ -567,13 +567,22 @@ The leader's quorum executor (`ha/quorum_sync.rs`) maintains V, q and n. V is ev
 
 Before a node asks for the leader lock, it must win a live vote (`ha/vote.rs`, `quorum/round.rs`):
 
-1. The candidate reads its own WAL position and timeline from PostgreSQL, and asks every voter that is a `Running` member with an API URL for `GET /wal`. Each peer request is limited to 2 s and the whole round to 3 s. The own read runs at the same time, so the vote takes at most 3 s.
+1. The candidate reads its own WAL position and timeline from PostgreSQL, and sends `POST /vote` to every voter that is a `Running` member with an API URL (SB-40, see the next section). Each peer request is limited to 2 s and the whole round to 3 s. The own read runs at the same time, so the vote takes at most 3 s.
 2. The vote is refused when: the candidate is not in V; any answering node reports it is not in recovery (a writable primary is alive); a voter is on a newer timeline; a voter on the same timeline is ahead of the candidate; or fewer than `q` other voters on the candidate's timeline answered. Voters on an older timeline do not count. Unreachable voters simply do not answer.
 3. Every failure is a refusal, not an error. The candidate stays a follower, tries again in the next cycle, and no lock is taken: no primary rather than a lost commit. If `maximum_lag_on_failover` is set, the same live values are checked against it.
 4. When no voter could be contacted the log carries a WARN that points at `restapi.tls`, `ca_cert` and the client certificate.
 5. After the vote and the lock, the new primary first sets PostgreSQL to `ANY n' (V')` and waits (at most 2 s) until `SHOW synchronous_standby_names` shows it. Here `V' = (V without the new primary) + the old leader` and `n' = |V| − q`. Only then does it run `pg_ctl promote`. If this fails it does not promote and gives the lock back. Afterwards it writes `/sync` as `(V', q)`. The new primary therefore never accepts writes under a weaker setting than the old one.
 
 A switchover or a failover with a `candidate` is checked up front with the same inputs, so the old leader does not give up the lock for a candidate that cannot win. See the known limitation below for the 409 messages.
+
+#### `POST /vote`: a voter stops streaming from the old primary first
+
+The candidate does not ask a voter for a plain read. On `POST /vote` the voter, in order: removes `primary_conninfo` from `postgresql.auto.conf` (it survives a restart) and reloads; waits until `pg_stat_wal_receiver` has no row and the live `primary_conninfo` is empty, which confirms it no longer streams from the old primary; only then reads its WAL position, and checks the fence again after the read; finally answers with the same JSON as `GET /wal` plus `"fenced": true`.
+
+- Any step that cannot be confirmed (timeout, PostgreSQL older than 13, which cannot reload `primary_conninfo`, DCS unavailable, too many concurrent calls) answers `503`, and the candidate counts it as no vote. A voter that did not confirm is not counted, so with too many such voters there is no failover (no primary, but no lost commit).
+- It is served only while the leader lock is free in the DCS; with a lock holder it answers `409`, because it changes configuration. It shares its concurrency limit with `/wal`. Unlike `/wal`, it is a mutating endpoint and uses the same protection as `/switchover`: when `restapi.username` and `restapi.password` are set it requires HTTP Basic Auth (otherwise `401`), and with REST mTLS the caller must present a client certificate. The candidate sends this node's own `restapi` credentials and client certificate, so every node must use the same REST credentials and CA. If a peer answers `401` or `403`, the candidate logs an error naming the peer; fix the credentials, because otherwise no vote succeeds and there is no failover. When REST auth is not configured, `/vote` is open like the other mutating endpoints.
+- The candidate never retries the request.
+- The follow loop points a fenced voter at the next lock holder (a missing `primary_conninfo` counts as a changed upstream). After a new primary is elected the voters follow it. If the old primary comes back after its lock expired, they follow it again, and each change restarts PostgreSQL once (throttled by `is_recently_reconfigured`). Until some leader holds the lock, fenced voters do not replicate.
 
 #### `GET /wal`
 
@@ -639,24 +648,25 @@ A larger count raises commit latency (the n-th fastest voter) and the number of 
 In quorum mode the leader logs these WARN lines when the condition appears and again every 30 executor cycles while it stays:
 
 - `synchronous_node_count is 1 with <k> eligible voters; a failover then needs almost every voter online (raise synchronous_node_count)`: `n = 1` with 3 or more eligible voters.
-- `synchronous_mode quorum without a watchdog (watchdog.mode is off): a hung primary is not fenced (zombie-primary risk)`: `watchdog.mode` is `off` (the default). Quorum does not require a watchdog and does not refuse to run without one; see the zombie warning below.
+- `synchronous_mode quorum without a watchdog (watchdog.mode is off): a hung primary is not fenced (zombie-primary risk)`: `watchdog.mode` is `off` (the default). Quorum does not require a watchdog and does not refuse to run without one (D12). The WARN stays: a hung primary does not fence itself, and the voters' fence only blocks its commits while PostgreSQL keeps running; see the zombie section below.
 - `every eligible voter is tagged nofailover; they vote but none of them can be elected`.
 
 #### What the guarantee covers
 
 - The guarantee starts when quorum is in force: from the moment PostgreSQL's `ANY n (V)` is in force and `/sync` holds the matching `(V, q)`. Commits made earlier, in async mode, are not covered. A planned mode switch is a human action, and a failover is a fault; the guarantee is built for the second.
 - It covers acknowledged commits: a client that got COMMIT without a warning. It does not cover a commit whose wait was cancelled (see the next section).
-- It assumes the old primary can no longer acknowledge commits by the time the vote reads the WAL positions (SI-3 in `quorum.rs`). That is ensured by lease fencing while the HA loop runs (invariants L5) and by the watchdog when it does not.
+- When the vote reads the WAL positions the old primary may still be acknowledging commits (SI-3 in `quorum.rs` no longer relies on the old primary stopping by itself). Since SB-40 the voters ensure it: each stops streaming from the old primary and confirms that before it reads its WAL position and answers. While the HA loop runs, lease fencing (invariants L5) still stops the old primary earlier. When the loop is stalled, once `q` voters have fenced, the old primary cannot collect `n` acknowledgements.
 - With `synchronous_mode_strict: false`, when no standby is eligible the executor falls back to an empty list (asynchronous). Commits in that period are not covered, and with an empty `/sync` no node is promoted automatically.
 
 #### Zombie or isolated old primary
 
 An old primary that is cut off from the voters, or hung while the others elect a new primary, is a zombie until it is fenced.
 
-- **Fencing.** While its HA loop runs, a primary that cannot renew the lock fences itself (immediate stop) before the lease ends, which is earlier than the lock expiry other nodes wait for. A hung process (SIGSTOP, a frozen VM, a blocked loop) cannot do that. Only the watchdog resets the host in that case. The default is `watchdog.mode: off`, so set `automatic` or `required` for quorum clusters.
+- **Fencing.** While its HA loop runs, a primary that cannot renew the lock fences itself (immediate stop) before the lease ends, which is earlier than the lock expiry other nodes wait for. A hung process (SIGSTOP, a frozen VM, a blocked loop) cannot do that, and PostgreSQL keeps running and stays writable. Only the watchdog resets the host in that case. The default is still `watchdog.mode: off`; it is advised for quorum clusters but not required (D12).
+- **Voter fence (SB-40).** A voter stops streaming from the old primary and confirms it before it answers `POST /vote`. Once a candidate has `q` votes, at most `|V| − q − 1` standbys (fewer than `n`) can still stream from the zombie, so the zombie cannot collect `n` acknowledgements and its COMMITs block. Every acknowledgement it got earlier came from `n` voters that held the commit, and `n + q + 1 > |V|` means the candidate or a fenced voter holds it, so the candidate's WAL position is not before that commit.
 - **What clients see on the zombie.** A COMMIT waits for `n` voters and none will answer, so it hangs. Another session on the zombie can already read that row, because PostgreSQL makes the commit visible locally before the wait ends. If the client cancels the wait, or the primary is shut down, PostgreSQL returns the COMMIT with the warning "The transaction has already committed locally, but might not have been replicated to the standby". See the PostgreSQL discussions of [synchronous replication edge cases](https://wiki.postgresql.org/wiki/PgCon_2020_Developer_Unconference/Edge_cases_of_synchronous_replication_in_HA_solutions). That commit was never acknowledged by the voters and can be lost. Treat the warning as an unknown outcome. Reads on the zombie can also miss commits made on the new primary.
 - **Why the guarantee still holds for acknowledged commits.** Such a commit is acknowledged only after `n` voters flushed it. The new primary was elected only after a candidate saw `q` voters that are not ahead of it, and the vote is refused if any answering node is a writable primary. The overlap argument above then means the new primary has every acknowledged commit. Commits the zombie writes after the split cannot be acknowledged by voters that now follow the new primary.
-- The one gap is the case the watchdog covers: a hung zombie that resumes while a voter still streams from it, and acknowledges a commit after that voter was read.
+- **Remaining limits.** (1) The fence starts only when a candidate starts an election. Until then the zombie can still collect acknowledgements, and the voters that hold those commits keep them safe. In the container tests (3 and 5 nodes, `n` of 1 and 2, 7 SIGSTOP runs) the zombie's last acknowledgement came 0.2 to 1.1 s before the new primary appeared, 0 were acknowledged after it, and 0 acknowledged commits were lost. After that its writes block, with no timeout. (2) PostgreSQL on the zombie keeps running: local reads and writes, and commits whose wait was cancelled (see above), remain until the watchdog resets the host or someone stops the database. (3) A voter that cannot confirm its fence (timeout, PostgreSQL older than 13) is not counted, and with too many of them there is no failover. (4) A fenced voter does not replicate until some leader holds the lock. If the old primary comes back after its lock expired, the voters follow it again and PostgreSQL restarts once on each. (5) This applies to quorum only. `sync` and async do not call `/vote` and have no such guarantee.
 
 #### Known limitation: the window after a failover or a late rejoin, and recovery
 
@@ -713,14 +723,14 @@ Only the lowercase strings in the table are accepted. Any other value, including
 
 **An invalid configuration already stored in the DCS** (for example a leftover `synchronous_mode: true` in a development cluster, or a bad hand edit) is applied by no node and never falls back to `"async"`. A running node keeps its last valid configuration and logs an ERROR naming the key and the accepted values (at most once per 60 seconds for the same content). A node that starts with no valid configuration known leaves synchronous replication alone and does not take part in elections until a valid configuration is written with `PUT /config`. While the stored configuration is invalid, `PATCH` returns **409**. An invalid value in `bootstrap.dcs` makes the node fail at startup.
 
-**Requirements for enabling `"quorum"`**: every node must run the same pg-ha version, no mixed versions; the nodes must reach each other's REST port for `GET /wal`; a watchdog is advised. Details are in "Quorum synchronous replication".
+**Requirements for enabling `"quorum"`**: every node must run the same pg-ha version, no mixed versions; the nodes must reach each other's REST port for `GET /wal` and `POST /vote`; a watchdog is advised (not required). Details are in "Quorum synchronous replication".
 
 **How to choose**:
 
 - Most cases use `synchronous_mode: "sync", strict: false, count: 1` — synchronous protection in normal operation, and the service keeps running in the extreme case
 - Financial and order workloads use `strict: true` — stop the service rather than lose data
 - A 5-node cluster may use `count: 2` — acknowledge only after the data is stored in 3 copies
-- Use `synchronous_mode: "quorum"` when one slow standby must not stall writes, or on 5 or more nodes with `count: 2` or more, so a failover survives a further failed node. Enable it only with the same pg-ha version everywhere, a watchdog, and node-to-node access to `GET /wal`
+- Use `synchronous_mode: "quorum"` when one slow standby must not stall writes, or on 5 or more nodes with `count: 2` or more, so a failover survives a further failed node. Enable it only with the same pg-ha version everywhere, node-to-node access to `GET /wal` and `POST /vote`, and preferably a watchdog (not required)
 
 #### Node tags (configured in `pg-ha.yml`)
 

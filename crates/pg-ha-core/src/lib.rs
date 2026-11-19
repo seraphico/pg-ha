@@ -49,7 +49,7 @@ pub use dynamic_config::{
 pub use error::{Error, Result};
 pub use ha::{ApiSnapshot, CommandSender, CycleResult, Ha, ShutdownOutcome, StatePublisher};
 pub use history::{History, HistoryEntry, HistoryEventType};
-pub use live_wal::LiveWalProbe;
+pub use live_wal::{LiveWalProbe, VoteFencer};
 pub use postgresql::{PgLiveWalProbe, PgState, Postgresql, WalStatus, parse_lsn};
 pub use slots::SlotManager;
 pub use standby_cluster::{StandbyCluster, StandbyClusterConfig};

@@ -18,7 +18,7 @@ use auth::basic_auth_middleware;
 use config::{get_config, patch_config_endpoint, put_config};
 use health::{
     get_cluster, health_async, health_check, health_primary, health_replica, health_standby_leader,
-    health_sync, liveness, node_status, wal_endpoint,
+    health_sync, liveness, node_status, vote_endpoint, wal_endpoint,
 };
 use management::{
     delete_switchover, post_failover, post_reinitialize, post_restart, post_switchover,
@@ -77,6 +77,7 @@ pub fn build_router_with_commands(
             post(post_switchover).delete(delete_switchover),
         )
         .route("/failover", post(post_failover))
+        .route("/vote", post(vote_endpoint))
         .route("/restart", post(post_restart))
         .route("/reinitialize", post(post_reinitialize))
         .route(

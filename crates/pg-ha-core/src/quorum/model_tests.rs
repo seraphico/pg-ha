@@ -48,7 +48,8 @@
 //!   post-state satisfy SI-1, checked here per step).
 //! * Network: reads are instantaneous and consistent; there is no staleness, so
 //!   SI-3 (read after the old leader stopped acknowledging) is true by
-//!   construction. A zombie primary that keeps acknowledging is NOT modelled.
+//!   construction. A zombie primary that keeps acknowledging is NOT modelled
+//!   here; `model_tests/sb40_zombie.rs` models it (SB-40).
 //! * Real PostgreSQL semantics (`ANY` vs `FIRST` equivalence, sync-rep waiting
 //!   details), real LSN byte arithmetic, REST, DCS CAS races, two leaders.
 //! * Voter-set sizes above 5, and multiple simultaneous failures of the DCS.
@@ -69,6 +70,7 @@ use std::time::Duration;
 
 mod executor_model;
 mod sb36_fixes;
+mod sb40_zombie;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {

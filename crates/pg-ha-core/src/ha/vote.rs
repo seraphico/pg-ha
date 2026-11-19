@@ -6,6 +6,14 @@
 //! before the executor has taken `/sync` back). Otherwise [`Ha::quorum_vote`] returns `NotApplicable` before doing
 //! any I/O, so the Priority election is unchanged.
 //!
+//! SB-40: asking a voter is `POST /vote`, not a plain read. The voter stops
+//! streaming from its upstream, confirms it, and only then reports its WAL
+//! position; a voter that cannot confirm answers 503, which is no vote. This
+//! closes the window where a hung old primary keeps collecting acknowledgements
+//! from voters that already answered. A fenced voter is pointed at the next
+//! lock holder by the follow loop (a missing `primary_conninfo` is a changed
+//! upstream). The watchdog stays optional (D12).
+//!
 //! Timing: the candidate's own live WAL read (`LIVE_WAL_READ_TIMEOUT`) and the
 //! peer round (`VOTE_ROUND_TIMEOUT`) run concurrently, so the whole vote takes
 //! at most `max(LIVE_WAL_READ_TIMEOUT, VOTE_ROUND_TIMEOUT)` (3 s), not their sum.
