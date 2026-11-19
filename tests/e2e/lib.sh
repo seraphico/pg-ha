@@ -271,7 +271,7 @@ wait_for_cluster_ready() {
             # this barrier (quick_test's "2 replicas", failover_ttl's
             # get_replicas, ha_full's replicated reads) don't assert too early.
             local primary replica_count=0
-            primary=$(get_primary)
+            primary=$(get_primary) || primary=""  # no primary yet: keep polling (set -e)
             local rnode
             for rnode in "${ALL_NODES[@]}"; do
                 if [ "$(http_get_status "$rnode/replica")" = "200" ]; then
@@ -348,7 +348,7 @@ wait_for_primary() {
 
     while true; do
         local primary
-        primary=$(get_primary)
+        primary=$(get_primary) || primary=""  # no primary yet: keep polling (set -e)
         if [ -n "$primary" ]; then
             local elapsed=$((SECONDS - start))
             log_info "Primary found at $primary in ${elapsed}s" >&2
@@ -376,7 +376,7 @@ wait_for_new_primary() {
 
     while true; do
         local primary
-        primary=$(get_primary)
+        primary=$(get_primary) || primary=""  # no primary yet: keep polling (set -e)
         if [ -n "$primary" ] && [ "$primary" != "$old_primary" ]; then
             local elapsed=$((SECONDS - start))
             log_info "New primary at $primary in ${elapsed}s" >&2
