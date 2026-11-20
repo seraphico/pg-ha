@@ -619,7 +619,7 @@ curl -u admin:secret -X PATCH http://localhost:8008/config \
 - 所有节点必须已经运行相同版本的 pg-ha（见下文）。先在每个节点上检查 `GET /wal`。
 - **从 async 启用时的写入顺序**（SB-36）：leader 先把 `/sync` 写成 `(V, q = |V| − n)`，再把 PostgreSQL 设为 `ANY n (V)`。切换后主库立刻挂掉，候选节点仍能赢得投票。两次写之间崩溃，只剩 PostgreSQL 这一步。（反过来的顺序会在 DCS 还不知道投票节点时就确认 quorum 提交。）从 `"sync"` 切过来时，执行器先用一次写入把 `/sync` 改成 `kind: quorum`，再把 `FIRST n (...)` 改写成 `ANY n (...)`。
 - 做计划内的破坏性操作（维护、switchover、停节点）之前，先等 leader 的 `GET /cluster` 显示 `sync.settled: true`。
-- **关闭**（`"async"` 或 `"sync"`）：只要 `/sync` 还是 `kind: quorum`，执行器就继续运行。退出过程中 `/sync` 不会写成 `q ≥ |V|`，所以候选节点始终能赢得投票，没有无 leader 的窗口。切到 `"async"` 时，它先清空 `synchronous_standby_names`，此时 `/sync` 仍保持 `q < |V|`；再过一个周期（因为有 gate），一次写入 `(V = {}, q = 0)`，然后按 priority 的形式写回 `/sync`。切到 `"sync"` 时，它一次写入 `(V*, min(q, max(q*, |V* ∖ caught_up|)))`，只在这个 `q` 小于 `|V*|` 时才写，否则等待；等 V 等于名单、名单长度等于 `n`、`q` 为 0 之后，交给 priority 的代码。保证：quorum 生效期间已确认的提交，failover 后不会丢。切换之后的提交遵循新模式：`"async"` 下不保证，`"sync"` 下按 priority 规则。
+- **关闭**（`"async"` 或 `"sync"`）：只要 `/sync` 还是 `kind: quorum`，执行器就继续运行。切换开始时只要 `/sync` 的 `q < |V|`，退出过程中 `/sync` 就不会写成 `q ≥ |V|`，候选节点始终能赢得投票，没有无 leader 的窗口。如果开始时 `/sync` 已经是 `q ≥ |V|`（例如旧版本在退出中途留下的状态），窗口依然存在。切到 `"async"` 时，它先清空 `synchronous_standby_names`，此时 `/sync` 仍保持 `q < |V|`；然后等 V 里的每个投票节点都追上了清空之后取的标记，才做交接：一次写入 `(V = {}, q = 0)`（已经是 priority 的形式，没有第二次写）。交接前 `/sync` 不变，`GET /cluster` 的 `sync.settled` 为 `false`，leader 限频输出 INFO/WARN 日志并列出落后的投票节点。某个投票节点宕机且一直追不上时，交接会一直等下去，需要运维介入。切到 `"sync"` 时，它一次写入 `(V*, min(q, max(q*, |V* ∖ caught_up|)))`，只在这个 `q` 小于 `|V*|` 时才写，否则等待；等 V 等于名单、名单长度等于 `n`、`q` 为 0 之后，交给 priority 的代码。保证：在 quorum 下已确认的提交，在切换过程中都保留，因为交接要等所有投票节点追上才做。切到 `"async"` 时代价是交接可能在投票节点宕机期间一直等待。切换之后的提交遵循新模式：`"async"` 下不保证，`"sync"` 下按 priority 规则。
 
 #### 选择 `synchronous_node_count`
 
