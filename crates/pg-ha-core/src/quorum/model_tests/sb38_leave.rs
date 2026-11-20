@@ -23,6 +23,12 @@
 //!   `q' = min(q, max(q*, |V* ∖ caught_up|))`, taken only when `q' < |V*|`;
 //!   otherwise wait with `/sync` as it is. SI-4 is the same gate as G.
 //!
+//! * **hand-off gate** (maintainer decision, option A): the async hand-off
+//!   `(V = {}, q = 0)` waits until `|V ∖ caught_up| == 0`, caught up to the mark
+//!   taken after PG `''` was written. Until then `/sync` stays at `q < |V|`.
+//!   The model checks the loss after the hand-off: the async election (highest
+//!   WAL among live eligible nodes) must hold every acknowledged commit.
+//!
 //! The model keeps `acked` (commits acknowledged while quorum was in force)
 //! checked by invariant I and by the vote (`LOST ACKNOWLEDGED COMMIT`) until the
 //! hand-off. Commits made after PG went asynchronous are not covered
@@ -39,10 +45,18 @@ const OLD: Fixes = Fixes {
     leave_new: false,
     leave_no_gate: false,
     leave_dcs_first: false,
+    leave_gate: false,
 };
+/// Production order and the hand-off gate (maintainer decision).
 const NEW: Fixes = Fixes {
     leave_new: true,
+    leave_gate: true,
     ..OLD
+};
+/// New order with the hand-off ungated (the code before the decision).
+const UNGATED: Fixes = Fixes {
+    leave_gate: false,
+    ..NEW
 };
 
 fn leave_world(fix: Fixes, standbys: usize, n0: usize, mode: Tm) -> World {
@@ -347,6 +361,10 @@ fn sb38_model_actually_exercises_the_leave() {
         .unwrap();
     let t = total.lock().unwrap().clone();
     eprintln!("sb38 coverage over {CASES} histories: {t:#?}");
+    assert!(
+        t.async_elections > 20,
+        "async elections after the hand-off: {t:?}"
+    );
     assert!(t.handed_off > 200, "hand-off rarely reached: {t:?}");
     assert!(t.acked > 1_000, "too few acknowledged commits: {t:?}");
     assert!(t.generations > 300, "too few promotions: {t:?}");
@@ -354,6 +372,131 @@ fn sb38_model_actually_exercises_the_leave() {
         t.refused_with_acked_missing > 50,
         "the vote never refused a data-losing candidate: {t:?}"
     );
+}
+
+// ---- after the hand-off: loss under the async election -----------------------
+
+/// 3 nodes, n = 1, `V = {n1, n2}`, `q = 1`. The commit is acknowledged on n1
+/// only (n2 lags). PG goes asynchronous, `/sync` stays `(V, 1)`, then the
+/// hand-off planner step runs. Then the primary and the holder n1 die and n2
+/// stands for election.
+fn double_failure(fix: Fixes) -> (World, Result<(), String>) {
+    let mut w = leave_world(fix, 2, 1, Tm::Async);
+    let run = |w: &mut World| -> Result<(), String> {
+        w.apply(&Action::Commit(1))?;
+        w.apply(&Action::Advance(1, 64))?;
+        assert!(!w.acked.is_empty());
+        assert!(w.nodes[2].lsn() < w.nodes[1].lsn(), "n2 lags");
+        w.apply(&Action::Plan(1))?; // PG ''
+        w.apply(&Action::Plan(1))?; // hand-off, or the gate waits
+        w.apply(&Action::Kill(1))?;
+        w.apply(&Action::KillLeader)?;
+        w.apply(&Action::Elect(2, 0xFF, 0, 0))
+    };
+    let r = run(&mut w);
+    (w, r)
+}
+
+#[test]
+fn ungated_handoff_loses_an_acked_commit() {
+    let (w, r) = double_failure(UNGATED);
+    assert!(w.handed_off, "{:?}", w.st);
+    let err = r.expect_err("n2 wins by highest WAL without the commit");
+    assert!(err.contains("after the async hand-off"), "{err}");
+}
+
+#[test]
+fn gated_handoff_waits_and_loses_nothing() {
+    let (w, r) = double_failure(NEW);
+    r.expect("no loss");
+    assert!(!w.handed_off, "n2 was not caught up: {:?}", w.st);
+    assert!(w.st.pg_names.is_empty(), "PG is asynchronous");
+    assert_eq!(
+        (w.st.voters.len(), w.st.quorum),
+        (2, 1),
+        "q < |V|, vote possible"
+    );
+    // The vote refuses n2 (it lacks the commit): leaderless, not lost.
+    assert_eq!(w.stats.generations, 0, "{:?}", w.stats);
+}
+
+/// Once the lagging voter has caught up the gated hand-off happens, and the
+/// same double failure loses nothing: the async election finds the commit on
+/// the highest WAL.
+#[test]
+fn gated_handoff_after_catch_up_keeps_the_commit() {
+    let mut w = leave_world(NEW, 2, 1, Tm::Async);
+    w.apply(&Action::Commit(1)).unwrap();
+    w.apply(&Action::Advance(1, 64)).unwrap();
+    w.apply(&Action::Plan(1)).unwrap();
+    w.apply(&Action::Plan(1)).unwrap();
+    assert!(!w.handed_off);
+    w.apply(&Action::Advance(2, 64)).unwrap();
+    w.apply(&Action::Plan(1)).unwrap();
+    assert!(w.handed_off, "{:?}", w.st);
+    w.apply(&Action::Kill(1)).unwrap();
+    w.apply(&Action::KillLeader).unwrap();
+    w.apply(&Action::Elect(2, 0xFF, 0, 0)).unwrap();
+    assert_eq!(w.stats.async_elections, 1);
+}
+
+/// Random pre-history, planner steps, then the primary and a random set of
+/// standbys die and every survivor stands for election (async rule once the
+/// hand-off happened). Fails with a lost acknowledged commit.
+fn double_failure_property(
+    fix: Fixes,
+    standbys: usize,
+    n0: usize,
+    pre: &[Action],
+    plans: usize,
+    kill: u8,
+) -> Result<(), String> {
+    let mut w = leave_world(fix, standbys, n0, Tm::Async);
+    for a in pre {
+        w.apply(a)?;
+    }
+    for _ in 0..plans {
+        w.apply(&Action::Plan(1))?;
+    }
+    for i in 1..=standbys {
+        if kill & (1 << (i % 8)) != 0 {
+            w.apply(&Action::Kill(i))?;
+        }
+    }
+    w.apply(&Action::KillLeader)?;
+    for c in 1..=standbys {
+        w.apply(&Action::Elect(c, 0xFF, 0, 0))?;
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(3000))]
+
+    /// Gated hand-off: the primary and any set of standbys die at any step; no
+    /// acknowledged commit is lost under the vote or the async election.
+    #[test]
+    fn gated_double_failure_never_loses(
+        standbys in 2usize..6,
+        n0 in 1usize..4,
+        pre in pre_history(),
+        plans in 0usize..8,
+        kill in any::<u8>(),
+    ) {
+        double_failure_property(NEW, standbys, n0, &pre, plans, kill).map_err(TestCaseError::fail)?;
+    }
+}
+
+/// Removing the gate is caught: primary and holders die after the hand-off.
+#[test]
+fn mutation_removing_the_handoff_gate_is_caught() {
+    let found = finds_counterexample(
+        3000,
+        (2usize..6, 1usize..4, pre_history(), 0usize..8, any::<u8>()),
+        |(s, n0, pre, plans, kill)| double_failure_property(UNGATED, s, n0, &pre, plans, kill),
+    );
+    let msg = found.expect("ungated hand-off survived the double-failure model");
+    assert!(msg.contains("after the async hand-off"), "{msg}");
 }
 
 // ---- mutations ----------------------------------------------------------------

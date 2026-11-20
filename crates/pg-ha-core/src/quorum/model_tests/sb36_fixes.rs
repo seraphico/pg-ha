@@ -41,6 +41,7 @@ const FIX: Fixes = Fixes {
     leave_new: false,
     leave_no_gate: false,
     leave_dcs_first: false,
+    leave_gate: false,
 };
 
 fn world(fix: Fixes, standbys: usize, n0: usize, steady: bool) -> World {

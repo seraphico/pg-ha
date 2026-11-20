@@ -150,6 +150,8 @@ struct Stats {
     leave_vote_impossible: usize,
     /// SB-38: hand-offs to the Priority/async code that completed.
     handed_off: usize,
+    /// SB-38: elections by the async rule (highest WAL) after the hand-off.
+    async_elections: usize,
 }
 
 /// SB-36 switches. All off = the model of the code before the fixes, so every
@@ -173,6 +175,11 @@ struct Fixes {
     leave_no_gate: bool,
     /// SB-38 mutation of the new order (async): empty `/sync` before PG.
     leave_dcs_first: bool,
+    /// SB-38 (maintainer decision): the async hand-off `(V = {}, q = 0)` waits
+    /// until every voter is caught up to the mark taken after PG went
+    /// asynchronous (`|V \ caught_up| == 0`). false = hand-off ungated (the
+    /// code before this decision), which can lose an acknowledged commit.
+    leave_gate: bool,
 }
 
 /// The `synchronous_mode` the planner is driving toward (SB-38).
@@ -212,6 +219,7 @@ impl Stats {
         self.kept_offline += o.kept_offline;
         self.leave_vote_impossible += o.leave_vote_impossible;
         self.handed_off += o.handed_off;
+        self.async_elections += o.async_elections;
     }
 }
 
@@ -286,6 +294,8 @@ struct World {
     /// SB-38: the hand-off to the Priority/async code happened. The quorum
     /// guarantee ends there (commits under the new mode follow its rules).
     handed_off: bool,
+    /// SB-38: the asynchronous election after the hand-off already happened.
+    async_elected: bool,
 }
 
 fn name(i: usize) -> String {
@@ -339,6 +349,7 @@ impl World {
             expired: 0,
             mode: Tm::Quorum,
             handed_off: false,
+            async_elected: false,
         }
     }
 
@@ -665,6 +676,8 @@ impl World {
             let before = self.st.clone();
             if self.fix.enabling()
                 && before.pg_names.is_empty()
+                // The async hand-off is not an enabling write: `acked` stays.
+                && self.mode != Tm::Async
                 && matches!(step, Step::SetDcs { .. })
             {
                 // The guarantee restarts when quorum is in force in PG.
@@ -690,8 +703,8 @@ impl World {
             }
             if self.leave_done() {
                 // The Priority/async code takes over; the quorum guarantee ends.
+                // `acked` is kept: the async election below checks it.
                 self.handed_off = true;
-                self.acked.clear();
                 self.stats.handed_off += 1;
                 break;
             }
@@ -745,9 +758,49 @@ impl World {
         }
     }
 
-    fn elect(&mut self, c: usize, reach: u8, late: u8, fail: u8) -> Result<(), String> {
-        if !self.leader_dead || self.handed_off {
+    /// SB-38: after an async hand-off (`/sync` empty, no vote) the candidate
+    /// that holds the highest WAL among the live, eligible nodes wins. Every
+    /// commit acknowledged while quorum was in force must be on it. Sync
+    /// hand-offs keep the Priority rules and are not checked here.
+    fn elect_async(&mut self, c: usize) -> Result<(), String> {
+        if self.mode != Tm::Async {
             return Ok(());
+        }
+        let c = self.idx(c);
+        let eligible = |w: &World, i: usize| {
+            i != w.leader && w.nodes[i].alive && w.cfg_excluded & (1 << (i % 8)) == 0
+        };
+        if !eligible(self, c) {
+            return Ok(());
+        }
+        let key = |w: &World, i: usize| (w.nodes[i].tl(), w.nodes[i].lsn());
+        let best = (0..self.nodes.len())
+            .filter(|&i| eligible(self, i))
+            .map(|i| key(self, i))
+            .max();
+        if best != Some(key(self, c)) {
+            return Ok(());
+        }
+        self.stats.async_elections += 1;
+        if let Some(&lost) = self.acked.iter().find(|&&x| !self.nodes[c].holds(x)) {
+            return Err(format!(
+                "LOST ACKNOWLEDGED COMMIT {lost} after the async hand-off: {} wins by highest WAL \
+                 (state {:?}, acked {:?})",
+                name(c),
+                self.st,
+                self.acked
+            ));
+        }
+        self.async_elected = true;
+        Ok(())
+    }
+
+    fn elect(&mut self, c: usize, reach: u8, late: u8, fail: u8) -> Result<(), String> {
+        if !self.leader_dead || self.async_elected {
+            return Ok(());
+        }
+        if self.handed_off {
+            return self.elect_async(c);
         }
         let c = self.idx(c);
         if c == self.leader || !self.nodes[c].alive {
@@ -1400,8 +1453,19 @@ fn next_leave(
     fix: Fixes,
 ) -> Option<Step> {
     if !fix.leave_dcs_first && !fix.leave_no_gate {
-        // The production order.
-        return next_step_leaving(state, target, caught_up);
+        // The production order, plus the hand-off gate of the maintainer
+        // decision: `(V = {}, q = 0)` only when every voter is caught up.
+        let step = next_step_leaving(state, target, caught_up)?;
+        if fix.leave_gate
+            && target.voters.is_empty()
+            && state.pg_names.is_empty()
+            && !state.voters.is_empty()
+            && matches!(&step, Step::SetDcs { voters, .. } if voters.is_empty())
+            && !state.voters.is_subset(caught_up)
+        {
+            return None;
+        }
+        return Some(step);
     }
     if target.voters.is_empty() {
         let empty_pg = Step::SetPg {

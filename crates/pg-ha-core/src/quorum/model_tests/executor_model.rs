@@ -281,6 +281,10 @@ struct Core {
     /// Each node's own value while it is not the one in `pg`.
     standby_pg: Vec<PgVals>,
     since_restart: bool,
+    /// SB-38: a switch away from quorum started and PostgreSQL has not reached
+    /// quorum again (also after the mode went back to quorum mid-leave). Only
+    /// then may the file read async while the effective value still has quorum.
+    leave_open: bool,
     violation: Option<String>,
     x: XStats,
     // ---- per cycle ----
@@ -355,6 +359,11 @@ impl Core {
     }
 
     fn settle(&mut self, ctx: &str) {
+        if self.mode != SynchronousMode::Quorum {
+            self.leave_open = true;
+        } else if !reads_as_no_quorum(&self.pg.file) && !reads_as_no_quorum(&self.pg.effective) {
+            self.leave_open = false;
+        }
         self.sync_w();
         self.w.refresh_acks();
         if self.violation.is_none()
@@ -398,11 +407,12 @@ impl Core {
                         [("effective", &self.pg.effective), ("file", &self.pg.file)]
                     {
                         let (names, n) = sem(text);
-                        // SB-38: leaving to async, the file can be async while
-                        // the effective value still has quorum; `/sync` keeps
-                        // `q < |V|` until the hand-off write.
-                        let _ = async_now;
-                        if reads_as_no_quorum(text)
+                        // SB-38: only while leaving quorum can the file be
+                        // async while the effective value still has quorum;
+                        // `/sync` keeps `q < |V|` until the hand-off write.
+                        let leaving = self.leave_open;
+                        if (async_now || leaving)
+                            && reads_as_no_quorum(text)
                             && !self.dcs.voters.is_empty()
                             && self.dcs.quorum < self.dcs.voters.len()
                         {
@@ -764,6 +774,7 @@ impl XWorld {
                 standbys + 1
             ],
             since_restart: false,
+            leave_open: false,
             violation: None,
             x: XStats::default(),
             fault: Fault::default(),
@@ -1040,6 +1051,9 @@ impl XWorld {
                     0 => SynchronousMode::Async,
                     1 => SynchronousMode::Sync,
                     _ => SynchronousMode::Quorum,
+                };
+                if self.core.mode != SynchronousMode::Quorum {
+                    self.core.leave_open = true;
                 }
             }
             XAction::GoPriority => self.go_priority(),
