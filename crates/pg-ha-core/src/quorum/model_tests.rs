@@ -1399,6 +1399,10 @@ fn next_leave(
     caught_up: &Names,
     fix: Fixes,
 ) -> Option<Step> {
+    if !fix.leave_dcs_first && !fix.leave_no_gate {
+        // The production order.
+        return next_step_leaving(state, target, caught_up);
+    }
     if target.voters.is_empty() {
         let empty_pg = Step::SetPg {
             names: Names::new(),

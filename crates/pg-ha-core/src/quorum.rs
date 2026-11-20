@@ -174,7 +174,32 @@ pub enum Step {
 /// then tighten `n`; when `n` must drop, raise `q` first; shrink `S` before
 /// `V`; relax `q` last and only behind the SI-4 gate. Every step keeps SI-1.
 pub fn next_step(state: &QuorumState, target: &QuorumTarget, caught_up: &Names) -> Option<Step> {
-    next_step_with(state, target, caught_up, true)
+    next_step_with(state, target, caught_up, true, false)
+}
+/// [`next_step`] for `synchronous_mode` leaving quorum (SB-38): no step
+/// publishes `q >= |V|`.
+///
+/// * Nobody eligible: PostgreSQL goes asynchronous first with `/sync` as it is
+///   (`q = |V| - n < |V|`, the vote still passes); the hand-off write
+///   `(V = {}, q = 0)` follows. `q` is not raised to `|U|` in between.
+/// * Removing voters: steps F and G are one write
+///   `(V*, min(q, max(q*, |V* ∖ caught_up|)))`, made only when that `q` is
+///   below `|V*|`; otherwise it waits with `/sync` unchanged.
+pub fn next_step_leaving(
+    state: &QuorumState,
+    target: &QuorumTarget,
+    caught_up: &Names,
+) -> Option<Step> {
+    next_step_with(state, target, caught_up, true, true)
+}
+/// [`next_step_leaving`] without the enabling rule (see
+/// [`plan_without_enabling`]).
+pub(crate) fn next_step_leaving_legacy(
+    state: &QuorumState,
+    target: &QuorumTarget,
+    caught_up: &Names,
+) -> Option<Step> {
+    next_step_with(state, target, caught_up, false, true)
 }
 /// The planner without the enabling rule (the behavior before SB-36); see
 /// [`plan_without_enabling`].
@@ -183,7 +208,7 @@ pub(crate) fn next_step_legacy(
     target: &QuorumTarget,
     caught_up: &Names,
 ) -> Option<Step> {
-    next_step_with(state, target, caught_up, false)
+    next_step_with(state, target, caught_up, false, false)
 }
 /// Enabling rule (SB-36 fix 1). From an empty `S` (asynchronous) with voters to
 /// enable: write DCS `(V*, q*)` first, with `q* = |V*| - n*`, and only then
@@ -220,6 +245,7 @@ fn next_step_with(
     target: &QuorumTarget,
     caught_up: &Names,
     enabling: bool,
+    leaving: bool,
 ) -> Option<Step> {
     let union_len = state.voters.union(&state.pg_names).count();
 
@@ -228,7 +254,7 @@ fn next_step_with(
         // non-empty make `q >= |U|` first so nobody can be elected during the
         // async window, then empty `S`, then empty `V`.
         if !state.pg_names.is_empty() {
-            if state.quorum < union_len {
+            if !leaving && state.quorum < union_len {
                 return Some(Step::SetDcs {
                     voters: state.voters.clone(),
                     quorum: union_len,
@@ -311,6 +337,14 @@ fn next_step_with(
 
     // F. Remove from V with q unchanged (this never weakens any guarantee).
     if !state.voters.is_subset(&target.voters) {
+        if leaving {
+            // F and G in one write: with q unchanged, `q >= |V*|` is possible
+            // (`|V| >= 2n`) and nobody could win the vote.
+            let voters: Names = state.voters.intersection(&target.voters).cloned().collect();
+            let missing = voters.difference(caught_up).count();
+            let quorum = state.quorum.min(target.quorum().max(missing));
+            return (quorum < voters.len()).then_some(Step::SetDcs { voters, quorum });
+        }
         return Some(Step::SetDcs {
             voters: state.voters.intersection(&target.voters).cloned().collect(),
             quorum: state.quorum,
@@ -367,6 +401,23 @@ fn plan_with(
         steps.push(step);
     }
     steps
+}
+
+/// [`plan`] for `synchronous_mode` leaving quorum; see [`next_step_leaving`].
+/// `enabling` is false for a PostgreSQL value that is not really asynchronous.
+pub fn plan_leaving(
+    state: &QuorumState,
+    target: &QuorumTarget,
+    caught_up: &Names,
+    max_steps: usize,
+    enabling: bool,
+) -> Vec<Step> {
+    let next = if enabling {
+        next_step_leaving
+    } else {
+        next_step_leaving_legacy
+    };
+    plan_with(state, target, caught_up, max_steps, next)
 }
 
 /// [`plan`] without the enabling rule: used for a PostgreSQL value that is
@@ -723,6 +774,64 @@ mod tests {
                 voters: n(&["a", "b"]),
                 quorum: 2
             }
+        );
+    }
+
+    #[test]
+    fn sb38_async_leave_empties_pg_first_and_never_raises_q() {
+        let st = QuorumState::new(["a", "b"], 1, ["a", "b"], 1);
+        let tgt = QuorumTarget::new::<[&str; 0], _>([], 0);
+        let caught = n(&["a", "b"]);
+        let steps = plan_leaving(&st, &tgt, &caught, 8, true);
+        assert_eq!(
+            steps,
+            vec![
+                Step::SetPg {
+                    names: Names::new(),
+                    n: 0
+                },
+                Step::SetDcs {
+                    voters: Names::new(),
+                    quorum: 0
+                },
+            ]
+        );
+        let mut s = st;
+        for step in &steps {
+            if let Step::SetDcs { voters, quorum } = step
+                && !voters.is_empty()
+            {
+                assert!(quorum < &voters.len());
+            }
+            s.apply(step);
+            assert!(s.voters.is_empty() || s.quorum < s.voters.len());
+        }
+    }
+
+    #[test]
+    fn sb38_sync_leave_fuses_voter_removal_with_relax() {
+        // V={a,b,c,d} q=2 (n=2); target V*={a,b} n=1 (q*=1). Removing c,d with
+        // q unchanged would give q=2=|V*|.
+        let st = QuorumState::new(["a", "b", "c", "d"], 2, ["a", "b"], 1);
+        let tgt = QuorumTarget::new(["a", "b"], 1);
+        let caught = n(&["a", "b"]);
+        let step = next_step_leaving(&st, &tgt, &caught);
+        assert_eq!(
+            step,
+            Some(Step::SetDcs {
+                voters: n(&["a", "b"]),
+                quorum: 1
+            })
+        );
+        // Nobody caught up: q' = 2 = |V*|, so wait.
+        assert_eq!(next_step_leaving(&st, &tgt, &Names::new()), None);
+        // Steady quorum keeps the old two writes.
+        assert_eq!(
+            next_step(&st, &tgt, &caught),
+            Some(Step::SetDcs {
+                voters: n(&["a", "b"]),
+                quorum: 2
+            })
         );
     }
 

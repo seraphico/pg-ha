@@ -884,12 +884,17 @@ fn t7_off_ends_with_the_exact_priority_off_value() {
         serde_json::to_string(last).unwrap(),
         r#"{"leader":"n0","sync_standby":null,"quorum":0}"#
     );
-    // q was raised before the PG value was emptied.
+    // SB-38: PostgreSQL is emptied first; no `/sync` write publishes q >= |V|.
     let first_set = io.calls.iter().position(|c| c.starts_with("set:")).unwrap();
     assert!(
-        io.calls[..first_set]
-            .iter()
-            .any(|c| c == "dcs:n0:n1,n2:2:Quorum")
+        io.calls[..first_set].iter().all(|c| !c.starts_with("dcs:")),
+        "{:?}",
+        io.calls
+    );
+    assert!(
+        io.calls.iter().all(|c| c != "dcs:n0:n1,n2:2:Quorum"),
+        "{:?}",
+        io.calls
     );
 }
 

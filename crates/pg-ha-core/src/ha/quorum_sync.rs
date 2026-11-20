@@ -85,8 +85,8 @@ use crate::postgresql::{Postgresql, ReplicationSnapshot};
 use crate::quorum::derive::{Derived, Phase, derive_state};
 use crate::quorum::mark::{Mark, caught_up, observe_mark};
 use crate::quorum::{
-    Names, QuorumState, QuorumTarget, Step, in_enabling_window, plan, plan_without_enabling,
-    post_promotion_state,
+    Names, QuorumState, QuorumTarget, Step, in_enabling_window, plan, plan_leaving,
+    plan_without_enabling, post_promotion_state,
 };
 use crate::sync::{SyncManager, SyncMode};
 use crate::sync_value::{
@@ -899,7 +899,16 @@ impl QuorumExec {
         // Keep SI-1 true in the state the planner starts from (raise only).
         // Not in the enabling window (SB-36): there `/sync` is already settled
         // and PostgreSQL is about to follow; raising q would undo that.
-        if !cur.si1_holds() && !(obs.reasonable && in_enabling_window(&cur, target)) {
+        // Not while leaving to async with PostgreSQL already asynchronous
+        // (SB-38): `q < |V|` stays until the hand-off write.
+        let leaving_async = input.mode == SynchronousMode::Async
+            && obs.reasonable
+            && cur.pg_names.is_empty()
+            && cur.quorum < cur.voters.len();
+        if !cur.si1_holds()
+            && !leaving_async
+            && !(obs.reasonable && in_enabling_window(&cur, target))
+        {
             let quorum = needed_quorum(&cur);
             acts.push(Act::Dcs {
                 voters: cur.voters.clone(),
@@ -928,7 +937,9 @@ impl QuorumExec {
         let mut gated = false;
         // An unreadable value is not asynchronous, whatever the planner is told:
         // no enabling rule for it (it must be replaced with q kept high).
-        let steps = if obs.reasonable {
+        let steps = if input.mode != SynchronousMode::Quorum {
+            plan_leaving(&cur, target, caught, 4, obs.reasonable)
+        } else if obs.reasonable {
             plan(&cur, target, caught, 4)
         } else {
             plan_without_enabling(&cur, target, caught, 4)

@@ -398,8 +398,11 @@ impl Core {
                         [("effective", &self.pg.effective), ("file", &self.pg.file)]
                     {
                         let (names, n) = sem(text);
-                        if async_now
-                            && reads_as_no_quorum(text)
+                        // SB-38: leaving to async, the file can be async while
+                        // the effective value still has quorum; `/sync` keeps
+                        // `q < |V|` until the hand-off write.
+                        let _ = async_now;
+                        if reads_as_no_quorum(text)
                             && !self.dcs.voters.is_empty()
                             && self.dcs.quorum < self.dcs.voters.len()
                         {
