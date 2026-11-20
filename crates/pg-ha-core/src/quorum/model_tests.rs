@@ -70,6 +70,7 @@ use std::time::Duration;
 
 mod executor_model;
 mod sb36_fixes;
+mod sb38_leave;
 mod sb40_zombie;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +145,11 @@ struct Stats {
     granted_in_enable_window: usize,
     /// SB-36 fix 2: planner runs where an offline voter was kept in the target.
     kept_offline: usize,
+    /// SB-38: planner steps that left `/sync` at `q >= |V|` (nobody electable)
+    /// while quorum was being switched off and the hand-off had not happened.
+    leave_vote_impossible: usize,
+    /// SB-38: hand-offs to the Priority/async code that completed.
+    handed_off: usize,
 }
 
 /// SB-36 switches. All off = the model of the code before the fixes, so every
@@ -158,6 +164,24 @@ struct Fixes {
     enable_q_too_low: bool,
     /// Fix 2: an offline voter whose member record has not expired stays in `V*`.
     keep_offline: bool,
+    /// SB-38: order of the writes when `synchronous_mode` leaves quorum.
+    /// false = the order of the code today (planner nobody-eligible branch and
+    /// steps F then G); true = the proposed order (see `sb38_leave.rs`).
+    leave_new: bool,
+    /// SB-38 mutation of the new order (sync): remove from `V` without the
+    /// SI-4 gate (`q` straight to the target value).
+    leave_no_gate: bool,
+    /// SB-38 mutation of the new order (async): empty `/sync` before PG.
+    leave_dcs_first: bool,
+}
+
+/// The `synchronous_mode` the planner is driving toward (SB-38).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Tm {
+    #[default]
+    Quorum,
+    Async,
+    Sync,
 }
 
 impl Fixes {
@@ -186,6 +210,8 @@ impl Stats {
         self.enable_writes += o.enable_writes;
         self.granted_in_enable_window += o.granted_in_enable_window;
         self.kept_offline += o.kept_offline;
+        self.leave_vote_impossible += o.leave_vote_impossible;
+        self.handed_off += o.handed_off;
     }
 }
 
@@ -255,6 +281,11 @@ struct World {
     fix: Fixes,
     /// Bit `i % 8`: node `i` is offline and its member record has expired.
     expired: u8,
+    /// SB-38: the mode being driven toward (default quorum: nothing changes).
+    mode: Tm,
+    /// SB-38: the hand-off to the Priority/async code happened. The quorum
+    /// guarantee ends there (commits under the new mode follow its rules).
+    handed_off: bool,
 }
 
 fn name(i: usize) -> String {
@@ -306,7 +337,37 @@ impl World {
             stats: Stats::default(),
             fix: Fixes::default(),
             expired: 0,
+            mode: Tm::Quorum,
+            handed_off: false,
         }
+    }
+
+    /// SB-38: `/sync` and PG have reached the state the Priority/async code
+    /// takes over from (T7: `V = S = {}`, `q = 0`; T9: `q = 0`, `V = S`,
+    /// `|S| = n`).
+    fn leave_done(&self) -> bool {
+        let st = &self.st;
+        match self.mode {
+            Tm::Quorum => false,
+            Tm::Async => st.voters.is_empty() && st.pg_names.is_empty() && st.quorum == 0,
+            Tm::Sync => {
+                st.quorum == 0
+                    && !st.pg_names.is_empty()
+                    && st.voters == st.pg_names
+                    && st.pg_names.len() == st.effective_n()
+            }
+        }
+    }
+
+    /// SB-38: PG is asynchronous while `/sync` still holds `V` with `q < |V|`,
+    /// on the way out of quorum. Commits here are not covered; the commits
+    /// acknowledged earlier still are (invariant I stays checked).
+    fn leaving_window(&self) -> bool {
+        self.mode != Tm::Quorum
+            && self.fix.enabling()
+            && self.st.pg_names.is_empty()
+            && !self.st.voters.is_empty()
+            && self.st.quorum < self.st.voters.len()
     }
 
     /// SB-36: `S` is empty while `V` is non-empty with `q < |V|`. The cluster
@@ -314,6 +375,7 @@ impl World {
     /// not covered (maintainer decision).
     fn enabling_window(&self) -> bool {
         self.fix.enabling()
+            && self.mode == Tm::Quorum
             && self.st.pg_names.is_empty()
             && !self.st.voters.is_empty()
             && self.st.quorum < self.st.voters.len()
@@ -363,7 +425,15 @@ impl World {
                 })
                 .collect(),
         };
-        let mgr = SyncManager::new(SyncMode::Quorum, self.cfg_n, self.cfg_strict);
+        if self.mode == Tm::Async {
+            return QuorumTarget::new::<[&str; 0], _>([], 0);
+        }
+        let sm = if self.mode == Tm::Sync {
+            SyncMode::Priority
+        } else {
+            SyncMode::Quorum
+        };
+        let mgr = SyncManager::new(sm, self.cfg_n, self.cfg_strict);
         let voters: Vec<String> = self.st.voters.iter().cloned().collect();
         let sel = mgr
             .select_sync_standbys(
@@ -437,7 +507,7 @@ impl World {
     }
 
     fn check(&self, ctx: &str) -> Result<(), String> {
-        if self.enabling_window() {
+        if self.handed_off || self.enabling_window() {
             return Ok(());
         }
         if self.fix.enabling() && self.st.effective_n() > 0 && self.st.voters.is_empty() {
@@ -447,7 +517,7 @@ impl World {
             ));
         }
         let leader = name(self.leader);
-        if !self.st.si1_holds_excluding(&leader) {
+        if !self.leaving_window() && !self.st.si1_holds_excluding(&leader) {
             return Err(format!(
                 "SI-1 violated {ctx}: {:?} (leader {leader})",
                 self.st
@@ -576,6 +646,9 @@ impl World {
         if !self.leader_alive() {
             return Ok(());
         }
+        if self.handed_off {
+            return Ok(());
+        }
         self.finalize_dcs()?;
         let target = self.target();
         if self.fix.keep_offline
@@ -609,6 +682,19 @@ impl World {
             }
             self.refresh_acks();
             self.check(&format!("after step {step:?} from {before:?}"))?;
+            if self.mode != Tm::Quorum
+                && !self.st.voters.is_empty()
+                && self.st.quorum >= self.st.voters.len()
+            {
+                self.stats.leave_vote_impossible += 1;
+            }
+            if self.leave_done() {
+                // The Priority/async code takes over; the quorum guarantee ends.
+                self.handed_off = true;
+                self.acked.clear();
+                self.stats.handed_off += 1;
+                break;
+            }
         }
         Ok(())
     }
@@ -619,6 +705,13 @@ impl World {
     /// settled `|V*| - n*` of `QuorumTarget::quorum`; everything after that is
     /// the unchanged planner.
     fn plan_steps(&mut self, target: &QuorumTarget, caught: &Names) -> Vec<Step> {
+        if self.mode != Tm::Quorum {
+            return if self.fix.leave_new {
+                plan_leave(&self.st, target, caught, 16, self.fix)
+            } else {
+                plan(&self.st, target, caught, 16)
+            };
+        }
         let mutated = self.fix.enable_pg_first || self.fix.enable_q_too_low;
         if mutated && self.st.pg_names.is_empty() && !target.voters.is_empty() {
             let q = target
@@ -653,7 +746,7 @@ impl World {
     }
 
     fn elect(&mut self, c: usize, reach: u8, late: u8, fail: u8) -> Result<(), String> {
-        if !self.leader_dead {
+        if !self.leader_dead || self.handed_off {
             return Ok(());
         }
         let c = self.idx(c);
@@ -1263,4 +1356,93 @@ proptest! {
             prop_assert!(priority.voters().iter().all(|p| eligible.contains(p)));
         }
     }
+}
+
+/// SB-38: the planner when `synchronous_mode` leaves quorum, in the proposed
+/// order. Runs the real planner's `next_step` for everything except the two
+/// places that publish `q >= |V|`:
+///
+/// * nobody eligible (async): PG goes to async FIRST with `(V, q)` unchanged
+///   (`q = |V| - n < |V|`: the vote still passes and invariant I still holds
+///   for every commit acknowledged under quorum), then the hand-off write
+///   `(V = {}, q = 0)`; no `q = |U|` raise in between.
+/// * removing voters (sync): the planner's F (`V*`, `q` unchanged) followed by
+///   G (relax behind SI-4) is one write `(V*, min(q, max(q*, |V* \ caught|)))`,
+///   and only when that `q'` is `< |V*|`; otherwise wait (`/sync` stays as it
+///   is, `q < |V|`).
+fn plan_leave(
+    state: &QuorumState,
+    target: &QuorumTarget,
+    caught_up: &Names,
+    max_steps: usize,
+    fix: Fixes,
+) -> Vec<Step> {
+    let mut state = state.clone();
+    let mut caught_up = caught_up.clone();
+    let mut steps = Vec::new();
+    while steps.len() < max_steps {
+        let Some(step) = next_leave(&state, target, &caught_up, fix) else {
+            break;
+        };
+        state.apply(&step);
+        if matches!(step, Step::SetPg { .. }) {
+            caught_up.clear();
+        }
+        steps.push(step);
+    }
+    steps
+}
+
+fn next_leave(
+    state: &QuorumState,
+    target: &QuorumTarget,
+    caught_up: &Names,
+    fix: Fixes,
+) -> Option<Step> {
+    if target.voters.is_empty() {
+        let empty_pg = Step::SetPg {
+            names: Names::new(),
+            n: 0,
+        };
+        let hand_off = Step::SetDcs {
+            voters: Names::new(),
+            quorum: 0,
+        };
+        if fix.leave_dcs_first {
+            // Mutation: `/sync` emptied while PG still has quorum.
+            if !state.voters.is_empty() || state.quorum != 0 {
+                return Some(hand_off);
+            }
+            return (!state.pg_names.is_empty()).then_some(empty_pg);
+        }
+        if !state.pg_names.is_empty() {
+            return Some(empty_pg);
+        }
+        if !state.voters.is_empty() || state.quorum != 0 {
+            return Some(hand_off);
+        }
+        return None;
+    }
+    let step = next_step(state, target, caught_up)?;
+    if let Step::SetDcs { voters, quorum } = &step
+        && voters.is_subset(&state.voters)
+        && voters.len() < state.voters.len()
+        && *quorum == state.quorum
+    {
+        // The planner's F. Fuse it with G.
+        let missing = voters.difference(caught_up).count();
+        let q = if fix.leave_no_gate {
+            target.quorum().min(state.quorum)
+        } else {
+            state.quorum.min(target.quorum().max(missing))
+        };
+        if q >= voters.len() {
+            return None;
+        }
+        return Some(Step::SetDcs {
+            voters: voters.clone(),
+            quorum: q,
+        });
+    }
+    Some(step)
 }
