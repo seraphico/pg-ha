@@ -171,7 +171,7 @@ impl Watchdog {
     #[cfg(target_os = "linux")]
     fn keepalive_linux(&self) {
         if let Some(fd) = self.fd {
-            let byte: [u8; 1] = [b'1'];
+            let byte: [u8; 1] = *b"1";
             let ret = unsafe { libc::write(fd, byte.as_ptr() as *const libc::c_void, 1) };
             if ret < 0 {
                 warn!("Watchdog keepalive write failed");
@@ -183,7 +183,7 @@ impl Watchdog {
     fn disarm_linux(&mut self) {
         if let Some(fd) = self.fd.take() {
             // Write magic 'V' character to safely close without triggering reboot
-            let magic: [u8; 1] = [b'V'];
+            let magic: [u8; 1] = *b"V";
             unsafe {
                 libc::write(fd, magic.as_ptr() as *const libc::c_void, 1);
                 libc::close(fd);
