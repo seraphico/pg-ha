@@ -1453,19 +1453,20 @@ fn next_leave(
     fix: Fixes,
 ) -> Option<Step> {
     if !fix.leave_dcs_first && !fix.leave_no_gate {
-        // The production order, plus the hand-off gate of the maintainer
-        // decision: `(V = {}, q = 0)` only when every voter is caught up.
-        let step = next_step_leaving(state, target, caught_up)?;
-        if fix.leave_gate
+        if !fix.leave_gate
             && target.voters.is_empty()
             && state.pg_names.is_empty()
-            && !state.voters.is_empty()
-            && matches!(&step, Step::SetDcs { voters, .. } if voters.is_empty())
-            && !state.voters.is_subset(caught_up)
+            && (!state.voters.is_empty() || state.quorum != 0)
         {
-            return None;
+            // Mutation: the hand-off before the gate existed.
+            return Some(Step::SetDcs {
+                voters: Names::new(),
+                quorum: 0,
+            });
         }
-        return Some(step);
+        // The production planner, including the hand-off gate of the
+        // maintainer decision (`|V ∖ caught_up| == 0`).
+        return next_step_leaving(state, target, caught_up);
     }
     if target.voters.is_empty() {
         let empty_pg = Step::SetPg {

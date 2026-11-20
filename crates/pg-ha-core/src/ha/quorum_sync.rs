@@ -230,6 +230,8 @@ pub(crate) struct QuorumExec {
     /// Consecutive cycles `q > |V| - n` has held (None: not open). Rate limit
     /// for the "failover is not possible" warning.
     window_cycles: Option<u32>,
+    /// Consecutive cycles the async hand-off has waited for voters (SB-38).
+    handoff_wait_cycles: Option<u32>,
 }
 
 /// How often a standing warning is repeated, in executor cycles (the same
@@ -523,6 +525,7 @@ impl QuorumExec {
             unreadable: None,
             observed_n: None,
             window_cycles: None,
+            handoff_wait_cycles: None,
         }
     }
 
@@ -550,6 +553,25 @@ impl QuorumExec {
             return false;
         }
         match &mut self.window_cycles {
+            Some(cycles) => {
+                *cycles += 1;
+                *cycles % WARN_EVERY_CYCLES == 0
+            }
+            slot => {
+                *slot = Some(1);
+                true
+            }
+        }
+    }
+
+    /// Rate limit for the "hand-off waits for voters" warning: true when the
+    /// wait starts and on every 30th consecutive cycle; ending it resets it.
+    pub(crate) fn note_handoff_wait(&mut self, waiting: bool) -> bool {
+        if !waiting {
+            self.handoff_wait_cycles = None;
+            return false;
+        }
+        match &mut self.handoff_wait_cycles {
             Some(cycles) => {
                 *cycles += 1;
                 *cycles % WARN_EVERY_CYCLES == 0
@@ -706,6 +728,9 @@ impl QuorumExec {
         let window_open = quorum_kind
             && v_now > 0
             && !enabling
+            // SB-38: PG already async with q < |V| is the leave waiting for the
+            // hand-off; it has its own message below.
+            && !(input.mode != SynchronousMode::Quorum && n_now == 0 && q_now < v_now)
             && !crate::cluster::quorum_is_settled(v_now, q_now, n_now);
         if self.note_window(window_open) {
             warn!(
@@ -800,6 +825,21 @@ impl QuorumExec {
             for w in &warnings {
                 warn!("{}", w.text());
             }
+        }
+        // SB-38: the hand-off to async waits for every voter to catch up.
+        let lagging: Vec<&String> = if input.mode != SynchronousMode::Quorum
+            && obs.reasonable
+            && target.voters.is_empty()
+            && state.pg_names.is_empty()
+        {
+            state.voters.difference(&caught).collect()
+        } else {
+            Vec::new()
+        };
+        if self.note_handoff_wait(!lagging.is_empty()) {
+            warn!(
+                "quorum sync: leaving quorum waits for voters {lagging:?} to catch up before /sync is handed off; /sync keeps q={q_now} of {v_now} voters meanwhile"
+            );
         }
         let acts = match self.assemble(input, &obs, &state, &target, &caught, relax_blocked, strict)
         {

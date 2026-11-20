@@ -1218,7 +1218,8 @@ fn model_executor_actually_exercises_the_paths() {
     assert!(t.lease_fault > 1_500, "lease faults rare: {t:?}");
     assert!(t.t8_done > 60, "T8 rarely completed: {t:?}");
     assert!(t.t9_done > 70, "T9 rarely completed: {t:?}");
-    assert!(t.t7_done > 120, "T7 rarely completed: {t:?}");
+    // SB-38: the hand-off now waits for every voter to catch up (about 78 here).
+    assert!(t.t7_done > 40, "T7 rarely completed: {t:?}");
     assert!(t.finalize_match > 90, "match finalization rare: {t:?}");
     assert!(t.finalize_reset > 20, "reset finalization rare: {t:?}");
     assert!(t.commits_skipped_blind > 10, "no blind window: {t:?}");

@@ -181,7 +181,8 @@ pub fn next_step(state: &QuorumState, target: &QuorumTarget, caught_up: &Names) 
 ///
 /// * Nobody eligible: PostgreSQL goes asynchronous first with `/sync` as it is
 ///   (`q = |V| - n < |V|`, the vote still passes); the hand-off write
-///   `(V = {}, q = 0)` follows. `q` is not raised to `|U|` in between.
+///   `(V = {}, q = 0)` follows, only once every voter is in `caught_up`
+///   (`None` until then). `q` is not raised to `|U|` in between.
 /// * Removing voters: steps F and G are one write
 ///   `(V*, min(q, max(q*, |V* ∖ caught_up|)))`, made only when that `q` is
 ///   below `|V*|`; otherwise it waits with `/sync` unchanged.
@@ -266,6 +267,12 @@ fn next_step_with(
             });
         }
         if !state.voters.is_empty() || state.quorum != 0 {
+            // Leaving quorum: the hand-off ends the vote, so it waits until
+            // every voter has reached the mark taken after PG went async.
+            // Acknowledged commits are then on all of them (SB-38).
+            if leaving && !state.voters.is_subset(caught_up) {
+                return None;
+            }
             return Some(Step::SetDcs {
                 voters: Names::new(),
                 quorum: 0,
@@ -783,19 +790,26 @@ mod tests {
         let tgt = QuorumTarget::new::<[&str; 0], _>([], 0);
         let caught = n(&["a", "b"]);
         let steps = plan_leaving(&st, &tgt, &caught, 8, true);
+        // The new PG value starts a new mark: the hand-off waits for the next
+        // cycle even though everyone was caught up to the old one.
         assert_eq!(
             steps,
-            vec![
-                Step::SetPg {
-                    names: Names::new(),
-                    n: 0
-                },
-                Step::SetDcs {
-                    voters: Names::new(),
-                    quorum: 0
-                },
-            ]
+            vec![Step::SetPg {
+                names: Names::new(),
+                n: 0
+            }]
         );
+        let mut s = st.clone();
+        s.apply(&steps[0]);
+        let hand_off = Step::SetDcs {
+            voters: Names::new(),
+            quorum: 0,
+        };
+        // Gate: every voter must be caught up to that mark.
+        assert_eq!(next_step_leaving(&s, &tgt, &n(&["a"])), None);
+        assert_eq!(next_step_leaving(&s, &tgt, &Names::new()), None);
+        assert_eq!(next_step_leaving(&s, &tgt, &caught), Some(hand_off.clone()));
+        let steps = vec![steps[0].clone(), hand_off];
         let mut s = st;
         for step in &steps {
             if let Step::SetDcs { voters, quorum } = step
