@@ -85,8 +85,8 @@ use crate::postgresql::{Postgresql, ReplicationSnapshot};
 use crate::quorum::derive::{Derived, Phase, derive_state};
 use crate::quorum::mark::{Mark, caught_up, observe_mark};
 use crate::quorum::{
-    Names, QuorumState, QuorumTarget, Step, in_enabling_window, plan, plan_without_enabling,
-    post_promotion_state,
+    Names, QuorumState, QuorumTarget, Step, in_enabling_window, plan, plan_leaving,
+    plan_without_enabling, post_promotion_state,
 };
 use crate::sync::{SyncManager, SyncMode};
 use crate::sync_value::{
@@ -209,6 +209,9 @@ struct PendingSet {
     key: ShapeKey,
     /// Shape key that was in force when `text` was issued.
     pre_key: ShapeKey,
+    /// `synchronous_mode` when `text` was issued: a retry after a mode change
+    /// would replay a value the new mode did not ask for.
+    mode: SynchronousMode,
     /// Cycles in which SHOW showed neither.
     cycles: u32,
 }
@@ -230,6 +233,8 @@ pub(crate) struct QuorumExec {
     /// Consecutive cycles `q > |V| - n` has held (None: not open). Rate limit
     /// for the "failover is not possible" warning.
     window_cycles: Option<u32>,
+    /// Consecutive cycles the async hand-off has waited for voters (SB-38).
+    handoff_wait_cycles: Option<u32>,
 }
 
 /// How often a standing warning is repeated, in executor cycles (the same
@@ -523,6 +528,7 @@ impl QuorumExec {
             unreadable: None,
             observed_n: None,
             window_cycles: None,
+            handoff_wait_cycles: None,
         }
     }
 
@@ -550,6 +556,25 @@ impl QuorumExec {
             return false;
         }
         match &mut self.window_cycles {
+            Some(cycles) => {
+                *cycles += 1;
+                *cycles % WARN_EVERY_CYCLES == 0
+            }
+            slot => {
+                *slot = Some(1);
+                true
+            }
+        }
+    }
+
+    /// Rate limit for the "hand-off waits for voters" warning: true when the
+    /// wait starts and on every 30th consecutive cycle; ending it resets it.
+    pub(crate) fn note_handoff_wait(&mut self, waiting: bool) -> bool {
+        if !waiting {
+            self.handoff_wait_cycles = None;
+            return false;
+        }
+        match &mut self.handoff_wait_cycles {
             Some(cycles) => {
                 *cycles += 1;
                 *cycles % WARN_EVERY_CYCLES == 0
@@ -706,6 +731,9 @@ impl QuorumExec {
         let window_open = quorum_kind
             && v_now > 0
             && !enabling
+            // SB-38: PG already async with q < |V| is the leave waiting for the
+            // hand-off; it has its own message below.
+            && !(input.mode != SynchronousMode::Quorum && n_now == 0 && q_now < v_now)
             && !crate::cluster::quorum_is_settled(v_now, q_now, n_now);
         if self.note_window(window_open) {
             warn!(
@@ -726,7 +754,7 @@ impl QuorumExec {
                         p.text, p.cycles, obs.raw
                     );
                 }
-                let retry = obs.key == p.pre_key;
+                let retry = obs.key == p.pre_key && input.mode == p.mode;
                 // Retry the same text, or (when the value changed to something
                 // else) write back what is in force, so the file cannot hold
                 // a different value than the one we observe.
@@ -801,6 +829,21 @@ impl QuorumExec {
                 warn!("{}", w.text());
             }
         }
+        // SB-38: the hand-off to async waits for every voter to catch up.
+        let lagging: Vec<&String> = if input.mode != SynchronousMode::Quorum
+            && obs.reasonable
+            && target.voters.is_empty()
+            && state.pg_names.is_empty()
+        {
+            state.voters.difference(&caught).collect()
+        } else {
+            Vec::new()
+        };
+        if self.note_handoff_wait(!lagging.is_empty()) {
+            warn!(
+                "quorum sync: leaving quorum waits for voters {lagging:?} to catch up before /sync is handed off; /sync keeps q={q_now} of {v_now} voters meanwhile"
+            );
+        }
         let acts = match self.assemble(input, &obs, &state, &target, &caught, relax_blocked, strict)
         {
             Ok(acts) => acts,
@@ -848,6 +891,7 @@ impl QuorumExec {
                         text: text.clone(),
                         key,
                         pre_key: obs.key.clone(),
+                        mode: input.mode,
                         cycles: 0,
                     });
                     return match io.set_pg(&text).await {
@@ -899,7 +943,16 @@ impl QuorumExec {
         // Keep SI-1 true in the state the planner starts from (raise only).
         // Not in the enabling window (SB-36): there `/sync` is already settled
         // and PostgreSQL is about to follow; raising q would undo that.
-        if !cur.si1_holds() && !(obs.reasonable && in_enabling_window(&cur, target)) {
+        // Not while leaving to async with PostgreSQL already asynchronous
+        // (SB-38): `q < |V|` stays until the hand-off write.
+        let leaving_async = input.mode == SynchronousMode::Async
+            && obs.reasonable
+            && cur.pg_names.is_empty()
+            && cur.quorum < cur.voters.len();
+        if !cur.si1_holds()
+            && !leaving_async
+            && !(obs.reasonable && in_enabling_window(&cur, target))
+        {
             let quorum = needed_quorum(&cur);
             acts.push(Act::Dcs {
                 voters: cur.voters.clone(),
@@ -928,7 +981,9 @@ impl QuorumExec {
         let mut gated = false;
         // An unreadable value is not asynchronous, whatever the planner is told:
         // no enabling rule for it (it must be replaced with q kept high).
-        let steps = if obs.reasonable {
+        let steps = if input.mode != SynchronousMode::Quorum {
+            plan_leaving(&cur, target, caught, 4, obs.reasonable)
+        } else if obs.reasonable {
             plan(&cur, target, caught, 4)
         } else {
             plan_without_enabling(&cur, target, caught, 4)

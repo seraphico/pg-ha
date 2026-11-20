@@ -688,6 +688,28 @@ fn a_failed_set_pg_is_recorded_as_pending_because_the_file_may_have_changed() {
     assert!(exec.has_pending());
 }
 
+#[test]
+fn a_pending_set_is_not_replayed_after_the_mode_changed() {
+    // An async cycle fails its `set_pg("")`; the operator goes back to quorum.
+    // The retry must not empty PostgreSQL while /sync is a quorum (SB-38 CI).
+    let show = "ANY 2 (\"n1\",\"n2\")";
+    let s = || Some(sync("n0", "n1,n2", 0, SyncKind::Quorum));
+    let mut exec = ready_with_mark(show, 500);
+    let mut io = FakeIo::new(show, &ALL);
+    io.set_pg_err = true;
+    let leave = input(SynchronousMode::Async, 0, &[], s());
+    assert!(matches!(
+        cycle(&mut exec, &mut io, &leave),
+        ExecOutcome::Failed(_)
+    ));
+    assert!(io.calls.iter().any(|c| c == "set:"));
+    assert!(exec.has_pending());
+    io.set_pg_err = false;
+    let back = input(Q, 2, &three(), s());
+    cycle(&mut exec, &mut io, &back);
+    assert!(io.pg_sets.iter().all(|v| !v.is_empty()), "{:?}", io.pg_sets);
+    assert!(!exec.has_pending());
+}
 // ───────────────────────────── unreadable values ─────────────────────────────
 
 fn assert_never_lowers_q(io: &FakeIo, from: u32) {
@@ -884,13 +906,159 @@ fn t7_off_ends_with_the_exact_priority_off_value() {
         serde_json::to_string(last).unwrap(),
         r#"{"leader":"n0","sync_standby":null,"quorum":0}"#
     );
-    // q was raised before the PG value was emptied.
+    // SB-38: PostgreSQL is emptied first; no `/sync` write publishes q >= |V|.
     let first_set = io.calls.iter().position(|c| c.starts_with("set:")).unwrap();
     assert!(
-        io.calls[..first_set]
-            .iter()
-            .any(|c| c == "dcs:n0:n1,n2:2:Quorum")
+        io.calls[..first_set].iter().all(|c| !c.starts_with("dcs:")),
+        "{:?}",
+        io.calls
     );
+    assert!(
+        io.calls.iter().all(|c| c != "dcs:n0:n1,n2:2:Quorum"),
+        "{:?}",
+        io.calls
+    );
+}
+
+// ───────────────────────────── SB-38 ─────────────────────────────
+
+/// Async leave, PostgreSQL already empty: `/sync` is `(V={n1,n2}, q=1)`.
+fn leave_async_input() -> ExecInput {
+    input(
+        SynchronousMode::Async,
+        1,
+        &["n1", "n2"],
+        Some(sync("n0", "n1,n2", 1, SyncKind::Quorum)),
+    )
+}
+
+#[test]
+fn sb38_handoff_waits_while_a_voter_lags_and_proceeds_when_caught_up() {
+    let inp = leave_async_input();
+    // Mark 500 taken for the empty value; n2 is 1 byte short.
+    let mut exec = ready_with_mark("", 500);
+    let mut io = FakeIo::new("", &[("n1", 1000), ("n2", 499)]);
+    let o = cycle(&mut exec, &mut io, &inp);
+    assert_eq!(o, ExecOutcome::NoChange, "{:?}", io.calls);
+    assert!(io.dcs_writes.is_empty(), "{:?}", io.calls);
+    assert!(io.pg_sets.is_empty(), "{:?}", io.calls);
+
+    // n2 reaches the mark: the hand-off is written.
+    io.repl = snapshot(1000, &[("n1", 1000), ("n2", 500)]);
+    let o = cycle(&mut exec, &mut io, &inp);
+    assert_eq!(o, ExecOutcome::HandedOff, "{:?}", io.calls);
+    assert_eq!(
+        serde_json::to_string(io.dcs_writes.last().unwrap()).unwrap(),
+        r#"{"leader":"n0","sync_standby":null,"quorum":0}"#
+    );
+}
+
+#[test]
+fn sb38_handoff_waits_for_a_voter_with_no_replication_row() {
+    let inp = leave_async_input();
+    let mut exec = ready_with_mark("", 500);
+    let mut io = FakeIo::new("", &[("n1", 1000)]);
+    assert_eq!(cycle(&mut exec, &mut io, &inp), ExecOutcome::NoChange);
+    assert!(io.dcs_writes.is_empty(), "{:?}", io.calls);
+}
+
+#[test]
+fn sb38_handoff_wait_is_rate_limited() {
+    let mut exec = ready();
+    assert!(exec.note_handoff_wait(true), "first cycle logs");
+    for _ in 0..(WARN_EVERY_CYCLES - 2) {
+        assert!(!exec.note_handoff_wait(true));
+    }
+    assert!(exec.note_handoff_wait(true), "every 30th cycle logs again");
+    assert!(!exec.note_handoff_wait(false));
+    assert!(exec.note_handoff_wait(true), "a new wait logs again");
+}
+
+#[test]
+fn sb38_leaving_async_does_not_raise_q_to_v_even_with_a_stale_mark() {
+    // A fresh mark blocks relaxing; the exemption must still keep q at 1.
+    let inp = leave_async_input();
+    let mut io = FakeIo::new("", &ALL);
+    let mut exec = ready();
+    for _ in 0..3 {
+        cycle(&mut exec, &mut io, &inp);
+    }
+    assert!(
+        io.dcs_writes.iter().all(|w| w.quorum != 2),
+        "{:?}",
+        io.calls
+    );
+}
+
+#[test]
+fn sb38_leaving_async_with_an_unreadable_value_raises_q_before_replacing_it() {
+    // A wildcard is not asynchronous: the exemption does not apply, so q goes
+    // to |V| before the value is replaced.
+    let inp = leave_async_input();
+    let mut io = FakeIo::new("\"*\"", &ALL);
+    let mut exec = ready();
+    cycle(&mut exec, &mut io, &inp);
+    let first = io.dcs_writes.first().expect("a /sync write");
+    assert_eq!((first.quorum, first.kind), (2, SyncKind::Quorum));
+    assert_eq!(io.pg_sets, vec![String::new()], "{:?}", io.calls);
+}
+
+/// Sync leave: V={n1,n2,n3} drops n3, S={n1,n2}.
+fn leave_sync_input(count: usize, q: u32) -> ExecInput {
+    input(
+        SynchronousMode::Sync,
+        count,
+        &["n1", "n2"],
+        Some(sync("n0", "n1,n2,n3", q, SyncKind::Quorum)),
+    )
+}
+
+#[test]
+fn sb38_sync_leave_removes_the_voter_and_relaxes_q_in_one_write() {
+    // ANY 2 of V={n1,n2,n3}: q = 1. Target q* = 0; everyone is caught up.
+    let show = "ANY 2 (\"n1\",\"n2\")";
+    let inp = leave_sync_input(2, 1);
+    let mut io = FakeIo::new(show, &ALL);
+    let o = cycle(&mut ready_with_mark(show, 500), &mut io, &inp);
+    assert_eq!(o, ExecOutcome::Progressed, "{:?}", io.calls);
+    // One /sync write (never q=2 = |V*| in between); the PG form follows.
+    assert_eq!(io.dcs_writes.len(), 1, "{:?}", io.calls);
+    assert_eq!(io.writes()[0], "dcs:n0:n1,n2:0:Quorum", "{:?}", io.calls);
+}
+
+#[test]
+fn sb38_sync_leave_waits_when_the_merged_q_would_not_be_below_v() {
+    // V={n1,n2,n3}, S={n1}, n=1: q = 2. Target V*={n1}, q* = 0. While n1 is
+    // short of the mark q' = min(2, max(0, 1)) = 1 = |V*|: no write at all
+    // (the old order removed voters with q=2 unchanged, above |V*| = 1).
+    let show = "ANY 1 (\"n1\")";
+    let inp = input(
+        SynchronousMode::Sync,
+        1,
+        &["n1"],
+        Some(sync("n0", "n1,n2,n3", 2, SyncKind::Quorum)),
+    );
+    let mut io = FakeIo::new(show, &[("n1", 499)]);
+    let mut exec = ready_with_mark(show, 500);
+    let o = cycle(&mut exec, &mut io, &inp);
+    assert_eq!(o, ExecOutcome::NoChange, "{:?}", io.calls);
+    assert!(io.dcs_writes.is_empty(), "{:?}", io.calls);
+
+    // Once n1 has reached the mark, q' = 0 < 1 and the write goes out.
+    io.repl = snapshot(1000, &[("n1", 500)]);
+    let o = cycle(&mut exec, &mut io, &inp);
+    assert_eq!(o, ExecOutcome::Progressed, "{:?}", io.calls);
+    assert_eq!(io.writes()[0], "dcs:n0:n1:0:Quorum", "{:?}", io.calls);
+}
+
+#[test]
+fn sb38_sync_leave_with_a_fresh_mark_does_not_write() {
+    let show = "ANY 2 (\"n1\",\"n2\")";
+    let inp = leave_sync_input(2, 1);
+    let mut io = FakeIo::new(show, &ALL);
+    let o = cycle(&mut ready(), &mut io, &inp);
+    assert_eq!(o, ExecOutcome::NoChange, "{:?}", io.calls);
+    assert!(io.dcs_writes.is_empty(), "{:?}", io.calls);
 }
 
 #[test]
