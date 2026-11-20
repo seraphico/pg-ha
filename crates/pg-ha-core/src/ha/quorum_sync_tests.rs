@@ -688,6 +688,28 @@ fn a_failed_set_pg_is_recorded_as_pending_because_the_file_may_have_changed() {
     assert!(exec.has_pending());
 }
 
+#[test]
+fn a_pending_set_is_not_replayed_after_the_mode_changed() {
+    // An async cycle fails its `set_pg("")`; the operator goes back to quorum.
+    // The retry must not empty PostgreSQL while /sync is a quorum (SB-38 CI).
+    let show = "ANY 2 (\"n1\",\"n2\")";
+    let s = || Some(sync("n0", "n1,n2", 0, SyncKind::Quorum));
+    let mut exec = ready_with_mark(show, 500);
+    let mut io = FakeIo::new(show, &ALL);
+    io.set_pg_err = true;
+    let leave = input(SynchronousMode::Async, 0, &[], s());
+    assert!(matches!(
+        cycle(&mut exec, &mut io, &leave),
+        ExecOutcome::Failed(_)
+    ));
+    assert!(io.calls.iter().any(|c| c == "set:"));
+    assert!(exec.has_pending());
+    io.set_pg_err = false;
+    let back = input(Q, 2, &three(), s());
+    cycle(&mut exec, &mut io, &back);
+    assert!(io.pg_sets.iter().all(|v| !v.is_empty()), "{:?}", io.pg_sets);
+    assert!(!exec.has_pending());
+}
 // ───────────────────────────── unreadable values ─────────────────────────────
 
 fn assert_never_lowers_q(io: &FakeIo, from: u32) {

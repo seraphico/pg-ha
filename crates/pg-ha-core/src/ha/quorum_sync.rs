@@ -209,6 +209,9 @@ struct PendingSet {
     key: ShapeKey,
     /// Shape key that was in force when `text` was issued.
     pre_key: ShapeKey,
+    /// `synchronous_mode` when `text` was issued: a retry after a mode change
+    /// would replay a value the new mode did not ask for.
+    mode: SynchronousMode,
     /// Cycles in which SHOW showed neither.
     cycles: u32,
 }
@@ -751,7 +754,7 @@ impl QuorumExec {
                         p.text, p.cycles, obs.raw
                     );
                 }
-                let retry = obs.key == p.pre_key;
+                let retry = obs.key == p.pre_key && input.mode == p.mode;
                 // Retry the same text, or (when the value changed to something
                 // else) write back what is in force, so the file cannot hold
                 // a different value than the one we observe.
@@ -888,6 +891,7 @@ impl QuorumExec {
                         text: text.clone(),
                         key,
                         pre_key: obs.key.clone(),
+                        mode: input.mode,
                         cycles: 0,
                     });
                     return match io.set_pg(&text).await {
