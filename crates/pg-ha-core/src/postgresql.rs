@@ -316,6 +316,9 @@ pub(crate) struct ReplicaWalSample {
     pub(crate) receiver: Option<(u64, u64)>,
     /// `pg_postmaster_start_time()`
     pub(crate) postmaster_start: Option<String>,
+    /// `pg_control_recovery()`: (`min_recovery_end_timeline`,
+    /// `min_recovery_end_lsn`). `None` when not read or both are zero.
+    pub(crate) min_recovery_end: Option<(u64, u64)>,
 }
 
 /// How a replica's published timeline relates to its published position.
@@ -358,6 +361,14 @@ pub(crate) struct ReplicaWalResolution {
 /// - the pair remembered from this server run when the position is at or
 ///   above it. This is the failover case: the dying upstream's last WAL
 ///   arrives after the last sample, then the receiver exits.
+///
+/// - the `pg_control_recovery()` pair, once replay reached its LSN. A
+///   promotion writes the new timeline there until its first checkpoint
+///   completes, so a node killed in that window and restarted as a standby
+///   (no receiver, checkpoint still on the old timeline) still knows. The
+///   replay LSN, not the receive position, is the test: replay is what has
+///   consumed the timeline switch. Before that point the pair says nothing
+///   about the timeline of the node's own WAL.
 ///
 /// pg_rewind and pg_basebackup need a stopped server, so a new
 /// `pg_postmaster_start_time()` drops the remembered pair. A replica may
@@ -404,6 +415,13 @@ pub(crate) fn resolve_replica_wal(
         && wal_position >= last.flushed_lsn
     {
         timeline = timeline.max(Some(last.timeline));
+    }
+    if let Some((min_timeline, min_lsn)) = sample.min_recovery_end
+        && min_timeline > 0
+        && min_lsn > 0
+        && replay >= min_lsn
+    {
+        timeline = timeline.max(Some(min_timeline));
     }
     ReplicaWalResolution {
         wal_position,
@@ -1270,7 +1288,9 @@ impl Postgresql {
                 (SELECT timeline_id FROM pg_control_checkpoint()), \
                 r.flushed_lsn - '0/0', \
                 r.received_tli, \
-                pg_postmaster_start_time() \
+                pg_postmaster_start_time(), \
+                (SELECT min_recovery_end_timeline FROM pg_control_recovery()), \
+                (SELECT min_recovery_end_lsn - '0/0' FROM pg_control_recovery()) \
                 FROM (SELECT 1) AS one \
                 LEFT JOIN pg_stat_wal_receiver AS r ON true";
 
@@ -1288,6 +1308,8 @@ impl Postgresql {
                     sample.checkpoint_timeline = num(2);
                     sample.receiver = num(3).zip(num(4));
                     sample.postmaster_start = row.get(5).map(str::to_owned);
+                    sample.min_recovery_end =
+                        num(6).zip(num(7)).filter(|&(tl, lsn)| tl > 0 && lsn > 0);
                 }
             }
 
@@ -3073,7 +3095,12 @@ mod tests {
             checkpoint_timeline: checkpoint_tl,
             receiver,
             postmaster_start: Some(RUN.to_string()),
+            min_recovery_end: None,
         }
+    }
+    fn with_min(mut s: ReplicaWalSample, timeline: u64, lsn: u64) -> ReplicaWalSample {
+        s.min_recovery_end = Some((timeline, lsn));
+        s
     }
 
     fn received(flushed: u64, timeline: u64) -> ReceivedWal {
@@ -3084,6 +3111,72 @@ mod tests {
         }
     }
 
+    // The captures behind these rows are in the SB-37 evidence
+    // (pg18-restart-timeline.md, X1/X2/X3b): real PostgreSQL 18 values.
+    #[test]
+    fn the_control_file_pair_is_a_lower_bound_built_from_the_captures() {
+        let table = [
+            // X1: promoted standby killed before its end-of-recovery
+            // checkpoint, restarted as a standby: checkpoint 1, pair (2, ..).
+            (
+                "X1",
+                with_min(sample(None, Some(0x4036598), Some(1), None), 2, 0x40362C8),
+                Some(2),
+            ),
+            // X2: the other standby: its pair is still timeline 1.
+            (
+                "X2",
+                with_min(sample(None, Some(0x4036598), Some(1), None), 1, 0x3000120),
+                Some(1),
+            ),
+            // X3b: old primary with the history file but no WAL of timeline 2.
+            (
+                "X3b",
+                with_min(sample(None, Some(0x5000000), Some(1), None), 1, 0x5000000),
+                Some(1),
+            ),
+            // Replay below the point: the pair does not describe this WAL yet.
+            (
+                "below",
+                with_min(sample(None, Some(0x40362C7), Some(1), None), 2, 0x40362C8),
+                Some(1),
+            ),
+            // Exactly at the point counts.
+            (
+                "at",
+                with_min(sample(None, Some(0x40362C8), Some(1), None), 2, 0x40362C8),
+                Some(2),
+            ),
+            // A zero pair (never read, or a server that never recovered) is ignored.
+            (
+                "zero tl",
+                with_min(sample(None, Some(0x4036598), Some(1), None), 0, 0x40362C8),
+                Some(1),
+            ),
+            (
+                "zero lsn",
+                with_min(sample(None, Some(0x4036598), Some(1), None), 2, 0),
+                Some(1),
+            ),
+            // No pair at all: unchanged behaviour.
+            (
+                "none",
+                sample(None, Some(0x4036598), Some(1), None),
+                Some(1),
+            ),
+            // Never lowers a timeline other evidence already gave.
+            (
+                "max",
+                with_min(sample(None, Some(0x4036598), Some(3), None), 2, 0x40362C8),
+                Some(3),
+            ),
+        ];
+        for (name, s, expected) in table {
+            let r = resolve_replica_wal(&s, None);
+            assert_eq!(r.timeline, expected, "{name}");
+            assert_eq!(r.source, ReplicaTimelineSource::LowerBound, "{name}");
+        }
+    }
     #[test]
     fn streaming_replica_publishes_the_receiver_timeline_not_the_checkpoint() {
         // Streamed timeline 6, last restartpoint still on 5.
@@ -3249,6 +3342,7 @@ mod tests {
             checkpoint_timeline: Some(5),
             receiver: None,
             postmaster_start: Some("2026-01-01 00:00:00+00".to_string()),
+            min_recovery_end: None,
         };
         let r = resolve_replica_wal(&sample, seen.as_ref());
         assert_eq!(r.timeline, Some(6));

@@ -857,6 +857,49 @@ mod tests {
         assert!(state.replicas().is_empty());
     }
 
+    /// SB-37: a 503 from `/replica` (the leaderless-stuck reason) is an HTTP
+    /// answer, not a transport failure: the probe reports "not healthy", the
+    /// backend leaves the RO pool, and a later 200 restores it. No proxy
+    /// source change is needed for the new `/replica` rule.
+    #[tokio::test]
+    async fn test_replica_503_with_stuck_reason_removes_backend_and_200_restores_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (to_server, mut from_test) = tokio::sync::mpsc::unbounded_channel::<bool>();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let stuck = from_test.recv().await.unwrap_or(false);
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf).await;
+                let reply: &[u8] = if stuck {
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                };
+                let _ = conn.write_all(reply).await;
+            }
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/replica");
+        let backend = |healthy: bool| PgBackend {
+            addr: "10.0.0.2:5432".parse().unwrap(),
+            name: "node2".into(),
+            is_primary: false,
+            is_healthy: healthy,
+            api_url: format!("http://{addr}"),
+        };
+        for (stuck, expect_in_pool) in [(false, true), (true, false), (false, true)] {
+            to_server.send(stuck).unwrap();
+            let ok = probe(&client, &url).await.expect("an HTTP answer");
+            assert_eq!(ok, !stuck);
+            let state = UpstreamState {
+                backends: vec![backend(ok)],
+            };
+            assert_eq!(state.replicas().len() == 1, expect_in_pool);
+        }
+    }
+
     #[test]
     fn test_round_robin_selection() {
         let state = UpstreamState {

@@ -78,6 +78,12 @@ pub struct NodeState {
     /// SB-13: `n` of `synchronous_standby_names` as this node's quorum
     /// executor last read it. Only set while this node leads; `None` else.
     pub quorum_n: Option<usize>,
+    /// SB-37: the cluster has had no leader for a whole lock ttl, this node's
+    /// last two votes were refused, or the DCS was unreadable for a whole ttl.
+    /// `/replica` is 503 while set.
+    pub leaderless_stuck: bool,
+    /// SB-37: this node's last two quorum votes were both refused.
+    pub election_stalled: bool,
 }
 
 impl AppState {
@@ -104,6 +110,8 @@ impl AppState {
                 shutting_down: false,
                 rewind_check: false,
                 quorum_n: None,
+                leaderless_stuck: false,
+                election_stalled: false,
             })),
             dcs: None,
             lease_timing: None,
@@ -145,6 +153,8 @@ impl AppState {
                 shutting_down: false,
                 rewind_check: false,
                 quorum_n: None,
+                leaderless_stuck: false,
+                election_stalled: false,
             })),
             dcs: Some(dcs),
             lease_timing: Some(lease_timing),
@@ -228,6 +238,8 @@ impl NodeState {
         self.wal_position = snapshot.wal_position;
         self.replication_lag = snapshot.replication_lag;
         self.quorum_n = snapshot.quorum_n;
+        self.leaderless_stuck = snapshot.leaderless_stuck;
+        self.election_stalled = snapshot.election_stalled;
     }
 
     /// H1: `/primary` is 200 exactly when this node holds the leader lock,
@@ -249,12 +261,15 @@ impl NodeState {
     /// H2: a healthy replica is running, recorded as a replica, observed in
     /// recovery, and not waiting for a rewind check (forked history must not
     /// be served on the RO path). A server observed out of recovery is never
-    /// served as a replica, whatever its recorded role.
+    /// served as a replica, whatever its recorded role. SB-37: nor while the
+    /// cluster is leaderless and stuck: the read-only path then has nothing
+    /// to follow and an operator has to look.
     pub fn is_healthy_replica(&self) -> bool {
         self.state == MemberState::Running
             && self.role == MemberRole::Replica
             && self.pg_in_recovery == Some(true)
             && !self.rewind_check
+            && !self.leaderless_stuck
     }
 
     /// True if this node is a standby leader
@@ -303,6 +318,8 @@ mod tests {
             wal_position: Some(2000),
             replication_lag: Some(500),
             quorum_n: Some(1),
+            leaderless_stuck: true,
+            election_stalled: true,
         }
     }
 
@@ -317,9 +334,12 @@ mod tests {
                 (Some(4), Some(2000), Some(500))
             );
             assert_eq!(s.quorum_n, Some(1));
+            assert!(s.leaderless_stuck && s.election_stalled);
         }
         let mut unknown = snapshot();
         unknown.quorum_n = None;
+        unknown.leaderless_stuck = false;
+        unknown.election_stalled = false;
         unknown.timeline = None;
         unknown.wal_position = None;
         unknown.replication_lag = None;
@@ -330,5 +350,6 @@ mod tests {
             (None, None, None)
         );
         assert_eq!(s.quorum_n, None);
+        assert!(!s.leaderless_stuck && !s.election_stalled);
     }
 }

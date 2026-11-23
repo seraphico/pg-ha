@@ -34,6 +34,23 @@ pub(crate) async fn health_primary(State(state): State<RouterState>) -> impl Int
     }
 }
 
+/// SB-37: why `/replica` is 503 while the cluster is leaderless and stuck.
+pub(crate) const LEADERLESS_STUCK_REASON: &str = "cluster has no leader and the election is stuck";
+/// SB-37: where an operator is sent while the election is stuck.
+const ELECTION_STUCK_HINT: &str =
+    "see the operations guide, section Quorum recovery (no supported command yet)";
+/// `/cluster` `election` object: whether this node sees the cluster stuck
+/// without a leader, and whether its own votes are refused.
+fn election_json(s: &crate::state::NodeState) -> serde_json::Value {
+    let mut election = json!({
+        "stalled": s.election_stalled,
+        "leaderless_stuck": s.leaderless_stuck,
+    });
+    if s.leaderless_stuck {
+        election["hint"] = json!(ELECTION_STUCK_HINT);
+    }
+    election
+}
 /// GET /replica?lag=<max_lag_bytes>
 /// Returns 200 if this node is a healthy replica (optionally with lag check).
 pub(crate) async fn health_replica(
@@ -43,13 +60,14 @@ pub(crate) async fn health_replica(
     let s = state.app.read().await;
 
     if !s.is_healthy_replica() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "state": format!("{:?}", s.state),
-                "role": format!("{:?}", s.role),
-            })),
-        );
+        let mut body = json!({
+            "state": format!("{:?}", s.state),
+            "role": format!("{:?}", s.role),
+        });
+        if s.leaderless_stuck {
+            body["reason"] = json!(LEADERLESS_STUCK_REASON);
+        }
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
     }
 
     if s.is_noloadbalance() {
@@ -243,6 +261,7 @@ pub(crate) async fn get_cluster(State(state): State<RouterState>) -> impl IntoRe
                     "scope": s.scope,
                     "members": topology,
                     "sync": sync_json(cluster.sync_state.as_ref(), s.quorum_n),
+                    "election": election_json(&s),
                 }))
                 .into_response();
             }
@@ -256,6 +275,7 @@ pub(crate) async fn get_cluster(State(state): State<RouterState>) -> impl IntoRe
         "scope": s.scope,
         "members": [],
         "sync": null,
+        "election": election_json(&s),
     }))
     .into_response()
 }

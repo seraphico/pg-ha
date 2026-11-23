@@ -320,10 +320,13 @@ pub(crate) fn rewind_hold_state(
 /// Bring the recorded role in line with the observation.
 ///
 /// A server observed in recovery is not a primary, whatever pg-ha did before.
+/// A node that never held a role (`Uninitialized`) but runs as a standby pg-ha
+/// configured is a `Replica`: it started that way after a crash or restart.
 /// The role is never raised to `Primary` here: only the leader path does that,
 /// after observing the server out of recovery.
 pub(crate) fn reconcile_role(current: MemberRole, identity: PgIdentity) -> MemberRole {
     match (current, identity) {
+        (MemberRole::Uninitialized, PgIdentity::ManagedStandby) => MemberRole::Replica,
         (MemberRole::Primary, PgIdentity::ManagedStandby | PgIdentity::UnmanagedRecovery) => {
             MemberRole::Replica
         }
@@ -693,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_only_lowers_primary_when_observed_in_recovery() {
+    fn reconcile_only_lowers_primary_and_labels_a_managed_standby() {
         let roles = [
             MemberRole::Primary,
             MemberRole::Replica,
@@ -707,7 +710,9 @@ mod tests {
                     id,
                     PgIdentity::ManagedStandby | PgIdentity::UnmanagedRecovery
                 );
-                if role == MemberRole::Primary && in_recovery {
+                if (role == MemberRole::Primary && in_recovery)
+                    || (role == MemberRole::Uninitialized && id == PgIdentity::ManagedStandby)
+                {
                     assert_eq!(got, MemberRole::Replica, "{role:?} {id:?}");
                 } else {
                     assert_eq!(got, role, "{role:?} {id:?}");
@@ -720,6 +725,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_uninitialized_role_becomes_replica_only_for_a_managed_standby() {
+        let table = [
+            (PgIdentity::ManagedStandby, MemberRole::Replica),
+            (PgIdentity::UnmanagedRecovery, MemberRole::Uninitialized),
+            (PgIdentity::Primary, MemberRole::Uninitialized),
+            (
+                PgIdentity::Unknown {
+                    has_standby_signal: true,
+                },
+                MemberRole::Uninitialized,
+            ),
+            (
+                PgIdentity::Unknown {
+                    has_standby_signal: false,
+                },
+                MemberRole::Uninitialized,
+            ),
+        ];
+        for (id, expected) in table {
+            assert_eq!(
+                reconcile_role(MemberRole::Uninitialized, id),
+                expected,
+                "{id:?}"
+            );
+        }
+    }
     #[test]
     fn watchdog_is_disarmed_only_when_postgres_cannot_write() {
         use WatchdogAction::*;

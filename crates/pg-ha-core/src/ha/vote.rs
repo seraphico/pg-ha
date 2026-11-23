@@ -239,15 +239,22 @@ impl Ha {
         None
     }
 
-    /// Log (rate limited) that a candidate was refused because `q >= |V|`:
-    /// nobody can win, and without a leader nothing relaxes `q`. True when the
-    /// line was logged. `refusal` is the text of the refused vote.
+    /// Log (rate limited) that a candidate is refused for lack of votes and
+    /// the cluster has no leader: with `q >= |V|` at once (nobody can win,
+    /// nothing relaxes `q` without a leader), otherwise from the second
+    /// consecutive refusal (a single refusal during an ordinary failover is
+    /// normal). True when the line was logged. `refusal` is the text of the
+    /// refused vote and carries the counts.
     pub(super) fn note_unelectable_quorum(&mut self, refusal: &str) -> bool {
+        let state = self
+            .cluster
+            .sync_state
+            .as_ref()
+            .filter(|s| super::election::quorum_sync_in_force(Some(s)));
+        let unwinnable = state.is_some_and(|s| s.quorum as usize >= s.voter_count());
         let stalled = refusal.contains("InsufficientVotes")
-            && self.cluster.sync_state.as_ref().is_some_and(|s| {
-                super::election::quorum_sync_in_force(Some(s))
-                    && s.quorum as usize >= s.voter_count()
-            });
+            && state.is_some()
+            && (unwinnable || self.stuck.election_stalled());
         if !stalled {
             self.quorum_stall_logged_at = None;
             return false;
@@ -261,17 +268,41 @@ impl Ha {
             return false;
         }
         self.quorum_stall_logged_at = Some(now);
-        let (q, v) = self
-            .cluster
-            .sync_state
-            .as_ref()
-            .map_or((0, 0), |s| (s.quorum, s.voter_count()));
+        let (q, voters) = state.map_or((0, Vec::new()), |s| {
+            (
+                s.quorum,
+                s.sync_standby_names()
+                    .into_iter()
+                    .map(str::to_ascii_lowercase)
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let me = self.config.name.to_ascii_lowercase();
+        // Voters that are not a running member with an API address cannot
+        // answer the vote; the others may still not have answered in time.
+        let silent: Vec<&str> = voters
+            .iter()
+            .map(String::as_str)
+            .filter(|v| *v != me)
+            .filter(|v| {
+                !self
+                    .cluster
+                    .get_member(v)
+                    .is_some_and(|m| m.state == MemberState::Running && !m.api_url.is_empty())
+            })
+            .collect();
+        let silent = if silent.is_empty() {
+            "none (every other voter is a running member; they did not answer with enough votes)"
+                .to_owned()
+        } else {
+            silent.join(",")
+        };
         error!(
-            "The cluster cannot elect a primary: /sync has q={q} with {v} voters (q >= |V|), so no candidate can collect enough votes, and nothing relaxes q while there is no leader. It stays without a primary until /sync is relaxed (tracked as SB-36)"
+            "The cluster has no leader and this candidate cannot collect enough votes ({refusal}); /sync has q={q} over voters [{}]. Voters that cannot answer: {silent}. It stays without a primary until enough of those voters return. See the operations guide, section Quorum recovery",
+            voters.join(",")
         );
         true
     }
-
     /// Test seam: replace this node's own live WAL reader.
     #[cfg(test)]
     pub(super) fn set_local_wal_probe(

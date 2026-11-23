@@ -37,6 +37,7 @@ mod lease;
 mod lineage;
 pub(crate) mod quorum_sync;
 mod shutdown;
+mod stuck;
 mod vote;
 
 use identity::{LeaderAction, PgIdentity};
@@ -93,6 +94,12 @@ pub struct ApiSnapshot {
     /// read it with SHOW. Only while this node leads and the executor runs;
     /// None otherwise.
     pub quorum_n: Option<usize>,
+    /// SB-37: no leader for a whole lock ttl, two consecutive refused votes
+    /// on this node, or a DCS unreadable for a whole ttl. `/replica` is 503
+    /// while it is set (an ordinary failover never sets it).
+    pub leaderless_stuck: bool,
+    /// SB-37: this node's last two quorum votes were both refused.
+    pub election_stalled: bool,
 }
 
 /// Hook that writes an [`ApiSnapshot`] into the REST API state. The HA engine
@@ -201,6 +208,9 @@ pub struct Ha {
     /// SB-13: when the "cluster cannot elect a primary until `/sync` is
     /// relaxed" ERROR was last logged (at most every `QUORUM_STALL_LOG_INTERVAL`).
     quorum_stall_logged_at: Option<std::time::Instant>,
+    /// SB-37: what the loop has seen of the leader lock, the DCS and this
+    /// node's votes, for the `/replica` stuck rule.
+    stuck: stuck::StuckTracker,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -252,6 +262,7 @@ impl Ha {
             local_wal,
             quorum_exec: Default::default(),
             quorum_stall_logged_at: None,
+            stuck: stuck::StuckTracker::default(),
         };
         (ha, cmd_tx)
     }
@@ -307,6 +318,11 @@ impl Ha {
             shutting_down: self.shutting_down,
             rewind_check: self.has_rewind_check_marker(),
             quorum_n: self.quorum_observed_n(),
+            leaderless_stuck: self.stuck.is_stuck(
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(self.dcs.ttl()),
+            ),
+            election_stalled: self.stuck.election_stalled(),
         }
     }
 
@@ -354,6 +370,8 @@ impl Ha {
         match self.dcs.get_cluster().await {
             Ok(cluster) => {
                 self.cluster = cluster;
+                self.stuck
+                    .observe_leader(std::time::Instant::now(), self.cluster.leader.is_some());
                 // Check dynamic config for pause
                 self.is_paused = self
                     .cluster
@@ -374,6 +392,7 @@ impl Ha {
             }
             Err(e) => {
                 error!("Failed to load cluster from DCS: {e}");
+                self.stuck.observe_read_failed(std::time::Instant::now());
                 return self.handle_dcs_error().await;
             }
         }
@@ -8213,6 +8232,7 @@ mod tests {
                 checkpoint_timeline: Some(checkpoint_tl),
                 receiver: Some((receive, 6)),
                 postmaster_start: Some(run.clone()),
+                min_recovery_end: None,
             };
             let last = resolve_replica_wal(&streaming, None).remember;
             // The leader died: its last WAL (shutdown checkpoint) arrived
@@ -10863,7 +10883,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn the_stall_error_is_logged_once_per_interval_and_only_for_q_at_least_v() {
+        async fn the_stall_error_is_logged_once_per_interval_for_q_at_least_v_or_a_stalled_election()
+         {
             let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let _guard = tracing::subscriber::set_default(ErrorCounter(errors.clone()));
             let count = || errors.load(std::sync::atomic::Ordering::SeqCst);
@@ -10886,10 +10907,15 @@ mod tests {
                 .checked_sub(QUORUM_STALL_LOG_INTERVAL + std::time::Duration::from_secs(1));
             assert!(ha.note_unelectable_quorum(refusal));
             assert_eq!(count(), 3);
-            // q < |V|: an ordinary refusal, no ERROR.
+            // q < |V|: a single refusal is an ordinary one, no ERROR.
             ha.cluster.sync_state = Some(sync_of("node2,node3", 1, SyncKind::Quorum));
             assert!(!ha.note_unelectable_quorum(refusal));
             assert_eq!(count(), 3);
+            // Two consecutive refused votes: the election is stalled, so it logs.
+            ha.stuck.observe_vote(true);
+            ha.stuck.observe_vote(true);
+            assert!(ha.note_unelectable_quorum(refusal));
+            assert_eq!(count(), 4);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -11137,16 +11163,192 @@ mod tests {
             }
         }
 
-        /// A leaderless candidate refused with q >= |V| logs the stall ERROR
-        /// from the election path, once per interval; q < |V| logs none.
+        /// SB-37: a refused vote returns early, and the node must still
+        /// refresh its member record, else its record expires and peers stop
+        /// counting it as a voter.
         #[tokio::test]
-        async fn a_refused_candidate_with_q_at_least_v_logs_the_stall_error_once() {
+        async fn a_refused_vote_refreshes_the_member_record() {
+            // q = |V| logs the stall ERROR; see the note in
+            // `two_consecutive_refused_votes_make_the_snapshot_stuck`.
+            let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _guard = tracing::subscriber::set_default(ErrorCounter(errors));
+            let dcs = Arc::new(MockDcs::new());
+            let setup = Setup {
+                voters: "test_node,node2",
+                quorum: 2,
+                ..Setup::quorum()
+            };
+            let (mut ha, dir) = build(
+                "vote-refused-touch",
+                setup,
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(FakePeers::new().ok("node2", 1, 50))),
+            );
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+            assert_eq!(dcs.touch_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: a standby that is not the healthiest node only waits, and
+        /// still refreshes its member record.
+        #[tokio::test]
+        async fn a_not_healthiest_cycle_refreshes_the_member_record() {
+            let dcs = Arc::new(MockDcs::new());
+            let setup = Setup {
+                members: vec![
+                    member_at("test_node", 100),
+                    member_at("node2", 500),
+                    member_at("node3", 50),
+                ],
+                ..Setup::quorum()
+            };
+            let (mut ha, dir) = build(
+                "not-healthiest-touch",
+                setup,
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(PanicPeers)),
+            );
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(
+                matches!(&result, CycleResult::Follower(m) if m.contains("not the healthiest")),
+                "{result}"
+            );
+            assert_eq!(dcs.touch_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: one refused vote is not a stall; two in a row are, and the
+        /// snapshot the REST API serves says so.
+        #[tokio::test]
+        async fn two_consecutive_refused_votes_make_the_snapshot_stuck() {
+            // The second refusal logs the stall ERROR; a thread-local
+            // subscriber keeps the shared callsite registered for the tests
+            // that count it.
+            let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _guard = tracing::subscriber::set_default(ErrorCounter(errors));
+            let dcs = Arc::new(MockDcs::new());
+            let setup = Setup {
+                voters: "test_node,node2",
+                quorum: 2,
+                ..Setup::quorum()
+            };
+            let (mut ha, dir) = build(
+                "vote-stuck",
+                setup,
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(FakePeers::new().ok("node2", 1, 50))),
+            );
+            assert!(!ha.api_snapshot().leaderless_stuck);
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+            let snap = ha.api_snapshot();
+            assert!(!snap.election_stalled && !snap.leaderless_stuck);
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+            let snap = ha.api_snapshot();
+            assert!(snap.election_stalled && snap.leaderless_stuck);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: a refusal that waiting fixes (a writable primary answered)
+        /// never counts toward the stall.
+        #[tokio::test]
+        async fn a_refusal_that_waiting_fixes_never_stalls() {
+            let dcs = Arc::new(MockDcs::new());
+            let (mut ha, dir) = build(
+                "vote-primary-alive",
+                Setup::quorum(),
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(FakePeers::new().primary("node2", 1, 90))),
+            );
+            for _ in 0..3 {
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(refused(&result).contains("PrimaryAlive"), "{result}");
+            }
+            let snap = ha.api_snapshot();
+            assert!(!snap.election_stalled && !snap.leaderless_stuck);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: a standby that is not the healthiest node only gets the
+        /// time rule (it casts no vote), and a leader clears it.
+        #[tokio::test]
+        async fn a_waiting_standby_is_stuck_only_after_a_leaderless_ttl() {
+            let dcs = Arc::new(MockDcs::new());
+            let setup = Setup {
+                members: vec![
+                    member_at("test_node", 100),
+                    member_at("node2", 500),
+                    member_at("node3", 50),
+                ],
+                ..Setup::quorum()
+            };
+            let (mut ha, dir) = build(
+                "waiting-stuck",
+                setup,
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(PanicPeers)),
+            );
+            let ttl = std::time::Duration::from_secs(ha.dcs.ttl());
+            let now = std::time::Instant::now();
+            ha.stuck
+                .observe_leader(now - ttl + std::time::Duration::from_secs(5), false);
+            let _ = ha.process_unhealthy_cluster().await;
+            let snap = ha.api_snapshot();
+            assert!(!snap.election_stalled && !snap.leaderless_stuck);
+            // The same cluster, leaderless since a whole ttl ago.
+            ha.stuck.observe_leader(now - ttl, true);
+            ha.stuck.observe_leader(now - ttl, false);
+            assert!(ha.api_snapshot().leaderless_stuck);
+            assert!(!ha.api_snapshot().election_stalled);
+            ha.stuck.observe_leader(now, true);
+            assert!(!ha.api_snapshot().leaderless_stuck);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: run_cycle feeds the tracker: a DCS that cannot be read for a
+        /// whole ttl is stuck, one failed read is not, a good read ends it.
+        #[tokio::test]
+        async fn run_cycle_reports_an_unreadable_dcs_only_after_a_ttl() {
+            let dcs = Arc::new(MockDcs::new());
+            let (mut ha, dir) = build(
+                "unreadable-stuck",
+                Setup::quorum(),
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(PanicPeers)),
+            );
+            dcs.fail_cluster_reads
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = ha.run_cycle().await;
+            assert!(!ha.api_snapshot().leaderless_stuck, "one failed read");
+            let ttl = std::time::Duration::from_secs(ha.dcs.ttl());
+            ha.stuck = stuck::StuckTracker::default();
+            ha.stuck
+                .observe_read_failed(std::time::Instant::now() - ttl);
+            let _ = ha.run_cycle().await;
+            assert!(
+                ha.api_snapshot().leaderless_stuck,
+                "a whole ttl of failures"
+            );
+            dcs.fail_cluster_reads
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let _ = ha.run_cycle().await;
+            assert!(!ha.api_snapshot().leaderless_stuck, "a good read ends it");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// A leaderless candidate refused for lack of votes logs the stall
+        /// ERROR from the election path, once per interval: at once with
+        /// q >= |V|, from the second consecutive refusal with q < |V|.
+        #[tokio::test]
+        async fn a_refused_candidate_logs_the_stall_error_once() {
             let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let _guard = tracing::subscriber::set_default(ErrorCounter(errors.clone()));
             let count = || errors.load(std::sync::atomic::Ordering::SeqCst);
             for (q, voters, expected) in [
                 (2u32, "test_node,node2", 1),
-                (1, "test_node,node2,node3", 0),
+                (1, "test_node,node2,node3", 1),
             ] {
                 let before = count();
                 let dcs = Arc::new(MockDcs::new());
