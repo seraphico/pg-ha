@@ -1,7 +1,7 @@
 # Lightweight: PostgreSQL + Linux pg-ha binary
-# PG version is determined by the base image tag (e.g. postgres:16, postgres:18).
+# PG version is determined by the base image tag (e.g. postgres:18, postgres:16).
 # RUST_TARGET is passed by Makefile / docker compose (Mac Intel / Mac ARM / Linux amd64).
-ARG PG_VERSION=16
+ARG PG_VERSION=18
 FROM postgres:${PG_VERSION}
 
 ARG RUST_TARGET=x86_64-unknown-linux-gnu

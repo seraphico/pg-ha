@@ -34,12 +34,12 @@ Start a three-node development cluster with `make up`:
 # Clone the project
 git clone <repo-url> pg-ha && cd pg-ha
 
-# Start the three-node cluster (compile Linux binaries + build the image + start; default PG 16)
+# Start the three-node cluster (compile Linux binaries + build the image + start; default PG 18)
 make up
 
 # Use another official postgres image tag
-make up PG_VERSION=17
-make up PG_VERSION=18
+make up PG_VERSION=16     # compatibility check
+make up PG_VERSION=19rc1
 
 # Verify cluster topology (member names, roles, replication upstream)
 curl -s http://localhost:8008/cluster | jq .
@@ -80,11 +80,11 @@ make down
 Install the following on each server:
 
 ```bash
-# Install PostgreSQL 16
-sudo apt-get install postgresql-16 postgresql-client-16
+# Install PostgreSQL 18 (main line; 16 and later are supported)
+sudo apt-get install postgresql-18 postgresql-client-18
 
 # Confirm the bin path
-ls /usr/lib/postgresql/16/bin/pg_ctl
+ls /usr/lib/postgresql/18/bin/pg_ctl
 
 # Create the pg-ha user and directories
 sudo useradd -r -m -s /bin/bash pgha
@@ -134,7 +134,7 @@ retry_timeout: 10
 
 postgresql:
   data_dir: /var/lib/postgresql/16/data
-  bin_dir: /usr/lib/postgresql/16/bin
+  bin_dir: /usr/lib/postgresql/18/bin
   listen: 0.0.0.0
   port: 5432
   superuser:
@@ -517,10 +517,10 @@ Proxy probes of `/primary` and `/replica` use the same `restapi.tls`. When it is
 
 ### Choosing the PostgreSQL Version
 
-The image is the official `postgres:${PG_VERSION}`. `make up` passes `PG_VERSION` to compose; the default is **16**. When `docker/Dockerfile` does not receive that argument, its own `ARG` defaults to 19. A normal `make up` does not use that default.
+The image is the official `postgres:${PG_VERSION}`. `make up` passes `PG_VERSION` to compose; the default is **18** (the main line). The compose files and the `ARG` in `docker/Dockerfile` also default to 18. PostgreSQL 16 and later stay supported.
 
 ```bash
-# Default PostgreSQL 16
+# Default PostgreSQL 18
 make up
 
 # Use another official image tag

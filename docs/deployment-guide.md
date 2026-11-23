@@ -34,12 +34,12 @@
 # 克隆项目
 git clone <repo-url> pg-ha && cd pg-ha
 
-# 启动三节点集群（编译 Linux 二进制 + 构建镜像 + 启动，默认 PG 16）
+# 启动三节点集群（编译 Linux 二进制 + 构建镜像 + 启动，默认 PG 18）
 make up
 
 # 使用其他官方 postgres 镜像标签
-make up PG_VERSION=17
-make up PG_VERSION=18
+make up PG_VERSION=16     # 兼容性验证
+make up PG_VERSION=19rc1
 
 # 验证集群拓扑（成员名、角色、复制上游）
 curl -s http://localhost:8008/cluster | jq .
@@ -80,11 +80,11 @@ make down
 每台服务器上安装：
 
 ```bash
-# 安装 PostgreSQL 16
-sudo apt-get install postgresql-16 postgresql-client-16
+# 安装 PostgreSQL 18（主线版本；16 及以上兼容）
+sudo apt-get install postgresql-18 postgresql-client-18
 
 # 确认 bin 路径
-ls /usr/lib/postgresql/16/bin/pg_ctl
+ls /usr/lib/postgresql/18/bin/pg_ctl
 
 # 创建 pg-ha 用户和目录
 sudo useradd -r -m -s /bin/bash pgha
@@ -134,7 +134,7 @@ retry_timeout: 10
 
 postgresql:
   data_dir: /var/lib/postgresql/16/data
-  bin_dir: /usr/lib/postgresql/16/bin
+  bin_dir: /usr/lib/postgresql/18/bin
   listen: 0.0.0.0
   port: 5432
   superuser:
@@ -516,10 +516,10 @@ REST 管理 API 也支持内建 HTTPS，配置形状与 `raft.tls` 的服务端�
 
 ### PostgreSQL 版本选择
 
-镜像是官方 `postgres:${PG_VERSION}`。`make up` 把 `PG_VERSION` 传给 compose，默认 **16**。`docker/Dockerfile` 在没收到该参数时自己的 `ARG` 默认是 19，正常走 `make up` 不会用到这个默认值。
+镜像是官方 `postgres:${PG_VERSION}`。`make up` 把 `PG_VERSION` 传给 compose，默认 **18**（主线版本）；compose 文件和 `docker/Dockerfile` 的 `ARG` 默认值也都是 18。PG 16 及以上保持兼容。
 
 ```bash
-# 默认 PostgreSQL 16
+# 默认 PostgreSQL 18
 make up
 
 # 换官方镜像标签

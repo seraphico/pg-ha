@@ -1,7 +1,7 @@
 # pg-ha local development
 #
-#   make                    # build Linux binaries + start 3-node Docker cluster (PG 16)
-#   make PG_VERSION=18      # same but with PostgreSQL 18
+#   make                    # build Linux binaries + start 3-node Docker cluster (PG 18)
+#   make PG_VERSION=16      # same but with PostgreSQL 16 (compatibility)
 #   make build              # Linux binaries only
 #   make up                 # build images + start cluster
 #   make down               # wipe cluster (Raft + PGDATA volumes)
@@ -53,7 +53,7 @@ export RUST_TARGET
 export DOCKER_PLATFORM
 
 # PostgreSQL version for Docker image (default: 16, supports 14-18)
-PG_VERSION ?= 16
+PG_VERSION ?= 18
 export PG_VERSION
 
 # REST API mode for the dev cluster: off (plaintext HTTP, default) | tls | mtls
@@ -202,14 +202,14 @@ print-env:
 help:
 	@echo "pg-ha development toolchain"
 	@echo ""
-	@echo "Usage: make [target] [PG_VERSION=16|17|18] [RUST_TARGET=...]"
+	@echo "Usage: make [target] [PG_VERSION=16|17|18|19rc1] [RUST_TARGET=...]"
 	@echo ""
 	@echo "Targets:"
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /' | column -t -s ':'
 	@echo ""
 	@echo "Examples:"
-	@echo "  make                     Build + start 3-node cluster (PG 16)"
-	@echo "  make up PG_VERSION=18    Start cluster with PostgreSQL 18"
+	@echo "  make                     Build + start 3-node cluster (PG 18)"
+	@echo "  make up PG_VERSION=16    Start cluster with PostgreSQL 16"
 	@echo "  make build               Compile Linux binaries only"
 	@echo "  make down                Stop cluster and wipe all data"
 	@echo "  make logs                Follow cluster logs"

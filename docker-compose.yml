@@ -8,7 +8,7 @@ services:
       dockerfile: docker/Dockerfile
       args:
         RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
-        PG_VERSION: ${PG_VERSION:-16}
+        PG_VERSION: ${PG_VERSION:-18}
     container_name: pg-ha-node1
     hostname: node1
     environment:
@@ -50,7 +50,7 @@ services:
       dockerfile: docker/Dockerfile
       args:
         RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
-        PG_VERSION: ${PG_VERSION:-16}
+        PG_VERSION: ${PG_VERSION:-18}
     container_name: pg-ha-node2
     hostname: node2
     environment:
@@ -88,7 +88,7 @@ services:
       dockerfile: docker/Dockerfile
       args:
         RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
-        PG_VERSION: ${PG_VERSION:-16}
+        PG_VERSION: ${PG_VERSION:-18}
     container_name: pg-ha-node3
     hostname: node3
     environment:
