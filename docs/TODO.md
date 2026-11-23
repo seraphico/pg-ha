@@ -236,7 +236,7 @@ pg-ha 明确不支持外部 DCS，保留 failsafe 只会误导，故移除。
 3. **构建和测试**：
    - `cargo build` / `make build` — 本机或面向 Linux 容器的发布二进制（Mac 上走 `cargo-zigbuild`、`cross` 或 `docker-compose.build.yml`）
    - `make test` — `cargo test --workspace`
-   - `make up` — 编译并启动 3 节点 Docker 集群（默认 PostgreSQL 16；`PG_VERSION` 传给官方 `postgres` 镜像）
+   - `make up` — 编译并启动 3 节点 Docker 集群（默认 PostgreSQL 18；`PG_VERSION` 传给官方 `postgres` 镜像）
    - `make e2e` — 端到端脚本（不在 CI 里）
 4. **工具链**：
    - Rust **1.99.1**（`rust-toolchain.toml`、Docker 构建镜像 `rust:1.99.1-bookworm`、CI release 使用 `dtolnay/rust-toolchain@1.99.1`）。`edition = "2024"`，代码使用已稳定的 if-let chains。不跟浮动的 `stable`

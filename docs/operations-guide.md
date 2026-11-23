@@ -892,7 +892,7 @@ pg-ha 收到第一个 SIGTERM 或 SIGINT 后（`Ha::graceful_shutdown`）：
 # 1. 看 PostgreSQL 为什么停不掉
 tail -n 100 $PGDATA/pg_log.log
 # 2. 以 PostgreSQL 的 OS 用户手工停库（ERROR 里给出了完整命令）
-sudo -u postgres /usr/lib/postgresql/16/bin/pg_ctl stop -D $PGDATA -m immediate
+sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl stop -D $PGDATA -m immediate
 #    pg_ctl 本身不能用时：
 sudo -u postgres kill -QUIT $(head -1 $PGDATA/postmaster.pid)
 # 3. pg-ha 在一个 loop_wait 内发现 PostgreSQL 已停，删除锁并退出

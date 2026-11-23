@@ -896,7 +896,7 @@ This is intentional. The moment pg-ha exits, the lock expires and another node p
 # 1. See why PostgreSQL cannot be stopped
 tail -n 100 $PGDATA/pg_log.log
 # 2. Stop PostgreSQL by hand as the PostgreSQL OS user (the ERROR gives the full command)
-sudo -u postgres /usr/lib/postgresql/16/bin/pg_ctl stop -D $PGDATA -m immediate
+sudo -u postgres /usr/lib/postgresql/18/bin/pg_ctl stop -D $PGDATA -m immediate
 #    When pg_ctl itself cannot be used:
 sudo -u postgres kill -QUIT $(head -1 $PGDATA/postmaster.pid)
 # 3. Within one loop_wait, pg-ha sees that PostgreSQL has stopped, deletes the lock, and exits

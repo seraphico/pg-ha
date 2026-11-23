@@ -194,5 +194,5 @@ Failover time, proxy throughput and latency, Raft write throughput on the WAL pa
 
 1. Name the TODO number.
 2. Entry points: `src/main.rs`, `crates/pg-ha-core/src/ha/mod.rs`, `crates/pg-ha-core/src/config.rs`, `crates/pg-ha-dcs/src/raft_dcs.rs`, `crates/pg-ha-dcs/src/store.rs`, `crates/pg-ha-dcs/src/wal.rs`.
-3. Build and test: `cargo build` / `make build` (Linux binaries for the container; on a Mac via `cargo-zigbuild`, `cross`, or `docker-compose.build.yml`). `make test` is `cargo test --workspace`. `make up` builds and starts the 3-node cluster (default PostgreSQL 16; `PG_VERSION` selects the official `postgres` image). `make e2e` runs the end-to-end scripts and is not in CI.
+3. Build and test: `cargo build` / `make build` (Linux binaries for the container; on a Mac via `cargo-zigbuild`, `cross`, or `docker-compose.build.yml`). `make test` is `cargo test --workspace`. `make up` builds and starts the 3-node cluster (default PostgreSQL 18; `PG_VERSION` selects the official `postgres` image). `make e2e` runs the end-to-end scripts and is not in CI.
 4. Toolchain: Rust **1.99.1** (`rust-toolchain.toml`, image `rust:1.99.1-bookworm`, CI `dtolnay/rust-toolchain@1.99.1`). `edition = "2024"`. Do not float on `stable`. openraft 0.9. Logs use `tracing`. Errors use `thiserror` / `anyhow`.

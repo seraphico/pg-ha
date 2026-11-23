@@ -51,7 +51,7 @@ services:
       dockerfile: docker/Dockerfile
       args:
         RUST_TARGET: ${RUST_TARGET:-x86_64-unknown-linux-gnu}
-        PG_VERSION: ${PG_VERSION:-16}
+        PG_VERSION: ${PG_VERSION:-18}
     pull_policy: build
     container_name: pg-ha5-node1
     hostname: node1
