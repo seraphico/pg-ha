@@ -65,6 +65,14 @@ impl std::error::Error for PeerProbeError {}
 #[async_trait]
 pub trait PeerWalProbe: Send + Sync {
     async fn read(&self, target: &PeerTarget) -> Result<WalPosition, PeerProbeError>;
+    /// The reading plus the pg-ha version the peer reports (SB-37; None when
+    /// it does not report one). Defaults to no version.
+    async fn read_with_version(
+        &self,
+        target: &PeerTarget,
+    ) -> Result<(WalPosition, Option<String>), PeerProbeError> {
+        self.read(target).await.map(|p| (p, None))
+    }
 }
 
 /// What a round collected.

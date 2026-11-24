@@ -21,7 +21,8 @@ use health::{
     health_sync, liveness, node_status, vote_endpoint, wal_endpoint,
 };
 use management::{
-    delete_switchover, post_failover, post_reinitialize, post_restart, post_switchover,
+    delete_recovery, delete_switchover, get_recovery, post_failover, post_recovery,
+    post_reinitialize, post_restart, post_switchover,
 };
 use observability::{get_history, get_metrics};
 use router_state::RouterState;
@@ -80,6 +81,12 @@ pub fn build_router_with_commands(
         .route("/vote", post(vote_endpoint))
         .route("/restart", post(post_restart))
         .route("/reinitialize", post(post_reinitialize))
+        .route(
+            "/recovery",
+            get(get_recovery)
+                .post(post_recovery)
+                .delete(delete_recovery),
+        )
         .route(
             "/config",
             get(get_config).put(put_config).patch(patch_config_endpoint),

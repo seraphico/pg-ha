@@ -959,7 +959,7 @@ impl XWorld {
                     crash: crash.clone(),
                 };
                 tokio::select! {
-                    r = pre_promote_sync(&mut io, mode, &me, sync.as_ref()) => Some(r),
+                    r = pre_promote_sync(&mut io, mode, &me, sync.as_ref(), None) => Some(r),
                     _ = crash.notified() => None,
                 }
             });

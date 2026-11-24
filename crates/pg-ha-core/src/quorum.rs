@@ -624,8 +624,88 @@ pub(crate) fn holds_a_prefix(peer: &WalPosition, ancestors: &[AncestorEnd]) -> b
         .iter()
         .any(|a| a.timeline == peer.timeline && peer.lsn <= a.switchpoint)
 }
+/// SB-37: may `candidate` be promoted under an operator's recovery grant that
+/// names the voters `lost`?
+///
+/// The strict rule of [`quorum_vote_decision`] needs `q` other voters, which a
+/// cluster that lost voters for good cannot reach. The grant replaces that
+/// count by a named loss: the operator accepts that commits held only by
+/// `lost` may be gone, and in exchange every OTHER voter must answer.
+///
+/// * the candidate must be a voter, and `lost` may name only voters other
+///   than the candidate (so `|lost| <= |V| - 1`);
+/// * any responder that is not in recovery refuses (`PrimaryAlive`), named
+///   voters and non-voters included;
+/// * any voter, named or not, on a newer timeline refuses (`HigherTimeline`),
+///   and one on the same timeline with a higher LSN refuses (`BehindPeer`):
+///   a named voter that came back ahead must not be discarded silently;
+/// * a named voter that answers lower or behind is simply not counted and can
+///   never stand in for a missing voter;
+/// * every voter in `V ∖ lost ∖ {candidate}` must answer on the candidate's
+///   timeline (an older-timeline answer is not counted, as no prefix rule is
+///   applied here), otherwise `InsufficientVotes { got, need }` with
+///   `need = |V ∖ lost ∖ {candidate}|`.
+///
+/// `quorum` plays no part: with `k` named voters the commits that can be lost
+/// are exactly those held only by `lost`, and none when `k <= |V| - q - 1`
+/// (then every acknowledged commit has a holder among the counted voters).
+pub fn recovery_vote_decision(
+    candidate: &WalPosition,
+    voters: &Names,
+    lost: &Names,
+    peers: &[WalPosition],
+) -> VoteDecision {
+    let me = candidate.name.to_ascii_lowercase();
+    if !voters.contains(&me) || lost.contains(&me) || !lost.is_subset(voters) {
+        return VoteDecision::Refused(VoteRefusal::NotVoter);
+    }
+    let mut present = Names::new();
+    for p in peers {
+        let name = p.name.to_ascii_lowercase();
+        if name == me {
+            continue;
+        }
+        if !p.in_recovery {
+            return VoteDecision::Refused(VoteRefusal::PrimaryAlive {
+                peer: p.name.clone(),
+            });
+        }
+        if !voters.contains(&name) {
+            continue;
+        }
+        if p.timeline > candidate.timeline {
+            return VoteDecision::Refused(VoteRefusal::HigherTimeline {
+                peer: p.name.clone(),
+            });
+        }
+        if p.timeline == candidate.timeline {
+            if p.lsn > candidate.lsn {
+                return VoteDecision::Refused(VoteRefusal::BehindPeer {
+                    peer: p.name.clone(),
+                });
+            }
+            if !lost.contains(&name) {
+                present.insert(name);
+            }
+        }
+    }
+    let need = voters
+        .iter()
+        .filter(|v| **v != me && !lost.contains(*v))
+        .count();
+    if present.len() < need {
+        return VoteDecision::Refused(VoteRefusal::InsufficientVotes {
+            got: present.len(),
+            need,
+        });
+    }
+    VoteDecision::Granted {
+        votes: present.len(),
+    }
+}
 pub mod derive;
 pub mod mark;
+pub mod recovery;
 pub mod round;
 
 #[cfg(test)]
@@ -1318,6 +1398,111 @@ mod tests {
                 "{label}"
             );
         }
+    }
+    #[test]
+    fn recovery_vote_table() {
+        use VoteRefusal::*;
+        let v = n(&["a", "b", "c", "d", "e"]);
+        let lost = n(&["d", "e"]);
+        let a = pos("a", 2, 100);
+        let ok = [pos("b", 2, 100), pos("c", 2, 90)];
+        assert_eq!(
+            recovery_vote_decision(&a, &v, &lost, &ok),
+            VoteDecision::Granted { votes: 2 }
+        );
+        // candidate named lost, or not a voter
+        assert_eq!(
+            recovery_vote_decision(&a, &v, &n(&["a"]), &ok),
+            VoteDecision::Refused(NotVoter)
+        );
+        assert_eq!(
+            recovery_vote_decision(&pos("z", 2, 1), &v, &lost, &ok),
+            VoteDecision::Refused(NotVoter)
+        );
+        // `lost` names a non-voter
+        assert_eq!(
+            recovery_vote_decision(&a, &v, &n(&["d", "x"]), &ok),
+            VoteDecision::Refused(NotVoter)
+        );
+        // a writable primary refuses, named or not, voter or not
+        for who in ["b", "d", "z"] {
+            let mut p = ok.to_vec();
+            p.push(WalPosition {
+                in_recovery: false,
+                ..pos(who, 2, 100)
+            });
+            assert_eq!(
+                recovery_vote_decision(&a, &v, &lost, &p),
+                VoteDecision::Refused(PrimaryAlive { peer: who.into() }),
+                "{who}"
+            );
+        }
+        // higher timeline refuses, named or not
+        for who in ["b", "d"] {
+            let mut p = ok.to_vec();
+            p.push(pos(who, 3, 1));
+            assert_eq!(
+                recovery_vote_decision(&a, &v, &lost, &p),
+                VoteDecision::Refused(HigherTimeline { peer: who.into() }),
+                "{who}"
+            );
+        }
+        // ahead on the same timeline refuses, also a returned named voter
+        for who in ["c", "e"] {
+            let mut p = ok.to_vec();
+            p.push(pos(who, 2, 101));
+            assert_eq!(
+                recovery_vote_decision(&a, &v, &lost, &p),
+                VoteDecision::Refused(BehindPeer { peer: who.into() }),
+                "{who}"
+            );
+        }
+        // a named voter that answers level or lower is ignored
+        let mut p = ok.to_vec();
+        p.extend([pos("d", 2, 100), pos("e", 1, 5)]);
+        assert_eq!(
+            recovery_vote_decision(&a, &v, &lost, &p),
+            VoteDecision::Granted { votes: 2 }
+        );
+        // a missing non-named voter refuses and nothing from the named
+        // voters stands in for it
+        assert_eq!(
+            recovery_vote_decision(&a, &v, &lost, &[pos("b", 2, 100), pos("d", 2, 100)]),
+            VoteDecision::Refused(InsufficientVotes { got: 1, need: 2 })
+        );
+        // a non-named voter on an older timeline is not counted
+        assert_eq!(
+            recovery_vote_decision(&a, &v, &lost, &[pos("b", 2, 100), pos("c", 1, 90)]),
+            VoteDecision::Refused(InsufficientVotes { got: 1, need: 2 })
+        );
+        // the candidate's own answer is ignored, answers from non-voters too
+        let mut p = ok.to_vec();
+        p.extend([pos("a", 9, 9), pos("z", 9, 999)]);
+        assert_eq!(
+            recovery_vote_decision(&a, &v, &lost, &p),
+            VoteDecision::Granted { votes: 2 }
+        );
+    }
+    #[test]
+    fn recovery_vote_with_empty_lost_needs_every_other_voter() {
+        let v = n(&["a", "b", "c"]);
+        let a = pos("a", 1, 10);
+        assert_eq!(
+            recovery_vote_decision(&a, &v, &n(&[]), &[pos("b", 1, 10)]),
+            VoteDecision::Refused(VoteRefusal::InsufficientVotes { got: 1, need: 2 })
+        );
+        assert_eq!(
+            recovery_vote_decision(&a, &v, &n(&[]), &[pos("b", 1, 10), pos("c", 1, 1)]),
+            VoteDecision::Granted { votes: 2 }
+        );
+    }
+    #[test]
+    fn recovery_vote_with_everyone_else_lost_needs_no_peer() {
+        let v = n(&["a", "b", "c"]);
+        assert_eq!(
+            recovery_vote_decision(&pos("a", 1, 10), &v, &n(&["b", "c"]), &[]),
+            VoteDecision::Granted { votes: 0 }
+        );
     }
     #[test]
     fn vote_with_zero_quorum_needs_no_peers() {

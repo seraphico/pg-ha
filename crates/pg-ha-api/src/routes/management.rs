@@ -51,11 +51,11 @@ async fn send_command(state: RouterState, cmd: ManagementCommand) -> impl IntoRe
                 CommandStatus::Rejected => StatusCode::CONFLICT,
                 CommandStatus::Error => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            (
-                status_code,
-                Json(json!({"status": resp.status, "message": resp.message})),
-            )
-                .into_response()
+            let mut body = json!({"status": resp.status, "message": resp.message});
+            if let Some(data) = resp.data {
+                body["assessment"] = data;
+            }
+            (status_code, Json(body)).into_response()
         }
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -102,4 +102,73 @@ pub(crate) async fn post_restart(State(state): State<RouterState>) -> impl IntoR
 /// POST /reinitialize
 pub(crate) async fn post_reinitialize(State(state): State<RouterState>) -> impl IntoResponse {
     send_command(state, ManagementCommand::Reinitialize).await
+}
+
+/// `POST /recovery` body (SB-37). Unknown fields are refused.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryRequest {
+    lost: Vec<String>,
+    digest: String,
+}
+
+fn bad_request(message: impl Into<String>) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"status": "rejected", "message": message.into()})),
+    )
+        .into_response()
+}
+
+/// Validate a `POST /recovery` body: 1 or more distinct non-empty names
+/// (compared case-insensitively, passed on lower-cased) and a 64-hex digest.
+fn validate_recovery(body: RecoveryRequest) -> Result<(Vec<String>, String), String> {
+    let mut lost: Vec<String> = Vec::with_capacity(body.lost.len());
+    for name in &body.lost {
+        let n = name.trim().to_ascii_lowercase();
+        if n.is_empty() {
+            return Err("lost: empty name".into());
+        }
+        if lost.contains(&n) {
+            return Err(format!("lost: {n} named twice"));
+        }
+        lost.push(n);
+    }
+    if lost.is_empty() {
+        return Err("lost: name at least one voter".into());
+    }
+    if !pg_ha_core::quorum::recovery::is_digest(&body.digest) {
+        return Err("digest: must be exactly 64 hexadecimal characters".into());
+    }
+    Ok((lost, body.digest.to_ascii_lowercase()))
+}
+
+/// GET /recovery — SB-37 read-only quorum recovery assessment. It reads every
+/// member's `GET /wal`, so it is behind the management authentication.
+pub(crate) async fn get_recovery(State(state): State<RouterState>) -> impl IntoResponse {
+    send_command(state, ManagementCommand::RecoveryExplain).await
+}
+
+/// POST /recovery — SB-37 authorize the recovery the explain proposed.
+pub(crate) async fn post_recovery(
+    State(state): State<RouterState>,
+    body: Result<Json<RecoveryRequest>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(e) => return bad_request(format!("invalid body: {}", e.body_text())),
+    };
+    match validate_recovery(body) {
+        Ok((lost, digest)) => {
+            send_command(state, ManagementCommand::RecoveryGrant { lost, digest })
+                .await
+                .into_response()
+        }
+        Err(e) => bad_request(e),
+    }
+}
+
+/// DELETE /recovery — SB-37 delete an unused grant.
+pub(crate) async fn delete_recovery(State(state): State<RouterState>) -> impl IntoResponse {
+    send_command(state, ManagementCommand::RecoveryCancel).await
 }

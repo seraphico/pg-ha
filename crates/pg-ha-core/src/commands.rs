@@ -32,6 +32,14 @@ pub enum ManagementCommand {
 
     /// Reinitialize this node (wipe data, re-clone)
     Reinitialize,
+    /// SB-37: read-only quorum recovery assessment (`GET /recovery`). Reads
+    /// the voters with `GET /wal` only; never asks for a vote.
+    RecoveryExplain,
+    /// SB-37: authorize the recovery the explain proposed (`POST
+    /// /recovery`): the named lost voters and the digest it printed.
+    RecoveryGrant { lost: Vec<String>, digest: String },
+    /// SB-37: delete an unused grant (`DELETE /recovery`).
+    RecoveryCancel,
 }
 
 /// Response to a management command
@@ -39,6 +47,9 @@ pub enum ManagementCommand {
 pub struct CommandResponse {
     pub status: CommandStatus,
     pub message: String,
+    /// Structured result (SB-37: the recovery assessment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,10 +61,18 @@ pub enum CommandStatus {
 }
 
 impl CommandResponse {
+    /// The same response carrying `data`.
+    pub fn with_data(self, data: serde_json::Value) -> Self {
+        Self {
+            data: Some(data),
+            ..self
+        }
+    }
     pub fn accepted(msg: impl Into<String>) -> Self {
         Self {
             status: CommandStatus::Accepted,
             message: msg.into(),
+            data: None,
         }
     }
 
@@ -61,6 +80,7 @@ impl CommandResponse {
         Self {
             status: CommandStatus::Rejected,
             message: msg.into(),
+            data: None,
         }
     }
 
@@ -68,6 +88,7 @@ impl CommandResponse {
         Self {
             status: CommandStatus::Error,
             message: msg.into(),
+            data: None,
         }
     }
 }

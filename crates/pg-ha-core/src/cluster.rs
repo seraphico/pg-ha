@@ -40,6 +40,83 @@ pub struct Cluster {
     /// to tell whether every node has published its timeline evidence.
     #[serde(default)]
     pub dcs_voters: Option<usize>,
+    /// SB-37: the operator's one-shot quorum recovery grant (DCS `/recovery`,
+    /// TTL = lock ttl). None when absent, expired or unparsable.
+    #[serde(default)]
+    pub recovery: Option<Recovery>,
+}
+/// SB-37: what a recovery grant was planned against. The grant is used only
+/// while the live `/sync` and `/timeline` still equal it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverySnapshot {
+    /// `/sync` leader, lower-cased.
+    pub sync_leader: String,
+    /// `/sync` voters, lower-cased and sorted.
+    pub voters: Vec<String>,
+    /// `/sync` quorum `q`.
+    pub quorum: u32,
+    /// `/timeline` record: timeline, begin LSN and key version (None: no
+    /// current-format record).
+    pub timeline: Option<TimelineId>,
+    pub timeline_version: Option<u64>,
+}
+impl RecoverySnapshot {
+    /// The snapshot of a live `/sync` and `/timeline`.
+    pub fn of(sync: &SyncState, timeline: &ClusterTimeline) -> Self {
+        let mut voters: Vec<String> = sync
+            .sync_standby_names()
+            .into_iter()
+            .map(str::to_ascii_lowercase)
+            .collect();
+        voters.sort();
+        voters.dedup();
+        Self {
+            sync_leader: sync.leader.to_ascii_lowercase(),
+            voters,
+            quorum: sync.quorum,
+            timeline: timeline.record().map(TimelineRecord::id),
+            timeline_version: timeline.version(),
+        }
+    }
+    /// Does the live state still equal this snapshot?
+    pub fn matches(&self, sync: Option<&SyncState>, timeline: &ClusterTimeline) -> bool {
+        sync.is_some_and(|s| Self::of(s, timeline) == *self)
+    }
+}
+/// SB-37: DCS `/recovery`, written create-only by `POST /recovery` and
+/// deleted by any leader lock acquisition, by `DELETE /recovery`, or by its
+/// TTL. It lets `candidate` win the vote with every voter outside `lost`
+/// instead of `q` voters, accepting that commits held only by `lost` may be
+/// gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recovery {
+    pub candidate: String,
+    /// Voters the operator declared lost (lower-cased, sorted).
+    pub lost: Vec<String>,
+    pub snapshot: RecoverySnapshot,
+    /// The candidate is below the recorded timeline: the newer history is
+    /// abandoned (same effect as `pg-ha.accept_timeline_loss`).
+    pub timeline_loss: bool,
+    /// The digest the operator confirmed.
+    pub digest: String,
+    /// Node whose REST API wrote the grant.
+    pub created_by: String,
+    /// pg-ha version of that node; a candidate of another version ignores it.
+    pub pg_ha_version: String,
+    /// Expiry (millis since the epoch) as the DCS reports it; not stored.
+    #[serde(skip)]
+    pub expire_at_ms: Option<u64>,
+}
+impl Recovery {
+    /// Is `name` this grant's candidate?
+    pub fn names_candidate(&self, name: &str) -> bool {
+        self.candidate.eq_ignore_ascii_case(name)
+    }
+    /// The grant as stored in DCS; None when the value does not parse (a
+    /// malformed grant is treated as absent).
+    pub fn parse(value: &str) -> Option<Self> {
+        serde_json::from_str(value).ok()
+    }
 }
 
 /// D6: the DCS `/timeline` key as read, with the version for CAS writes.

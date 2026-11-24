@@ -221,7 +221,28 @@ impl Ha {
             );
         }
 
-        let should_attempt = if let Some(candidate) = designated_candidate.as_deref() {
+        // SB-37: a current quorum recovery grant reserves the election for
+        // its candidate, like a designated candidate.
+        let recovery_candidate = self.current_recovery_candidate().map(str::to_owned);
+        let should_attempt = if let Some(candidate) = recovery_candidate.as_deref() {
+            if candidate.eq_ignore_ascii_case(&self.config.name) {
+                let allowed = !self.config.tags.nofailover
+                    && self.config.tags.failover_priority != 0
+                    && sync_failover_allowed(
+                        &self.config.name,
+                        self.dynamic_config_state.last_config.sync_mode(),
+                        self.cluster.sync_state.as_ref(),
+                    );
+                if allowed {
+                    warn!(
+                        "This node is the candidate of the operator's quorum recovery grant — campaigning with every voter outside the named lost voters"
+                    );
+                }
+                allowed
+            } else {
+                false
+            }
+        } else if let Some(candidate) = designated_candidate.as_deref() {
             if candidate == self.config.name {
                 let allowed = sync_failover_allowed(
                     &self.config.name,
@@ -280,6 +301,9 @@ impl Ha {
             let anchor = super::lease::LeaseAnchor::now();
             match self.dcs.attempt_to_acquire_leader().await {
                 Ok(true) => {
+                    // SB-37: the grant this lock was won with, for the
+                    // promote of this term (read before `is_leader` is set).
+                    self.recovery_term = self.live_recovery_grant().cloned();
                     self.is_leader = true;
                     self.extend_leader_lease(anchor);
                     // Memory only: what this election was, before the
@@ -287,6 +311,17 @@ impl Ha {
                     self.note_pending_history();
                     // Clear the failover key after successful acquisition
                     let _ = self.dcs.set_failover_value("").await;
+                    // SB-37: any acquisition consumes the recovery grant.
+                    if self.cluster.recovery.is_some() {
+                        let _ = self.dcs.delete_recovery().await;
+                    }
+                    if let Some(r) = &self.recovery_term {
+                        error!(
+                            "Quorum recovery: took the leader lock under the operator's grant; promoting accepts the loss of commits that only {} may hold (timeline loss: {})",
+                            r.lost.join(","),
+                            if r.timeline_loss { "yes" } else { "no" }
+                        );
+                    }
                     self.enforce_primary_role().await
                 }
                 Ok(false) => {
@@ -300,6 +335,15 @@ impl Ha {
             // Same reason as the refused vote above: a standby that only
             // waits for another node still has to publish its record.
             let _ = self.touch_member().await;
+            if let Some(candidate) = recovery_candidate.as_deref() {
+                return CycleResult::Follower(
+                    if candidate.eq_ignore_ascii_case(&self.config.name) {
+                        "quorum recovery candidate may not fail over (nofailover, failover_priority 0 or not sync-eligible)".into()
+                    } else {
+                        format!("deferring to the quorum recovery candidate ({candidate})")
+                    },
+                );
+            }
             match designated_candidate.as_deref() {
                 Some(candidate) if candidate == self.config.name => CycleResult::Follower(
                     "designated candidate is not sync-eligible — not acquiring lock".into(),

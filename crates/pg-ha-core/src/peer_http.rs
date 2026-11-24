@@ -74,6 +74,9 @@ struct WalBody {
     timeline: Option<u64>,
     wal_position: Option<u64>,
     pg_in_recovery: bool,
+    /// SB-37: the peer's pg-ha version (`GET /wal`; absent before 0.1.26).
+    #[serde(default)]
+    pg_ha_version: Option<String>,
 }
 
 /// Asks a peer for its vote at `POST /vote` (SB-40): the peer stops streaming
@@ -138,6 +141,15 @@ async fn wal_answer(
     response: reqwest::Response,
     target: &PeerTarget,
 ) -> Result<WalPosition, PeerProbeError> {
+    wal_answer_with_version(response, target)
+        .await
+        .map(|(p, _)| p)
+}
+/// [`wal_answer`] plus the version the peer reports.
+async fn wal_answer_with_version(
+    response: reqwest::Response,
+    target: &PeerTarget,
+) -> Result<(WalPosition, Option<String>), PeerProbeError> {
     let status = response.status();
     if status != reqwest::StatusCode::OK {
         return Err(PeerProbeError::Status(status.as_u16()));
@@ -154,12 +166,15 @@ async fn wal_answer(
     if !body.name.eq_ignore_ascii_case(&target.name) {
         return Err(PeerProbeError::Mismatch);
     }
-    Ok(WalPosition {
-        name: body.name,
-        in_recovery: body.pg_in_recovery,
-        timeline,
-        lsn,
-    })
+    Ok((
+        WalPosition {
+            name: body.name,
+            in_recovery: body.pg_in_recovery,
+            timeline,
+            lsn,
+        },
+        body.pg_ha_version,
+    ))
 }
 /// SB-37: reads a peer's live position at `GET /wal`, which changes nothing
 /// on the peer (unlike [`ReqwestPeerWalProbe`]). The follow path uses it to
@@ -179,6 +194,12 @@ impl ReqwestPeerWalReader {
 #[async_trait]
 impl PeerWalProbe for ReqwestPeerWalReader {
     async fn read(&self, target: &PeerTarget) -> Result<WalPosition, PeerProbeError> {
+        self.read_with_version(target).await.map(|(p, _)| p)
+    }
+    async fn read_with_version(
+        &self,
+        target: &PeerTarget,
+    ) -> Result<(WalPosition, Option<String>), PeerProbeError> {
         let url = format!("{}/wal", target.api_url.trim_end_matches('/'));
         let response = self
             .client
@@ -186,7 +207,7 @@ impl PeerWalProbe for ReqwestPeerWalReader {
             .send()
             .await
             .map_err(map_reqwest_error)?;
-        wal_answer(response, target).await
+        wal_answer_with_version(response, target).await
     }
 }
 
@@ -274,6 +295,33 @@ mod tests {
         assert_eq!(got.timeline, 4);
         let request = seen.await.unwrap();
         assert!(request.starts_with("GET /wal "), "{request}");
+    }
+    /// SB-37: the reader returns the version a peer reports, None when an
+    /// older peer reports none.
+    #[tokio::test]
+    async fn reader_returns_the_reported_version() {
+        let reader = ReqwestPeerWalReader::new(None).unwrap();
+        for (body, want) in [
+            (
+                r#"{"name":"node3","timeline":4,"wal_position":7,"pg_in_recovery":true,"pg_ha_version":"9.9.9"}"#,
+                Some("9.9.9".to_string()),
+            ),
+            (
+                r#"{"name":"node3","timeline":4,"wal_position":7,"pg_in_recovery":true}"#,
+                None,
+            ),
+        ] {
+            let api_url = serve_once(http("200 OK", body)).await;
+            let (p, v) = reader
+                .read_with_version(&PeerTarget {
+                    name: "node3".into(),
+                    api_url,
+                })
+                .await
+                .unwrap();
+            assert_eq!(p.lsn, 7);
+            assert_eq!(v, want);
+        }
     }
     #[tokio::test]
     async fn probe_asks_with_post_vote() {

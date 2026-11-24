@@ -78,6 +78,17 @@ pub(super) fn classify_acquisition(
         ),
     }
 }
+/// SB-37: event type and reason of an acquisition under a recovery grant.
+pub(super) fn quorum_recovery_event(r: &crate::cluster::Recovery) -> (HistoryEventType, String) {
+    (
+        HistoryEventType::QuorumRecovery,
+        format!(
+            "quorum recovery: accepted loss of {}; timeline loss: {}",
+            r.lost.join(","),
+            if r.timeline_loss { "yes" } else { "no" }
+        ),
+    )
+}
 impl Ha {
     /// On a successful lock acquisition: remember what this election was, in
     /// memory only. No DCS access (the promote path must not gain a write).
@@ -87,8 +98,12 @@ impl Ha {
             self.pending_history = None;
             return;
         }
-        let (event_type, old_leader, reason) =
+        let (mut event_type, old_leader, mut reason) =
             classify_acquisition(self.cluster.failover.as_ref(), &self.cluster.timeline);
+        // SB-37: the lock was won under the operator's recovery grant.
+        if let Some(r) = &self.recovery_term {
+            (event_type, reason) = quorum_recovery_event(r);
+        }
         self.pending_history = Some(PendingHistory {
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)

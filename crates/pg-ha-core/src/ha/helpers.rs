@@ -928,7 +928,14 @@ impl Ha {
         match verdict {
             Ok(()) => OwnEligibility::Eligible,
             Err(why) => {
-                if !timeline_files::has_accept_timeline_loss(&self.config.postgresql.data_dir) {
+                // SB-37: a quorum recovery grant that accepted the timeline
+                // loss has the marker file's effect, for a node that is only
+                // behind the recorded timeline.
+                let granted = matches!(why, lineage::Ineligible::Behind { .. })
+                    && self.recovery_in_force().is_some_and(|r| r.timeline_loss);
+                if !granted
+                    && !timeline_files::has_accept_timeline_loss(&self.config.postgresql.data_dir)
+                {
                     return OwnEligibility::Ineligible(why);
                 }
                 // The override only applies when nobody else may campaign.

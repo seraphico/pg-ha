@@ -16,6 +16,8 @@ async-trait = { workspace = true }
 tokio-postgres = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true }
+# SB-37: SHA-256 of the recovery digest (already in the lock through rustls).
+ring = "0.17"
 
 [dev-dependencies]
 proptest = "1"

@@ -1146,11 +1146,19 @@ pub(crate) const PRE_PROMOTE_CONFIRM_STEP: Duration = Duration::from_millis(100)
 /// rendered, a call failed or timed out ([`IO_TIMEOUT`]), or SHOW did not show
 /// the new shape within [`PRE_PROMOTE_CONFIRM_TIMEOUT`]. When SHOW already
 /// shows the shape (a retry after a failed `pg_ctl promote`) nothing is written.
+///
+/// SB-37: `recovery_lost` is set when this node won the lock under a quorum
+/// recovery grant. The inherited value would name voters that are gone, and a
+/// standby promoted under it blocks its first write (E4). It installs
+/// `ANY 1 (V ∖ lost ∖ {me})` instead (the voters that just answered the vote),
+/// or the empty value when no other voter is left; finalization of `/sync`
+/// then takes the reset path.
 pub(crate) async fn pre_promote_sync<IO: SyncIo>(
     io: &mut IO,
     mode: SynchronousMode,
     me: &str,
     sync: Option<&SyncState>,
+    recovery_lost: Option<&[String]>,
 ) -> std::result::Result<(), String> {
     if !executor_applies(mode, sync) {
         return Ok(());
@@ -1162,11 +1170,26 @@ pub(crate) async fn pre_promote_sync<IO: SyncIo>(
     if s.leader.eq_ignore_ascii_case(me) {
         return Ok(());
     }
-    let current = QuorumState::new(s.sync_standby_names(), s.quorum as usize, [""; 0], 0);
-    let Some(post) = post_promotion_state(&current, me, &s.leader) else {
-        return Ok(());
+    let wanted = match recovery_lost {
+        Some(lost) => {
+            let present: Vec<String> = s
+                .sync_standby_names()
+                .into_iter()
+                .map(str::to_ascii_lowercase)
+                .filter(|v| !v.eq_ignore_ascii_case(me))
+                .filter(|v| !lost.iter().any(|l| l.eq_ignore_ascii_case(v)))
+                .collect();
+            let n = usize::from(!present.is_empty());
+            QuorumTarget::new(&present, n)
+        }
+        None => {
+            let current = QuorumState::new(s.sync_standby_names(), s.quorum as usize, [""; 0], 0);
+            let Some(post) = post_promotion_state(&current, me, &s.leader) else {
+                return Ok(());
+            };
+            QuorumTarget::new(&post.pg_names, post.pg_n)
+        }
     };
-    let wanted = QuorumTarget::new(&post.pg_names, post.pg_n);
     let text = render_quorum_value(&wanted, false)
         .map_err(|e| format!("cannot render the pre-promote value: {e}"))?;
     let key = parse_sync_value(&text)
@@ -1237,11 +1260,13 @@ impl Ha {
             lease: self.leader_lease,
             paused: self.is_paused,
         };
+        let lost = self.recovery_term.as_ref().map(|r| r.lost.clone());
         pre_promote_sync(
             &mut io,
             mode,
             &self.config.name,
             self.cluster.sync_state.as_ref(),
+            lost.as_deref(),
         )
         .await
     }

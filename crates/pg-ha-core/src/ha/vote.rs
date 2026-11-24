@@ -28,6 +28,7 @@ use crate::quorum::round::{
 };
 use crate::quorum::{
     AncestorEnd, Names, VoteDecision, WalPosition, quorum_vote_decision_with_history,
+    recovery_vote_decision,
 };
 
 /// Is a rate-limited log line due? `last` is when it was last logged.
@@ -137,18 +138,36 @@ impl Ha {
             );
         }
 
-        let ancestors = self.vote_ancestors(own_timeline);
-        match quorum_vote_decision_with_history(
-            &candidate,
-            &voters,
-            quorum,
-            &round.answers,
-            &ancestors,
-        ) {
-            VoteDecision::Refused(reason) => {
-                VoteGate::Refuse(format!("quorum vote refused: {reason:?}"))
+        // SB-37: under the operator's recovery grant the named loss replaces
+        // the count of `q`: every voter outside `lost` must answer, none ahead.
+        let grant_lost: Option<Names> = self
+            .live_recovery_grant()
+            .map(|g| g.lost.iter().map(|n| n.to_ascii_lowercase()).collect());
+        let decision = match &grant_lost {
+            Some(lost) => recovery_vote_decision(&candidate, &voters, lost, &round.answers),
+            None => {
+                let ancestors = self.vote_ancestors(own_timeline);
+                quorum_vote_decision_with_history(
+                    &candidate,
+                    &voters,
+                    quorum,
+                    &round.answers,
+                    &ancestors,
+                )
             }
+        };
+        match decision {
+            VoteDecision::Refused(reason) => match &grant_lost {
+                Some(_) => VoteGate::Refuse(format!("quorum recovery vote refused: {reason:?}")),
+                None => VoteGate::Refuse(format!("quorum vote refused: {reason:?}")),
+            },
             VoteDecision::Granted { .. } => {
+                if let Some(lost) = &grant_lost {
+                    error!(
+                        "Quorum recovery: won the vote under the operator's grant without the votes of {}; accepting the loss of commits that only those voters may hold",
+                        lost.iter().cloned().collect::<Vec<_>>().join(",")
+                    );
+                }
                 // SB-11 ceiling with the SAME live values as the vote (no
                 // mixing of published and live readings).
                 let max_lag = self
@@ -346,7 +365,7 @@ impl Ha {
             silent.join(",")
         };
         error!(
-            "The cluster has no leader and this candidate cannot collect enough votes ({refusal}); /sync has q={q} over voters [{}]. Voters that cannot answer: {silent}. It stays without a primary until enough of those voters return. See the operations guide, section Quorum synchronous replication (known limitation)",
+            "The cluster has no leader and this candidate cannot collect enough votes ({refusal}); /sync has q={q} over voters [{}]. Voters that cannot answer: {silent}. It stays without a primary until enough of those voters return. If they are gone for good, run pg-ha-ctl recover",
             voters.join(",")
         );
         true

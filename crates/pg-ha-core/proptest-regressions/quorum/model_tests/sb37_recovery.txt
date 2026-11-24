@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 11cd68a23feeadabc1b2588b3681e5e23326e9c50603612bbcee15987be4045f # shrinks to h = (3, 1, [Revive(0), Commit(1), Commit(1), Revive(0), Commit(1), Commit(1), KillLeader, Commit(1), Revive(0), Revive(0), Commit(1), Elect(0, 255, 0), Commit(1), Commit(1), Commit(1), Commit(1), Commit(1), Commit(1), Commit(1), Commit(1)])

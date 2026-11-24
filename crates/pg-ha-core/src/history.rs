@@ -38,6 +38,8 @@ pub enum HistoryEventType {
     Failover,
     Switchover,
     Promote,
+    /// SB-37: a promotion under the operator's quorum recovery grant.
+    QuorumRecovery,
 }
 
 impl std::fmt::Display for HistoryEventType {
@@ -46,6 +48,7 @@ impl std::fmt::Display for HistoryEventType {
             Self::Failover => write!(f, "failover"),
             Self::Switchover => write!(f, "switchover"),
             Self::Promote => write!(f, "promote"),
+            Self::QuorumRecovery => write!(f, "quorum_recovery"),
         }
     }
 }
