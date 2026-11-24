@@ -211,6 +211,11 @@ pub struct Ha {
     /// SB-37: what the loop has seen of the leader lock, the DCS and this
     /// node's votes, for the `/replica` stuck rule.
     stuck: stuck::StuckTracker,
+    /// SB-37: reads the upstream's `GET /wal` (read-only) before a standby
+    /// restarts PostgreSQL to follow it. None: only the DCS quorum check runs.
+    upstream_reader: Option<Arc<dyn PeerWalProbe>>,
+    /// SB-37: when the "not restarting PostgreSQL to follow" WARN was last logged.
+    follow_deferred_logged_at: Option<std::time::Instant>,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -263,6 +268,8 @@ impl Ha {
             quorum_exec: Default::default(),
             quorum_stall_logged_at: None,
             stuck: stuck::StuckTracker::default(),
+            upstream_reader: None,
+            follow_deferred_logged_at: None,
         };
         (ha, cmd_tx)
     }
@@ -279,6 +286,11 @@ impl Ha {
         self.peer_probe = Some(probe);
     }
 
+    /// Install the read-only `GET /wal` reader the follow path uses to confirm
+    /// the upstream before restarting PostgreSQL to follow it (SB-37).
+    pub fn set_upstream_reader(&mut self, reader: Arc<dyn PeerWalProbe>) {
+        self.upstream_reader = Some(reader);
+    }
     /// The REST API state derived from the current HA state.
     pub fn api_snapshot(&self) -> ApiSnapshot {
         let pg_running = self.postgresql.is_running();
@@ -1529,6 +1541,8 @@ mod tests {
         fail_cluster_reads: std::sync::atomic::AtomicBool,
         /// Number of `get_cluster` calls.
         cluster_reads: std::sync::atomic::AtomicUsize,
+        /// `quorum_confirmed()` (SB-37); true by default.
+        quorum_confirmed: std::sync::atomic::AtomicBool,
     }
 
     impl MockDcs {
@@ -1554,6 +1568,7 @@ mod tests {
                 fail_config_reads: std::sync::atomic::AtomicBool::new(false),
                 fail_cluster_reads: std::sync::atomic::AtomicBool::new(false),
                 cluster_reads: std::sync::atomic::AtomicUsize::new(0),
+                quorum_confirmed: std::sync::atomic::AtomicBool::new(true),
             }
         }
 
@@ -1587,6 +1602,7 @@ mod tests {
                 fail_config_reads: std::sync::atomic::AtomicBool::new(false),
                 fail_cluster_reads: std::sync::atomic::AtomicBool::new(false),
                 cluster_reads: std::sync::atomic::AtomicUsize::new(0),
+                quorum_confirmed: std::sync::atomic::AtomicBool::new(true),
             }
         }
 
@@ -1835,6 +1851,10 @@ mod tests {
         }
         fn loop_wait(&self) -> u64 {
             10
+        }
+        fn quorum_confirmed(&self) -> bool {
+            self.quorum_confirmed
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
         fn set_lock_timing(&self, ttl: u64, _retry_timeout: u64) {
             self.lock_ttl
@@ -3879,6 +3899,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// SB-37: a standby restarts PostgreSQL to follow the lock holder only
+    /// when the lock is confirmed (see `follow::follow_restart_refusal`).
+    mod follow_gate_tests {
+        use super::*;
+        use crate::quorum::WalPosition;
+        use crate::quorum::round::{PeerProbeError, PeerTarget, PeerWalProbe};
+        /// A fixed `GET /wal` answer; counts the reads.
+        struct FixedReader {
+            answer: std::result::Result<WalPosition, PeerProbeError>,
+            reads: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl PeerWalProbe for FixedReader {
+            async fn read(
+                &self,
+                _target: &PeerTarget,
+            ) -> std::result::Result<WalPosition, PeerProbeError> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.answer.clone()
+            }
+        }
+        fn answer(in_recovery: bool) -> std::result::Result<WalPosition, PeerProbeError> {
+            Ok(WalPosition {
+                name: "node3".into(),
+                in_recovery,
+                timeline: 2,
+                lsn: 100,
+            })
+        }
+        fn reader(a: std::result::Result<WalPosition, PeerProbeError>) -> Arc<FixedReader> {
+            Arc::new(FixedReader {
+                answer: a,
+                reads: Default::default(),
+            })
+        }
+        /// node2, a running standby streaming from node1 (dead), while node3
+        /// holds the lock. Returns the upstream after one follow cycle.
+        async fn follow_once(
+            label: &str,
+            quorum_confirmed: bool,
+            reader: Option<Arc<FixedReader>>,
+        ) -> (Option<String>, String) {
+            let dcs = Arc::new(MockDcs::with_leader("node3"));
+            dcs.quorum_confirmed
+                .store(quorum_confirmed, std::sync::atomic::Ordering::SeqCst);
+            let (mut ha, dir) = identity_test_ha("node2", label, dcs, Some(true), true);
+            preset_auto_conf(&dir, "node1");
+            ha.config.retry_timeout = 0;
+            if let Some(r) = reader {
+                ha.set_upstream_reader(r);
+            }
+            ha.cluster = Cluster {
+                timeline: rec(1),
+                leader: Some(Leader {
+                    name: "node3".into(),
+                    version: 1,
+                }),
+                members: vec![
+                    Member {
+                        api_url: "http://node3:8008".into(),
+                        role: MemberRole::Primary,
+                        ..member_at("node3", "host=node3 port=5432")
+                    },
+                    member_at("node2", "host=node2 port=5432"),
+                ],
+                ..Default::default()
+            };
+            let result = ha.follow_upstream("node3").await;
+            let upstream = ha.read_current_upstream();
+            let _ = std::fs::remove_dir_all(&dir);
+            (upstream, result.to_string())
+        }
+        #[tokio::test]
+        async fn no_restart_while_the_dcs_has_no_quorum_leader() {
+            let r = reader(answer(false));
+            let (upstream, result) = follow_once("gate-no-quorum", false, Some(r.clone())).await;
+            assert_eq!(upstream.as_deref(), Some("node1"), "{result}");
+            assert!(result.contains("not restarting PostgreSQL"), "{result}");
+            assert!(result.contains("may be stale"), "{result}");
+            assert_eq!(
+                r.reads.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no peer read while the DCS view is stale"
+            );
+            // Without a reader installed the DCS rule alone still holds.
+            let (upstream, result) = follow_once("gate-no-quorum-noreader", false, None).await;
+            assert_eq!(upstream.as_deref(), Some("node1"), "{result}");
+        }
+        #[tokio::test]
+        async fn no_restart_while_the_lock_holder_is_unreachable_or_not_primary() {
+            for (label, a) in [
+                ("gate-unreachable", Err(PeerProbeError::Timeout)),
+                ("gate-in-recovery", answer(true)),
+            ] {
+                let (upstream, result) = follow_once(label, true, Some(reader(a))).await;
+                assert_eq!(upstream.as_deref(), Some("node1"), "{label}: {result}");
+                assert!(result.contains("not restarting PostgreSQL"), "{result}");
+            }
+        }
+        #[tokio::test]
+        async fn restart_once_the_lock_is_confirmed() {
+            let r = reader(answer(false));
+            let (upstream, result) = follow_once("gate-confirmed", true, Some(r.clone())).await;
+            assert_eq!(upstream.as_deref(), Some("node3"), "{result}");
+            assert_eq!(r.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+            // Adapters without a quorum notion and no reader: as before.
+            let (upstream, result) = follow_once("gate-default", true, None).await;
+            assert_eq!(upstream.as_deref(), Some("node3"), "{result}");
+        }
+        #[test]
+        fn refusal_table() {
+            use crate::ha::follow::follow_restart_refusal as r;
+            let up = answer(false);
+            let rec = answer(true);
+            let down: std::result::Result<WalPosition, PeerProbeError> =
+                Err(PeerProbeError::Transport("dns".into()));
+            assert!(r(false, "node3", true, Some(&up)).is_some());
+            assert!(r(false, "node3", true, None).is_some());
+            assert!(r(true, "node3", true, None).is_none());
+            assert!(r(true, "node3", true, Some(&up)).is_none());
+            assert!(r(true, "node3", true, Some(&down)).is_some());
+            assert!(r(true, "node3", true, Some(&rec)).is_some());
+            // A cascade source is a standby by design: reachable is enough.
+            assert!(r(true, "node4", false, Some(&rec)).is_none());
+            assert!(r(true, "node4", false, Some(&down)).is_some());
+        }
+    }
     #[tokio::test]
     async fn test_reconfigure_replica_keeps_auto_conf_lines() {
         let (mut ha, dir) = identity_test_ha(

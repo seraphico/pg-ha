@@ -70,6 +70,15 @@ pub trait DcsAdapter: Send + Sync {
     /// Get the configured loop_wait
     fn loop_wait(&self) -> u64;
 
+    /// SB-37: does this DCS node currently see a leader that holds a quorum?
+    /// `false` means reads are served from local state that may be stale
+    /// (no consensus leader known, or this node leads without recent quorum
+    /// acknowledgements): a leader lock read now may belong to a dead node.
+    /// Adapters without that notion keep the default `true`.
+    fn quorum_confirmed(&self) -> bool {
+        true
+    }
+
     /// Update the TTL written into the leader lock and the DCS write timeout
     /// (from dynamic `/config`). Defaults to a no-op for adapters that ignore
     /// dynamic timing; RaftDcs applies both so the lease and lock stay aligned.

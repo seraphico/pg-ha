@@ -463,6 +463,24 @@ fn repeat_is_harmless(request: &Request) -> bool {
 }
 /// The contacted node is not the Raft leader (its `ForwardToLeader`), so it
 /// appended nothing.
+/// SB-37: the longest a Raft leader may go without a quorum acknowledgement
+/// and still count as confirmed: the election timeout ceiling (3000 ms). A
+/// follower in the majority hears a heartbeat every 500 ms; past this bound
+/// the majority has elected another leader or this leader is cut off.
+const QUORUM_ACK_MAX_MS: u64 = 3000;
+/// SB-37: the condition behind [`DcsAdapter::quorum_confirmed`]. A follower
+/// is confirmed while it knows a current leader (openraft clears it when the
+/// election timeout fires without heartbeats). A leader is confirmed only
+/// while a quorum acknowledged it within [`QUORUM_ACK_MAX_MS`]: openraft 0.9
+/// keeps a minority leader in place (R19), so `current_leader` alone is not
+/// enough there.
+fn raft_quorum_confirmed(is_leader: bool, knows_leader: bool, quorum_ack_ms: Option<u64>) -> bool {
+    if is_leader {
+        quorum_ack_ms.is_some_and(|ms| ms <= QUORUM_ACK_MAX_MS)
+    } else {
+        knows_leader
+    }
+}
 fn is_not_leader_rejection(status: reqwest::StatusCode, body: &str) -> bool {
     status == reqwest::StatusCode::SERVICE_UNAVAILABLE && body.contains("forward")
 }
@@ -792,6 +810,14 @@ impl DcsAdapter for RaftDcs {
     fn loop_wait(&self) -> u64 {
         self.loop_wait
     }
+    fn quorum_confirmed(&self) -> bool {
+        let metrics = self.raft.metrics().borrow().clone();
+        raft_quorum_confirmed(
+            metrics.state == openraft::ServerState::Leader,
+            metrics.current_leader.is_some(),
+            metrics.millis_since_quorum_ack,
+        )
+    }
 
     fn set_lock_timing(&self, ttl: u64, retry_timeout: u64) {
         let ttl = ttl.max(1);
@@ -905,6 +931,26 @@ mod tests {
         })
     }
 
+    #[test]
+    fn raft_quorum_confirmed_table() {
+        // (is_leader, knows_leader, quorum_ack_ms, confirmed)
+        let table = [
+            (false, false, None, false),
+            (false, true, None, true),
+            (true, true, None, false),
+            (true, true, Some(0), true),
+            (true, true, Some(QUORUM_ACK_MAX_MS), true),
+            (true, true, Some(QUORUM_ACK_MAX_MS + 1), false),
+            (true, true, Some(60_000), false),
+        ];
+        for (is_leader, knows, ack, expected) in table {
+            assert_eq!(
+                raft_quorum_confirmed(is_leader, knows, ack),
+                expected,
+                "{is_leader} {knows} {ack:?}"
+            );
+        }
+    }
     #[test]
     fn history_write_is_a_cas_without_ttl() {
         let hkey = "/service/test/history";
@@ -1107,6 +1153,14 @@ mod tests {
             leader.raft().metrics().borrow().current_leader,
             Some(leader_id)
         );
+        // SB-37: a leader acknowledged by a quorum is confirmed, and so is a
+        // follower that knows it.
+        assert!(leader.quorum_confirmed(), "healthy Raft leader");
+        let follower = nodes
+            .iter()
+            .find(|n| n.raft().metrics().borrow().id != leader_id)
+            .unwrap();
+        assert!(follower.quorum_confirmed(), "follower of a healthy leader");
 
         // Partition: stop the peers' RPC servers and their Raft cores. The
         // core shutdown also covers keep-alive connections that outlive the
@@ -1141,6 +1195,14 @@ mod tests {
             leader.raft().metrics().borrow().current_leader,
             Some(leader_id),
             "openraft 0.9 keeps the minority leader"
+        );
+        // SB-37: ...but it is no longer confirmed: no quorum acknowledgement
+        // for longer than the election timeout ceiling. A lock read on it
+        // may belong to a dead node.
+        assert!(
+            !leader.quorum_confirmed(),
+            "minority leader must not be confirmed (ack age {:?} ms)",
+            leader.raft().metrics().borrow().millis_since_quorum_ack
         );
 
         // The fix: the renewal returns Error::Timeout after retry_timeout.

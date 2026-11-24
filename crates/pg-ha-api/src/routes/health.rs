@@ -38,7 +38,7 @@ pub(crate) async fn health_primary(State(state): State<RouterState>) -> impl Int
 pub(crate) const LEADERLESS_STUCK_REASON: &str = "cluster has no leader and the election is stuck";
 /// SB-37: where an operator is sent while the election is stuck.
 const ELECTION_STUCK_HINT: &str =
-    "see the operations guide, section Quorum recovery (no supported command yet)";
+    "see the operations guide, section Quorum synchronous replication (known limitation)";
 /// `/cluster` `election` object: whether this node sees the cluster stuck
 /// without a leader, and whether its own votes are refused.
 fn election_json(s: &crate::state::NodeState) -> serde_json::Value {

@@ -130,27 +130,63 @@ impl PeerWalProbe for ReqwestPeerWalProbe {
                  on every node, otherwise no vote can succeed and quorum cannot be reached"
             );
         }
-        if status != reqwest::StatusCode::OK {
-            return Err(PeerProbeError::Status(status.as_u16()));
-        }
-        let bytes = response.bytes().await.map_err(map_reqwest_error)?;
-        let body: WalBody = serde_json::from_slice(&bytes)
-            .map_err(|err| PeerProbeError::BadBody(err.to_string()))?;
-        let timeline = body
-            .timeline
-            .ok_or_else(|| PeerProbeError::BadBody("timeline missing".into()))?;
-        let lsn = body
-            .wal_position
-            .ok_or_else(|| PeerProbeError::BadBody("wal_position missing".into()))?;
-        if !body.name.eq_ignore_ascii_case(&target.name) {
-            return Err(PeerProbeError::Mismatch);
-        }
-        Ok(WalPosition {
-            name: body.name,
-            in_recovery: body.pg_in_recovery,
-            timeline,
-            lsn,
+        wal_answer(response, target).await
+    }
+}
+/// A `/wal` or `/vote` answer as a [`WalPosition`] of `target`.
+async fn wal_answer(
+    response: reqwest::Response,
+    target: &PeerTarget,
+) -> Result<WalPosition, PeerProbeError> {
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        return Err(PeerProbeError::Status(status.as_u16()));
+    }
+    let bytes = response.bytes().await.map_err(map_reqwest_error)?;
+    let body: WalBody =
+        serde_json::from_slice(&bytes).map_err(|err| PeerProbeError::BadBody(err.to_string()))?;
+    let timeline = body
+        .timeline
+        .ok_or_else(|| PeerProbeError::BadBody("timeline missing".into()))?;
+    let lsn = body
+        .wal_position
+        .ok_or_else(|| PeerProbeError::BadBody("wal_position missing".into()))?;
+    if !body.name.eq_ignore_ascii_case(&target.name) {
+        return Err(PeerProbeError::Mismatch);
+    }
+    Ok(WalPosition {
+        name: body.name,
+        in_recovery: body.pg_in_recovery,
+        timeline,
+        lsn,
+    })
+}
+/// SB-37: reads a peer's live position at `GET /wal`, which changes nothing
+/// on the peer (unlike [`ReqwestPeerWalProbe`]). The follow path uses it to
+/// check that the node it would restart PostgreSQL to follow is reachable and,
+/// for the lock holder, runs as a primary.
+pub struct ReqwestPeerWalReader {
+    client: reqwest::Client,
+}
+impl ReqwestPeerWalReader {
+    /// `tls`: this node's REST TLS material, as for [`ReqwestPeerWalProbe`].
+    pub fn new(tls: Option<&RestApiTlsConfig>) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: build_peer_client(tls, PEER_REQUEST_TIMEOUT, "upstream /wal client")?,
         })
+    }
+}
+#[async_trait]
+impl PeerWalProbe for ReqwestPeerWalReader {
+    async fn read(&self, target: &PeerTarget) -> Result<WalPosition, PeerProbeError> {
+        let url = format!("{}/wal", target.api_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        wal_answer(response, target).await
     }
 }
 
@@ -211,6 +247,34 @@ mod tests {
         assert!(got.in_recovery);
     }
 
+    /// SB-37: the follow-path reader only reads: `GET /wal`, never `/vote`.
+    #[tokio::test]
+    async fn reader_asks_with_get_wal_and_parses_the_answer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"name":"node3","timeline":4,"wal_position":7,"pg_in_recovery":false}"#;
+            let _ = sock.write_all(http("200 OK", body).as_bytes()).await;
+            let _ = sock.shutdown().await;
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        let got = ReqwestPeerWalReader::new(None)
+            .unwrap()
+            .read(&PeerTarget {
+                name: "node3".into(),
+                api_url: format!("http://{addr}"),
+            })
+            .await
+            .unwrap();
+        assert!(!got.in_recovery);
+        assert_eq!(got.timeline, 4);
+        let request = seen.await.unwrap();
+        assert!(request.starts_with("GET /wal "), "{request}");
+    }
     #[tokio::test]
     async fn probe_asks_with_post_vote() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

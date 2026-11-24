@@ -1145,7 +1145,7 @@ async fn cluster_election_follows_the_flags() {
     assert!(
         json["election"]["hint"]
             .as_str()
-            .is_some_and(|h| h.contains("Quorum recovery"))
+            .is_some_and(|h| h.contains("Quorum synchronous replication"))
     );
 }
 #[tokio::test]

@@ -298,7 +298,7 @@ impl Ha {
             silent.join(",")
         };
         error!(
-            "The cluster has no leader and this candidate cannot collect enough votes ({refusal}); /sync has q={q} over voters [{}]. Voters that cannot answer: {silent}. It stays without a primary until enough of those voters return. See the operations guide, section Quorum recovery",
+            "The cluster has no leader and this candidate cannot collect enough votes ({refusal}); /sync has q={q} over voters [{}]. Voters that cannot answer: {silent}. It stays without a primary until enough of those voters return. See the operations guide, section Quorum synchronous replication (known limitation)",
             voters.join(",")
         );
         true
