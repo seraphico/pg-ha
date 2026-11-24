@@ -26,7 +26,9 @@ use crate::peer_http::align_api_scheme;
 use crate::quorum::round::{
     PEER_REQUEST_TIMEOUT, PeerTarget, VOTE_ROUND_TIMEOUT, collect_wal_positions,
 };
-use crate::quorum::{Names, VoteDecision, WalPosition, quorum_vote_decision};
+use crate::quorum::{
+    AncestorEnd, Names, VoteDecision, WalPosition, quorum_vote_decision_with_history,
+};
 
 /// Is a rate-limited log line due? `last` is when it was last logged.
 pub(super) fn log_due(
@@ -135,7 +137,14 @@ impl Ha {
             );
         }
 
-        match quorum_vote_decision(&candidate, &voters, quorum, &round.answers) {
+        let ancestors = self.vote_ancestors(own_timeline);
+        match quorum_vote_decision_with_history(
+            &candidate,
+            &voters,
+            quorum,
+            &round.answers,
+            &ancestors,
+        ) {
             VoteDecision::Refused(reason) => {
                 VoteGate::Refuse(format!("quorum vote refused: {reason:?}"))
             }
@@ -164,6 +173,45 @@ impl Ha {
         }
     }
 
+    /// SB-37: the candidate's own history for the prefix rule of
+    /// [`quorum_vote_decision_with_history`]: the ancestors of `timeline` from
+    /// `pg_wal/<timeline>.history`. Empty (rule off, the plain rule applies)
+    /// unless this node is shown on the latest timeline (D6 `Eligible`; not
+    /// under the timeline-loss override), and when the file is missing or
+    /// unreadable (fail closed).
+    fn vote_ancestors(&self, timeline: u64) -> Vec<AncestorEnd> {
+        if !matches!(
+            self.own_eligibility(),
+            super::helpers::OwnEligibility::Eligible
+        ) {
+            return Vec::new();
+        }
+        match crate::timeline_files::timeline_ancestors(&self.config.postgresql.data_dir, timeline)
+        {
+            Ok(Some(lines)) => lines
+                .into_iter()
+                .map(|l| AncestorEnd {
+                    timeline: l.parent,
+                    switchpoint: l.switchpoint,
+                })
+                .collect(),
+            Ok(None) => {
+                warn!(
+                    timeline,
+                    "Quorum vote: no history file for this node's timeline; voters on older timelines are not counted"
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                warn!(
+                    timeline,
+                    error = %e,
+                    "Quorum vote: history file unreadable; voters on older timelines are not counted"
+                );
+                Vec::new()
+            }
+        }
+    }
     /// `n` the executor last read from SHOW; only while this node leads and the
     /// executor applies (else it is stale or not ours).
     pub(super) fn quorum_observed_n(&self) -> Option<usize> {

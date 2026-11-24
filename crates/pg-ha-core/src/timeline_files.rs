@@ -105,6 +105,35 @@ pub(crate) fn timeline_begin(data_dir: &Path, timeline: u64) -> Result<Option<u6
     }
 }
 
+/// SB-37: the ancestors of `timeline` and where each ended, from its own
+/// history file (empty for timeline 1). `Ok(None)` when the file does not
+/// exist. Every line must name a parent below `timeline`.
+pub(crate) fn timeline_ancestors(
+    data_dir: &Path,
+    timeline: u64,
+) -> Result<Option<Vec<HistoryLine>>, String> {
+    if timeline <= 1 {
+        return Ok(Some(Vec::new()));
+    }
+    let path = data_dir
+        .join("pg_wal")
+        .join(format!("{timeline:08X}.history"));
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let lines = parse_history(&content).map_err(|e| format!("{}: {e}", path.display()))?;
+    match lines.last() {
+        Some(last) if last.parent < timeline => Ok(Some(lines)),
+        Some(_) => Err(format!(
+            "{}: parent timeline not below {timeline}",
+            path.display()
+        )),
+        None => Err(format!("{}: no entries", path.display())),
+    }
+}
+
 /// Newest history on disk: highest `<TLI>.history` (timeline 1 when none),
 /// its begin LSN, and whether a WAL segment named with it exists.
 pub(crate) fn newest_history(data_dir: &Path) -> Result<HistoryEvidence, String> {
@@ -280,6 +309,27 @@ mod tests {
 
         put(&dir, "000000030000000000000004", "");
         assert!(newest_history(&dir).unwrap().wal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timeline_ancestors_reads_the_timelines_own_file() {
+        let dir = temp_data_dir("ancestors");
+        assert_eq!(timeline_ancestors(&dir, 1).unwrap(), Some(vec![]));
+        assert_eq!(timeline_ancestors(&dir, 3).unwrap(), None, "missing file");
+        put(&dir, "00000003.history", TL3);
+        let lines = timeline_ancestors(&dir, 3).unwrap().unwrap();
+        assert_eq!(
+            lines.iter().map(|l| l.parent).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(lines[1].switchpoint, 0x404D778);
+        put(&dir, "00000004.history", "5\t0/10\tx\n");
+        assert!(timeline_ancestors(&dir, 4).is_err(), "parent above");
+        put(&dir, "00000005.history", "");
+        assert!(timeline_ancestors(&dir, 5).is_err(), "empty file");
+        put(&dir, "00000006.history", "1\tzz\tx\n");
+        assert!(timeline_ancestors(&dir, 6).is_err(), "malformed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

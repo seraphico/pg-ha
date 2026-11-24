@@ -11310,6 +11310,57 @@ mod tests {
             }
         }
 
+        /// SB-37 prefix rule through the live vote: a voter on an ancestor
+        /// timeline at or below its switchpoint counts only when this node's
+        /// own history file says so, and the rule fails closed without it.
+        #[tokio::test]
+        async fn the_vote_counts_a_prefix_voter_only_from_the_own_history_file() {
+            for (label, file, peer_lsn, pass) in [
+                ("prefix-ok", true, 0x2000u64, true),
+                ("prefix-past-switchpoint", true, 0x2001, false),
+                ("prefix-no-file", false, 0x2000, false),
+            ] {
+                let dcs = Arc::new(MockDcs::new());
+                let setup = Setup {
+                    members: vec![
+                        Member {
+                            api_url: "http://test_node:8008".into(),
+                            ..member_with_tl("test_node", 0x3100, 3)
+                        },
+                        member_at("node2", 0x2000),
+                        member_at("node3", 0x2000),
+                    ],
+                    ..Setup::quorum()
+                };
+                let (mut ha, dir) = build(
+                    label,
+                    setup,
+                    &dcs,
+                    local(Some(3), 0x3100),
+                    Some(Arc::new(FakePeers::new().ok("node2", 2, peer_lsn))),
+                );
+                ha.cluster.timeline = rec(3);
+                if file {
+                    let wal = dir.join("pg_wal");
+                    std::fs::create_dir_all(&wal).unwrap();
+                    std::fs::write(
+                        wal.join("00000003.history"),
+                        "1\t0/1000\tno recovery target specified\n2\t0/2000\tno recovery target specified\n",
+                    )
+                    .unwrap();
+                }
+                let gate = ha.quorum_vote().await;
+                if pass {
+                    assert_eq!(gate, VoteGate::Pass, "{label}");
+                } else {
+                    assert!(
+                        matches!(&gate, VoteGate::Refuse(m) if m.contains("InsufficientVotes")),
+                        "{label}: {gate:?}"
+                    );
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
         /// SB-37: a refused vote returns early, and the node must still
         /// refresh its member record, else its record expires and peers stop
         /// counting it as a voter.
