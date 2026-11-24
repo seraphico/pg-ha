@@ -94,7 +94,7 @@ docker-compose.yml + docker/entrypoint.sh 新增 `PG_HA_RESTAPI_TLS_*` 变量，
 
 **仍开放**：
 
-- ~~Quorum 模式的运维文档~~ ✅ 已补（SB-13 PR5）：`/wal`、mark 与 gate、僵尸主库警告、选型和 `synchronous_node_count` 取值见[运维指南](operations-guide.md#法定人数同步复制quorum)。仍开放：failover 之后或成员记录已过期的投票节点回来时 `q` 暂时等于 `|V|`，此时丢了主库集群会一直没有主库，还没有受支持的手工恢复步骤（SB-36 后续）
+- ~~Quorum 模式的运维文档~~ ✅ 已补（SB-13 PR5）：`/wal`、mark 与 gate、僵尸主库警告、选型和 `synchronous_node_count` 取值见[运维指南](operations-guide.md#法定人数同步复制quorum)。SB-37 PR A 已落地：双重故障后回来的节点由 `pg_control_recovery()` 提供时间线下界而自动恢复，被拒投票和非最健康周期会刷新成员记录，卡住的集群在 `/replica` 上返回 503 并带原因，`GET /cluster` 有 `election` 对象；投票按前缀规则计入停在祖先 timeline 切换点之内的投票节点；失去多数派时备库不为跟随旧锁而重启 PostgreSQL。仍开放：failover 之后或成员记录已过期的投票节点回来时 `q` 暂时等于 `|V|`，投票节点永久丢失时集群会一直没有主库，还没有受支持的手工恢复步骤（SB-37 PR B）；X2 残余见运维指南
 - ~~**SB-11**~~ ✅ 已完成：`maximum_lag_on_failover` 已接入 `is_healthiest_node`——参照是当轮已通过资格/running/sync 闸门的候选集合（含自身）里最大的 `wal_position`，落后超阈值的候选（含自身）不参选，`wal_position` 未知者保守排除；阈值 `None`（默认）功能关闭、与接入前逐字节等价（与同步侧的 `maximum_lag_on_syncnode` 一致）
 - ~~**SB-10**~~ ✅ 已完成：`/patroni`、`/primary`、`/replica` 和 `/metrics` 的 `timeline`、`wal_position`、`replication_lag` 由 HA 循环经 `ApiSnapshot` 填充（复用 `touch_member` 的 `wal_status`，不多一次查询）。lag = leader 最后发布的位置减本节点位置（字节，最小 0，近似：写入重时最多少约一个 `loop_wait`，衡量已收到而非已应用）；主库为 0，未知为 `null` / 指标省略；`/replica?lag=` 对未知 fail-open
 

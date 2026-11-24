@@ -99,7 +99,16 @@ qsh_prepare() { # leaves the cluster ready in quorum mode; echoes the primary
         p=$(qsh_primary); [ -n "$p" ] && break; sleep 2
     done
     qsh_set_quorum || log_warn "could not PATCH synchronous_mode=quorum" >&2
-    qsh_ready 300
+    qsh_ready 300 && return 0
+    # Not ready: show what each node says (stderr, so the caller's value stays empty).
+    for n in "${NODES[@]}"; do
+        {
+            echo "[DIAG] $n /patroni $(qsh_get "$n" patroni | jq -c '{role,state,timeline,pg_in_recovery}' 2>/dev/null) /replica $(qsh_code "$n" replica) /primary $(qsh_code "$n" primary)"
+            docker logs --tail 400 "$(qsh_c "$n")" 2>&1 | grep pg_ha | grep -v "no action\|openraft\|Health probe" | tail -n 12 | cut -c1-260 | sed "s/^/[DIAG] $n: /"
+        } >&2
+    done
+    echo "[DIAG] sync $(qsh_get "${NODES[0]}" cluster | jq -c .sync 2>/dev/null)" >&2
+    return 1
 }
 # The writer runs inside the primary's container; every id psql acknowledged is
 # appended to /tmp/acked (the file survives `docker kill`).
@@ -183,11 +192,18 @@ test_scenario_8_heals_by_itself() {
     grep '^[0-9]' "$TMPD/acked" | sort > "$TMPD/acked.ids"
     acked=$(wc -l < "$TMPD/acked.ids" | tr -d ' ')
     qsh_check "$([ "${acked:-0}" -gt 0 ] && echo true || echo false)" "the writer acknowledged $acked rows before the kill"
+    local restarted
+    restarted=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     docker start "$(qsh_c "$p")" "$(qsh_c "$newp")" > /dev/null
     t0=$SECONDS
     prim=$(qsh_wait_primary 240)
-    assert_not_empty "$prim" "a primary appeared with no command ($((SECONDS - t0)) s after the start)"
+    local heal=$((SECONDS - t0)) ttl
+    assert_not_empty "$prim" "a primary appeared with no command ($heal s after the start)"
     [ -n "$prim" ] || return
+    # Within the order of one lock ttl: the two nodes need a start and a few
+    # HA cycles each, so the bound is 4 x ttl (60 s with the dev ttl of 15 s).
+    ttl=$(qsh_get "$prim" config | jq -r '.ttl // 30' 2>/dev/null)
+    qsh_check "$([ "$heal" -le $((4 * ttl)) ] && echo true || echo false)" "healed in $heal s (<= 4 x ttl = $((4 * ttl)) s)"
     local final
     final=$(qsh_ready 300)
     assert_not_empty "$final" "the cluster is ready again (one primary, every standby 200 on /replica)"
@@ -202,11 +218,19 @@ test_scenario_8_heals_by_itself() {
         [ "$role" = "Replica" ] || { bad=$((bad + 1)); log_info "$n reports role '$role'"; }
     done
     assert_eq "0" "$bad" "every standby reports role Replica"
-    local evidence=0
+    # The G3 symptom is a RETURNED node that publishes no timeline evidence.
+    # While two of three nodes are down the survivor cannot write its member
+    # record (no Raft majority) and may log the line about its stale record;
+    # those lines are printed, the assertion counts the ones after the start.
+    local evidence=0 before=0 lines
     for n in "${NODES[@]}"; do
-        evidence=$((evidence + $(docker logs --since "$since" "$(qsh_c "$n")" 2>&1 | grep -c "no timeline evidence published")))
+        lines=$(docker logs --since "$since" "$(qsh_c "$n")" 2>&1 | grep "no timeline evidence published")
+        [ -n "$lines" ] && echo "$lines" | cut -c1-200 | sed "s/^/[INFO] $n: /"
+        before=$((before + $(echo "$lines" | awk -v t="$restarted" 'NF && $1 < t' | wc -l)))
+        evidence=$((evidence + $(echo "$lines" | awk -v t="$restarted" 'NF && $1 >= t' | wc -l)))
     done
-    assert_eq "0" "$evidence" "no node logged 'no timeline evidence published' after the first kill"
+    log_info "'no timeline evidence published' lines while the two nodes were down: $before"
+    assert_eq "0" "$evidence" "no node logged 'no timeline evidence published' after the restart"
 }
 
 # ── (c) the lost-voter case: stuck, 503 with the reason, then healed ──

@@ -86,6 +86,13 @@ curl -s http://localhost:8008/replica?lag=1048576 | jq .
 # 已知 lag 超过 1MB 时返回 503
 # lag 未知（没有 leader 记录或位置缺失，如 failover 期间）时仍返回 200，响应里 "lag": null（fail-open）
 ```
+**集群没有 leader 且选举卡住时**，`/replica` 返回 503，响应里带 `"reason": "cluster has no leader and the election is stuck"`，代理会把这个节点移出只读池。普通 failover 期间（leader 锁缺失几秒）`/replica` 保持 200，不会出现这个原因。只有下面三种情况之一才算卡住：
+
+- 集群没有 leader 已经满一个锁 `ttl`；
+- 本节点作为候选连续两次投票被拒绝（`InsufficientVotes`、`HigherTimeline`、`BehindPeer`；对方是可写主库这类等一等就会好的拒绝不算）；
+- DCS 连续读失败满一个 `ttl`（只失败一次不算）。
+
+出现新的 leader 后下一个周期（最多 `loop_wait`）就清除，`/replica` 恢复 200。`/primary`、`/health`、`/sync`、`/async` 不受影响。`GET /cluster` 里的 `election` 对象给出这个节点的判断：`stalled`（本节点最近两次投票都被拒绝）、`leaderless_stuck`（上面三种情况之一），卡住时还有 `hint`，指向本指南的「法定人数同步复制」一节。
 
 ### 同步 / 异步备库检查
 
@@ -682,10 +689,19 @@ SB-36 已经关闭的情况不受影响：启用 quorum 和投票节点短暂离
 如何发现：
 
 - 任意节点的 `GET /cluster` 里没有 role 为 `primary` 的成员，并且 `sync.kind` 为 `"quorum"`，`sync.quorum` 大于等于 `sync.voters` 里的名字数。非 leader 节点上 `sync.n` 和 `sync.settled` 都是 `null`（只有 leader 会读 `n`），所以要自己比较 `quorum` 和 `voters`。
-- 候选节点每 60 秒输出一条 ERROR：`The cluster cannot elect a primary: /sync has q=<q> with <v> voters (q >= |V|), so no candidate can collect enough votes, and nothing relaxes q while there is no leader`。被拒候选的周期结果是 `quorum vote refused: InsufficientVotes { got: .., need: .. }`。
+- 候选节点每 60 秒输出一条 ERROR：`The cluster has no leader and this candidate cannot collect enough votes (quorum vote refused: InsufficientVotes { got: .., need: .. }); /sync has q=<q> over voters [..]. Voters that cannot answer: ..`。`q >= |V|` 时第一次被拒就输出；`q < |V|` 时从连续第二次被拒开始输出。
+- 备库的 `/replica` 返回 503，带原因 `cluster has no leader and the election is stuck`（见「Replica 检查」），`GET /cluster` 里 `election.leaderless_stuck` 为 `true`。
 - 如果 `q < |V|`，原因不同：在线并能应答的投票节点少于 `q` 个。投票节点回来、彼此之间 `GET /wal` 通了之后会自己恢复。
 
 没用的操作（从代码得出，重启一项有容器测试佐证）：重启任意节点上的 pg-ha 或 PostgreSQL；重启旧主（容器测试里 214 秒后集群仍然没有主库，`/sync` 不变）；`POST /failover`（指定 candidate 时返回 409，不指定时投票仍然拒绝）；`POST /switchover`（需要 leader）；用 `PUT` / `PATCH /config` 改成别的 `synchronous_mode`（执行器只在 leader 上运行，而带投票节点的 quorum `/sync` 会让投票和成员规则一直生效，不管模式写什么）。`/sync` 只有 leader 会写（不变量 C2）。没有任何 REST 端点或 CLI 命令可以写 `/sync`。
+
+**自动恢复：双重故障后回来的节点。** 主库被杀，新晋升的主库在它的 end-of-recovery checkpoint 完成之前也被杀，两个节点再启动。第二个节点以没有上游的备库启动，它的 `pg_control` 检查点还在旧时间线，pg-ha 过去因此发布旧的时间线，把它当成落后的节点，选举一直拿不到证据。现在 pg-ha 还读 `pg_control_recovery()` 的 `min_recovery_end_timeline` / `min_recovery_end_lsn`：重放位置达到这个 LSN 时，它记录的时间线才算数（只作下界，只会少报，不会多报）。PG 18 的容器测试（3 节点和 5 节点）里这个节点显示 `min_recovery_end_timeline = 2`，集群在没有任何命令的情况下选出主库，写入端确认过的行一行不丢。同一次修复让被拒绝投票和「不是最健康节点」的周期也刷新成员记录，让这类备库不会因记录过期而不被算作投票节点，并把这种启动后的备库标成 `Replica`（以前是 `Uninitialized`）。
+
+**投票如何计较旧 timeline 上的节点（前缀规则）。** 候选在 timeline `T` 上时，在较旧 timeline 上的投票节点通常不计票（不同 timeline 的 LSN 不能比较）。例外：候选自己的 `pg_wal/<T>.history` 写明那条 timeline 是它的祖先、在切换点 `S` 结束，而该投票节点的实时位置 `<= S`。这时它的 WAL 是候选 WAL 的前缀，候选拥有它可能确认过的一切，所以算一票。PG 18 的 3 节点容器测试里，第二次被杀的新主（timeline 3）回来时，唯一的另一个投票节点还停在 timeline 2 的切换点上，靠这条规则集群在 12 秒内自己选出主库，已确认的行一行不丢。超过 `S` 的节点、timeline 不在候选历史里的节点照旧不计票；更新 timeline 上的节点照旧拒绝。只有候选在最新 timeline 上（D6）时才用这条规则，用了 `pg-ha.accept_timeline_loss` 覆盖或历史文件读不出时不用。
+
+**失去多数派时备库不重启。** 备库只在它要跟随的 leader 锁得到确认时，才为了改 `primary_conninfo` 而重启（或停止）PostgreSQL：本地 Raft 节点看得到一个有多数派的 leader，上游节点能应答 `GET /wal`，并且锁持有者报告 `pg_in_recovery=false`。否则 PostgreSQL 保持运行，每分钟一条 WARN `Not restarting PostgreSQL to follow <node>: <原因>`，下一个周期再试。这样，在多数节点挂掉、本地只读到已死节点的旧锁时，备库不会因为重启丢掉它已流复制到的 timeline。
+
+**这个修复覆盖不到的情况（X2 残余）**：幸存的备库已经重放了新时间线的 WAL，之后在没有接收进程的情况下重启，`pg_control_recovery()` 仍然是旧时间线，它发布的时间线偏低。偏低只会让它在选举里输给知道更多的节点，或被拒绝，不会造成丢提交；但如果知道新时间线的节点永远不回来，这些备库没有证据可用，集群仍然没有主库，这时 `/replica` 会按上面的规则变成 503，需要运维介入。如果晋升之后所有幸存的投票节点都在没有上游的情况下重启过，它们要等到下一个 restartpoint（最长 `checkpoint_timeout`，默认 5 分钟）把检查点 timeline 推进到新 timeline 之后，才会发布正确的 timeline，自愈可能要等这么久。
 
 **手工恢复：目前没有受支持的步骤。** 代码里没有可以安全手工放宽 `q` 的办法，而安全的取值取决于已经挂掉的主库当时生效的 `n`，DCS 里不存这个值。不要手工修改 Raft 文件。这是留给维护者的待决问题（见 SB-36 的记录）。在此之前请避开这个窗口：每次 failover 或节点重新加入之后，先等新 leader 上 `sync.settled: true`，再做下一步有破坏性的操作，并保持足够多的健康投票节点。
 
