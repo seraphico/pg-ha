@@ -71,6 +71,7 @@ while [[ $# -gt 0 ]]; do
             echo "  tags             Node tags: DCS publication, candidate checks, nosync"
             echo "  rewind_unclean   SB-28: ahead replica killed uncleanly rejoins by itself"
             echo "  quorum_selfheal  SB-37: quorum cluster without a leader heals itself / reports stuck (QSH_NODES=3|5)"
+            echo "  quorum_recovery  SB-37: pg-ha-ctl recover for lost voters (QRC_NODES=3|5; the real recovery needs 5)"
             echo "  consistency      Cross-layer consistency tests"
             echo "  ha_full          Full HA lifecycle tests"
             echo ""
@@ -305,11 +306,12 @@ run_specific_test() {
         tags)       file="test_tags.sh" ;;
         rewind_unclean|sb28) file="test_rewind_unclean.sh" ;;
         quorum_selfheal|sb37) file="test_quorum_selfheal.sh" ;;
+        quorum_recovery|sb37r) file="test_quorum_recovery.sh" ;;
         consistency) file="test_consistency.sh" ;;
         ha_full|full) file="test_ha_full.sh" ;;
         *)
             log_fail "Unknown test: $test_name"
-            echo "Valid tests: smoke, bootstrap, failover, failover_ttl, switchover, partition, pause, config, metrics, connections, rejoin, rewind_unclean, quorum_selfheal, consistency, ha_full"
+            echo "Valid tests: smoke, bootstrap, failover, failover_ttl, switchover, partition, pause, config, metrics, connections, rejoin, rewind_unclean, quorum_selfheal, quorum_recovery, consistency, ha_full"
             exit 1
             ;;
     esac

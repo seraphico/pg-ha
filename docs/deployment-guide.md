@@ -496,6 +496,8 @@ REST 管理 API 也支持内建 HTTPS，配置形状与 `raft.tls` 的服务端�
 - 再设置 `ca_cert` 并把 `require_client_cert` 设为 `true`，即开启 mTLS：服务端要求客户端出示由 `ca_cert` 签发的证书，拒绝无证书（TLS alert 116 `certificate_required`）或外部 CA 证书（TLS alert 48 `unknown_ca`）的连接。`require_client_cert=true` 时若 `ca_cert` 缺失/不可读/为空，启动即报错退出（fail-fast）。
 - 省略整个 `restapi.tls` 时行为与以往完全一致：明文 HTTP，现有部署不受影响。
 
+**Quorum 恢复端点与版本要求**：`GET`、`POST`、`DELETE /recovery`（`pg-ha-ctl recover` 使用）是管理端点，与 `/switchover` 使用同一套 Basic Auth / mTLS。`POST /recovery` 创建一次性 DCS 键 `/recovery`（TTL 等于 leader 锁 TTL），并且只有所有应答的节点运行相同版本的 pg-ha 时才被接受，所以请先完成滚动升级。见运维指南「法定人数同步复制」。
+
 **Basic Auth 与 TLS 的关系**：Basic Auth 本身不变，启用 TLS 后依然生效。但 Basic Auth 凭据只有在 REST API 启用 TLS 后才在传输中受保护；在明文 HTTP 下，凭据与所有管理命令（switchover/failover/restart/reinitialize/config 等）都以明文传输。生产环境请务必为 REST API 启用 TLS。
 
 代理对 `/primary`、`/replica` 的探活使用同一套 `restapi.tls`。未配置时走明文 `http://`。配置了 `cert` + `key` 后探活改为 `https://`，并用 `ca_cert` 校验服务器证书。`require_client_cert: true` 时，探活出示本节点自己的 REST 服务端证书。
