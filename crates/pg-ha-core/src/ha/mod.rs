@@ -217,6 +217,8 @@ pub struct Ha {
     upstream_reader: Option<Arc<dyn PeerWalProbe>>,
     /// SB-37: when the "not restarting PostgreSQL to follow" WARN was last logged.
     follow_deferred_logged_at: Option<std::time::Instant>,
+    /// SB-37 / SB-31: when a failed forked-off check was last logged.
+    fork_check_logged_at: Option<std::time::Instant>,
     /// SB-37: the quorum recovery grant this node won the lock with, kept for
     /// the promote of this lock term (the DCS key is deleted at acquisition).
     /// Cleared when the lock is not ours.
@@ -275,6 +277,7 @@ impl Ha {
             stuck: stuck::StuckTracker::default(),
             upstream_reader: None,
             follow_deferred_logged_at: None,
+            fork_check_logged_at: None,
             recovery_term: None,
         };
         (ha, cmd_tx)
@@ -5142,6 +5145,8 @@ mod tests {
         ControldataInProduction,
         /// pg_controldata: `Database cluster state: shut down in recovery`.
         ControldataShutDownInRecovery,
+        /// pg_controldata prints `<dir>/pg-ha-test.controldata`.
+        ControldataFromFile,
         /// pg_ctl: `stop` succeeds and removes postmaster.pid; anything else
         /// fails at once. Only for tests that never call start().
         PgCtlStopOk,
@@ -5191,9 +5196,10 @@ mod tests {
     const FAKE_PSQL_PRIMARY: &str = "echo f\nexit 0\n";
 
     impl FakeBin {
-        const ALL: [FakeBin; 15] = [
+        const ALL: [FakeBin; 16] = [
             FakeBin::ControldataInProduction,
             FakeBin::ControldataShutDownInRecovery,
+            FakeBin::ControldataFromFile,
             FakeBin::PgCtlStopOk,
             FakeBin::RewindOk,
             FakeBin::RewindFail,
@@ -5213,6 +5219,7 @@ mod tests {
             match self {
                 FakeBin::ControldataInProduction => "controldata-in-production",
                 FakeBin::ControldataShutDownInRecovery => "controldata-shut-down-in-recovery",
+                FakeBin::ControldataFromFile => "controldata-from-file",
                 FakeBin::PgCtlStopOk => "pg-ctl-stop-ok",
                 FakeBin::RewindOk => "rewind-ok",
                 FakeBin::RewindFail => "rewind-fail",
@@ -5240,6 +5247,10 @@ mod tests {
                     "pg_controldata",
                     "echo 'Database cluster state:               shut down in recovery'\n",
                 )],
+                // -D <dir>: $2 is the data directory.
+                FakeBin::ControldataFromFile => {
+                    vec![("pg_controldata", "cat \"$2/pg-ha-test.controldata\"\n")]
+                }
                 // stop -D <dir> -m <mode> -w: $3 is the data directory.
                 FakeBin::PgCtlStopOk => vec![(
                     "pg_ctl",
@@ -5557,6 +5568,92 @@ mod tests {
         assert!(dir.join("standby.signal").is_file());
         assert_start_attempted(&ha, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SB-37 / SB-31 start check: a standby (pg_control `in archive
+    /// recovery`) with `min_recovery` as its minimum recovery point and the
+    /// given files in pg_wal.
+    async fn start_fork_case(
+        label: &str,
+        min_recovery: &str,
+        wal: &[(&str, &str)],
+    ) -> Option<String> {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            label,
+            Arc::new(MockDcs::new()),
+            Some(fake_pg_bin(FakeBin::ControldataFromFile)),
+        );
+        std::fs::write(
+            dir.join("pg-ha-test.controldata"),
+            format!(
+                "Database cluster state:               in archive recovery\n\
+                 Latest checkpoint's TimeLineID:       1\n\
+                 Minimum recovery ending location:     {min_recovery}\n\
+                 Min recovery ending loc's timeline:   1\n"
+            ),
+        )
+        .unwrap();
+        let wal_dir = dir.join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        for (name, content) in wal {
+            std::fs::write(wal_dir.join(name), content).unwrap();
+        }
+        let _ = ha.handle_postgres_not_running().await;
+        assert!(dir.join("standby.signal").is_file());
+        assert_start_attempted(&ha, 1);
+        let m = marker(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        m
+    }
+
+    const SEG8_TL1: (&str, &str) = ("000000010000000000000008", "");
+    const HIST2: (&str, &str) = (
+        "00000002.history",
+        "1\t0/8037260\tno recovery target specified\n",
+    );
+
+    #[tokio::test]
+    async fn test_start_marks_standby_forked_off_the_newest_timeline() {
+        let m = start_fork_case("sb31-start-diverged", "0/8038750", &[SEG8_TL1, HIST2])
+            .await
+            .expect("rewind-check marker");
+        assert!(
+            m.contains(
+                "standby forked off the newest timeline: replayed timeline 1 up to 0/8038750 but timeline 2 left timeline 1 at 0/8037260"
+            ),
+            "{m}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_no_marker_when_not_past_the_switchpoint() {
+        assert_eq!(
+            start_fork_case("sb31-start-at-s", "0/8037260", &[SEG8_TL1, HIST2]).await,
+            None
+        );
+        assert_eq!(
+            start_fork_case("sb31-start-behind", "0/7000120", &[SEG8_TL1, HIST2]).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_no_marker_without_a_newer_history() {
+        assert_eq!(
+            start_fork_case("sb31-start-no-hist", "0/8038750", &[SEG8_TL1]).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_no_marker_for_an_unrelated_timeline() {
+        // Timeline 4's history lists only timeline 3; this node is on 1.
+        let unrelated = ("00000004.history", "3\t0/10\tx\n");
+        assert_eq!(
+            start_fork_case("sb31-start-unrelated", "0/8038750", &[SEG8_TL1, unrelated]).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -9062,6 +9159,43 @@ mod tests {
         // the standby failed (no pg_ctl): pg_rewind not reached.
         assert!(is_error_starting(&result, "Rejoin stop failed"), "{result}");
         assert_eq!(ha.postgresql().observed_in_recovery(), None);
+        assert!(marker(&dir).is_some());
+        assert!(!rewind_called(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_marked_standby_waits_for_a_confirmed_lock_before_rewind() {
+        // SB-37 follow gate on the RewindCheck path (SB-31 marks running
+        // standbys): pg_rewind stops PostgreSQL, so an unconfirmed lock waits.
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        dcs.quorum_confirmed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-rewind-check-unconfirmed",
+            dcs,
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        put_marker(&dir);
+        ha.cluster = ready_cluster();
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            follower_containing(
+                &result,
+                "rewind-check marker present; not running pg_rewind against node1: the DCS has no leader with a quorum here"
+            ),
+            "{result}"
+        );
+        assert_eq!(
+            ha.postgresql().observed_in_recovery(),
+            Some(true),
+            "not stopped"
+        );
         assert!(marker(&dir).is_some());
         assert!(!rewind_called(&dir));
         let _ = std::fs::remove_dir_all(&dir);

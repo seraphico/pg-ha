@@ -118,6 +118,23 @@ impl Ha {
             .await
             .map_err(std::io::Error::other)??;
             info!("Created rewind-check marker: {reason}");
+        } else if let Some(fork) = self.start_fork_check().await {
+            // SB-37 / SB-31: a standby whose replayed WAL left its timeline
+            // after the newest timeline on disk branched off it.
+            let reason = format!("standby forked off the newest timeline: {fork}");
+            let data_dir = self.config.postgresql.data_dir.clone();
+            let marker_reason = reason.clone();
+            tokio::task::spawn_blocking(move || {
+                standby_config::create_rewind_check_marker(&data_dir, &marker_reason)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            warn!(
+                timeline = fork.newest,
+                switchpoint = %crate::postgresql::format_lsn(fork.switchpoint),
+                replay_lsn = %crate::postgresql::format_lsn(fork.replay_lsn),
+                "Created rewind-check marker: {reason}; pg_rewind runs once the leader is a confirmed primary"
+            );
         }
 
         let leader = self.cluster.leader.as_ref().map(|l| l.name.clone());
@@ -970,6 +987,113 @@ impl Ha {
     }
 
     /// Whether the rewind-check marker (PGDATA/pg-ha.rewind_check) exists (D4).
+    /// SB-37 / SB-31, before a standby start: [`timeline_files::local_fork`]
+    /// with pg_control's minimum recovery point as the replayed position.
+    /// Any read error gives None (no marker, today's behaviour), logged.
+    pub(super) async fn start_fork_check(&self) -> Option<crate::timeline_files::ForkedOff> {
+        let bound = match self.postgresql.controldata_replay_bound().await {
+            Ok(b) => b?,
+            Err(e) => {
+                warn!("Forked-off check before the start skipped: {e}");
+                return None;
+            }
+        };
+        let data_dir = self.config.postgresql.data_dir.clone();
+        let checked = tokio::task::spawn_blocking(move || {
+            crate::timeline_files::local_fork(&data_dir, bound.0, bound.1)
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r);
+        match checked {
+            Ok(fork) => fork,
+            Err(e) => {
+                warn!("Forked-off check before the start skipped: {e}");
+                None
+            }
+        }
+    }
+
+    /// SB-37 / SB-31, on a running standby without the marker: the newest
+    /// history in `pg_wal` is above every timeline the node has WAL on
+    /// (cheap, local), and the live replay LSN is past the point where that
+    /// timeline left the replay timeline. Then the rewind-check marker is
+    /// created and the next cycle takes the RewindCheck path. Returns the
+    /// cycle result when the marker was created.
+    pub(super) async fn mark_forked_off_standby(&mut self) -> Option<CycleResult> {
+        let data_dir = self.config.postgresql.data_dir.clone();
+        let dir = data_dir.clone();
+        let local =
+            tokio::task::spawn_blocking(move || crate::timeline_files::local_timelines(&dir))
+                .await
+                .ok()?
+                .ok()?;
+        if local.newest_history <= local.highest_segment {
+            return None;
+        }
+        let point = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.postgresql.replay_point(),
+        )
+        .await;
+        let (lower_bound, replay) = match point {
+            Ok(Ok(Some(p))) => p,
+            Ok(Ok(None)) => return None,
+            Ok(Err(e)) => return self.fork_check_failed(&e.to_string()),
+            Err(_) => return self.fork_check_failed("replay point query timed out"),
+        };
+        let dir = data_dir.clone();
+        let fork = match tokio::task::spawn_blocking(move || {
+            crate::timeline_files::local_fork(&dir, lower_bound, replay)
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r)
+        {
+            Ok(Some(f)) => f,
+            Ok(None) => return None,
+            Err(e) => return self.fork_check_failed(&e),
+        };
+        let reason = format!("standby forked off the newest timeline: {fork}");
+        let marker_reason = reason.clone();
+        let created = tokio::task::spawn_blocking(move || {
+            standby_config::create_rewind_check_marker(&data_dir, &marker_reason)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|r| r);
+        if let Err(e) = created {
+            return self.fork_check_failed(&format!(
+                "{reason}, but the rewind-check marker could not be created: {e}"
+            ));
+        }
+        warn!(
+            timeline = fork.newest,
+            switchpoint = %crate::postgresql::format_lsn(fork.switchpoint),
+            replay_lsn = %crate::postgresql::format_lsn(fork.replay_lsn),
+            "Created rewind-check marker: {reason}; pg_rewind runs once the leader is a confirmed primary"
+        );
+        let _ = self.touch_member().await;
+        Some(CycleResult::Follower(format!(
+            "created the rewind-check marker: {reason}"
+        )))
+    }
+
+    /// A failed forked-off check: WARN at most once per minute; the cycle
+    /// goes on as before (None).
+    fn fork_check_failed(&mut self, why: &str) -> Option<CycleResult> {
+        let now = std::time::Instant::now();
+        if super::vote::log_due(
+            self.fork_check_logged_at,
+            now,
+            std::time::Duration::from_secs(60),
+        ) {
+            self.fork_check_logged_at = Some(now);
+            warn!("Forked-off check on the running standby failed: {why}");
+        }
+        None
+    }
+
     pub(super) fn has_rewind_check_marker(&self) -> bool {
         standby_config::has_rewind_check_marker(&self.config.postgresql.data_dir)
     }

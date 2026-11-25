@@ -445,6 +445,54 @@ pub fn parse_lsn(lsn: &str) -> Option<u64> {
     Some((hi << 32) | lo)
 }
 
+/// A byte offset as PostgreSQL prints an LSN ("0/8037260").
+pub(crate) fn format_lsn(lsn: u64) -> String {
+    format!("{:X}/{:X}", lsn >> 32, lsn & 0xFFFF_FFFF)
+}
+
+/// SB-37 / SB-31: what a stopped data directory says about its replayed WAL,
+/// from `pg_controldata`: (timeline lower bound, LSN lower bound). The LSN
+/// is `Minimum recovery ending location`, which PostgreSQL only advances to
+/// WAL already replayed; the timeline is the higher of `Min recovery ending
+/// loc's timeline` and `Latest checkpoint's TimeLineID`. `None` when the
+/// minimum recovery point is 0/0 (not set) or a field is missing.
+pub(crate) fn parse_controldata_replay_bound(stdout: &str) -> Option<(u64, u64)> {
+    let field = |name: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|rest| rest.strip_prefix(':'))
+            .map(str::trim)
+    };
+    let lsn = parse_lsn(field("Minimum recovery ending location")?)?;
+    let min_tli: u64 = field("Min recovery ending loc's timeline")?.parse().ok()?;
+    let ckpt_tli: u64 = field("Latest checkpoint's TimeLineID")?.parse().ok()?;
+    (lsn > 0).then_some((min_tli.max(ckpt_tli), lsn))
+}
+
+/// SB-37 / SB-31: lower bound of the timeline of a running replica's
+/// replayed WAL: the checkpoint timeline, the receiver's timeline, and the
+/// `pg_control_recovery()` timeline once replay reached its LSN (as in
+/// [`resolve_replica_wal`]; each is at or below the replay timeline).
+pub(crate) fn replay_timeline_lower_bound(
+    checkpoint_timeline: Option<u64>,
+    receiver_timeline: Option<u64>,
+    min_recovery_end: Option<(u64, u64)>,
+    replay_lsn: u64,
+) -> u64 {
+    let mut t = checkpoint_timeline
+        .unwrap_or(0)
+        .max(receiver_timeline.unwrap_or(0));
+    if let Some((tl, lsn)) = min_recovery_end
+        && tl > 0
+        && lsn > 0
+        && replay_lsn >= lsn
+    {
+        t = t.max(tl);
+    }
+    t
+}
+
 /// Timeline from a WAL file name: its first 8 hex digits.
 /// "00000003000000000000000A" -> Some(3)
 pub fn parse_walfile_timeline(walfile: &str) -> Option<u64> {
@@ -1566,6 +1614,55 @@ impl Postgresql {
         })
     }
 
+    /// SB-37 / SB-31: (replay timeline lower bound, `pg_last_wal_replay_lsn()`)
+    /// of a running replica, from one statement. `Ok(None)` when the server
+    /// is not in recovery or has replayed nothing.
+    pub async fn replay_point(&self) -> Result<Option<(u64, u64)>> {
+        let client = self.connect_local().await?;
+        let rows = client
+            .simple_query(
+                "SELECT pg_is_in_recovery(), \
+                 pg_last_wal_replay_lsn() - '0/0', \
+                 (SELECT timeline_id FROM pg_control_checkpoint()), \
+                 (SELECT received_tli FROM pg_stat_wal_receiver), \
+                 (SELECT min_recovery_end_timeline FROM pg_control_recovery()), \
+                 (SELECT min_recovery_end_lsn - '0/0' FROM pg_control_recovery())",
+            )
+            .await
+            .map_err(|e| Error::Postgres(format!("replay point query failed: {e}")))?;
+        for msg in rows {
+            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
+                if row.get(0) != Some("t") {
+                    return Ok(None);
+                }
+                let num = |i: usize| row.get(i).and_then(|v| v.parse::<u64>().ok());
+                let Some(replay) = num(1) else {
+                    return Ok(None);
+                };
+                let timeline =
+                    replay_timeline_lower_bound(num(2), num(3), num(4).zip(num(5)), replay);
+                return Ok(Some((timeline, replay)));
+            }
+        }
+        Err(Error::Postgres("replay point query returned no row".into()))
+    }
+
+    /// SB-37 / SB-31: [`parse_controldata_replay_bound`] of this data
+    /// directory (PostgreSQL stopped).
+    pub async fn controldata_replay_bound(&self) -> Result<Option<(u64, u64)>> {
+        let output = Command::new(self.pg_controldata_bin())
+            .args(["-D", self.data_dir_str()])
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Postgres(format!("pg_controldata failed: {stderr}")));
+        }
+        Ok(parse_controldata_replay_bound(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
     /// Query current WAL position from PostgreSQL.
     /// On primary: pg_current_wal_lsn()
     /// On replica: pg_last_wal_replay_lsn() (or receive, whichever is higher)
@@ -2439,6 +2536,63 @@ mod tests {
         assert_eq!(parse_lsn("1/3000060"), Some((1u64 << 32) | 0x3000060));
         assert_eq!(parse_lsn("0/0"), Some(0));
         assert_eq!(parse_lsn("FF/FFFFFFFF"), Some((0xFFu64 << 32) | 0xFFFFFFFF));
+    }
+
+    #[test]
+    fn format_lsn_round_trips() {
+        for s in ["0/8037260", "0/0", "1/A", "FF/FFFFFFFF"] {
+            assert_eq!(format_lsn(parse_lsn(s).unwrap()), s);
+        }
+    }
+
+    /// Lines of `pg_controldata` on the PG 18.7 named voter (stopped, killed
+    /// as a standby), evidence/pr-b2-prestart-probe.md.
+    const CONTROLDATA_NODE5: &str = "Database cluster state:               in archive recovery\n\
+        Latest checkpoint location:           0/7000080\n\
+        Latest checkpoint's REDO location:    0/7000028\n\
+        Latest checkpoint's TimeLineID:       1\n\
+        Latest checkpoint's PrevTimeLineID:   1\n\
+        Minimum recovery ending location:     0/7000120\n\
+        Min recovery ending loc's timeline:   1\n";
+
+    #[test]
+    fn controldata_replay_bound_parsing() {
+        assert_eq!(
+            parse_controldata_replay_bound(CONTROLDATA_NODE5),
+            Some((1, 0x7000120))
+        );
+        let higher_ckpt = CONTROLDATA_NODE5.replace(
+            "Latest checkpoint's TimeLineID:       1",
+            "Latest checkpoint's TimeLineID:       3",
+        );
+        assert_eq!(
+            parse_controldata_replay_bound(&higher_ckpt),
+            Some((3, 0x7000120))
+        );
+        let unset = CONTROLDATA_NODE5.replace("0/7000120", "0/0");
+        assert_eq!(parse_controldata_replay_bound(&unset), None, "0/0: not set");
+        let missing = CONTROLDATA_NODE5.replace("Min recovery ending loc's timeline:   1\n", "");
+        assert_eq!(parse_controldata_replay_bound(&missing), None);
+    }
+
+    #[test]
+    fn replay_timeline_lower_bound_cases() {
+        assert_eq!(
+            replay_timeline_lower_bound(Some(1), Some(1), None, 0x8038750),
+            1
+        );
+        assert_eq!(replay_timeline_lower_bound(Some(1), Some(2), None, 5), 2);
+        assert_eq!(replay_timeline_lower_bound(None, None, None, 5), 0);
+        assert_eq!(
+            replay_timeline_lower_bound(Some(1), None, Some((2, 0x40362C8)), 0x4036598),
+            2,
+            "X1: replay past the pg_control_recovery() pair"
+        );
+        assert_eq!(
+            replay_timeline_lower_bound(Some(1), None, Some((2, 0x40362C8)), 0x40362C7),
+            1,
+            "before the pair it says nothing"
+        );
     }
 
     #[test]

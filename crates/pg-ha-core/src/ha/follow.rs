@@ -131,6 +131,25 @@ impl Ha {
                         "rewind-check marker present; waiting for {lock_owner} to run as a primary before pg_rewind"
                     ));
                 }
+                // SB-37 follow gate: pg_rewind stops PostgreSQL, so it waits
+                // for a confirmed lock like a restart to follow does.
+                if let Some(why) = self.follow_restart_deferred(lock_owner, lock_owner).await {
+                    let now = std::time::Instant::now();
+                    if super::vote::log_due(
+                        self.follow_deferred_logged_at,
+                        now,
+                        FOLLOW_DEFERRED_LOG_INTERVAL,
+                    ) {
+                        self.follow_deferred_logged_at = Some(now);
+                        warn!(
+                            "Rewind-check marker present; not running pg_rewind against {lock_owner}: {why}; retrying next cycle"
+                        );
+                    }
+                    return CycleResult::Follower(format!(
+                        "rewind-check marker present; not running pg_rewind against {lock_owner}: {why}"
+                    ));
+                }
+                self.follow_deferred_logged_at = None;
                 info!(
                     "Rewind-check marker present and {lock_owner} holds the leader lock — checking with pg_rewind before following"
                 );
@@ -202,7 +221,14 @@ impl Ha {
                     upstream_name
                 ));
             }
-            FollowerAction::Follow => {}
+            FollowerAction::Follow => {
+                // SB-37 / SB-31: a running standby whose replayed WAL forked
+                // off the newest timeline never streams again; mark it so
+                // the next cycle takes the RewindCheck path.
+                if let Some(r) = self.mark_forked_off_standby().await {
+                    return r;
+                }
+            }
         }
 
         // A standby pg-ha configured: keep it following the right upstream.
