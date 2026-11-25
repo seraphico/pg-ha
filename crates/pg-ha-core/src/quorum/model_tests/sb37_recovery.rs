@@ -36,6 +36,17 @@
 //! * **P4** every counted non-named voter holds a log that is a prefix of the
 //!   candidate's (ground truth).
 //!
+//! # The stuck-`q` world (decision b)
+//!
+//! `RWorld::new_stuck`: the dead leader (node 0) is NOT a voter, `V` is the
+//! other nodes and the DCS `q = |V|` (the vote needs `q` OTHER voters, so it
+//! can never pass), while the commits were acknowledged by `n` standbys as
+//! before. The grant may name ONLINE voters; the checks are P1 to P4 as
+//! above, with `|lost| < n` as the "nothing can be lost" bound (every
+//! acknowledged commit is held by at least `n` voters). **P5**: when every
+//! voter is reachable, the grant loses no acknowledged commit whatever it
+//! names, and a named voter that is ahead refuses the vote.
+//!
 //! # What is NOT modelled
 //!
 //! The TTL as a clock (`Expire` is an action), the DCS, REST, the digest and
@@ -102,6 +113,10 @@ struct RStats {
     crash_after_lock: u64,
     crash_after_promote: u64,
     stale_pairs_ignored_by_guard: u64,
+    /// Granted with a named voter that was reachable (decision b).
+    online_named_granted: u64,
+    /// Granted with every voter reachable.
+    all_reachable_granted: u64,
 }
 
 impl RStats {
@@ -122,6 +137,8 @@ impl RStats {
         self.crash_after_lock += o.crash_after_lock;
         self.crash_after_promote += o.crash_after_promote;
         self.stale_pairs_ignored_by_guard += o.stale_pairs_ignored_by_guard;
+        self.online_named_granted += o.online_named_granted;
+        self.all_reachable_granted += o.all_reachable_granted;
     }
 }
 
@@ -143,6 +160,8 @@ struct RWorld {
     leader_dead: bool,
     n: usize,
     q: usize,
+    /// The stuck-`q` world: the initial leader is not a voter, `q = |V|`.
+    stuck: bool,
     latest_tl: u64,
     histories: HashMap<u64, Vec<AncestorEnd>>,
     acked: Vec<u64>,
@@ -177,6 +196,7 @@ impl RWorld {
             leader_dead: false,
             n,
             q: m - 1 - n,
+            stuck: false,
             latest_tl: 1,
             histories,
             acked: vec![0],
@@ -189,12 +209,28 @@ impl RWorld {
         }
     }
 
+    /// The stuck-`q` world (see the module docs): `V` = every node but the
+    /// initial leader, `q = |V|`, `n` standbys acknowledge.
+    fn new_stuck(m: usize, n: usize, proto: Protocol) -> RWorld {
+        let mut w = RWorld::new(m, n.clamp(1, m - 1), proto);
+        w.stuck = true;
+        w.q = m - 1;
+        w
+    }
+
     fn idx(&self, i: usize) -> usize {
         i % self.nodes.len()
     }
 
     fn voters(&self) -> Names {
-        (0..self.nodes.len()).map(name).collect()
+        (usize::from(self.stuck)..self.nodes.len())
+            .map(name)
+            .collect()
+    }
+
+    /// The commits `lost` may give up are at least those of `n` holders.
+    fn nothing_lost_below(&self) -> usize {
+        if self.stuck { self.n - 1 } else { self.n }
     }
 
     fn names(&self, set: &BTreeSet<usize>) -> Names {
@@ -309,10 +345,10 @@ impl RWorld {
             RAction::Grant(c, mask, with_leader) => {
                 let c = self.idx(*c);
                 if self.leader_dead && self.grant.is_none() && self.nodes[c].alive {
-                    let mut lost: BTreeSet<usize> = (0..self.nodes.len())
+                    let mut lost: BTreeSet<usize> = (usize::from(self.stuck)..self.nodes.len())
                         .filter(|&j| j != c && mask & (1 << (j % 8)) != 0)
                         .collect();
-                    if *with_leader && self.leader != c {
+                    if *with_leader && self.leader != c && !self.stuck {
                         lost.insert(self.leader);
                     }
                     self.grant = Some(Grant {
@@ -372,6 +408,11 @@ impl RWorld {
 
     fn elect(&mut self, c: usize, reach: u8, crash: u8) -> Result<(), String> {
         if !self.leader_dead {
+            return Ok(());
+        }
+        if self.stuck && self.latest_tl > 1 {
+            // The stuck-`q` world ends at the first promote (`/sync` is
+            // reset by the new leader, which this model does not carry).
             return Ok(());
         }
         let c = self.idx(c);
@@ -478,6 +519,14 @@ impl RWorld {
             }
             VoteDecision::Granted { .. } => {
                 self.stats.grant_granted += 1;
+                if g.lost.iter().any(|j| reached.contains(j)) {
+                    self.stats.online_named_granted += 1;
+                }
+                if (usize::from(self.stuck)..self.nodes.len())
+                    .all(|j| j == c || reached.contains(&j))
+                {
+                    self.stats.all_reachable_granted += 1;
+                }
                 if !matches!(
                     quorum_vote_decision(candidate, &voters, self.q, &peers),
                     VoteDecision::Granted { .. }
@@ -496,6 +545,9 @@ impl RWorld {
                 // candidate's log.
                 let cand_log = self.nodes[c].log.clone();
                 for &j in reached {
+                    if self.stuck && j == 0 {
+                        continue;
+                    }
                     if !g.lost.contains(&j) && !is_prefix(&self.nodes[j].log, &cand_log) {
                         return Err(format!(
                             "P4: counted voter {} holds a log that is not a prefix of {}'s \
@@ -514,16 +566,24 @@ impl RWorld {
                     .filter(|&x| !self.nodes[c].holds(x))
                     .collect();
                 for &x in &missing {
-                    let holders: Vec<usize> = (0..self.nodes.len())
+                    let holders: Vec<usize> = (usize::from(self.stuck)..self.nodes.len())
                         .filter(|&j| self.nodes[j].holds(x))
                         .collect();
                     let named_only = holders.iter().all(|j| g.lost.contains(j));
                     let seen = holders.iter().any(|j| reached.contains(j));
-                    if g.lost.len() <= self.n {
+                    let bound = self.nothing_lost_below();
+                    if g.lost.len() <= bound {
                         return Err(format!(
-                            "P1: commit {x} lost with |lost| = {} <= |V|-q-1 = {} (grant {})",
+                            "P1: commit {x} lost with |lost| = {} <= {bound} (grant {})",
                             g.lost.len(),
-                            self.n,
+                            g.id
+                        ));
+                    }
+                    let every_voter_reached = (usize::from(self.stuck)..self.nodes.len())
+                        .all(|j| j == c || reached.contains(&j));
+                    if self.stuck && every_voter_reached {
+                        return Err(format!(
+                            "P5: commit {x} lost although every voter answered (grant {})",
                             g.id
                         ));
                     }
@@ -634,7 +694,14 @@ fn raction_strategy() -> impl Strategy<Value = RAction> {
 }
 
 fn run_r(proto: Protocol, m: usize, n: usize, actions: &[RAction]) -> Result<RStats, String> {
-    let mut w = RWorld::new(m, n.min(m - 1), proto);
+    run_world(RWorld::new(m, n.min(m - 1), proto), actions)
+}
+
+fn run_stuck(proto: Protocol, m: usize, n: usize, actions: &[RAction]) -> Result<RStats, String> {
+    run_world(RWorld::new_stuck(m, n, proto), actions)
+}
+
+fn run_world(mut w: RWorld, actions: &[RAction]) -> Result<RStats, String> {
     for (k, a) in actions.iter().enumerate() {
         w.apply(a).map_err(|e| format!("step {k}: {e}"))?;
     }
@@ -1007,4 +1074,221 @@ fn mutation_pg_control_bound_without_the_replay_check_is_caught() {
     let e = witness(proto, 3, 1, &diverged_node_with_unreplayed_pair());
     eprintln!("{e}");
     assert!(e.contains("P4") || e.contains("P1"), "{e}");
+}
+
+// ---- decision (b): every voter online, q = |V|, an online voter is named ----
+
+fn stuck_histories() -> impl Strategy<Value = (usize, usize, Vec<RAction>)> {
+    (
+        3usize..6,
+        1usize..5,
+        prop::collection::vec(raction_strategy(), 20..140),
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(CASES))]
+    /// P1 to P5 with `q = |V|`: random histories, grants naming online and
+    /// unreachable voters, crash points.
+    #[test]
+    fn stuck_q_grant_never_loses_more_than_it_names(h in stuck_histories()) {
+        run_stuck(Protocol::default(), h.0, h.1, &h.2).map_err(TestCaseError::fail)?;
+    }
+}
+
+#[test]
+fn stuck_q_model_exercises_online_named_voters() {
+    use proptest::test_runner::{Config, TestRng, TestRunner};
+    let config = Config {
+        cases: CASES,
+        ..Config::default()
+    };
+    let mut runner = TestRunner::new_with_rng(
+        config.clone(),
+        TestRng::deterministic_rng(config.rng_algorithm),
+    );
+    let total = Mutex::new(RStats::default());
+    runner
+        .run(&stuck_histories(), |(m, n, actions)| {
+            let st = run_stuck(Protocol::default(), m, n, &actions).map_err(TestCaseError::fail)?;
+            total.lock().unwrap().add(&st);
+            Ok(())
+        })
+        .unwrap();
+    let t = total.lock().unwrap().clone();
+    eprintln!("SB-37 stuck-q model coverage over {CASES} histories: {t:#?}");
+    assert!(t.grant_granted > 100, "{t:?}");
+    assert!(
+        t.online_named_granted > 50,
+        "no online voter was named: {t:?}"
+    );
+    assert!(t.all_reachable_granted > 20, "{t:?}");
+    assert!(
+        t.grant_only > 50,
+        "the grant must matter (q is stuck): {t:?}"
+    );
+    assert!(t.refused_behind_or_higher > 20, "{t:?}");
+    assert!(t.refused_primary_alive > 5, "{t:?}");
+}
+
+#[test]
+fn stuck_q_exhaustive() {
+    for (m, n, depth) in [(3, 1, 8), (3, 2, 8), (4, 2, 6)] {
+        let actions = all_actions(m);
+        let start = RWorld::new_stuck(m, n, Protocol::default());
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(start.key());
+        let mut frontier: VecDeque<(RWorld, usize)> = VecDeque::new();
+        frontier.push_back((start, 0));
+        let mut total = RStats::default();
+        while let Some((w, d)) = frontier.pop_front() {
+            if d == depth || seen.len() >= 300_000 {
+                continue;
+            }
+            for a in &actions {
+                let mut next = w.clone();
+                next.stats = RStats::default();
+                next.apply(a)
+                    .unwrap_or_else(|e| panic!("m={m} n={n} depth {} after {a:?}: {e}", d + 1));
+                total.add(&next.stats);
+                if seen.insert(next.key()) {
+                    frontier.push_back((next, d + 1));
+                }
+            }
+        }
+        eprintln!(
+            "SB-37 stuck-q exhaustive m={m} n={n}: {} states, {total:?}",
+            seen.len()
+        );
+        assert!(seen.len() > 5_000, "{}", seen.len());
+        assert!(total.online_named_granted > 0, "{total:?}");
+    }
+}
+
+/// The deterministic story: V = {n1, n2}, n0 (leader) dies with commits that
+/// both standbys hold. n2 is promoted giving up the ONLINE n1; nothing
+/// acknowledged is lost, and n1 (level) follows.
+#[test]
+fn stuck_q_online_named_voter_costs_no_acknowledged_commit() {
+    use RAction::*;
+    let mut w = RWorld::new_stuck(3, 1, Protocol::default());
+    for a in [
+        Commit(3),
+        Advance(1, 9),
+        Advance(2, 2),
+        KillLeader,
+        // Without a grant the plain vote can never pass (q = |V| = 2).
+        Elect(1, 0xff, 0),
+    ] {
+        w.apply(&a).unwrap();
+    }
+    assert!(w.leader_dead, "q = |V|: the strict vote never passes");
+    assert_eq!(w.stats.plain_granted, 0);
+    // n1 is the best voter and names the online, lower n2.
+    for a in [Grant(1, 0b100, false), Elect(1, 0xff, 0)] {
+        w.apply(&a).unwrap();
+    }
+    assert!(!w.leader_dead && w.leader == 1, "granted");
+    assert_eq!(w.stats.online_named_granted, 1);
+    assert_eq!(w.stats.all_reachable_granted, 1);
+    assert_eq!(w.stats.accepted_loss, 0, "nothing was given up");
+    assert!(w.acked.iter().all(|x| w.nodes[1].holds(*x)));
+}
+
+/// Named online voter that is AHEAD of the candidate (node2 holds more than
+/// node1): the vote refuses, nothing is promoted.
+fn stuck_online_named_voter_ahead() -> Vec<RAction> {
+    use RAction::*;
+    vec![
+        Commit(2),
+        Advance(1, 1),
+        Advance(2, 9),
+        KillLeader,
+        // n1 (behind) is the candidate and names the online n2.
+        Grant(1, 0b100, false),
+        Elect(1, 0xff, 0),
+    ]
+}
+
+#[test]
+fn stuck_q_online_named_voter_ahead_refuses_the_vote() {
+    let mut w = RWorld::new_stuck(3, 1, Protocol::default());
+    for a in stuck_online_named_voter_ahead() {
+        w.apply(&a).unwrap();
+    }
+    assert!(w.leader_dead);
+    assert_eq!(w.stats.refused_behind_or_higher, 1);
+}
+
+fn stuck_mutant_caught(proto: Protocol) -> Option<String> {
+    use proptest::test_runner::{Config, TestRng, TestRunner};
+    let config = Config {
+        cases: 8 * CASES,
+        failure_persistence: None,
+        ..Config::default()
+    };
+    let mut runner = TestRunner::new_with_rng(
+        config.clone(),
+        TestRng::deterministic_rng(config.rng_algorithm),
+    );
+    runner
+        .run(&stuck_histories(), |(m, n, actions)| {
+            run_stuck(proto, m, n, &actions).map_err(TestCaseError::fail)?;
+            Ok(())
+        })
+        .err()
+        .map(|e| e.to_string())
+}
+
+#[test]
+fn stuck_q_mutation_ignore_the_online_named_voter_is_caught() {
+    let proto = Protocol {
+        ignore_named: true,
+        ..Protocol::default()
+    };
+    // The real vote refuses the story, the mutant promotes the lagging node.
+    run_stuck(Protocol::default(), 3, 1, &stuck_online_named_voter_ahead())
+        .expect("the real protocol must hold");
+    let e = run_stuck(proto, 3, 1, &stuck_online_named_voter_ahead())
+        .expect_err("mutant survived the witness");
+    eprintln!("{e}");
+    assert!(
+        e.contains("P5: commit") && e.contains("every voter answered"),
+        "{e}"
+    );
+    let e = stuck_mutant_caught(proto).expect("mutant survived the search");
+    assert!(e.contains("P1") || e.contains("P5"), "{e}");
+}
+
+#[test]
+fn stuck_q_mutation_skip_the_wal_check_is_caught() {
+    let e = stuck_mutant_caught(Protocol {
+        skip_wal_check: true,
+        ..Protocol::default()
+    })
+    .expect("mutant survived");
+    assert!(
+        e.contains("P1") || e.contains("P4") || e.contains("P5"),
+        "{e}"
+    );
+}
+
+#[test]
+fn stuck_q_mutation_count_a_missing_voter_is_caught() {
+    let e = stuck_mutant_caught(Protocol {
+        count_missing: true,
+        ..Protocol::default()
+    })
+    .expect("mutant survived");
+    assert!(e.contains("P1") || e.contains("P5"), "{e}");
+}
+
+#[test]
+fn stuck_q_mutation_act_while_a_primary_exists_is_caught() {
+    let e = stuck_mutant_caught(Protocol {
+        ignore_primary: true,
+        ..Protocol::default()
+    })
+    .expect("mutant survived");
+    assert!(e.contains("P2") && e.contains("writable"), "{e}");
 }

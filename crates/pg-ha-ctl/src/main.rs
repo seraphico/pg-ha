@@ -151,11 +151,21 @@ fn render_explain(endpoint: &str, message: &str, a: &Value) -> String {
                 "no"
             }
         };
+        if risk["named_online"].as_bool() == Some(true) {
+            out.push_str(&format!(
+                "  every voter answers and q >= the number of voters: the vote can never pass, only the dead leader could relax q\n  online voter given up: {} (it holds nothing the candidate lacks; the vote refuses if it is ahead; it is left out of the first synchronous set and follows the new primary, a rewind if its WAL diverged)\n",
+                join(&a["lost"])
+            ));
+        }
         out.push_str(&format!(
             "  candidate: {}\n  lost: {}\n  commits only the lost voters hold may be lost: {}\n  everything acknowledged before the current timeline began is on the candidate: {}\n  newer timeline history abandoned: {}\n",
             a["candidate"].as_str().unwrap_or("?"),
             join(&a["lost"]),
-            yes("possible"),
+            if risk["named_online"].as_bool() == Some(true) {
+                "no, while it is not ahead (the vote checks again)"
+            } else {
+                yes("possible")
+            },
             yes("pre_timeline_safe"),
             yes("timeline_loss"),
         ));
@@ -581,6 +591,29 @@ mod tests {
         assert!(text.contains("may be lost: yes"), "{text}");
         let healed = serde_json::json!({"outcome": "will_heal", "voters": []});
         assert!(!render_explain("e", "m", &healed).contains("--digest"));
+    }
+    #[test]
+    fn explain_names_the_online_voter_that_is_given_up() {
+        let a = serde_json::json!({
+            "outcome": "needs_acceptance",
+            "candidate": "node2",
+            "lost": ["node4"],
+            "risk": {"possible": true, "pre_timeline_safe": true, "timeline_loss": false, "named_online": true},
+            "digest": "cd".repeat(32),
+            "quorum": 3,
+            "voters": [
+                {"name": "node2", "timeline": 2, "lsn": 100, "status": "candidate"},
+                {"name": "node4", "timeline": 2, "lsn": 90, "status": "counted; named as given up while online"},
+            ],
+        });
+        let text = render_explain("http://n2:8008", "needs acceptance", &a);
+        assert!(text.contains("online voter given up: node4"), "{text}");
+        assert!(text.contains("can never pass"), "{text}");
+        assert!(
+            text.contains("may be lost: no, while it is not ahead"),
+            "{text}"
+        );
+        assert!(text.contains("recover --lost node4 --digest"), "{text}");
     }
     #[test]
     fn waiting_reads_the_primary_from_the_cluster() {

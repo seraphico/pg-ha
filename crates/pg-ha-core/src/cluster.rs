@@ -97,6 +97,11 @@ pub struct Recovery {
     /// The candidate is below the recorded timeline: the newer history is
     /// abandoned (same effect as `pg-ha.accept_timeline_loss`).
     pub timeline_loss: bool,
+    /// `lost` names ONLINE voters only (every voter answered and `q >= |V|`):
+    /// no commit a voter holds is given up, the named voters just do not
+    /// count for the vote nor for the first synchronous set.
+    #[serde(default)]
+    pub named_online: bool,
     /// The digest the operator confirmed.
     pub digest: String,
     /// Node whose REST API wrote the grant.
@@ -111,6 +116,17 @@ impl Recovery {
     /// Is `name` this grant's candidate?
     pub fn names_candidate(&self, name: &str) -> bool {
         self.candidate.eq_ignore_ascii_case(name)
+    }
+    /// What the grant gives up, for logs and the history reason.
+    pub fn loss_text(&self) -> String {
+        let lost = self.lost.join(",");
+        if self.named_online {
+            format!(
+                "online voter {lost} (every voter answered and q >= |V|; no commit a voter holds is given up, {lost} leaves the synchronous set until it follows the new primary)"
+            )
+        } else {
+            format!("loss of {lost}")
+        }
     }
     /// The grant as stored in DCS; None when the value does not parse (a
     /// malformed grant is treated as absent).

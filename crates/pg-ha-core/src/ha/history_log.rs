@@ -83,8 +83,8 @@ pub(super) fn quorum_recovery_event(r: &crate::cluster::Recovery) -> (HistoryEve
     (
         HistoryEventType::QuorumRecovery,
         format!(
-            "quorum recovery: accepted loss of {}; timeline loss: {}",
-            r.lost.join(","),
+            "quorum recovery: accepted {}; timeline loss: {}",
+            r.loss_text(),
             if r.timeline_loss { "yes" } else { "no" }
         ),
     )

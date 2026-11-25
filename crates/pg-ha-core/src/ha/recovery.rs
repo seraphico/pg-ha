@@ -309,6 +309,15 @@ impl Ha {
                     Outcome::Blocked { reason } => format!("refused: {reason}"),
                     Outcome::WillHeal { reason, .. } => format!("will heal by itself: {reason}"),
                     Outcome::NeedsAcceptance {
+                        candidate,
+                        lost,
+                        risk,
+                        ..
+                    } if risk.named_online => format!(
+                        "needs acceptance: every voter answers and the vote can never pass (q >= the voters); promoting {candidate} gives up no commit a voter holds, the online voter {} leaves the synchronous set until it follows the new primary",
+                        lost.join(",")
+                    ),
+                    Outcome::NeedsAcceptance {
                         candidate, lost, ..
                     } => format!(
                         "needs acceptance: promoting {candidate} gives up the commits that only {} may hold",
@@ -427,6 +436,7 @@ impl Ha {
             lost: named.clone(),
             snapshot: RecoverySnapshot::of(sync, &self.cluster.timeline),
             timeline_loss: risk.timeline_loss,
+            named_online: risk.named_online,
             digest: digest.clone(),
             created_by: self.config.name.clone(),
             pg_ha_version: crate::VERSION.to_string(),
@@ -438,17 +448,18 @@ impl Ha {
         };
         match self.dcs.create_recovery(&value).await {
             Ok(true) => {
+                let text = grant.loss_text();
                 warn!(
                     candidate = %candidate,
                     lost = %named.join(","),
                     timeline_loss = risk.timeline_loss,
-                    "Quorum recovery authorized by the operator: {candidate} may be promoted without the votes of {}; the commits that only those voters may hold are given up. The grant expires in {} s",
+                    named_online = risk.named_online,
+                    "Quorum recovery authorized by the operator: {candidate} may be promoted without counting {}; accepted: {text}. The grant expires in {} s",
                     named.join(","),
                     self.dcs.ttl()
                 );
                 CommandResponse::accepted(format!(
-                    "quorum recovery authorized: {candidate} may be promoted, accepting the loss of commits that only {} may hold; the grant expires in {} s",
-                    named.join(","),
+                    "quorum recovery authorized: {candidate} may be promoted, accepting the {text}; the grant expires in {} s",
                     self.dcs.ttl()
                 ))
                 .with_data(serde_json::to_value(&view.assessment).unwrap_or_default())

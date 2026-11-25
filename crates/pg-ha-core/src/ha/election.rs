@@ -317,8 +317,8 @@ impl Ha {
                     }
                     if let Some(r) = &self.recovery_term {
                         error!(
-                            "Quorum recovery: took the leader lock under the operator's grant; promoting accepts the loss of commits that only {} may hold (timeline loss: {})",
-                            r.lost.join(","),
+                            "Quorum recovery: took the leader lock under the operator's grant; promoting accepts the {} (timeline loss: {})",
+                            r.loss_text(),
                             if r.timeline_loss { "yes" } else { "no" }
                         );
                     }

@@ -260,6 +260,7 @@ fn recovery_json(r: Option<&pg_ha_core::cluster::Recovery>) -> serde_json::Value
         "candidate": r.candidate,
         "lost": r.lost,
         "timeline_loss": r.timeline_loss,
+        "named_online": r.named_online,
         "expires_in_s": r.expire_at_ms.map(|at| at.saturating_sub(now) / 1000),
     })
 }

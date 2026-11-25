@@ -1601,6 +1601,7 @@ mod tests {
                 timeline_version: None,
             },
             timeline_loss: false,
+            named_online: false,
             digest: "ab".repeat(32),
             created_by: "node2".into(),
             pg_ha_version: "0.1.25".into(),

@@ -18,7 +18,8 @@
 //! | a node answers `in_recovery = false` | `Blocked` | 4 |
 //! | no voter may campaign | `Blocked` | 4 |
 //! | the normal vote passes for the best candidate | `WillHeal` | 3 |
-//! | every voter answers and the vote still fails (`q >= |V|`) | `Blocked` | 4 |
+//! | every voter answers, the vote fails (`q >= |V|`) | `NeedsAcceptance` naming the lowest ONLINE voter (`risk.named_online`) | 4 |
+//! | every voter answers, `q < |V|`, a voter ahead or no one to name | `Blocked` | 4 |
 //! | the recovery rule refuses (a voter ahead that may not campaign) | `Blocked` | 4 |
 //! | otherwise | `NeedsAcceptance` with the digest | 4 |
 use std::collections::BTreeMap;
@@ -84,6 +85,13 @@ pub struct Risk {
     /// The candidate is below the recorded timeline: the newer history is
     /// abandoned.
     pub timeline_loss: bool,
+    /// The only voter(s) named are ONLINE ones: every voter answers, `q >=
+    /// |V|` and the vote can never pass. The named voter answers on the
+    /// candidate's timeline and is not ahead (the vote checks that again), so
+    /// no acknowledged commit that a voter holds is given up; what the grant
+    /// gives away is only the voter's place in the new synchronous set.
+    #[serde(default)]
+    pub named_online: bool,
 }
 
 /// The verdict.
@@ -167,6 +175,7 @@ pub fn digest(
     struct Canonical<'a> {
         candidate: String,
         lost: Vec<String>,
+        named_online: bool,
         possible: bool,
         pre_timeline_safe: bool,
         quorum: u32,
@@ -184,6 +193,7 @@ pub fn digest(
     let canonical = Canonical {
         candidate: candidate.to_ascii_lowercase(),
         lost,
+        named_online: risk.named_online,
         possible: risk.possible,
         pre_timeline_safe: risk.pre_timeline_safe,
         quorum: snapshot.quorum,
@@ -201,6 +211,15 @@ pub fn digest(
 /// Is `digest` a well-formed digest (64 hex characters)?
 pub fn is_digest(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn refusal_reason(cname: &str, why: VoteRefusal) -> String {
+    match why {
+        VoteRefusal::BehindPeer { peer } | VoteRefusal::HigherTimeline { peer } => format!(
+            "voter {peer} is ahead of the best candidate {cname} but may not campaign; promoting {cname} would discard WAL that is still reachable"
+        ),
+        other => format!("the recovery vote would refuse {cname}: {other:?}"),
+    }
 }
 
 fn quorum_sync(sync: Option<&SyncState>) -> Option<&SyncState> {
@@ -381,37 +400,81 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
             Some(q),
         );
     }
-    let lost: Names = voters
+    let mut lost: Names = voters
         .iter()
         .filter(|v| **v != cname)
         .filter(|v| reading(v).is_none_or(|p| p.timeline < candidate.timeline))
         .cloned()
         .collect();
+    // Every other voter answers on the candidate's timeline (or ahead) and
+    // the vote still fails. The count `q` can then never be met (`q >= |V|`:
+    // the candidate needs `q` OTHER voters), whatever the voters hold: the
+    // dead leader is the only one that can relax `q`. The operator may give
+    // up one ONLINE voter to get out (maintainer decision SB-37 b). It is the
+    // lowest one, so the claim is the smallest true one: the vote below
+    // refuses when any voter is ahead of the candidate, named or not, and a
+    // voter level with or behind the candidate holds nothing the candidate
+    // lacks.
+    let mut named_online = false;
     if lost.is_empty() {
+        let stuck = (q as usize) >= voters.len();
+        let given_up = voters
+            .iter()
+            .filter(|v| **v != cname)
+            .filter_map(|v| reading(v))
+            .min_by(|a, b| {
+                (a.timeline, a.lsn)
+                    .cmp(&(b.timeline, b.lsn))
+                    .then_with(|| b.name.cmp(&a.name))
+            })
+            .map(|p| p.name.to_ascii_lowercase());
+        match given_up.filter(|_| stuck) {
+            Some(name) => {
+                named_online = true;
+                lost.insert(name);
+            }
+            None => {
+                // `q < |V|`: only a voter ahead that may not campaign can
+                // refuse the vote (the check below says which); a single
+                // voter has nobody to name.
+                if let VoteDecision::Refused(why) =
+                    recovery_vote_decision(&candidate, &voters, &lost, input.readings)
+                {
+                    return done(
+                        Outcome::Blocked {
+                            reason: refusal_reason(&cname, why),
+                        },
+                        report,
+                        Some(q),
+                    );
+                }
+                return done(
+                    Outcome::Blocked {
+                        reason: format!(
+                            "the vote fails although every voter answers (q={q} of {} voters) and there is no other voter to name",
+                            voters.len()
+                        ),
+                    },
+                    report,
+                    Some(q),
+                );
+            }
+        }
+    }
+    if let VoteDecision::Refused(why) =
+        recovery_vote_decision(&candidate, &voters, &lost, input.readings)
+    {
         return done(
             Outcome::Blocked {
-                reason: format!(
-                    "every voter answers and the vote still fails (q={q} of {} voters): wait for the leader that relaxes q; naming no voter accepts nothing",
-                    voters.len()
-                ),
+                reason: refusal_reason(&cname, why),
             },
             report,
             Some(q),
         );
     }
-    if let VoteDecision::Refused(why) =
-        recovery_vote_decision(&candidate, &voters, &lost, input.readings)
-    {
-        let reason = match why {
-            VoteRefusal::BehindPeer { peer } | VoteRefusal::HigherTimeline { peer } => format!(
-                "voter {peer} is ahead of the best candidate {cname} but may not campaign; promoting {cname} would discard WAL that is still reachable"
-            ),
-            other => format!("the recovery vote would refuse {cname}: {other:?}"),
-        };
-        return done(Outcome::Blocked { reason }, report, Some(q));
-    }
     let k = lost.len();
     let risk = Risk {
+        named_online,
         possible: k >= voters.len().saturating_sub(q as usize),
         pre_timeline_safe: input
             .timeline
@@ -420,6 +483,21 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
         timeline_loss,
     };
     let lost: Vec<String> = lost.into_iter().collect();
+    let report = if named_online {
+        report
+            .into_iter()
+            .map(|mut r| {
+                if lost.contains(&r.name.to_ascii_lowercase()) {
+                    r.status.push_str(
+                        "; named as given up while online (holds nothing the candidate lacks)",
+                    );
+                }
+                r
+            })
+            .collect()
+    } else {
+        report
+    };
     let snapshot = RecoverySnapshot::of(sync, input.timeline);
     let digest = digest(&snapshot, &cname, &lost, &risk);
     done(
@@ -733,13 +811,125 @@ mod tests {
         }
     }
 
+    /// SB-37 decision (b): every voter answers and `q >= |V|`, the vote can
+    /// never pass. The lowest ONLINE voter is proposed as given up.
     #[test]
-    fn everyone_answers_and_q_too_high_blocks() {
+    fn everyone_answers_and_q_too_high_names_the_lowest_online_voter() {
+        let mut c = Case::five();
+        c.sync = Some(sync("node2,node3,node4", 3));
+        c.voters = eligible(&["node2", "node3", "node4"]);
+        c.readings = vec![
+            pos("node2", 2, 500),
+            pos("node3", 2, 400),
+            pos("node4", 2, 450),
+        ];
+        let a = c.run();
+        match &a.outcome {
+            Outcome::NeedsAcceptance {
+                candidate,
+                lost,
+                risk,
+                digest,
+            } => {
+                assert_eq!(candidate, "node2");
+                assert_eq!(lost, &["node3"], "the lowest voter, online");
+                assert!(risk.named_online);
+                assert!(risk.possible, "q=|V|: k >= |V|-q");
+                assert!(risk.pre_timeline_safe && !risk.timeline_loss);
+                assert!(is_digest(digest));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(a.outcome.exit_code(), 4);
+        assert!(a.voters[1].status.contains("given up while online"));
+        assert!(!a.voters[2].status.contains("given up"));
+        // The digest covers the class: the same names with named_online off
+        // (voters really lost) is another digest.
+        let (d, snap) = match &a.outcome {
+            Outcome::NeedsAcceptance { digest, risk, .. } => (
+                digest.clone(),
+                (
+                    risk.clone(),
+                    RecoverySnapshot::of(c.sync.as_ref().unwrap(), &c.timeline),
+                ),
+            ),
+            _ => unreachable!(),
+        };
+        let off = Risk {
+            named_online: false,
+            ..snap.0
+        };
+        assert_ne!(d, digest(&snap.1, "node2", &["node3".into()], &off));
+        // Ties: the lower position first, then the greater name (the mirror
+        // of the candidate order).
+        c.readings = vec![
+            pos("node2", 2, 500),
+            pos("node3", 2, 400),
+            pos("node4", 2, 400),
+        ];
+        match c.run().outcome {
+            Outcome::NeedsAcceptance { lost, .. } => assert_eq!(lost, &["node4"]),
+            other => panic!("{other:?}"),
+        }
+        // Two voters (the candidate and one more), q = 2.
         let mut c = Case::five();
         c.sync = Some(sync("node2,node3", 2));
         c.voters = eligible(&["node2", "node3"]);
         c.readings = vec![pos("node2", 2, 500), pos("node3", 2, 400)];
-        assert!(blocked(&c.run()).contains("every voter answers"));
+        match c.run().outcome {
+            Outcome::NeedsAcceptance { lost, risk, .. } => {
+                assert_eq!(lost, &["node3"]);
+                assert!(risk.named_online);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The same state, but a voter is ahead of the best campaigner: nothing
+    /// to accept, whoever is named.
+    #[test]
+    fn stuck_q_with_a_voter_ahead_that_may_not_campaign_blocks() {
+        let mut c = Case::five();
+        c.sync = Some(sync("node2,node3,node4", 3));
+        c.voters = eligible(&["node2", "node3", "node4"]);
+        c.voters.get_mut("node4").unwrap().campaign = Campaign::No("nofailover".into());
+        c.readings = vec![
+            pos("node2", 2, 500),
+            pos("node3", 2, 400),
+            pos("node4", 2, 600),
+        ];
+        assert!(
+            blocked(&c.run()).contains("node4 is ahead"),
+            "{:?}",
+            c.run()
+        );
+        // On a newer timeline too.
+        c.readings[2] = pos("node4", 3, 1);
+        assert!(
+            blocked(&c.run()).contains("node4 is ahead"),
+            "{:?}",
+            c.run()
+        );
+    }
+
+    /// `q < |V|` with every voter answering and the vote failing can only be
+    /// a voter ahead; a lone voter has nobody to name.
+    #[test]
+    fn online_voter_is_named_only_when_q_can_never_be_met() {
+        let mut c = Case::five();
+        c.sync = Some(sync("node2,node3,node4", 2));
+        c.voters = eligible(&["node2", "node3", "node4"]);
+        c.voters.get_mut("node4").unwrap().campaign = Campaign::No("nofailover".into());
+        c.readings = vec![
+            pos("node2", 2, 500),
+            pos("node3", 2, 400),
+            pos("node4", 2, 600),
+        ];
+        assert!(blocked(&c.run()).contains("node4 is ahead"));
+        c.sync = Some(sync("node2", 1));
+        c.voters = eligible(&["node2"]);
+        c.readings = vec![pos("node2", 2, 500)];
+        assert!(blocked(&c.run()).contains("no other voter to name"));
     }
 
     #[test]
@@ -751,6 +941,7 @@ mod tests {
             possible: true,
             pre_timeline_safe: true,
             timeline_loss: false,
+            named_online: false,
         };
         let d = digest(&s, "node2", &["node3".into()], &risk);
         assert!(is_digest(&d));

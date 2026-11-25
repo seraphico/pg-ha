@@ -1605,6 +1605,7 @@ mod recovery {
                 timeline_version: None,
             },
             timeline_loss: false,
+            named_online: true,
             digest: DIGEST.into(),
             created_by: "node3".into(),
             pg_ha_version: pg_ha_core::VERSION.into(),
@@ -1613,6 +1614,7 @@ mod recovery {
         let json = get(state).await;
         assert_eq!(json["recovery"]["candidate"], "node2");
         assert_eq!(json["recovery"]["lost"], serde_json::json!(["node1"]));
+        assert_eq!(json["recovery"]["named_online"], true);
         let left = json["recovery"]["expires_in_s"].as_u64().unwrap();
         assert!((9..=10).contains(&left), "{left}");
     }

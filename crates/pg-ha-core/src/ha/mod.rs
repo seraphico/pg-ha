@@ -12706,6 +12706,172 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&dir);
             }
 
+            /// SB-37 decision (b): V = {test_node, node2, node3}, q = 3,
+            /// every voter answers, the old leader is dead: the vote can
+            /// never pass. node3 (the lowest) is named while online.
+            fn stuck_q_ha(label: &str, dcs: &Arc<MockDcs>, peers: FakePeers) -> (Ha, PathBuf) {
+                let (mut ha, dir) = build(
+                    label,
+                    Setup {
+                        quorum: 3,
+                        ..Setup::quorum()
+                    },
+                    dcs,
+                    local(Some(1), 100),
+                    Some(Arc::new(peers)),
+                );
+                ha.set_upstream_reader(Arc::new(Versioned(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 80),
+                    Some(crate::VERSION),
+                )));
+                dcs.mirror_cluster(&ha.cluster);
+                (ha, dir)
+            }
+            fn all_answer() -> FakePeers {
+                FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 80)
+            }
+            async fn stuck_q_digest(ha: &Ha) -> String {
+                let r = ha.handle_recovery_explain(None).await;
+                assert!(
+                    r.message.contains("the vote can never pass"),
+                    "{}",
+                    r.message
+                );
+                match assessment(&r).outcome {
+                    Outcome::NeedsAcceptance {
+                        candidate,
+                        lost,
+                        risk,
+                        digest,
+                    } => {
+                        assert_eq!(candidate, "test_node");
+                        assert_eq!(lost, ["node3"]);
+                        assert!(risk.named_online);
+                        digest
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            #[tokio::test]
+            async fn stuck_q_the_online_voter_can_be_given_up_and_the_candidate_wins() {
+                let _skip = quorum_sync::SkipPrePromoteGuard::new();
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_q_ha("recovery-stuck-q", &dcs, all_answer());
+                // Without a grant the same state stays leaderless.
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+                // Only the voter the explain proposes can be named: node2
+                // answers and is not the one given up.
+                let digest = stuck_q_digest(&ha).await;
+                let r = ha
+                    .handle_recovery_grant(vec!["node2".into()], digest.clone(), None)
+                    .await;
+                assert_eq!(r.status, CommandStatus::Rejected);
+                assert!(r.message.contains("[node3], not [node2]"), "{}", r.message);
+                let r = ha
+                    .handle_recovery_grant(vec!["node3".into()], digest, None)
+                    .await;
+                assert_eq!(r.status, CommandStatus::Accepted, "{}", r.message);
+                assert!(r.message.contains("online voter node3"), "{}", r.message);
+                ha.cluster.recovery = dcs.cluster.lock().unwrap().recovery.clone();
+                assert!(ha.cluster.recovery.as_ref().unwrap().named_online);
+                let _ = ha.process_unhealthy_cluster().await;
+                assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+                assert!(dcs.cluster.lock().unwrap().recovery.is_none());
+                let term = ha.recovery_term.clone().expect("grant kept");
+                assert!(term.named_online);
+                let pending = ha.pending_history.clone().expect("history noted");
+                assert_eq!(pending.event_type, HistoryEventType::QuorumRecovery);
+                assert!(
+                    pending
+                        .reason
+                        .starts_with("quorum recovery: accepted online voter node3 (every voter answered and q >= |V|"),
+                    "{}",
+                    pending.reason
+                );
+                assert!(
+                    pending.reason.ends_with("timeline loss: no"),
+                    "{}",
+                    pending.reason
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// The given-up online voter cannot make the vote lose more than
+            /// named: ahead refuses it; the other voter must still answer;
+            /// when it is gone the vote still passes (it cannot block).
+            #[tokio::test]
+            async fn stuck_q_the_named_online_voter_cannot_win_block_or_hide_more() {
+                let _skip = quorum_sync::SkipPrePromoteGuard::new();
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_q_ha("recovery-stuck-q-named", &dcs, all_answer());
+                let digest = stuck_q_digest(&ha).await;
+                let r = ha
+                    .handle_recovery_grant(vec!["node3".into()], digest, None)
+                    .await;
+                assert_eq!(r.status, CommandStatus::Accepted, "{}", r.message);
+                ha.cluster.recovery = dcs.cluster.lock().unwrap().recovery.clone();
+                // node3 came back ahead (or on a newer timeline): refused.
+                for (tl, lsn, why) in [(1, 150, "BehindPeer"), (2, 1, "HigherTimeline")] {
+                    ha.set_peer_probe(Arc::new(
+                        FakePeers::new().ok("node2", 1, 90).ok("node3", tl, lsn),
+                    ));
+                    let result = ha.process_unhealthy_cluster().await;
+                    assert!(
+                        matches!(&result, CycleResult::Follower(m) if m.contains("quorum recovery vote refused") && m.contains(why)),
+                        "{why}: {result}"
+                    );
+                    assert_eq!(lock_held_by(&dcs), None);
+                }
+                // The other voter (not named) must answer: never counted as
+                // present when missing.
+                ha.set_peer_probe(Arc::new(FakePeers::new().ok("node3", 1, 80)));
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(
+                    matches!(&result, CycleResult::Follower(m) if m.contains("InsufficientVotes")),
+                    "{result}"
+                );
+                assert_eq!(lock_held_by(&dcs), None);
+                // The named voter answering level or lower, or not at all,
+                // does not block.
+                ha.set_peer_probe(Arc::new(FakePeers::new().ok("node2", 1, 90)));
+                let _ = ha.process_unhealthy_cluster().await;
+                assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// The explain on another node: the best voter (node3, ahead of
+            /// this node) is the candidate, and the lowest other one is named.
+            #[tokio::test]
+            async fn stuck_q_the_best_voter_is_the_candidate_and_the_lowest_is_given_up() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_q_ha(
+                    "recovery-stuck-q-ahead",
+                    &dcs,
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 150),
+                );
+                ha.set_upstream_reader(Arc::new(Versioned(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 150),
+                    Some(crate::VERSION),
+                )));
+                let a = assessment(&ha.handle_recovery_explain(None).await);
+                match a.outcome {
+                    Outcome::NeedsAcceptance {
+                        candidate,
+                        lost,
+                        risk,
+                        ..
+                    } => {
+                        assert_eq!(candidate, "node3");
+                        assert_eq!(lost, ["node2"]);
+                        assert!(risk.named_online);
+                    }
+                    other => panic!("{other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
             /// A grant with `timeline_loss` for a candidate that is behind
             /// the recorded timeline (/timeline = 2, this node on 1).
             fn behind_ha(label: &str, dcs: &Arc<MockDcs>) -> (Ha, PathBuf) {
@@ -12722,6 +12888,7 @@ mod tests {
                         &ha.cluster.timeline,
                     ),
                     timeline_loss,
+                    named_online: false,
                     digest: "0".repeat(64),
                     created_by: "node2".into(),
                     pg_ha_version: crate::VERSION.into(),
