@@ -774,6 +774,64 @@ async fn body_text(state: AppState, uri: &str) -> (StatusCode, String) {
     (status, String::from_utf8(body.to_vec()).unwrap())
 }
 
+/// SB-37: a leaderless, stuck cluster makes `/replica` 503 with the reason;
+/// `/primary` and `/health` keep answering from their own state, and clearing
+/// the flag brings the replica back.
+#[tokio::test]
+async fn test_replica_is_503_with_the_reason_only_while_stuck() {
+    let state = test_state();
+    set_replica(&state).await;
+    let (status, body) = body_text(state.clone(), "/replica").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("no leader"), "{body}");
+    state.update(|s| s.leaderless_stuck = true).await;
+    let (status, body) = body_text(state.clone(), "/replica").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        json["reason"],
+        "cluster has no leader and the election is stuck"
+    );
+    // The lag query string does not change it.
+    assert_eq!(
+        status_of(state.clone(), "/replica?lag=100000").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // Other endpoints are not affected by the flag.
+    assert_eq!(
+        status_of(state.clone(), "/primary").await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a replica is never primary"
+    );
+    assert_eq!(status_of(state.clone(), "/health").await, StatusCode::OK);
+    state.update(|s| s.leaderless_stuck = false).await;
+    assert_eq!(status_of(state, "/replica").await, StatusCode::OK);
+}
+/// SB-37: the flag never touches `/primary` or `/health` of the primary.
+#[tokio::test]
+async fn test_stuck_flag_does_not_affect_the_primary_endpoints() {
+    let state = test_state();
+    set_primary(&state).await;
+    state
+        .update(|s| {
+            s.leaderless_stuck = true;
+            s.election_stalled = true;
+        })
+        .await;
+    assert_eq!(status_of(state.clone(), "/primary").await, StatusCode::OK);
+    assert_eq!(status_of(state, "/health").await, StatusCode::OK);
+}
+/// SB-37: a node that is not a healthy replica for another reason keeps its
+/// own 503 and does not claim the stuck reason when the cluster is fine.
+#[tokio::test]
+async fn test_replica_503_without_the_flag_has_no_stuck_reason() {
+    let state = test_state();
+    set_replica(&state).await;
+    state.update(|s| s.rewind_check = true).await;
+    let (status, body) = body_text(state, "/replica").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!body.contains("election is stuck"), "{body}");
+}
 /// SB-10: an unknown lag fails open: 200 with `"lag": null`, never 503.
 #[tokio::test]
 async fn test_replica_lag_unknown_fails_open() {
@@ -1055,6 +1113,41 @@ async fn cluster_sync_is_null_without_a_sync_state() {
     assert!(json["sync"].is_null());
 }
 
+/// SB-37: `/cluster` carries the `election` object; `hint` only when stuck.
+#[tokio::test]
+async fn cluster_election_follows_the_flags() {
+    let (state, _dcs) = config_state("{}");
+    let get = |state: AppState| async move {
+        let resp = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/cluster")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+    };
+    let json = get(state.clone()).await;
+    assert_eq!(json["election"]["stalled"], false);
+    assert_eq!(json["election"]["leaderless_stuck"], false);
+    assert!(json["election"].get("hint").is_none());
+    state.update(|s| s.election_stalled = true).await;
+    let json = get(state.clone()).await;
+    assert_eq!(json["election"]["stalled"], true);
+    assert_eq!(json["election"]["leaderless_stuck"], false);
+    assert!(json["election"].get("hint").is_none());
+    state.update(|s| s.leaderless_stuck = true).await;
+    let json = get(state).await;
+    assert_eq!(json["election"]["leaderless_stuck"], true);
+    assert!(
+        json["election"]["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("Quorum synchronous replication"))
+    );
+}
 #[tokio::test]
 async fn cluster_sync_reports_an_unrelaxed_quorum_window() {
     use pg_ha_core::cluster::SyncKind;

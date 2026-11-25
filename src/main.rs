@@ -235,6 +235,9 @@ async fn main() -> anyhow::Result<()> {
             _ => None,
         },
     )?));
+    ha.set_upstream_reader(Arc::new(pg_ha_core::peer_http::ReqwestPeerWalReader::new(
+        config.restapi.tls.as_ref(),
+    )?));
 
     // ─── Initialize REST API ───
     let app_state = AppState::with_dcs(

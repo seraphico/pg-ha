@@ -498,16 +498,29 @@ pub enum VoteDecision {
     Refused(VoteRefusal),
 }
 
+/// SB-37: one line of the candidate's own timeline history file: the
+/// ancestor `timeline` ended at `switchpoint` (the next timeline of the
+/// candidate's history began there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AncestorEnd {
+    pub timeline: u64,
+    pub switchpoint: u64,
+}
+
 /// SI-2: may `candidate` be promoted?
 ///
 /// * the candidate must be a voter;
 /// * any responder that is not in recovery means a primary is alive: refuse;
-/// * a voter on a newer timeline: refuse; on an older one: not counted (LSNs
-///   of different timelines are not comparable);
-/// * a same-timeline voter with a higher LSN: refuse;
-/// * otherwise that voter counts as one vote. At least `quorum` voters other
-///   than the candidate must count. Fewer means refuse (no leader rather than
-///   a lost commit).
+/// * a voter on a newer timeline: refuse;
+/// * a same-timeline voter with a higher LSN: refuse; otherwise it counts as
+///   one vote;
+/// * a voter on an older timeline counts only under the prefix rule below;
+///   otherwise it is not counted (LSNs of different timelines are not
+///   comparable);
+/// * at least `quorum` voters other than the candidate must count. Fewer
+///   means refuse (no leader rather than a lost commit).
+///
+/// Equivalent to [`quorum_vote_decision_with_history`] with no history.
 ///
 /// `peers` holds the live answers actually received (unreachable nodes are
 /// simply absent). Answers from non-voters and from the candidate itself are
@@ -517,6 +530,48 @@ pub fn quorum_vote_decision(
     voters: &Names,
     quorum: usize,
     peers: &[WalPosition],
+) -> VoteDecision {
+    quorum_vote_decision_with_history(candidate, voters, quorum, peers, &[])
+}
+
+/// [`quorum_vote_decision`] plus the SB-37 prefix rule. `ancestors` is the
+/// candidate's own history file for `candidate.timeline` (empty: the rule
+/// does not apply, which is also what a caller passes when the file cannot be
+/// read: fail closed).
+///
+/// Prefix rule: a voter that reports timeline `T_v < candidate.timeline`
+/// counts as a vote when `ancestors` names `T_v` with switchpoint `S` and the
+/// voter's LSN is `<= S`. Its WAL is then a prefix of the candidate's: the
+/// candidate has all of timeline `T_v` up to `S`. A voter beyond `S`, or on a
+/// timeline that is not in the candidate's history, is not counted.
+///
+/// A published timeline is a lower bound (a voter may under-report). That is
+/// still safe while every candidate is on the latest recorded timeline (D6,
+/// so timelines form one chain and each one began exactly at its parent's
+/// switchpoint): a voter that really is on a later timeline than `T_v` has
+/// WAL at or past `S` (where `T_v + 1` began), so its LSN is `> S`. Callers
+/// pass no history when the candidate campaigns under the D6 override.
+pub fn quorum_vote_decision_with_history(
+    candidate: &WalPosition,
+    voters: &Names,
+    quorum: usize,
+    peers: &[WalPosition],
+    ancestors: &[AncestorEnd],
+) -> VoteDecision {
+    decide(candidate, voters, quorum, peers, ancestors, holds_a_prefix)
+}
+
+/// The rule with the older-timeline test as a parameter (the tests run
+/// mutated versions of it through the same code).
+pub(crate) type PrefixTest = fn(&WalPosition, &[AncestorEnd]) -> bool;
+
+pub(crate) fn decide(
+    candidate: &WalPosition,
+    voters: &Names,
+    quorum: usize,
+    peers: &[WalPosition],
+    ancestors: &[AncestorEnd],
+    prefix: PrefixTest,
 ) -> VoteDecision {
     let me = candidate.name.to_ascii_lowercase();
     if !voters.contains(&me) {
@@ -542,6 +597,9 @@ pub fn quorum_vote_decision(
             });
         }
         if p.timeline < candidate.timeline {
+            if prefix(p, ancestors) {
+                votes.insert(name);
+            }
             continue;
         }
         if p.lsn > candidate.lsn {
@@ -560,6 +618,12 @@ pub fn quorum_vote_decision(
     VoteDecision::Granted { votes: votes.len() }
 }
 
+/// SB-37 prefix rule for one older-timeline voter.
+pub(crate) fn holds_a_prefix(peer: &WalPosition, ancestors: &[AncestorEnd]) -> bool {
+    ancestors
+        .iter()
+        .any(|a| a.timeline == peer.timeline && peer.lsn <= a.switchpoint)
+}
 pub mod derive;
 pub mod mark;
 pub mod round;
@@ -1016,6 +1080,245 @@ mod tests {
         );
     }
 
+    // ── SB-37 prefix rule ──
+    /// The PG 18 3-node scenario 8 values (evidence pr-a-pg18-3n-r2.md):
+    /// candidate node2 on timeline 3, `00000003.history` = 1 0/5000060,
+    /// 2 0/5037050; voter node3 on timeline 2 at exactly 0/5037050.
+    const S1: u64 = 0x5000060;
+    const S2: u64 = 0x5037050;
+    fn r2_history() -> Vec<AncestorEnd> {
+        vec![
+            AncestorEnd {
+                timeline: 1,
+                switchpoint: S1,
+            },
+            AncestorEnd {
+                timeline: 2,
+                switchpoint: S2,
+            },
+        ]
+    }
+    fn gap_history() -> Vec<AncestorEnd> {
+        // Timeline 4 whose history skips 2 (2 was abandoned).
+        vec![
+            AncestorEnd {
+                timeline: 1,
+                switchpoint: 0x100,
+            },
+            AncestorEnd {
+                timeline: 3,
+                switchpoint: 0x300,
+            },
+        ]
+    }
+    fn no_switchpoint_check(p: &WalPosition, a: &[AncestorEnd]) -> bool {
+        a.iter().any(|a| a.timeline == p.timeline)
+    }
+    fn one_past_switchpoint(p: &WalPosition, a: &[AncestorEnd]) -> bool {
+        a.iter()
+            .any(|a| a.timeline == p.timeline && p.lsn <= a.switchpoint + 1)
+    }
+    fn any_older_timeline(p: &WalPosition, a: &[AncestorEnd]) -> bool {
+        a.iter().any(|a| p.lsn <= a.switchpoint)
+    }
+    /// (label, candidate, quorum, peers, history, granted)
+    type PrefixRow = (
+        &'static str,
+        WalPosition,
+        usize,
+        Vec<WalPosition>,
+        Vec<AncestorEnd>,
+        bool,
+    );
+    fn prefix_table() -> Vec<PrefixRow> {
+        let c3 = pos("node2", 3, 0x50370E0);
+        vec![
+            (
+                "r2: voter at the switchpoint counts",
+                c3.clone(),
+                1,
+                vec![pos("node3", 2, S2)],
+                r2_history(),
+                true,
+            ),
+            (
+                "voter below the switchpoint counts",
+                c3.clone(),
+                1,
+                vec![pos("node3", 2, S2 - 0x10)],
+                r2_history(),
+                true,
+            ),
+            (
+                "grandparent timeline below its end counts",
+                c3.clone(),
+                1,
+                vec![pos("node3", 1, S1)],
+                r2_history(),
+                true,
+            ),
+            (
+                "one byte past the switchpoint is not counted",
+                c3.clone(),
+                1,
+                vec![pos("node3", 2, S2 + 1)],
+                r2_history(),
+                false,
+            ),
+            (
+                "far past the switchpoint is not counted",
+                c3.clone(),
+                1,
+                vec![pos("node3", 2, S2 + 0x1000)],
+                r2_history(),
+                false,
+            ),
+            (
+                "grandparent past its end is not counted",
+                c3.clone(),
+                1,
+                vec![pos("node3", 1, S1 + 1)],
+                r2_history(),
+                false,
+            ),
+            (
+                "under-reported (really on 3, publishes 2) past S",
+                c3.clone(),
+                1,
+                vec![pos("node3", 2, 0x5037100)],
+                r2_history(),
+                false,
+            ),
+            (
+                "no history: fail closed",
+                c3.clone(),
+                1,
+                vec![pos("node3", 2, S2)],
+                vec![],
+                false,
+            ),
+            (
+                "timeline not in the history",
+                pos("c", 4, 0x400),
+                1,
+                vec![pos("node3", 2, 0x200)],
+                gap_history(),
+                false,
+            ),
+            (
+                "both kinds of votes add up",
+                c3.clone(),
+                2,
+                vec![pos("node3", 2, S2), pos("node4", 3, 0x5037090)],
+                r2_history(),
+                true,
+            ),
+        ]
+    }
+    fn voters_of(c: &WalPosition, peers: &[WalPosition]) -> Names {
+        let mut names: Vec<&str> = peers.iter().map(|p| p.name.as_str()).collect();
+        names.push(c.name.as_str());
+        n(&names)
+    }
+    #[test]
+    fn prefix_rule_table() {
+        for (label, c, q, peers, hist, granted) in prefix_table() {
+            let d = quorum_vote_decision_with_history(&c, &voters_of(&c, &peers), q, &peers, &hist);
+            assert_eq!(
+                matches!(d, VoteDecision::Granted { .. }),
+                granted,
+                "{label}: {d:?}"
+            );
+        }
+    }
+    #[test]
+    fn prefix_rule_keeps_every_other_refusal() {
+        let c3 = pos("node2", 3, 0x50370E0);
+        let v = n(&["node2", "node3", "node4"]);
+        let hist = r2_history();
+        // A higher timeline still refuses, even next to a prefix voter.
+        let d = quorum_vote_decision_with_history(
+            &c3,
+            &v,
+            1,
+            &[pos("node3", 2, S2), pos("node4", 4, 1)],
+            &hist,
+        );
+        assert_eq!(
+            d,
+            VoteDecision::Refused(VoteRefusal::HigherTimeline {
+                peer: "node4".into()
+            })
+        );
+        // A same-timeline voter ahead still refuses.
+        let d = quorum_vote_decision_with_history(
+            &c3,
+            &v,
+            1,
+            &[pos("node3", 2, S2), pos("node4", 3, 0x5037200)],
+            &hist,
+        );
+        assert_eq!(
+            d,
+            VoteDecision::Refused(VoteRefusal::BehindPeer {
+                peer: "node4".into()
+            })
+        );
+        // A writable primary still refuses.
+        let mut primary = pos("node4", 2, S2);
+        primary.in_recovery = false;
+        let d =
+            quorum_vote_decision_with_history(&c3, &v, 1, &[pos("node3", 2, S2), primary], &hist);
+        assert!(matches!(
+            d,
+            VoteDecision::Refused(VoteRefusal::PrimaryAlive { .. })
+        ));
+        // A non-voter on an ancestor timeline is not counted.
+        let d = quorum_vote_decision_with_history(
+            &c3,
+            &n(&["node2", "node4"]),
+            1,
+            &[pos("node3", 2, S2)],
+            &hist,
+        );
+        assert_eq!(
+            d,
+            VoteDecision::Refused(VoteRefusal::InsufficientVotes { got: 0, need: 1 })
+        );
+        // Without history the old rule is unchanged.
+        assert_eq!(
+            quorum_vote_decision(&c3, &v, 1, &[pos("node3", 2, S2)]),
+            VoteDecision::Refused(VoteRefusal::InsufficientVotes { got: 0, need: 1 })
+        );
+    }
+    /// Each mutation of the older-timeline test grants a row the real rule
+    /// refuses: the table would catch it.
+    #[test]
+    fn prefix_rule_mutations_are_caught() {
+        let mutants: [(&str, PrefixTest); 3] = [
+            ("no switchpoint check", no_switchpoint_check),
+            ("LSN past the switchpoint counted", one_past_switchpoint),
+            ("non-ancestor timeline counted", any_older_timeline),
+        ];
+        for (what, m) in mutants {
+            let caught = prefix_table()
+                .into_iter()
+                .any(|(_, c, q, peers, hist, granted)| {
+                    let d = decide(&c, &voters_of(&c, &peers), q, &peers, &hist, m);
+                    matches!(d, VoteDecision::Granted { .. }) != granted
+                });
+            assert!(caught, "mutation not caught: {what}");
+        }
+        // And the real test passes the same table through the same seam.
+        for (label, c, q, peers, hist, granted) in prefix_table() {
+            let d = decide(&c, &voters_of(&c, &peers), q, &peers, &hist, holds_a_prefix);
+            assert_eq!(
+                matches!(d, VoteDecision::Granted { .. }),
+                granted,
+                "{label}"
+            );
+        }
+    }
     #[test]
     fn vote_with_zero_quorum_needs_no_peers() {
         let v = n(&["a", "b"]);

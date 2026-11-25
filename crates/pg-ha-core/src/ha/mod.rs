@@ -37,6 +37,7 @@ mod lease;
 mod lineage;
 pub(crate) mod quorum_sync;
 mod shutdown;
+mod stuck;
 mod vote;
 
 use identity::{LeaderAction, PgIdentity};
@@ -93,6 +94,12 @@ pub struct ApiSnapshot {
     /// read it with SHOW. Only while this node leads and the executor runs;
     /// None otherwise.
     pub quorum_n: Option<usize>,
+    /// SB-37: no leader for a whole lock ttl, two consecutive refused votes
+    /// on this node, or a DCS unreadable for a whole ttl. `/replica` is 503
+    /// while it is set (an ordinary failover never sets it).
+    pub leaderless_stuck: bool,
+    /// SB-37: this node's last two quorum votes were both refused.
+    pub election_stalled: bool,
 }
 
 /// Hook that writes an [`ApiSnapshot`] into the REST API state. The HA engine
@@ -201,6 +208,14 @@ pub struct Ha {
     /// SB-13: when the "cluster cannot elect a primary until `/sync` is
     /// relaxed" ERROR was last logged (at most every `QUORUM_STALL_LOG_INTERVAL`).
     quorum_stall_logged_at: Option<std::time::Instant>,
+    /// SB-37: what the loop has seen of the leader lock, the DCS and this
+    /// node's votes, for the `/replica` stuck rule.
+    stuck: stuck::StuckTracker,
+    /// SB-37: reads the upstream's `GET /wal` (read-only) before a standby
+    /// restarts PostgreSQL to follow it. None: only the DCS quorum check runs.
+    upstream_reader: Option<Arc<dyn PeerWalProbe>>,
+    /// SB-37: when the "not restarting PostgreSQL to follow" WARN was last logged.
+    follow_deferred_logged_at: Option<std::time::Instant>,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -252,6 +267,9 @@ impl Ha {
             local_wal,
             quorum_exec: Default::default(),
             quorum_stall_logged_at: None,
+            stuck: stuck::StuckTracker::default(),
+            upstream_reader: None,
+            follow_deferred_logged_at: None,
         };
         (ha, cmd_tx)
     }
@@ -268,6 +286,11 @@ impl Ha {
         self.peer_probe = Some(probe);
     }
 
+    /// Install the read-only `GET /wal` reader the follow path uses to confirm
+    /// the upstream before restarting PostgreSQL to follow it (SB-37).
+    pub fn set_upstream_reader(&mut self, reader: Arc<dyn PeerWalProbe>) {
+        self.upstream_reader = Some(reader);
+    }
     /// The REST API state derived from the current HA state.
     pub fn api_snapshot(&self) -> ApiSnapshot {
         let pg_running = self.postgresql.is_running();
@@ -307,6 +330,11 @@ impl Ha {
             shutting_down: self.shutting_down,
             rewind_check: self.has_rewind_check_marker(),
             quorum_n: self.quorum_observed_n(),
+            leaderless_stuck: self.stuck.is_stuck(
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(self.dcs.ttl()),
+            ),
+            election_stalled: self.stuck.election_stalled(),
         }
     }
 
@@ -354,6 +382,8 @@ impl Ha {
         match self.dcs.get_cluster().await {
             Ok(cluster) => {
                 self.cluster = cluster;
+                self.stuck
+                    .observe_leader(std::time::Instant::now(), self.cluster.leader.is_some());
                 // Check dynamic config for pause
                 self.is_paused = self
                     .cluster
@@ -374,6 +404,7 @@ impl Ha {
             }
             Err(e) => {
                 error!("Failed to load cluster from DCS: {e}");
+                self.stuck.observe_read_failed(std::time::Instant::now());
                 return self.handle_dcs_error().await;
             }
         }
@@ -1510,6 +1541,8 @@ mod tests {
         fail_cluster_reads: std::sync::atomic::AtomicBool,
         /// Number of `get_cluster` calls.
         cluster_reads: std::sync::atomic::AtomicUsize,
+        /// `quorum_confirmed()` (SB-37); true by default.
+        quorum_confirmed: std::sync::atomic::AtomicBool,
     }
 
     impl MockDcs {
@@ -1535,6 +1568,7 @@ mod tests {
                 fail_config_reads: std::sync::atomic::AtomicBool::new(false),
                 fail_cluster_reads: std::sync::atomic::AtomicBool::new(false),
                 cluster_reads: std::sync::atomic::AtomicUsize::new(0),
+                quorum_confirmed: std::sync::atomic::AtomicBool::new(true),
             }
         }
 
@@ -1568,6 +1602,7 @@ mod tests {
                 fail_config_reads: std::sync::atomic::AtomicBool::new(false),
                 fail_cluster_reads: std::sync::atomic::AtomicBool::new(false),
                 cluster_reads: std::sync::atomic::AtomicUsize::new(0),
+                quorum_confirmed: std::sync::atomic::AtomicBool::new(true),
             }
         }
 
@@ -1816,6 +1851,10 @@ mod tests {
         }
         fn loop_wait(&self) -> u64 {
             10
+        }
+        fn quorum_confirmed(&self) -> bool {
+            self.quorum_confirmed
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
         fn set_lock_timing(&self, ttl: u64, _retry_timeout: u64) {
             self.lock_ttl
@@ -3860,6 +3899,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// SB-37: a standby restarts PostgreSQL to follow the lock holder only
+    /// when the lock is confirmed (see `follow::follow_restart_refusal`).
+    mod follow_gate_tests {
+        use super::*;
+        use crate::quorum::WalPosition;
+        use crate::quorum::round::{PeerProbeError, PeerTarget, PeerWalProbe};
+        /// A fixed `GET /wal` answer; counts the reads.
+        struct FixedReader {
+            answer: std::result::Result<WalPosition, PeerProbeError>,
+            reads: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl PeerWalProbe for FixedReader {
+            async fn read(
+                &self,
+                _target: &PeerTarget,
+            ) -> std::result::Result<WalPosition, PeerProbeError> {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.answer.clone()
+            }
+        }
+        fn answer(in_recovery: bool) -> std::result::Result<WalPosition, PeerProbeError> {
+            Ok(WalPosition {
+                name: "node3".into(),
+                in_recovery,
+                timeline: 2,
+                lsn: 100,
+            })
+        }
+        fn reader(a: std::result::Result<WalPosition, PeerProbeError>) -> Arc<FixedReader> {
+            Arc::new(FixedReader {
+                answer: a,
+                reads: Default::default(),
+            })
+        }
+        /// node2, a running standby streaming from node1 (dead), while node3
+        /// holds the lock. Returns the upstream after one follow cycle.
+        async fn follow_once(
+            label: &str,
+            quorum_confirmed: bool,
+            reader: Option<Arc<FixedReader>>,
+        ) -> (Option<String>, String) {
+            let dcs = Arc::new(MockDcs::with_leader("node3"));
+            dcs.quorum_confirmed
+                .store(quorum_confirmed, std::sync::atomic::Ordering::SeqCst);
+            let (mut ha, dir) = identity_test_ha("node2", label, dcs, Some(true), true);
+            preset_auto_conf(&dir, "node1");
+            ha.config.retry_timeout = 0;
+            if let Some(r) = reader {
+                ha.set_upstream_reader(r);
+            }
+            ha.cluster = Cluster {
+                timeline: rec(1),
+                leader: Some(Leader {
+                    name: "node3".into(),
+                    version: 1,
+                }),
+                members: vec![
+                    Member {
+                        api_url: "http://node3:8008".into(),
+                        role: MemberRole::Primary,
+                        ..member_at("node3", "host=node3 port=5432")
+                    },
+                    member_at("node2", "host=node2 port=5432"),
+                ],
+                ..Default::default()
+            };
+            let result = ha.follow_upstream("node3").await;
+            let upstream = ha.read_current_upstream();
+            let _ = std::fs::remove_dir_all(&dir);
+            (upstream, result.to_string())
+        }
+        #[tokio::test]
+        async fn no_restart_while_the_dcs_has_no_quorum_leader() {
+            let r = reader(answer(false));
+            let (upstream, result) = follow_once("gate-no-quorum", false, Some(r.clone())).await;
+            assert_eq!(upstream.as_deref(), Some("node1"), "{result}");
+            assert!(result.contains("not restarting PostgreSQL"), "{result}");
+            assert!(result.contains("may be stale"), "{result}");
+            assert_eq!(
+                r.reads.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no peer read while the DCS view is stale"
+            );
+            // Without a reader installed the DCS rule alone still holds.
+            let (upstream, result) = follow_once("gate-no-quorum-noreader", false, None).await;
+            assert_eq!(upstream.as_deref(), Some("node1"), "{result}");
+        }
+        #[tokio::test]
+        async fn no_restart_while_the_lock_holder_is_unreachable_or_not_primary() {
+            for (label, a) in [
+                ("gate-unreachable", Err(PeerProbeError::Timeout)),
+                ("gate-in-recovery", answer(true)),
+            ] {
+                let (upstream, result) = follow_once(label, true, Some(reader(a))).await;
+                assert_eq!(upstream.as_deref(), Some("node1"), "{label}: {result}");
+                assert!(result.contains("not restarting PostgreSQL"), "{result}");
+            }
+        }
+        #[tokio::test]
+        async fn restart_once_the_lock_is_confirmed() {
+            let r = reader(answer(false));
+            let (upstream, result) = follow_once("gate-confirmed", true, Some(r.clone())).await;
+            assert_eq!(upstream.as_deref(), Some("node3"), "{result}");
+            assert_eq!(r.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+            // Adapters without a quorum notion and no reader: as before.
+            let (upstream, result) = follow_once("gate-default", true, None).await;
+            assert_eq!(upstream.as_deref(), Some("node3"), "{result}");
+        }
+        #[test]
+        fn refusal_table() {
+            use crate::ha::follow::follow_restart_refusal as r;
+            let up = answer(false);
+            let rec = answer(true);
+            let down: std::result::Result<WalPosition, PeerProbeError> =
+                Err(PeerProbeError::Transport("dns".into()));
+            assert!(r(false, "node3", true, Some(&up)).is_some());
+            assert!(r(false, "node3", true, None).is_some());
+            assert!(r(true, "node3", true, None).is_none());
+            assert!(r(true, "node3", true, Some(&up)).is_none());
+            assert!(r(true, "node3", true, Some(&down)).is_some());
+            assert!(r(true, "node3", true, Some(&rec)).is_some());
+            // A cascade source is a standby by design: reachable is enough.
+            assert!(r(true, "node4", false, Some(&rec)).is_none());
+            assert!(r(true, "node4", false, Some(&down)).is_some());
+        }
+    }
     #[tokio::test]
     async fn test_reconfigure_replica_keeps_auto_conf_lines() {
         let (mut ha, dir) = identity_test_ha(
@@ -8213,6 +8379,7 @@ mod tests {
                 checkpoint_timeline: Some(checkpoint_tl),
                 receiver: Some((receive, 6)),
                 postmaster_start: Some(run.clone()),
+                min_recovery_end: None,
             };
             let last = resolve_replica_wal(&streaming, None).remember;
             // The leader died: its last WAL (shutdown checkpoint) arrived
@@ -10863,7 +11030,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn the_stall_error_is_logged_once_per_interval_and_only_for_q_at_least_v() {
+        async fn the_stall_error_is_logged_once_per_interval_for_q_at_least_v_or_a_stalled_election()
+         {
             let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let _guard = tracing::subscriber::set_default(ErrorCounter(errors.clone()));
             let count = || errors.load(std::sync::atomic::Ordering::SeqCst);
@@ -10886,10 +11054,15 @@ mod tests {
                 .checked_sub(QUORUM_STALL_LOG_INTERVAL + std::time::Duration::from_secs(1));
             assert!(ha.note_unelectable_quorum(refusal));
             assert_eq!(count(), 3);
-            // q < |V|: an ordinary refusal, no ERROR.
+            // q < |V|: a single refusal is an ordinary one, no ERROR.
             ha.cluster.sync_state = Some(sync_of("node2,node3", 1, SyncKind::Quorum));
             assert!(!ha.note_unelectable_quorum(refusal));
             assert_eq!(count(), 3);
+            // Two consecutive refused votes: the election is stalled, so it logs.
+            ha.stuck.observe_vote(true);
+            ha.stuck.observe_vote(true);
+            assert!(ha.note_unelectable_quorum(refusal));
+            assert_eq!(count(), 4);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -11137,16 +11310,243 @@ mod tests {
             }
         }
 
-        /// A leaderless candidate refused with q >= |V| logs the stall ERROR
-        /// from the election path, once per interval; q < |V| logs none.
+        /// SB-37 prefix rule through the live vote: a voter on an ancestor
+        /// timeline at or below its switchpoint counts only when this node's
+        /// own history file says so, and the rule fails closed without it.
         #[tokio::test]
-        async fn a_refused_candidate_with_q_at_least_v_logs_the_stall_error_once() {
+        async fn the_vote_counts_a_prefix_voter_only_from_the_own_history_file() {
+            for (label, file, peer_lsn, pass) in [
+                ("prefix-ok", true, 0x2000u64, true),
+                ("prefix-past-switchpoint", true, 0x2001, false),
+                ("prefix-no-file", false, 0x2000, false),
+            ] {
+                let dcs = Arc::new(MockDcs::new());
+                let setup = Setup {
+                    members: vec![
+                        Member {
+                            api_url: "http://test_node:8008".into(),
+                            ..member_with_tl("test_node", 0x3100, 3)
+                        },
+                        member_at("node2", 0x2000),
+                        member_at("node3", 0x2000),
+                    ],
+                    ..Setup::quorum()
+                };
+                let (mut ha, dir) = build(
+                    label,
+                    setup,
+                    &dcs,
+                    local(Some(3), 0x3100),
+                    Some(Arc::new(FakePeers::new().ok("node2", 2, peer_lsn))),
+                );
+                ha.cluster.timeline = rec(3);
+                if file {
+                    let wal = dir.join("pg_wal");
+                    std::fs::create_dir_all(&wal).unwrap();
+                    std::fs::write(
+                        wal.join("00000003.history"),
+                        "1\t0/1000\tno recovery target specified\n2\t0/2000\tno recovery target specified\n",
+                    )
+                    .unwrap();
+                }
+                let gate = ha.quorum_vote().await;
+                if pass {
+                    assert_eq!(gate, VoteGate::Pass, "{label}");
+                } else {
+                    assert!(
+                        matches!(&gate, VoteGate::Refuse(m) if m.contains("InsufficientVotes")),
+                        "{label}: {gate:?}"
+                    );
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+        /// SB-37: a refused vote returns early, and the node must still
+        /// refresh its member record, else its record expires and peers stop
+        /// counting it as a voter.
+        #[tokio::test]
+        async fn a_refused_vote_refreshes_the_member_record() {
+            // q = |V| logs the stall ERROR; see the note in
+            // `two_consecutive_refused_votes_make_the_snapshot_stuck`.
+            let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _guard = tracing::subscriber::set_default(ErrorCounter(errors));
+            let dcs = Arc::new(MockDcs::new());
+            let setup = Setup {
+                voters: "test_node,node2",
+                quorum: 2,
+                ..Setup::quorum()
+            };
+            let (mut ha, dir) = build(
+                "vote-refused-touch",
+                setup,
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(FakePeers::new().ok("node2", 1, 50))),
+            );
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+            assert_eq!(dcs.touch_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: a standby that is not the healthiest node only waits, and
+        /// still refreshes its member record.
+        #[tokio::test]
+        async fn a_not_healthiest_cycle_refreshes_the_member_record() {
+            let dcs = Arc::new(MockDcs::new());
+            let setup = Setup {
+                members: vec![
+                    member_at("test_node", 100),
+                    member_at("node2", 500),
+                    member_at("node3", 50),
+                ],
+                ..Setup::quorum()
+            };
+            let (mut ha, dir) = build(
+                "not-healthiest-touch",
+                setup,
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(PanicPeers)),
+            );
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(
+                matches!(&result, CycleResult::Follower(m) if m.contains("not the healthiest")),
+                "{result}"
+            );
+            assert_eq!(dcs.touch_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: one refused vote is not a stall; two in a row are, and the
+        /// snapshot the REST API serves says so.
+        #[tokio::test]
+        async fn two_consecutive_refused_votes_make_the_snapshot_stuck() {
+            // The second refusal logs the stall ERROR; a thread-local
+            // subscriber keeps the shared callsite registered for the tests
+            // that count it.
+            let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let _guard = tracing::subscriber::set_default(ErrorCounter(errors));
+            let dcs = Arc::new(MockDcs::new());
+            let setup = Setup {
+                voters: "test_node,node2",
+                quorum: 2,
+                ..Setup::quorum()
+            };
+            let (mut ha, dir) = build(
+                "vote-stuck",
+                setup,
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(FakePeers::new().ok("node2", 1, 50))),
+            );
+            assert!(!ha.api_snapshot().leaderless_stuck);
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+            let snap = ha.api_snapshot();
+            assert!(!snap.election_stalled && !snap.leaderless_stuck);
+            let result = ha.process_unhealthy_cluster().await;
+            assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+            let snap = ha.api_snapshot();
+            assert!(snap.election_stalled && snap.leaderless_stuck);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: a refusal that waiting fixes (a writable primary answered)
+        /// never counts toward the stall.
+        #[tokio::test]
+        async fn a_refusal_that_waiting_fixes_never_stalls() {
+            let dcs = Arc::new(MockDcs::new());
+            let (mut ha, dir) = build(
+                "vote-primary-alive",
+                Setup::quorum(),
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(FakePeers::new().primary("node2", 1, 90))),
+            );
+            for _ in 0..3 {
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(refused(&result).contains("PrimaryAlive"), "{result}");
+            }
+            let snap = ha.api_snapshot();
+            assert!(!snap.election_stalled && !snap.leaderless_stuck);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: a standby that is not the healthiest node only gets the
+        /// time rule (it casts no vote), and a leader clears it.
+        #[tokio::test]
+        async fn a_waiting_standby_is_stuck_only_after_a_leaderless_ttl() {
+            let dcs = Arc::new(MockDcs::new());
+            let setup = Setup {
+                members: vec![
+                    member_at("test_node", 100),
+                    member_at("node2", 500),
+                    member_at("node3", 50),
+                ],
+                ..Setup::quorum()
+            };
+            let (mut ha, dir) = build(
+                "waiting-stuck",
+                setup,
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(PanicPeers)),
+            );
+            let ttl = std::time::Duration::from_secs(ha.dcs.ttl());
+            let now = std::time::Instant::now();
+            ha.stuck
+                .observe_leader(now - ttl + std::time::Duration::from_secs(5), false);
+            let _ = ha.process_unhealthy_cluster().await;
+            let snap = ha.api_snapshot();
+            assert!(!snap.election_stalled && !snap.leaderless_stuck);
+            // The same cluster, leaderless since a whole ttl ago.
+            ha.stuck.observe_leader(now - ttl, true);
+            ha.stuck.observe_leader(now - ttl, false);
+            assert!(ha.api_snapshot().leaderless_stuck);
+            assert!(!ha.api_snapshot().election_stalled);
+            ha.stuck.observe_leader(now, true);
+            assert!(!ha.api_snapshot().leaderless_stuck);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: run_cycle feeds the tracker: a DCS that cannot be read for a
+        /// whole ttl is stuck, one failed read is not, a good read ends it.
+        #[tokio::test]
+        async fn run_cycle_reports_an_unreadable_dcs_only_after_a_ttl() {
+            let dcs = Arc::new(MockDcs::new());
+            let (mut ha, dir) = build(
+                "unreadable-stuck",
+                Setup::quorum(),
+                &dcs,
+                local(Some(1), 100),
+                Some(Arc::new(PanicPeers)),
+            );
+            dcs.fail_cluster_reads
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = ha.run_cycle().await;
+            assert!(!ha.api_snapshot().leaderless_stuck, "one failed read");
+            let ttl = std::time::Duration::from_secs(ha.dcs.ttl());
+            ha.stuck = stuck::StuckTracker::default();
+            ha.stuck
+                .observe_read_failed(std::time::Instant::now() - ttl);
+            let _ = ha.run_cycle().await;
+            assert!(
+                ha.api_snapshot().leaderless_stuck,
+                "a whole ttl of failures"
+            );
+            dcs.fail_cluster_reads
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let _ = ha.run_cycle().await;
+            assert!(!ha.api_snapshot().leaderless_stuck, "a good read ends it");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// A leaderless candidate refused for lack of votes logs the stall
+        /// ERROR from the election path, once per interval: at once with
+        /// q >= |V|, from the second consecutive refusal with q < |V|.
+        #[tokio::test]
+        async fn a_refused_candidate_logs_the_stall_error_once() {
             let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let _guard = tracing::subscriber::set_default(ErrorCounter(errors.clone()));
             let count = || errors.load(std::sync::atomic::Ordering::SeqCst);
             for (q, voters, expected) in [
                 (2u32, "test_node,node2", 1),
-                (1, "test_node,node2,node3", 0),
+                (1, "test_node,node2,node3", 1),
             ] {
                 let before = count();
                 let dcs = Arc::new(MockDcs::new());

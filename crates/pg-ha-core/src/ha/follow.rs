@@ -11,6 +11,48 @@ use super::identity::{
     rewind_source_not_ready_reason,
 };
 use super::{CycleResult, Ha};
+use crate::peer_http::align_api_scheme;
+use crate::quorum::WalPosition;
+use crate::quorum::round::{PEER_REQUEST_TIMEOUT, PeerProbeError, PeerTarget};
+/// How often the "not restarting PostgreSQL to follow" WARN is repeated.
+const FOLLOW_DEFERRED_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// SB-37: may a standby restart PostgreSQL now to follow `upstream`?
+///
+/// Restarting PostgreSQL drops what the running server knows that its
+/// control file does not (the timeline it streamed last, see
+/// `resolve_replica_wal`), and following a node that is gone gains nothing.
+/// So the restart happens only when the leader lock it follows is confirmed:
+/// - `quorum_confirmed`: the local DCS node sees a leader that holds a quorum
+///   ([`crate::dcs::DcsAdapter::quorum_confirmed`]). Otherwise the lock was
+///   read from local state that may be stale (the lock of a dead node, before
+///   its ttl ran out);
+/// - `answer`: the upstream's `GET /wal` (None: no reader installed, only
+///   the first rule applies). No answer means the upstream is unreachable.
+///   When the upstream is the lock holder (no cascade source), it must also
+///   run as a primary: a lock holder still in recovery is either about to
+///   promote or a node that came back while its old lock is still in the DCS.
+///
+/// `Some(reason)` defers the restart to a later cycle; nothing else changes.
+pub(super) fn follow_restart_refusal(
+    quorum_confirmed: bool,
+    upstream: &str,
+    upstream_is_lock_owner: bool,
+    answer: Option<&Result<WalPosition, PeerProbeError>>,
+) -> Option<String> {
+    if !quorum_confirmed {
+        return Some(
+            "the DCS has no leader with a quorum here, so the leader lock may be stale".into(),
+        );
+    }
+    match answer {
+        None => None,
+        Some(Err(e)) => Some(format!("{upstream} does not answer GET /wal ({e})")),
+        Some(Ok(pos)) if upstream_is_lock_owner && pos.in_recovery => Some(format!(
+            "lock holder {upstream} is not running as a primary"
+        )),
+        Some(Ok(_)) => None,
+    }
+}
 
 /// Error text without the "PostgreSQL error: " wrapper, for the hold message.
 fn error_text(e: &crate::error::Error) -> String {
@@ -204,6 +246,28 @@ impl Ha {
                     .get_member(&expected_upstream)
                     .map(|m| m.conn_url.clone());
                 if let Some(url) = conn_url {
+                    if let Some(why) = self
+                        .follow_restart_deferred(&expected_upstream, lock_owner)
+                        .await
+                    {
+                        let now = std::time::Instant::now();
+                        if super::vote::log_due(
+                            self.follow_deferred_logged_at,
+                            now,
+                            FOLLOW_DEFERRED_LOG_INTERVAL,
+                        ) {
+                            self.follow_deferred_logged_at = Some(now);
+                            warn!(
+                                upstream = %expected_upstream,
+                                "Not restarting PostgreSQL to follow {expected_upstream}: {why}; PostgreSQL keeps running, retrying next cycle"
+                            );
+                        }
+                        let _ = self.touch_member().await;
+                        return CycleResult::Follower(format!(
+                            "not restarting PostgreSQL to follow {expected_upstream}: {why}"
+                        ));
+                    }
+                    self.follow_deferred_logged_at = None;
                     self.reconfigure_replica(&url).await;
                 }
             }
@@ -481,6 +545,37 @@ impl Ha {
         }
     }
 
+    /// [`follow_restart_refusal`] with this cycle's inputs; reads the
+    /// upstream's `GET /wal` only when the DCS check passed.
+    async fn follow_restart_deferred(&self, upstream: &str, lock_owner: &str) -> Option<String> {
+        let quorum_confirmed = self.dcs.quorum_confirmed();
+        let answer = match (&self.upstream_reader, quorum_confirmed) {
+            (Some(reader), true) => {
+                let https = self.config.restapi.tls.is_some();
+                let target = self
+                    .cluster
+                    .get_member(upstream)
+                    .filter(|m| !m.api_url.is_empty())
+                    .map(|m| PeerTarget {
+                        name: m.name.clone(),
+                        api_url: align_api_scheme(&m.api_url, https),
+                    });
+                Some(match target {
+                    Some(t) => tokio::time::timeout(PEER_REQUEST_TIMEOUT, reader.read(&t))
+                        .await
+                        .unwrap_or(Err(PeerProbeError::Timeout)),
+                    None => Err(PeerProbeError::Transport("no API address published".into())),
+                })
+            }
+            _ => None,
+        };
+        follow_restart_refusal(
+            quorum_confirmed,
+            upstream,
+            upstream == lock_owner,
+            answer.as_ref(),
+        )
+    }
     /// Reconfigure a running replica to follow a new upstream.
     /// Updates primary_conninfo in postgresql.auto.conf and restarts PG.
     pub(super) async fn reconfigure_replica(&mut self, new_upstream_connstr: &str) {

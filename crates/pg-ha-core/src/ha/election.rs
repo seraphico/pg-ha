@@ -256,9 +256,23 @@ impl Ha {
         // SB-13: a quorum-sync candidate must win the live vote first. This
         // runs before the lease anchor is read, so a slow vote never shortens
         // the lease. Priority clusters get `NotApplicable` without any I/O.
-        if should_attempt && let VoteGate::Refuse(why) = self.quorum_vote().await {
+        let vote = if should_attempt {
+            Some(self.quorum_vote().await)
+        } else {
+            None
+        };
+        // SB-37: two consecutive refusals that waiting does not fix make the
+        // election stalled. A node that is not a candidate this cycle, or a
+        // vote that is won or not needed, ends the streak.
+        self.stuck.observe_vote(
+            matches!(&vote, Some(VoteGate::Refuse(why)) if super::stuck::refusal_is_stalling(why)),
+        );
+        if let Some(VoteGate::Refuse(why)) = vote {
             self.note_unelectable_quorum(&why);
             self.is_leader = false;
+            // A refused vote must not let the member record expire: peers
+            // count this node as a voter only while the record is fresh.
+            let _ = self.touch_member().await;
             return CycleResult::Follower(why);
         }
 
@@ -283,6 +297,9 @@ impl Ha {
             }
         } else {
             self.is_leader = false;
+            // Same reason as the refused vote above: a standby that only
+            // waits for another node still has to publish its record.
+            let _ = self.touch_member().await;
             match designated_candidate.as_deref() {
                 Some(candidate) if candidate == self.config.name => CycleResult::Follower(
                     "designated candidate is not sync-eligible — not acquiring lock".into(),
