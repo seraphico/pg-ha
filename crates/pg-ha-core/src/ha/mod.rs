@@ -12388,7 +12388,9 @@ mod tests {
         /// SB-37: quorum recovery through the HA loop.
         mod recovery_tests {
             use super::*;
+            use crate::cluster::{Recovery, RecoverySnapshot};
             use crate::commands::CommandStatus;
+            use crate::ha::helpers::OwnEligibility;
             use crate::history::HistoryEventType;
             use crate::quorum::recovery::Outcome;
 
@@ -12684,6 +12686,145 @@ mod tests {
                     assert!(dcs.cluster.lock().unwrap().recovery.is_none());
                     let _ = std::fs::remove_dir_all(&dir);
                 }
+            }
+
+            /// Plan item 14: a grant that expired (the DCS TTL removed it
+            /// from `/recovery`) leaves the strict vote in charge.
+            #[tokio::test]
+            async fn an_expired_grant_falls_back_to_the_strict_vote() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_ha("recovery-expired", &dcs, Some(crate::VERSION));
+                granted(&mut ha, &dcs).await;
+                assert!(ha.live_recovery_grant().is_some());
+                // TTL expiry: the key is gone from the DCS and the next read.
+                dcs.cluster.lock().unwrap().recovery = None;
+                ha.cluster.recovery = None;
+                assert!(ha.live_recovery_grant().is_none());
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+                assert_eq!(lock_held_by(&dcs), None);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// A grant with `timeline_loss` for a candidate that is behind
+            /// the recorded timeline (/timeline = 2, this node on 1).
+            fn behind_ha(label: &str, dcs: &Arc<MockDcs>) -> (Ha, PathBuf) {
+                let (mut ha, dir) = stuck_ha(label, dcs, Some(crate::VERSION));
+                ha.cluster.timeline = rec(2);
+                (ha, dir)
+            }
+            fn loss_grant(ha: &Ha, candidate: &str, timeline_loss: bool) -> Recovery {
+                Recovery {
+                    candidate: candidate.into(),
+                    lost: vec!["node3".into()],
+                    snapshot: RecoverySnapshot::of(
+                        ha.cluster.sync_state.as_ref().unwrap(),
+                        &ha.cluster.timeline,
+                    ),
+                    timeline_loss,
+                    digest: "0".repeat(64),
+                    created_by: "node2".into(),
+                    pg_ha_version: crate::VERSION.into(),
+                    expire_at_ms: None,
+                }
+            }
+
+            /// Without a grant a behind node stands aside.
+            #[tokio::test]
+            async fn behind_without_a_grant_stands_aside() {
+                let dcs = Arc::new(MockDcs::new());
+                let (ha, dir) = behind_ha("recovery-behind-none", &dcs);
+                assert!(matches!(
+                    ha.own_eligibility(),
+                    OwnEligibility::Ineligible(lineage::Ineligible::Behind { .. })
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// (a) A matching grant with timeline_loss lets the named
+            /// candidate pass D6 (override), and only through the grant.
+            #[tokio::test]
+            async fn a_timeline_loss_grant_overrides_behind_for_its_candidate() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = behind_ha("recovery-tl-grant", &dcs);
+                ha.cluster.recovery = Some(loss_grant(&ha, "test_node", true));
+                assert!(matches!(
+                    ha.own_eligibility(),
+                    OwnEligibility::Override(lineage::Ineligible::Behind { .. })
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// (b) timeline_loss=false, a stale snapshot, another candidate,
+            /// another version or a held lock: still refused.
+            #[tokio::test]
+            async fn the_override_needs_a_live_grant_that_accepts_the_loss() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = behind_ha("recovery-tl-refused", &dcs);
+                let ineligible = |ha: &Ha, what: &str| {
+                    assert!(
+                        matches!(
+                            ha.own_eligibility(),
+                            OwnEligibility::Ineligible(lineage::Ineligible::Behind { .. })
+                        ),
+                        "{what}"
+                    );
+                };
+                ha.cluster.recovery = Some(loss_grant(&ha, "test_node", false));
+                ineligible(&ha, "timeline_loss=false");
+                ha.cluster.recovery = Some(loss_grant(&ha, "node2", true));
+                ineligible(&ha, "names another node");
+                let mut g = loss_grant(&ha, "test_node", true);
+                g.pg_ha_version = "0.0.1".into();
+                ha.cluster.recovery = Some(g);
+                ineligible(&ha, "another pg-ha version");
+                let mut g = loss_grant(&ha, "test_node", true);
+                g.snapshot.timeline_version = Some(99);
+                ha.cluster.recovery = Some(g);
+                ineligible(&ha, "stale snapshot");
+                ha.cluster.recovery = Some(loss_grant(&ha, "test_node", true));
+                ha.cluster.leader = Some(Leader {
+                    name: "node2".into(),
+                    version: 1,
+                });
+                ineligible(&ha, "lock held");
+                // The election itself refuses without taking the lock.
+                ha.cluster.leader = None;
+                ha.cluster.recovery = Some(loss_grant(&ha, "test_node", false));
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(
+                    matches!(&result, CycleResult::Follower(m) if m.contains("not taking part in the election")),
+                    "{result}"
+                );
+                assert_eq!(lock_held_by(&dcs), None);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// (c) The override is not applied while another member may
+            /// campaign.
+            #[tokio::test]
+            async fn the_override_is_ignored_while_another_member_may_campaign() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = behind_ha("recovery-tl-other", &dcs);
+                // node2 is on the latest timeline 2 with WAL on it.
+                let n2 = ha
+                    .cluster
+                    .members
+                    .iter_mut()
+                    .find(|m| m.name == "node2")
+                    .unwrap();
+                n2.timeline = Some(2);
+                n2.lineage = Some(test_lineage(2));
+                ha.cluster.recovery = Some(loss_grant(&ha, "test_node", true));
+                assert!(
+                    matches!(
+                        ha.own_eligibility(),
+                        OwnEligibility::OverrideIgnored { ref eligible, .. } if eligible == "node2"
+                    ),
+                    "{:?}",
+                    ha.own_eligibility()
+                );
+                let _ = std::fs::remove_dir_all(&dir);
             }
 
             /// A grant written by another pg-ha version is not used.
