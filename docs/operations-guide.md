@@ -594,8 +594,10 @@ switchover 和带 `candidate` 的 failover 会用同样的输入在动作之前�
 `GET /wal` 返回本节点的实时 WAL 位置，请求时从 PostgreSQL 现读（不是成员记录里发布的那份）：
 
 ```json
-{"name": "node2", "scope": "prod-cluster", "timeline": 3, "wal_position": 83886080, "pg_in_recovery": true}
+{"name": "node2", "scope": "prod-cluster", "timeline": 3, "wal_position": 83886080, "pg_in_recovery": true, "pg_ha_version": "0.1.25",
+ "timeline_history": [{"timeline": 1, "switchpoint": 67108960}, {"timeline": 2, "switchpoint": 75497568}]}
 ```
+- `timeline_history` 是本节点自己的 `pg_wal/<timeline>.history`（对应它报告的 timeline）：每个祖先 timeline 及其结束的 LSN。timeline 1、文件不存在或读不了时没有这个字段。`pg-ha-ctl recover` 使用候选节点的这一项，所以无论由哪个节点给出解释，对旧 timeline 投票节点的计票都和候选自己投票时的前缀规则一致。
 
 - 它的用途是让候选节点在投票时比较实时位置。成员记录里发布的 `wal_position` 每个 `loop_wait` 才刷新一次，可能过时：对优先级选举可以接受，对 quorum 不行。
 - **不需要认证**，和健康检查一样，这样节点之间不必共享 Basic Auth 凭据。它暴露节点名、集群 scope、timeline、WAL 位置和是否在恢复中。像其它开放端点一样，请用防火墙或网络策略把 REST 端口限制在集群节点和监控系统之内。
@@ -729,7 +731,7 @@ node1 is the primary (5 s after the grant)
 2. `recover --lost node5 --digest <digest>` 在你调用的节点上重新评估，只有点名的集合等于当前无法计票的投票节点、digest 等于当前算出的值时才执行（LSN 不在 digest 里，投票时会重新读）。随后写一次性的 DCS 键 `/recovery`（只能创建、TTL 等于 leader 锁 TTL，默认 15 秒），并最多等 60 秒直到 `GET /cluster` 显示候选成为主库（`--no-wait` 不等）。已有授权时再次执行会被拒绝（退出码 4，「already authorized」）；`recover --cancel` 删除未使用的授权。`GET /cluster` 在授权有效期内显示 `recovery`（`candidate`、`lost`、`timeline_loss`、`expires_in_s`），`/history` 以 `quorum_recovery` 记录这次晋升，原因形如 `quorum recovery: accepted loss of node5; timeline loss: no`。
 3. 只有被点名的候选使用授权，且仅在 leader 锁空闲、`/sync` 和 `/timeline` 与解释时一致时使用。它重新跑一轮 `POST /vote`：点名集合之外的每个投票节点都要应答，在同一 timeline 上且没有更靠前，任何地方都没有可写主库；被点名但仍然应答的节点也会被检查，若它更靠前就拒绝投票。新主在 `pg_ctl promote` 之前把 `synchronous_standby_names` 设为 `ANY 1 (在场的投票节点)`。任何一次拿到 leader 锁都会删除授权。候选若挂掉，授权在 TTL 后过期，再次解释会得到新的 digest。
 **丢失的含义。** 只有被点名的投票节点持有、且在 quorum 下已确认的提交会被放弃。丢失的投票节点数不超过 `|V| - q - 1` 时不会丢提交；解释里的 `risk.possible` 告诉你属于哪种情况。丢失的节点如果回来，会被 `pg_rewind` 回到新主的历史，只有它持有的行会消失（容器测试用真实 PostgreSQL 验证）。已死主库当时生效的 `n` 不存在 DCS 里；它的 `postgresql.auto.conf` 可能显示这个值，只能当作提示，因为在写文件和 reload 之间崩溃会让它差一步。
-**所有投票节点在线且 `q >= |V|`。** 正常投票需要 `q` 个其它投票节点，`q >= |V|` 时不管多少节点应答都通不过；本来由已死的主库放宽 `q`。它回不来时，`recover` 只在这一种状态下提供出路：所有投票节点应答、没有可写主库、投票永远通不过。它点名一个在线投票节点（位置最低的那个）作为放弃对象（`risk.named_online`，解释里写 `online voter given up: node4`）。可能丢的东西：任何投票节点持有的、已确认的提交都不会丢。候选是最靠前的投票节点，在它的 timeline 上应答的其它投票节点持有的都是它 WAL 的前缀；投票会重新读位置，被点名的节点（或任何投票节点）更靠前时以 `BehindPeer` / `HigherTimeline` 拒绝，所以只有被点名节点持有的提交不会被悄悄丢掉。没有任何投票节点持有过的提交（`/sync` 异步期间确认的）本来就不受 quorum 保护，与任何一次故障切换相同。其它场景的规则不变：被点名但本可以被正常计票的在线节点仍被拒绝（`the voters that cannot be counted now are [..], not [..]`），更靠前且不能参选的节点仍会阻止恢复。被点名节点之后的处理：和所有投票节点一样被投票隔离；新主在 `pg_ctl promote` 之前安装的 `ANY 1 (...)` 不包含它（所以它既不能确认也不能卡住最初的写入）；它赢不了选举（它自己的投票仍需要 `q` 个其它投票节点）；它像普通备库一样跟随新主，WAL 分叉时会被 rewind，开始流复制后由 executor 把它加回投票集合。`/history` 记录 `quorum recovery: accepted online voter node4 (...)`，`GET /cluster` 的 `recovery.named_online` 为 `true`。由单元测试、HA 循环测试和模型测试（`stuck_q_*`）验证；这个状态本身没有在容器里按需复现（只在一次主机休眠后见过一次）。
+**所有投票节点在线且 `q >= |V|`。** 正常投票需要 `q` 个其它投票节点，`q >= |V|` 时不管多少节点应答都通不过；本来由已死的主库放宽 `q`。它回不来时，`recover` 只在这一种状态下提供出路：所有投票节点应答、没有可写主库、投票永远通不过。它点名一个在线投票节点（位置最低的那个）作为放弃对象（`risk.named_online`，解释里写 `online voter given up: node4`）。可能丢的东西：任何投票节点持有的、已确认的提交都不会丢。候选是最靠前的投票节点，在它的 timeline 上应答的其它投票节点持有的都是它 WAL 的前缀；投票会重新读位置，被点名的节点（或任何投票节点）更靠前时以 `BehindPeer` / `HigherTimeline` 拒绝，所以只有被点名节点持有的提交不会被悄悄丢掉。没有任何投票节点持有过的提交（`/sync` 异步期间确认的）本来就不受 quorum 保护，与任何一次故障切换相同。其它场景的规则不变：被点名但本可以被正常计票的在线节点仍被拒绝（`the voters that cannot be counted now are [..], not [..]`），更靠前且不能参选的节点仍会阻止恢复。被点名节点之后的处理：和所有投票节点一样被投票隔离；新主在 `pg_ctl promote` 之前安装的 `ANY 1 (...)` 不包含它（所以它既不能确认也不能卡住最初的写入）；它赢不了选举（它自己的投票仍需要 `q` 个其它投票节点）；它像普通备库一样跟随新主，WAL 分叉时会被 rewind，开始流复制后由 executor 把它加回投票集合。`/history` 记录 `quorum recovery: accepted online voter node4 (...)`，`GET /cluster` 的 `recovery.named_online` 为 `true`。持有候选 WAL 前缀的旧 timeline 投票节点（位置在候选 history 文件里的切换点或之前）和投票时一样计票。由单元测试、HA 循环测试、模型测试（`stuck_q_*`）以及 PG 18.7 的 5 节点容器验证（`evidence/pr-b2-accepted-loss-online.md`）：先 switchover，再在 `/sync` 为 4 个投票节点 `q=4` 时杀掉新主；由 timeline 1 节点给出的解释点名一个在线投票节点，执行后候选升主，61 个已确认 id 缺失 0 个，之后所有节点都以主库的数据流复制。
 **要求与限制。** （1）所有节点必须运行相同版本的 pg-ha：应答的成员报告了另一个版本或没有报告版本时，执行会被拒绝（`GET /wal` 带 `pg_ha_version`），候选也会忽略其它版本写入的授权。从 0.1.25 升级的集群必须先升级完。（2）`GET/POST/DELETE /recovery` 与其它管理端点使用同一套 Basic Auth / mTLS。mTLS 这一项没有在容器里用 `REST_TLS=mtls` 实测过（容器测试在 `REST_TLS=off` 下跑，跳过客户端证书检查）；覆盖它的只有 401 / 鉴权单元测试，以及与 `/switchover` 共用同一个路由中间件这一事实。（3）DCS 必须可读：3 个节点时，丢了主库再丢一个投票节点也就丢了 Raft 多数派，没有幸存节点能写授权；丢失投票节点的容器测试用 5 个节点（3 个节点时只丢主库会自己恢复）。（4）所有投票节点都在线、投票仍然失败时（例如 3 个投票节点全部在线、`q=3`、没有 leader，记录见 `evidence/pr-b-pg18-stuck-q3-v3.md`），只有已死的主库能放宽 `q`，所以 `recover` 会提议放弃一个在线的投票节点（位置最低的那个，位置相同时取名字较大的），并打印 `online voter given up: node4`。见下面「所有投票节点在线且 `q >= |V|`」。（5）在 PG 18.7 和 PG 16、5 个节点上的实测：执行后约 5 秒候选在 `/primary` 上应答 200，新主上第一次被确认的写入在开始执行命令后约 14 秒；多出来的几秒原因没有调查。
 #### 要求：所有节点使用相同版本的 pg-ha
 
@@ -1026,6 +1028,14 @@ curl -s http://<recovered-node>:8008/patroni | jq .
 Starting PostgreSQL as a standby (not holding the leader lock)
 Created rewind-check marker: pg_controldata reports 'in production' (last ran as a primary)
 Rewind-check marker present and <leader> holds the leader lock — checking with pg_rewind before following
+pg_rewind succeeded; removed the rewind-check marker
+```
+
+**WAL 已从新 timeline 分叉出去的备库**（SB-31，以及被 `pg-ha-ctl recover` 点名为丢失、之后回来的投票节点）。备库可能持有新主没有的 WAL：它在自己的 timeline 上重放过了新 timeline 分出去的那个点。这时 PostgreSQL 无法跟随（`new timeline N forked off current database system timeline M before current recovery point`）。pg-ha 在两个地方按同一条规则给它建 rewind 检查标记：它自己的 `pg_wal` 里有一个更新 timeline 的 history 文件，文件里列出它的重放 timeline 和切换点 S，并且它已重放的位置超过 S。运行中的备库用实时的 `pg_last_wal_replay_lsn()`；启动前用 pg_control 的最小恢复点（history 文件通常在启动之后才从新主拿到，所以实际触发的是运行中的检查）。位置在 S 或之前的备库持有新 timeline 的前缀，不处理。之后走上面的路径：只有 leader 以主库运行且锁已确认时才运行 pg_rewind。日志（PG 18.7，回来的丢失投票节点）：
+
+```text
+Created rewind-check marker: standby forked off the newest timeline: replayed timeline 1 up to 0/7038750 but timeline 2 left timeline 1 at 0/7037260; pg_rewind runs once the leader is a confirmed primary
+Rewind-check marker present and node1 holds the leader lock — checking with pg_rewind before following
 pg_rewind succeeded; removed the rewind-check marker
 ```
 

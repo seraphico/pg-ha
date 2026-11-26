@@ -238,6 +238,22 @@ fail_over_to_b() {
         sleep 2
     done
     assert_eq "200" "$(http_get_status "$(name_to_url "$B")/primary")" "$B became primary after $P was killed" || return 1
+    # The precondition is read right after the promote: since SB-31 is fixed
+    # a running ahead replica is rewound within a few HA cycles.
+    local na0 nb0
+    for i in $(seq 1 15); do
+        na0=$(dpsql "$A" 'select count(*) from sb28'); nb0=$(dpsql "$B" 'select count(*) from sb28')
+        [ -n "$na0" ] && [ -n "$nb0" ] && break
+        sleep 1
+    done
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [ -n "$na0" ] && [ -n "$nb0" ] && [ "$na0" -gt "$nb0" ]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1)); log_pass "precondition: $A is ahead of the new primary $B right after the promote ($na0 > $nb0)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1)); log_fail "INVALID: $A is not ahead of $B right after the promote ($na0 vs $nb0)"
+        return 1
+    fi
+    A_STARTED=$(docker inspect -f '{{.State.StartedAt}}' "pg-ha-$A")
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$(http_get_status "$(name_to_url "$A")/primary")" != "200" ]; then
         TESTS_PASSED=$((TESTS_PASSED + 1)); log_pass "nofailover node $A did not become primary"
@@ -256,15 +272,27 @@ fail_over_to_b() {
         [ -n "$na" ] && [ -n "$nb" ] && break
         sleep 2
     done
-    log_info "rows after failover: $A=$na (ahead) $B=$nb (new primary)"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [ -n "$na" ] && [ -n "$nb" ] && [ "$na" -gt "$nb" ]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1)); log_pass "$A is ahead of the new primary $B ($na > $nb)"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1)); log_fail "$A is not ahead of $B ($na vs $nb); the scenario precondition is missing"
-        return 1
+    log_info "rows 30 s after the failover: $A=$na $B=$nb (new primary)"
+    if [ -n "$na" ] && [ "$na" = "$nb" ]; then
+        A_REWOUND_RUNNING=true
+        log_info "$A was already rewound while running (SB-31 path): the SB-28 restart path below is not reached"
     fi
     return 0
+}
+A_STARTED=""
+A_REWOUND_RUNNING=false
+
+# SB-31: the ahead replica keeps running (no restart). It must be rewound by
+# pg-ha (rewind-check marker from the forked-off check, then pg_rewind),
+# stream on the new timeline and hold exactly the new primary's rows.
+test_running_ahead_replica() {
+    check_a_rejoined "running, no restart (SB-31)"
+    local logs
+    logs=$(docker logs "pg-ha-$A" 2>&1)
+    assert_contains "$logs" "Created rewind-check marker: standby forked off the newest timeline" "[SB-31] $A logged the forked-off check with T, S and the replay LSN"
+    assert_contains "$logs" "pg_rewind completed successfully" "[SB-31] $A was rewound by pg_rewind"
+    echo "$logs" | grep -E "forked off the newest timeline|pg_rewind|rejoined" | cut -c1-300 | tail -n 6 | sed 's/^/[INFO] /'
+    assert_eq "$A_STARTED" "$(docker inspect -f '{{.State.StartedAt}}' "pg-ha-$A")" "[SB-31] the $A container was not restarted"
 }
 
 # After a restart of A: running replica, no hold file, streaming on B's timeline, equal row count.
@@ -311,15 +339,18 @@ check_a_rejoined() { # <label>
     done
     assert_eq "$nb" "$na" "[$label] row count of $A equals the new primary's"
     TESTS_RUN=$((TESTS_RUN + 1))
-    if [ -n "$nb" ] && [ "$nb" -lt "$((ROWS_BASE + ROWS_AHEAD))" ]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1)); log_pass "[$label] the unreplicated rows were discarded ($nb < $((ROWS_BASE + ROWS_AHEAD)))"
+    # The rows of $A itself (the check used to read the primary's count, which
+    # is below the total whether or not $A was rewound).
+    if [ -n "$na" ] && [ "$na" -lt "$((ROWS_BASE + ROWS_AHEAD))" ]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1)); log_pass "[$label] the unreplicated rows were discarded on $A ($na < $((ROWS_BASE + ROWS_AHEAD)))"
     else
-        TESTS_FAILED=$((TESTS_FAILED + 1)); log_fail "[$label] the ahead rows are still there ($nb)"
+        TESTS_FAILED=$((TESTS_FAILED + 1)); log_fail "[$label] the ahead rows are still on $A ($na)"
     fi
 }
 
 test_unclean_kill() {
     local state
+    [ "$A_REWOUND_RUNNING" = true ] && log_info "[SIGKILL] $A was rewound while running before the kill; this kill checks only that it rejoins again"
     state=$(controldata_state "$A")
     log_info "pg_control state of $A before the kill: '$state'"
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -347,7 +378,14 @@ test_clean_stop_control() {
     check_a_rejoined "clean stop"
 }
 
-if setup_scenario && make_a_ahead && fail_over_to_b; then
+if [ "${RU_SB31:-0}" = 1 ]; then
+    # SB-31 reproduction: the same scenario without the restart step.
+    if setup_scenario && make_a_ahead && fail_over_to_b; then
+        test_running_ahead_replica
+    else
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); log_fail "INVALID: setup failed, the SB-31 checks were not run"
+    fi
+elif setup_scenario && make_a_ahead && fail_over_to_b; then
     test_unclean_kill
     test_clean_stop_control
     log_info "images at the end: $(docker inspect --format '{{.Name}} {{.Image}}' pg-ha-node1 pg-ha-node2 pg-ha-node3 | tr '\n' ' ')"

@@ -71,12 +71,28 @@ qrc_running_nodes() {
     local n
     for n in "${NODES[@]}"; do qrc_running "$n" && echo "$n"; done
 }
+# Create a node's container again (after it was destroyed) in the SAME compose
+# project and with the SAME image ID as the running nodes. Without both, compose
+# creates it in the directory's default project (another network) from whatever
+# image the tag points at, and the node cannot reach the cluster.
+qrc_compose_up() { # <node>
+    local n="$1" ref proj img ovr rc
+    for ref in "${NODES[@]}"; do [ "$ref" != "$n" ] && qrc_running "$ref" && break; done
+    proj=${E2E_COMPOSE_PROJECT:-$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$(qrc_c "$ref")")}
+    img=$(docker inspect -f '{{.Image}}' "$(qrc_c "$ref")")
+    ovr="$TMPD/compose-$n.yml"
+    printf 'services:\n  %s: {image: "%s", pull_policy: never}\n' "$n" "$img" > "$ovr"
+    (cd "$E2E_REPO_ROOT" && docker compose -p "$proj" -f "$COMPOSE_FILE" -f "$ovr" up -d --no-build --no-deps "$n" > /dev/null 2>&1)
+    rc=$?
+    qrc_check "$([ "$rc" = 0 ] && [ "$(docker inspect -f '{{.Image}}' "$(qrc_c "$n")" 2>/dev/null)" = "$img" ] && \
+        [ "$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$(qrc_c "$n")" 2>/dev/null)" = "$proj" ] && echo true || echo false)" \
+        "precondition: $n was created again in project $proj with the cluster's image ${img:7:12}"
+}
 qrc_start_all() {
     local n
     for n in "${NODES[@]}"; do
         qrc_running "$n" && continue
-        docker start "$(qrc_c "$n")" > /dev/null 2>&1 \
-            || (cd "$E2E_REPO_ROOT" && docker compose -f "$COMPOSE_FILE" up -d --no-build "$n" > /dev/null 2>&1)
+        docker start "$(qrc_c "$n")" > /dev/null 2>&1 || qrc_compose_up "$n"
     done
 }
 qrc_patch_config() { # <node> <json>: HTTP code
@@ -172,9 +188,13 @@ qrc_no_grant_anywhere() {
 # The writer runs inside the primary's container; every id psql acknowledged is
 # appended to /tmp/acked (the file survives `docker kill`).
 qrc_start_writer() { # <node>
-    docker exec "$(qrc_c "$1")" sh -c 'rm -f /tmp/acked; : > /tmp/acked'
+    docker exec "$(qrc_c "$1")" sh -c 'rm -f /tmp/acked /tmp/acked.rejected; : > /tmp/acked'
     qrc_psql "$1" 'drop table if exists ql_ack; create table ql_ack(id serial primary key, t timestamptz default now())' > /dev/null
-    docker exec -d "$(qrc_c "$1")" sh -c 'while true; do id=$(psql -U postgres -d postgres -qAtc "insert into ql_ack default values returning id" 2>/dev/null | head -n1); [ -n "$id" ] && echo "$id" >> /tmp/acked; sleep 0.05; done'
+    # An id counts as acknowledged only when psql exited 0 with nothing on
+    # stderr: a commit whose synchronous wait was cancelled still returns its
+    # id, with a WARNING, and is NOT acknowledged. Anything else goes to
+    # /tmp/acked.rejected.
+    docker exec -d "$(qrc_c "$1")" sh -c 'while true; do id=$(psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres -qAtc "insert into ql_ack default values returning id" 2>/tmp/acked.err); rc=$?; if [ "$rc" = 0 ] && [ ! -s /tmp/acked.err ] && [ -n "$id" ]; then echo "$id" >> /tmp/acked; else echo "id=${id:-none} rc=$rc $(head -c 200 /tmp/acked.err | tr "\n" " ")" >> /tmp/acked.rejected; fi; sleep 0.05; done'
 }
 qrc_ids() { # <node> <outfile>: the ids a node holds, sorted
     qrc_psql "$1" "select id from ql_ack" 2> /dev/null | sort > "$2"
@@ -244,7 +264,8 @@ qrc_assert_acked() {
     missing=$(wc -l < "$TMPD/missing.ids" | tr -d ' ')
     unexplained=$(comm -23 "$TMPD/missing.ids" "$onlylost" | wc -l | tr -d ' ')
     undeclared=$(comm -12 "$acked" "$surv" | comm -23 - "$rows" | wc -l | tr -d ' ')
-    log_info "$label: $nacked acked, $missing missing on the new primary, $(wc -l < "$onlylost" | tr -d ' ') ids were held only by the lost voter"
+    log_info "$label: $nacked acked, $missing missing on the new primary, $(wc -l < "$onlylost" | tr -d ' ') ids were held only by the lost voter, $(comm -13 "$acked" "$rows" | wc -l | tr -d ' ') rows on the new primary were not acknowledged (in flight at the kill, or written after the promote)"
+    [ "$(wc -l < "$onlylost" | tr -d ' ')" = 0 ] && log_info "$label: no id was held only by the lost voter, so 'only those ids are missing' is not exercised here (the PR B2 drivers construct that case)"
     qrc_check "$([ "$nacked" -gt 0 ] && echo true || echo false)" "$label: the writer acknowledged $nacked rows before the kill"
     assert_eq "0" "$unexplained" "$label: every acked id is present except those only the lost voter held"
     assert_eq "0" "$undeclared" "$label: every acked id that any surviving node held is present"
@@ -503,7 +524,11 @@ test_destroyed_voter_recovery() {
     qrc_ids "$L" "$TMPD/rows-L.ids"
     log_info "returned $L holds $(wc -l < "$TMPD/rows-L.ids" | tr -d ' ') ids, the primary $final $(wc -l < "$TMPD/rows-final.ids" | tr -d ' ')"
     assert_eq "0" "$(diff "$TMPD/rows-L.ids" "$TMPD/rows-final.ids" | wc -l | tr -d ' ')" "the returned $L holds exactly the primary's rows"
-    assert_eq "0" "$(comm -12 "$TMPD/onlylost.ids" "$TMPD/rows-L.ids" | comm -23 - "$TMPD/rows-final.ids" | wc -l | tr -d ' ')" "the declared rows only $L held are gone on $L"
+    if [ -s "$TMPD/onlylost.ids" ]; then
+        assert_eq "0" "$(comm -12 "$TMPD/onlylost.ids" "$TMPD/rows-L.ids" | wc -l | tr -d ' ')" "the declared rows only $L held are gone on $L"
+    else
+        log_info "no id was held only by $L: 'its rows are gone' is not exercised (counted neither as pass nor fail)"
+    fi
     assert_eq "streaming" "$(qrc_psql "$final" "select state from pg_stat_replication where application_name = '$L'")" "$L streams from the primary again"
 }
 
@@ -621,7 +646,7 @@ test_candidate_killed_after_apply() {
     qrc_ids "$newp" "$TMPD/b-rows.ids"
     qrc_assert_acked "T4b" "$TMPD/b-acked.ids" "$TMPD/b-rows.ids" "$TMPD/b-onlylost.ids" "$TMPD/b-surv.ids"
     # The destroyed voter comes back as a new node.
-    (cd "$E2E_REPO_ROOT" && docker compose -f "$COMPOSE_FILE" up -d --no-build "$L" > /dev/null 2>&1)
+    qrc_compose_up "$L"
     docker start "$(qrc_c "$p")" > /dev/null 2>&1
     local final
     final=$(qrc_ready 480)
