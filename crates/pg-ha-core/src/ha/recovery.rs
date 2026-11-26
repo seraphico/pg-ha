@@ -34,20 +34,29 @@ use crate::quorum::round::{
 };
 use crate::quorum::{AncestorEnd, WalPosition};
 
-/// Records the version each peer reports while the round reads it.
+/// Records what each peer reports (version, own timeline history) while the
+/// round reads it.
 struct VersionRecorder {
     inner: Arc<dyn PeerWalProbe>,
     versions: Mutex<BTreeMap<String, Option<String>>>,
+    histories: Mutex<BTreeMap<String, Vec<AncestorEnd>>>,
 }
 
 #[async_trait]
 impl PeerWalProbe for VersionRecorder {
     async fn read(&self, target: &PeerTarget) -> Result<WalPosition, PeerProbeError> {
-        let (p, v) = self.inner.read_with_version(target).await?;
+        let (p, meta) = self.inner.read_with_meta(target).await?;
+        let name = target.name.to_ascii_lowercase();
+        if let Some(h) = meta.timeline_history {
+            self.histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name.clone(), h);
+        }
         self.versions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(target.name.to_ascii_lowercase(), v);
+            .insert(name, meta.version);
         Ok(p)
     }
 }
@@ -180,6 +189,7 @@ impl Ha {
             Arc::new(VersionRecorder {
                 inner,
                 versions: Mutex::new(BTreeMap::new()),
+                histories: Mutex::new(BTreeMap::new()),
             })
         });
         let round = async {
@@ -234,26 +244,35 @@ impl Ha {
             .iter()
             .map(|v| (v.clone(), self.recovery_campaign(v)))
             .collect();
-        let mut ancestors: BTreeMap<u64, Vec<AncestorEnd>> = BTreeMap::new();
-        for p in &readings {
-            if ancestors.contains_key(&p.timeline) {
-                continue;
-            }
-            if let Ok(Some(lines)) = crate::timeline_files::timeline_ancestors(
+        // Each node's OWN history file for the timeline it reports: this
+        // node's from its pg_wal, a peer's from its GET /wal answer. The
+        // candidate's entry is what its own vote uses (prefix rule).
+        let mut ancestors: BTreeMap<String, Vec<AncestorEnd>> = recorder
+            .as_ref()
+            .map(|r| {
+                r.histories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            })
+            .unwrap_or_default();
+        ancestors.remove(&me);
+        if let Some(own) = readings.iter().find(|p| p.name.eq_ignore_ascii_case(&me))
+            && let Ok(Some(lines)) = crate::timeline_files::timeline_ancestors(
                 &self.config.postgresql.data_dir,
-                p.timeline,
-            ) {
-                ancestors.insert(
-                    p.timeline,
-                    lines
-                        .into_iter()
-                        .map(|l| AncestorEnd {
-                            timeline: l.parent,
-                            switchpoint: l.switchpoint,
-                        })
-                        .collect(),
-                );
-            }
+                own.timeline,
+            )
+        {
+            ancestors.insert(
+                me.clone(),
+                lines
+                    .into_iter()
+                    .map(|l| AncestorEnd {
+                        timeline: l.parent,
+                        switchpoint: l.switchpoint,
+                    })
+                    .collect(),
+            );
         }
         let blocked = if self.is_paused {
             Some("pause mode is on: no election runs; resume the cluster first".to_string())

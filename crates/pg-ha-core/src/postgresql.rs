@@ -222,6 +222,25 @@ impl crate::live_wal::LiveWalProbe for PgLiveWalProbe {
             .wal_status_bounded(crate::live_wal::LIVE_WAL_READ_TIMEOUT)
             .await
     }
+
+    async fn timeline_history(&self, timeline: u64) -> Option<Vec<(u64, u64)>> {
+        if timeline <= 1 {
+            return None;
+        }
+        let dir = self.pg.config.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::timeline_files::timeline_ancestors(&dir, timeline)
+        })
+        .await
+        .ok()?
+        .ok()?
+        .map(|lines| {
+            lines
+                .into_iter()
+                .map(|l| (l.parent, l.switchpoint))
+                .collect()
+        })
+    }
 }
 #[async_trait::async_trait]
 impl crate::live_wal::VoteFencer for PgLiveWalProbe {

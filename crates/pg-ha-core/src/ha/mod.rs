@@ -12538,13 +12538,21 @@ mod tests {
                 ) -> std::result::Result<WalPosition, PeerProbeError> {
                     self.0.read(target).await
                 }
-                async fn read_with_version(
+                async fn read_with_meta(
                     &self,
                     target: &PeerTarget,
-                ) -> std::result::Result<(WalPosition, Option<String>), PeerProbeError>
-                {
+                ) -> std::result::Result<
+                    (WalPosition, crate::quorum::round::PeerMeta),
+                    PeerProbeError,
+                > {
                     let p = self.0.read(target).await?;
-                    Ok((p, self.1.map(str::to_string)))
+                    Ok((
+                        p,
+                        crate::quorum::round::PeerMeta {
+                            version: self.1.map(str::to_string),
+                            timeline_history: None,
+                        },
+                    ))
                 }
             }
 
@@ -12631,6 +12639,96 @@ mod tests {
                 let r = ha.handle_recovery_explain(Some("raft timeout")).await;
                 assert_eq!(r.status, CommandStatus::Error);
                 let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// `FakePeers` whose `node2` reports its own timeline history.
+            struct WithHistory(FakePeers, Option<Vec<crate::quorum::AncestorEnd>>);
+            #[async_trait::async_trait]
+            impl PeerWalProbe for WithHistory {
+                async fn read(
+                    &self,
+                    target: &PeerTarget,
+                ) -> std::result::Result<WalPosition, PeerProbeError> {
+                    self.0.read(target).await
+                }
+                async fn read_with_meta(
+                    &self,
+                    target: &PeerTarget,
+                ) -> std::result::Result<
+                    (WalPosition, crate::quorum::round::PeerMeta),
+                    PeerProbeError,
+                > {
+                    let p = self.0.read(target).await?;
+                    let history = if target.name == "node2" {
+                        self.1.clone()
+                    } else {
+                        None
+                    };
+                    Ok((
+                        p,
+                        crate::quorum::round::PeerMeta {
+                            version: Some(crate::VERSION.to_string()),
+                            timeline_history: history,
+                        },
+                    ))
+                }
+            }
+
+            /// SB-37 PR B2: the explain served by a node WITHOUT the
+            /// candidate's history file (this node is on timeline 1) uses the
+            /// history the candidate reports in `GET /wal`, so it counts the
+            /// prefix voters exactly as the candidate's own vote does.
+            #[tokio::test]
+            async fn explain_uses_the_candidates_reported_history() {
+                let mut outcomes = Vec::new();
+                for history in [
+                    Some(vec![crate::quorum::AncestorEnd {
+                        timeline: 1,
+                        switchpoint: 100,
+                    }]),
+                    None,
+                ] {
+                    let dcs = Arc::new(MockDcs::new());
+                    let (mut ha, dir) = build(
+                        "recovery-peer-history",
+                        Setup {
+                            quorum: 3,
+                            ..Setup::quorum()
+                        },
+                        &dcs,
+                        local(Some(1), 100),
+                        Some(Arc::new(PanicPeers)),
+                    );
+                    ha.set_upstream_reader(Arc::new(WithHistory(
+                        FakePeers::new().ok("node2", 2, 150).ok("node3", 1, 100),
+                        history,
+                    )));
+                    let r = ha.handle_recovery_explain(None).await;
+                    outcomes.push((assessment(&r), r.message.clone()));
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                let (with, msg) = &outcomes[0];
+                match &with.outcome {
+                    Outcome::NeedsAcceptance {
+                        candidate,
+                        lost,
+                        risk,
+                        ..
+                    } => {
+                        assert_eq!(candidate, "node2", "{msg}");
+                        assert_eq!(lost.len(), 1, "{msg}");
+                        assert!(risk.named_online, "{msg}");
+                    }
+                    other => panic!("{other:?} {msg}"),
+                }
+                let (without, msg) = &outcomes[1];
+                match &without.outcome {
+                    Outcome::NeedsAcceptance { lost, risk, .. } => {
+                        assert_eq!(lost, &["node3", "test_node"], "{msg}");
+                        assert!(!risk.named_online, "{msg}");
+                    }
+                    other => panic!("{other:?} {msg}"),
+                }
             }
 
             #[tokio::test]

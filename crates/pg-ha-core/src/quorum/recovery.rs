@@ -64,10 +64,12 @@ pub struct Inputs<'a> {
     pub unreachable: &'a BTreeMap<String, String>,
     /// Per voter in `/sync` (lower-cased names).
     pub voters: &'a BTreeMap<String, VoterInfo>,
-    /// Timeline history files as the serving node knows them, by timeline
-    /// (D6: one file per timeline number), for the prefix rule of the
-    /// normal vote. A missing entry: the plain rule.
-    pub ancestors: &'a BTreeMap<u64, Vec<AncestorEnd>>,
+    /// Each answering node's own history file for the timeline it reports
+    /// (lower-cased names): the serving node's from its pg_wal, a peer's from
+    /// its `GET /wal` answer. The candidate's entry is exactly what its own
+    /// vote uses for the prefix rule, so the explain does not depend on
+    /// which node serves it. A missing entry: the plain rule (fail closed).
+    pub ancestors: &'a BTreeMap<String, Vec<AncestorEnd>>,
     /// A condition of the serving node that stops every recovery (pause,
     /// unresolved `/config`, shutdown).
     pub blocked: Option<String>,
@@ -399,7 +401,7 @@ pub(crate) fn assess_with(input: &Inputs<'_>, prefix: PrefixTest) -> Assessment 
     } else {
         input
             .ancestors
-            .get(&candidate.timeline)
+            .get(&candidate.name.to_ascii_lowercase())
             .map_or(&[][..], Vec::as_slice)
     };
     let report = reports(Some(&candidate), ancestors);
@@ -604,7 +606,7 @@ mod tests {
         timeline: ClusterTimeline,
         readings: Vec<WalPosition>,
         voters: BTreeMap<String, VoterInfo>,
-        ancestors: BTreeMap<u64, Vec<AncestorEnd>>,
+        ancestors: BTreeMap<String, Vec<AncestorEnd>>,
         blocked: Option<String>,
     }
     impl Case {
@@ -723,8 +725,17 @@ mod tests {
         let mut c = Case::five();
         c.readings.push(pos("node4", 1, 90));
         assert!(matches!(c.run().outcome, Outcome::NeedsAcceptance { .. }));
+        // Another node's history does not stand in for the candidate's.
         c.ancestors.insert(
-            2,
+            "node3".into(),
+            vec![AncestorEnd {
+                timeline: 1,
+                switchpoint: 100,
+            }],
+        );
+        assert!(matches!(c.run().outcome, Outcome::NeedsAcceptance { .. }));
+        c.ancestors.insert(
+            "node2".into(),
             vec![AncestorEnd {
                 timeline: 1,
                 switchpoint: 100,
@@ -1067,7 +1078,7 @@ mod tests {
             ],
             voters: eligible(&["node2", "node3", "node4", "node5"]),
             ancestors: BTreeMap::from([(
-                2,
+                "node2".to_string(),
                 vec![AncestorEnd {
                     timeline: 1,
                     switchpoint: s,
@@ -1169,7 +1180,7 @@ mod tests {
                     blocked: None,
                 };
                 if history {
-                    c.ancestors.insert(2, anc.clone());
+                    c.ancestors.insert("node2".into(), anc.clone());
                 }
                 let used: &[AncestorEnd] = if history { &anc } else { &[] };
                 let voters: Names = ["node2", "node3", "node4"]

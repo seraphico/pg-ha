@@ -326,17 +326,28 @@ pub(crate) async fn wal_endpoint(State(state): State<RouterState>) -> impl IntoR
         let s = state.app.read().await;
         (s.name.clone(), s.scope.clone())
     };
-    (
-        StatusCode::OK,
-        Json(json!({
-            "name": name,
-            "scope": scope,
-            "timeline": wal.timeline,
-            "wal_position": wal.wal_position,
-            "pg_in_recovery": wal.in_recovery,
-            "pg_ha_version": pg_ha_core::VERSION,
-        })),
-    )
+    let mut body = json!({
+        "name": name,
+        "scope": scope,
+        "timeline": wal.timeline,
+        "wal_position": wal.wal_position,
+        "pg_in_recovery": wal.in_recovery,
+        "pg_ha_version": pg_ha_core::VERSION,
+    });
+    // SB-37: this node's own history file for its timeline, so that a
+    // `recover` explain served by another node counts voters with the same
+    // prefix rule as this node's own vote.
+    if let Some(timeline) = wal.timeline
+        && let Some(lines) = probe.timeline_history(timeline).await
+    {
+        body["timeline_history"] = lines
+            .into_iter()
+            .map(
+                |(timeline, switchpoint)| json!({"timeline": timeline, "switchpoint": switchpoint}),
+            )
+            .collect();
+    }
+    (StatusCode::OK, Json(body))
 }
 
 /// POST /vote

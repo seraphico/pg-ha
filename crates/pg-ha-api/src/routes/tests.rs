@@ -936,6 +936,9 @@ mod wal_endpoint {
                 Script::Hang => std::future::pending().await,
             }
         }
+        async fn timeline_history(&self, timeline: u64) -> Option<Vec<(u64, u64)>> {
+            (timeline == 2).then(|| vec![(1, 117_670_848)])
+        }
     }
     fn state_with(script: Script) -> AppState {
         test_state().with_wal_probe(Arc::new(FakeProbe(script)))
@@ -967,6 +970,18 @@ mod wal_endpoint {
         assert_eq!(body["pg_ha_version"], pg_ha_core::VERSION);
         assert_eq!(body["wal_position"], 4242);
         assert_eq!(body["pg_in_recovery"], true);
+    }
+    /// SB-37: the node's own history file for its timeline is published,
+    /// absent when there is none.
+    #[tokio::test]
+    async fn timeline_history_is_published() {
+        let (_, body) = get_wal(build_router(state_with(Script::Ok(Some(2))))).await;
+        assert_eq!(
+            body["timeline_history"],
+            serde_json::json!([{"timeline": 1, "switchpoint": 117_670_848u64}])
+        );
+        let (_, body) = get_wal(build_router(state_with(Script::Ok(Some(7))))).await;
+        assert!(body.get("timeline_history").is_none(), "{body}");
     }
     #[tokio::test]
     async fn probe_error_is_503() {
