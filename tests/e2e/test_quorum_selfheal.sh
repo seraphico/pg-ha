@@ -218,6 +218,7 @@ test_scenario_8_heals_by_itself() {
     # Within the order of one lock ttl: the two nodes need a start and a few
     # HA cycles each, so the bound is 4 x ttl (60 s with the dev ttl of 15 s).
     ttl=$(qsh_get "$prim" config | jq -r '.ttl // 30' 2>/dev/null)
+    case "$ttl" in ''|*[!0-9]*) log_warn "ttl read from /config is '$ttl', using the default 30"; ttl=30 ;; esac
     qsh_check "$([ "$heal" -le $((4 * ttl)) ] && echo true || echo false)" "healed in $heal s (<= 4 x ttl = $((4 * ttl)) s)"
     local final
     final=$(qsh_ready 300)

@@ -29,6 +29,20 @@
 #   - control: a clean `docker stop -t 120` + start of node3 also ends as a
 #     running streaming replica with equal row counts.
 #
+# Since SB-31 a RUNNING ahead replica is rewound by pg-ha within a few HA
+# cycles, so a SIGKILL tens of seconds after the promote would hit an already
+# rewound replica and never reach the SB-28 restart path (single-user crash
+# recovery before pg_rewind). The scenario therefore SIGKILLs A right after the
+# "A is ahead" precondition read, before the running-standby rewind can act, and
+# only then lets the old primary and A come back. After the rejoin the run
+# checks that A's log shows "Single-user crash recovery finished" since the
+# restart; without it the SB-28 path was not reached and the run is INVALID (a
+# counted failure, never a PASS).
+#   RU_SB31=1        the SB-31 scenario (no kill; the running replica is rewound)
+#   RU_LATE_KILL=1   NEGATIVE CONTROL of the path check: the kill is taken only
+#                    after the 30 s wait (A is rewound by then), so the run must
+#                    report INVALID and fail
+#
 # The expected result is a FAIL on an image built from main and a PASS on the
 # fixed image. Always check which image ran: the pinned image IDs are printed.
 #
@@ -253,6 +267,7 @@ fail_over_to_b() {
         TESTS_FAILED=$((TESTS_FAILED + 1)); log_fail "INVALID: $A is not ahead of $B right after the promote ($na0 vs $nb0)"
         return 1
     fi
+    P_CONTAINER="$c"
     A_STARTED=$(docker inspect -f '{{.State.StartedAt}}' "pg-ha-$A")
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "$(http_get_status "$(name_to_url "$A")/primary")" != "200" ]; then
@@ -261,31 +276,22 @@ fail_over_to_b() {
         TESTS_FAILED=$((TESTS_FAILED + 1)); log_fail "nofailover node $A became primary"
         return 1
     fi
-    # Old primary comes back (keeps 2 of 3 raft voters up for the next kill) and rejoins by itself.
-    docker start "$c" > /dev/null 2>&1 || true
-    KILLED=()
-    sleep 30   # $A's walreceiver now loops on "new timeline 2 forked off ... before current recovery point"
-    local na nb
-    for i in $(seq 1 15); do   # the new primary may need a moment before it answers psql
-        na=$(dpsql "$A" 'select count(*) from sb28')
-        nb=$(dpsql "$B" 'select count(*) from sb28')
-        [ -n "$na" ] && [ -n "$nb" ] && break
-        sleep 2
-    done
-    log_info "rows 30 s after the failover: $A=$na $B=$nb (new primary)"
-    if [ -n "$na" ] && [ "$na" = "$nb" ]; then
-        A_REWOUND_RUNNING=true
-        log_info "$A was already rewound while running (SB-31 path): the SB-28 restart path below is not reached"
-    fi
     return 0
 }
+P_CONTAINER=""
+# The old primary comes back (keeps 2 of 3 raft voters up) and rejoins by itself.
+start_old_primary() {
+    docker start "$P_CONTAINER" > /dev/null 2>&1 || true
+    KILLED=()
+}
 A_STARTED=""
-A_REWOUND_RUNNING=false
 
 # SB-31: the ahead replica keeps running (no restart). It must be rewound by
 # pg-ha (rewind-check marker from the forked-off check, then pg_rewind),
 # stream on the new timeline and hold exactly the new primary's rows.
 test_running_ahead_replica() {
+    start_old_primary
+    sleep 30   # $A's walreceiver loops on "new timeline 2 forked off ... before current recovery point" until pg-ha rewinds it
     check_a_rejoined "running, no restart (SB-31)"
     local logs
     logs=$(docker logs "pg-ha-$A" 2>&1)
@@ -348,9 +354,16 @@ check_a_rejoined() { # <label>
     fi
 }
 
+sb28_marker_count() { # how often A's log shows the single-user crash recovery of the SB-28 path
+    docker logs "pg-ha-$A" 2>&1 | grep -c "Single-user crash recovery finished"
+}
 test_unclean_kill() {
-    local state
-    [ "$A_REWOUND_RUNNING" = true ] && log_info "[SIGKILL] $A was rewound while running before the kill; this kill checks only that it rejoins again"
+    local state before after
+    if [ "${RU_LATE_KILL:-0}" = 1 ]; then
+        log_warn "RU_LATE_KILL=1 (negative control): the kill is taken after the 30 s wait, the SB-28 path is expected NOT to be reached"
+        start_old_primary
+        sleep 30
+    fi
     state=$(controldata_state "$A")
     log_info "pg_control state of $A before the kill: '$state'"
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -360,13 +373,27 @@ test_unclean_kill() {
         TESTS_FAILED=$((TESTS_FAILED + 1)); log_fail "$A state is '$state', expected 'in archive recovery'; the scenario precondition is missing"
         return 1
     fi
+    before=$(sb28_marker_count)
     KILLED+=("pg-ha-$A")
     docker kill "pg-ha-$A" > /dev/null
+    if [ "${RU_LATE_KILL:-0}" != 1 ]; then
+        # $A is down before any running-standby rewind could act: bring the old primary back, then $A.
+        start_old_primary
+        KILLED=("pg-ha-$A")
+        sleep 30
+    fi
     docker start "pg-ha-$A" > /dev/null
     KILLED=()
     check_a_rejoined "SIGKILL"
+    after=$(sb28_marker_count)
+    log_info "single-user crash recovery lines in the log of $A: before the restart $before, after $after"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [ "${after:-0}" -gt "${before:-0}" ]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1)); log_pass "[SIGKILL] the SB-28 path was reached: $A ran single-user crash recovery before pg_rewind after the restart"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1)); log_fail "INVALID: the SB-28 restart path was not reached (no single-user crash recovery on $A after the kill); the SIGKILL checks above do not cover SB-28"
+    fi
 }
-
 test_clean_stop_control() {
     local s=$SECONDS
     # pg-ha drains connections for up to 30 s before it stops PostgreSQL: allow it.

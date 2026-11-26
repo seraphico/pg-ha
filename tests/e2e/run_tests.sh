@@ -195,6 +195,14 @@ ensure_sync_mode() {
         async|sync|quorum) ;;
         *) log_fail "invalid SYNC_MODE='$SYNC_MODE' (expected async|sync|quorum)"; exit 2 ;;
     esac
+    # get_sync_mode looks for the primary on the 3-node REST ports only (8008 to
+    # 8010). On a 5-node cluster it would print an uncounted "[FAIL] No primary
+    # found"; the 5-node suites set the mode themselves (quorum_recovery,
+    # quorum_selfheal), so say so instead.
+    if [ "${QRC_NODES:-3}" = 5 ] || [ "${QSH_NODES:-3}" = 5 ]; then
+        log_info "5-node run (QRC_NODES/QSH_NODES=5): synchronous_mode is set by the suite itself, SYNC_MODE=$SYNC_MODE is not applied here"
+        return 0
+    fi
     if [ "$(get_sync_mode)" != "$SYNC_MODE" ]; then
         log_info "Setting synchronous_mode=$SYNC_MODE"
         set_sync_mode "$SYNC_MODE" || log_warn "Could not set synchronous_mode=$SYNC_MODE"

@@ -199,7 +199,16 @@ qrc_start_writer() { # <node>
 qrc_ids() { # <node> <outfile>: the ids a node holds, sorted
     qrc_psql "$1" "select id from ql_ack" 2> /dev/null | sort > "$2"
 }
-# Sampler: every 0.2 s, how many running nodes answer 200 on /primary.
+# qrc_ids plus a check that the read returned rows: a failed psql (error to
+# /dev/null) would otherwise give an empty set, which makes "only the lost
+# voter held these" equal to every id and excuses any loss.
+qrc_ids_checked() { # <node> <outfile> <label>
+    qrc_ids "$1" "$2"
+    local n; n=$(wc -l < "$2" | tr -d ' ')
+    qrc_check "$([ "$n" -gt 0 ] && echo true || echo false)" "$3: read $n ids from $1 (must be > 0)"
+}
+# Sampler: a sweep of /primary over all nodes, then a 0.2 s sleep. The real
+# period is measured (a sweep probes every node one after the other).
 qrc_sampler_start() { # <name>
     local log="$TMPD/sample-$1.log" stop="$TMPD/stop-$1"
     rm -f "$stop"; : > "$log"
@@ -227,7 +236,11 @@ qrc_sampler_stop() { # <name>: asserts at most one 200 at every sample
     two=$(awk '$2 > 1' "$log" | wc -l | tr -d ' ')
     with1=$(awk '$2 == 1' "$log" | wc -l | tr -d ' ')
     with0=$(awk '$2 == 0' "$log" | wc -l | tr -d ' ')
-    log_info "$1: $samples samples of /primary every 0.2 s on all nodes: $with1 with one 200, $with0 with none, $two with more than one"
+    local span maxgap
+    span=$(awk 'NR == 1 {a = $1} {b = $1} END {printf "%.2f", b - a}' "$log")
+    maxgap=$(awk 'NR > 1 {g = $1 - p; if (g > m) m = g} {p = $1} END {printf "%.2f", m}' "$log")
+    log_info "$1: $samples samples of /primary over $span s (mean period $(awk -v s="$span" -v n="$samples" 'BEGIN {if (n > 1) printf "%.2f", s / (n - 1); else print "n/a"}') s, max gap $maxgap s, one sweep probes every node in turn): $with1 with one 200, $with0 with none, $two with more than one"
+    qrc_check "$(awk -v g="$maxgap" 'BEGIN {print (g < 2) ? "true" : "false"}')" "$1: no gap between two samples reached 2 s (max $maxgap s)"
     awk '$2 > 1' "$log" | head -n 3 | sed 's/^/[INFO] two 200s: /'
     assert_eq "0" "$two" "$1: never two nodes answering 200 on /primary"
     qrc_check "$([ "$samples" -ge 25 ] && echo true || echo false)" "$1: sampled /primary $samples times (>= 25)"
@@ -308,10 +321,24 @@ test_refusals_and_auth() {
     assert_eq "400" "$code" "POST /recovery with an unknown field and a short digest is a 400"
     assert_eq "0" "$(qrc_no_grant_anywhere)" "no grant after the rejected requests"
     if [ "$REST_TLS" = mtls ]; then
+        # Positive control first: the same URL, CA and credentials WITH the
+        # client certificate must answer, otherwise a refusal below could be a
+        # wrong CA, a wrong host name or a dead node instead of the missing
+        # certificate.
+        code=$(curl -s --cacert "$E2E_REPO_ROOT/docker/tls/ca.crt" --cert "$E2E_REPO_ROOT/docker/tls/client.crt" \
+            --key "$E2E_REPO_ROOT/docker/tls/client.key" "${REST_AUTH[@]}" -m 8 -o /dev/null -w '%{http_code}' \
+            "$(qrc_url "$s")/recovery")
+        assert_eq "200" "$code" "mTLS control: GET /recovery with the client certificate answers 200"
+        local crc
         for m in GET POST DELETE; do
             code=$(curl -s --cacert "$E2E_REPO_ROOT/docker/tls/ca.crt" "${REST_AUTH[@]}" -m 8 -o /dev/null -w '%{http_code}' -X "$m" \
                 -H 'Content-Type: application/json' -d "$body" "$(qrc_url "$s")/recovery")
-            assert_eq "000" "$code" "mTLS: $m /recovery without a client certificate is refused at the handshake"
+            crc=$?
+            assert_eq "000" "$code" "mTLS: $m /recovery without a client certificate gets no HTTP answer"
+            # 56: connection reset / TLS alert after the handshake (TLS 1.3 client
+            # authentication), 35: handshake failure. 28 (timeout) or 7 (refused)
+            # would not prove a TLS refusal.
+            qrc_check "$([ "$crc" = 56 ] || [ "$crc" = 35 ] && echo true || echo false)" "mTLS: $m /recovery without a client certificate fails in TLS (curl exit $crc, want 56 or 35)"
         done
     else
         log_info "REST_TLS=$REST_TLS: the client-certificate check runs with REST_TLS=mtls"
@@ -340,6 +367,7 @@ test_pause_and_will_heal() {
     fi
     qrc_ctl "$s" recover --lost "$(qrc_last_voter "$p")" --digest "$ZERO_DIGEST" --no-wait
     assert_eq "4" "$QRC_RC" "paused: applying is refused (exit 4)"
+    assert_contains "$QRC_OUT" "pause mode is on" "paused: the apply is refused because of the pause (not a wrong digest)"
     assert_eq "0" "$(qrc_no_grant_anywhere)" "paused: no grant was written"
     assert_eq "" "$(qrc_wait_primary 3 "$p")" "paused: no node became primary"
     # Resume: the survivors elect by themselves.
@@ -403,7 +431,7 @@ test_destroyed_voter_recovery() {
     log_info "killed the primary $p; the lost voter will be $L; survivors ${survs[*]}"
     sleep 4
     # Static WAL now (the primary is dead and the lock has not expired): read what each voter holds.
-    for n in "${survs[@]}" "$L"; do qrc_ids "$n" "$TMPD/hold-$n.ids"; done
+    for n in "${survs[@]}" "$L"; do qrc_ids_checked "$n" "$TMPD/hold-$n.ids" "T3 hold"; done
     : > "$TMPD/surv.all"
     for n in "${survs[@]}"; do cat "$TMPD/hold-$n.ids" >> "$TMPD/surv.all"; done
     sort -u "$TMPD/surv.all" > "$TMPD/surv.ids"
@@ -499,7 +527,7 @@ test_destroyed_voter_recovery() {
     assert_not_empty "$first_ack" "the first write on the new primary was acknowledged (not blocked)"
     log_info "TIME to first acknowledged write: ${first_ack:-n/a} s after the apply command started"
     # Data.
-    qrc_ids "$newp" "$TMPD/rows.ids"
+    qrc_ids_checked "$newp" "$TMPD/rows.ids" "T3 new primary"
     qrc_assert_acked "T3" "$TMPD/acked.ids" "$TMPD/rows.ids" "$TMPD/onlylost.ids" "$TMPD/surv.ids"
     # Observability.
     sleep 3
@@ -509,19 +537,22 @@ test_destroyed_voter_recovery() {
     log_info "/history quorum_recovery entries: $hist"
     assert_contains "$(curl "${CURL_OPTS[@]}" -m 5 "$(qrc_url "$newp")/history" 2>/dev/null)" "quorum_recovery" "/history records a quorum_recovery event"
     assert_contains "$(curl "${CURL_OPTS[@]}" -m 5 "$(qrc_url "$newp")/history" 2>/dev/null)" "accepted loss of $L" "/history names the accepted loss"
-    assert_contains "$(docker logs "$(qrc_c "$newp")" 2>&1 | grep -c "won the vote under the operator's grant")" "1" "the candidate logged that it won the vote under the grant"
-    assert_contains "$(docker logs "$(qrc_c "$s")" 2>&1 | grep -c "authorized by the operator")" "[1-9]" "the REST node logged the authorization"
-    qrc_sampler_stop t3
+    assert_eq "1" "$(docker logs "$(qrc_c "$newp")" 2>&1 | grep -c "won the vote under the operator's grant")" "the candidate logged that it won the vote under the grant"
+    qrc_check "$([ "$(docker logs "$(qrc_c "$s")" 2>&1 | grep -c "authorized by the operator")" -ge 1 ] && echo true || echo false)" "the REST node logged the authorization"
     # The lost voter and the old primary return: rewound, the rows only they held are gone.
+    # The /primary sampler keeps running until the final cluster is ready: the
+    # restart of a node with a stale data directory is the likeliest window for
+    # a second 200.
     docker start "$(qrc_c "$L")" "$(qrc_c "$p")" > /dev/null
     local final
     final=$(qrc_ready 420)
+    qrc_sampler_stop t3
     [ -n "$final" ] || qrc_diag
     assert_not_empty "$final" "after the return the cluster is ready (one primary, every standby 200 on /replica)"
     [ -n "$final" ] || final=$(qrc_primary)
     sleep 5
-    qrc_ids "$final" "$TMPD/rows-final.ids"
-    qrc_ids "$L" "$TMPD/rows-L.ids"
+    qrc_ids_checked "$final" "$TMPD/rows-final.ids" "T3 final primary"
+    qrc_ids_checked "$L" "$TMPD/rows-L.ids" "T3 returned $L"
     log_info "returned $L holds $(wc -l < "$TMPD/rows-L.ids" | tr -d ' ') ids, the primary $final $(wc -l < "$TMPD/rows-final.ids" | tr -d ' ')"
     assert_eq "0" "$(diff "$TMPD/rows-L.ids" "$TMPD/rows-final.ids" | wc -l | tr -d ' ')" "the returned $L holds exactly the primary's rows"
     if [ -s "$TMPD/onlylost.ids" ]; then
@@ -548,7 +579,7 @@ test_lost_voter_returns_before_apply() {
     qrc_sampler_start t4a
     docker kill "$(qrc_c "$p")" > /dev/null
     sleep 3
-    for n in "${survs[@]}" "$L"; do qrc_ids "$n" "$TMPD/a-hold-$n.ids"; done
+    for n in "${survs[@]}" "$L"; do qrc_ids_checked "$n" "$TMPD/a-hold-$n.ids" "T4a hold"; done
     docker kill "$(qrc_c "$L")" > /dev/null
     docker cp "$(qrc_c "$p"):/tmp/acked" "$TMPD/a-acked" > /dev/null 2>&1
     grep '^[0-9]' "$TMPD/a-acked" | sort -u > "$TMPD/a-acked.ids"
@@ -562,27 +593,32 @@ test_lost_voter_returns_before_apply() {
     local start=$SECONDS gone=0
     while [ $((SECONDS - start)) -lt 150 ]; do
         qrc_ctl "$s" recover
-        if [ "$QRC_RC" != 4 ] || ! echo "$QRC_OUT" | grep -q "lost: $L"; then gone=1; break; fi
+        # Only the two answers of a cluster that has its voters back count:
+        # 3 (heals by itself) or 0 (nothing to do, a leader holds the lock).
+        # Exit 1/2 or a transport failure must not look like success.
+        if { [ "$QRC_RC" = 3 ] && echo "$QRC_OUT" | grep -q "heal"; } || { [ "$QRC_RC" = 0 ] && echo "$QRC_OUT" | grep -q "nothing to do"; }; then gone=1; break; fi
         sleep 1
     done
     qrc_check "$([ "$gone" = 1 ] && echo true || echo false)" "the explain stopped proposing $L as lost after it returned ($((SECONDS - start)) s)"
     qrc_show
     qrc_ctl "$s" recover --lost "$L" --digest "$digest" --no-wait; qrc_show
     assert_eq "4" "$QRC_RC" "the apply with the old digest is refused after the lost voter returned (exit 4)"
+    # REST route: "leader lock is held" once a leader exists; otherwise the HA command: "nothing to accept".
+    assert_contains "$QRC_OUT" "nothing to accept\|leader lock is held" "the refusal says there is nothing to accept (or the leader lock is held)"
     assert_eq "0" "$(qrc_no_grant_anywhere)" "no grant was written"
     local newp
     newp=$(qrc_wait_primary 150 "$p")
     assert_not_empty "$newp" "a primary appeared with no recovery command ($newp)"
-    qrc_sampler_stop t4a
     local survs_all="$TMPD/a-surv.all"
     : > "$survs_all"
     for n in "${survs[@]}" "$L"; do cat "$TMPD/a-hold-$n.ids" >> "$survs_all"; done
     sort -u "$survs_all" > "$TMPD/a-all.ids"
     : > "$TMPD/a-none.ids"
-    qrc_ids "$newp" "$TMPD/a-rows.ids"
+    qrc_ids_checked "$newp" "$TMPD/a-rows.ids" "T4a new primary"
     qrc_assert_acked "T4a" "$TMPD/a-acked.ids" "$TMPD/a-rows.ids" "$TMPD/a-none.ids" "$TMPD/a-all.ids"
     docker start "$(qrc_c "$p")" > /dev/null
     qrc_ready 420 > /dev/null
+    qrc_sampler_stop t4a
 }
 
 # ── T4b: the candidate is killed right after the apply; the lost voter is destroyed ──
@@ -601,7 +637,7 @@ test_candidate_killed_after_apply() {
     qrc_sampler_start t4b
     docker kill "$(qrc_c "$p")" > /dev/null
     sleep 4
-    for n in "${survs[@]}" "$L"; do qrc_ids "$n" "$TMPD/b-hold-$n.ids"; done
+    for n in "${survs[@]}" "$L"; do qrc_ids_checked "$n" "$TMPD/b-hold-$n.ids" "T4b hold"; done
     docker cp "$(qrc_c "$p"):/tmp/acked" "$TMPD/b-acked" > /dev/null 2>&1
     grep '^[0-9]' "$TMPD/b-acked" | sort -u > "$TMPD/b-acked.ids"
     vols=$(docker inspect -f '{{range .Mounts}}{{if .Name}}{{.Name}} {{end}}{{end}}' "$(qrc_c "$L")")
@@ -616,13 +652,17 @@ test_candidate_killed_after_apply() {
     assert_not_empty "$digest" "the explain prints a digest"
     qrc_ctl "$s" recover --lost "$L" --digest "$digest" --no-wait
     assert_eq "0" "$QRC_RC" "the apply is accepted (exit 0)"
+    assert_not_empty "$cand" "T4b: the candidate to kill is known"
+    [ -n "$cand" ] || return
     docker kill "$(qrc_c "$cand")" > /dev/null
+    qrc_check "$(qrc_running "$cand" && echo false || echo true)" "T4b: the candidate $cand is really down after docker kill"
     log_info "killed the candidate $cand right after the apply"
     # Three of five Raft members are gone: nobody can take the lock.
     sleep 20
     local anyp
     anyp=$(qrc_wait_primary 5 "$p" "$L" "$cand")
     log_info "primary among the survivors while the candidate is down: ${anyp:-none}"
+    assert_eq "" "$anyp" "T4b: no survivor became primary while the candidate was down"
     docker start "$(qrc_c "$cand")" > /dev/null
     local newp
     newp=$(qrc_wait_primary 90 "$p" "$L")
@@ -638,12 +678,11 @@ test_candidate_killed_after_apply() {
         log_info "a primary ($newp) appeared on its own after the candidate returned"
     fi
     assert_not_empty "$newp" "a primary exists after the candidate returned"
-    qrc_sampler_stop t4b
     : > "$TMPD/b-surv.all"
     for n in "${survs[@]}"; do cat "$TMPD/b-hold-$n.ids" >> "$TMPD/b-surv.all"; done
     sort -u "$TMPD/b-surv.all" > "$TMPD/b-surv.ids"
     comm -23 "$TMPD/b-hold-$L.ids" "$TMPD/b-surv.ids" > "$TMPD/b-onlylost.ids"
-    qrc_ids "$newp" "$TMPD/b-rows.ids"
+    qrc_ids_checked "$newp" "$TMPD/b-rows.ids" "T4b new primary"
     qrc_assert_acked "T4b" "$TMPD/b-acked.ids" "$TMPD/b-rows.ids" "$TMPD/b-onlylost.ids" "$TMPD/b-surv.ids"
     # The destroyed voter comes back as a new node.
     qrc_compose_up "$L"
@@ -651,11 +690,12 @@ test_candidate_killed_after_apply() {
     local final
     final=$(qrc_ready 480)
     assert_not_empty "$final" "the destroyed $L and the old primary $p joined again (one primary, every standby 200)"
+    qrc_sampler_stop t4b
     sleep 5
-    qrc_ids "$final" "$TMPD/b-final.ids"
-    qrc_ids "$L" "$TMPD/b-L.ids"
+    qrc_ids_checked "$final" "$TMPD/b-final.ids" "T4b final primary"
+    qrc_ids_checked "$L" "$TMPD/b-L.ids" "T4b rebuilt $L"
     assert_eq "0" "$(diff "$TMPD/b-L.ids" "$TMPD/b-final.ids" | wc -l | tr -d ' ')" "the rebuilt $L holds exactly the primary's rows"
-    qrc_ids "$p" "$TMPD/b-p.ids"
+    qrc_ids_checked "$p" "$TMPD/b-p.ids" "T4b old primary $p"
     assert_eq "0" "$(diff "$TMPD/b-p.ids" "$TMPD/b-final.ids" | wc -l | tr -d ' ')" "the old primary $p was rewound to exactly the primary's rows"
 }
 
