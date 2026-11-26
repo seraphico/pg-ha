@@ -373,6 +373,19 @@ test_unclean_kill() {
         TESTS_FAILED=$((TESTS_FAILED + 1)); log_fail "$A state is '$state', expected 'in archive recovery'; the scenario precondition is missing"
         return 1
     fi
+    if [ "${RU_LATE_KILL:-0}" != 1 ]; then
+        # Killed right after the promote, $A has not fetched the new timeline's history file yet; its restart
+        # would then only see an ordinary standby and the SB-28 path (marker, then pg_rewind on the unclean
+        # directory) would not be reached. Kill the moment the history file is on disk, before pg-ha's
+        # running-standby rewind (a few HA cycles) can act. If the window is missed the path check says INVALID.
+        local tli hist="" k
+        tli=$(dpsql "$B" "select substr(pg_walfile_name(pg_current_wal_lsn()),1,8)")
+        for k in $(seq 1 150); do
+            docker exec "pg-ha-$A" test -f "$PGDATA_DIR/pg_wal/$tli.history" 2>/dev/null && { hist=yes; break; }
+            sleep 0.2
+        done
+        log_info "history file $tli.history on $A before the kill: ${hist:-no} (polled ${k}x0.2s); rewind-check marker: $(docker exec "pg-ha-$A" test -f "$PGDATA_DIR/pg-ha.rewind_check" 2>/dev/null && echo yes || echo no)"
+    fi
     before=$(sb28_marker_count)
     KILLED+=("pg-ha-$A")
     docker kill "pg-ha-$A" > /dev/null
@@ -387,6 +400,7 @@ test_unclean_kill() {
     check_a_rejoined "SIGKILL"
     after=$(sb28_marker_count)
     log_info "single-user crash recovery lines in the log of $A: before the restart $before, after $after"
+    docker logs "pg-ha-$A" 2>&1 | grep -E "running single-user crash recovery|Single-user crash recovery finished|Created rewind-check marker|pg_rewind completed" | cut -c1-260 | sed 's/^/[INFO] [SB-28 log] /'
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "${after:-0}" -gt "${before:-0}" ]; then
         TESTS_PASSED=$((TESTS_PASSED + 1)); log_pass "[SIGKILL] the SB-28 path was reached: $A ran single-user crash recovery before pg_rewind after the restart"
