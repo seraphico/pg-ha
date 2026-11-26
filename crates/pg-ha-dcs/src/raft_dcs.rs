@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use pg_ha_core::cluster::{
     Cluster, ClusterConfig, ClusterTimeline, Failover, Leader, Member, MemberRole, MemberState,
-    SyncState, TimelineRecord,
+    Recovery, SyncState, TimelineRecord,
 };
 use pg_ha_core::dcs::DcsAdapter;
 use pg_ha_core::error::{Error, Result};
@@ -290,6 +290,10 @@ impl RaftDcs {
     fn failover_path(&self) -> String {
         format!("{}failover", self.base_path)
     }
+    /// SB-37: one-shot quorum recovery grant (TTL = lock ttl).
+    fn recovery_path(&self) -> String {
+        format!("{}recovery", self.base_path)
+    }
 
     /// Persistent cluster timeline (D6): no TTL, never lowered.
     /// Persistent cluster history (no TTL, capped by `History`).
@@ -536,6 +540,12 @@ impl DcsAdapter for RaftDcs {
             .await
             .and_then(|e| serde_json::from_str::<Failover>(&e.value).ok());
 
+        // SB-37: the recovery grant; a malformed value counts as absent.
+        let recovery = self
+            .store
+            .get(&self.recovery_path())
+            .await
+            .and_then(|e| recovery_from_entry(&e.value, e.expire_at));
         // Read sync key
         let sync_state = self
             .store
@@ -590,6 +600,7 @@ impl DcsAdapter for RaftDcs {
             history,
             timeline,
             dcs_voters,
+            recovery,
         })
     }
 
@@ -734,6 +745,29 @@ impl DcsAdapter for RaftDcs {
         }
     }
 
+    async fn create_recovery(&self, value: &str) -> Result<bool> {
+        let request = recovery_create_request(
+            self.recovery_path(),
+            value,
+            self.lock_ttl(),
+            current_millis(),
+        );
+        match self.propose(request).await? {
+            Response::Ok { .. } => Ok(true),
+            Response::NotChanged => Ok(false),
+        }
+    }
+    async fn delete_recovery(&self) -> Result<bool> {
+        let request = Request::Delete {
+            key: self.recovery_path(),
+            prev_value: None,
+            recursive: false,
+        };
+        match self.propose(request).await? {
+            Response::Ok { .. } => Ok(true),
+            Response::NotChanged => Ok(false),
+        }
+    }
     async fn set_config_value(&self, value: &str) -> Result<bool> {
         let request = Request::Set {
             key: self.config_path(),
@@ -876,6 +910,26 @@ fn timeline_write_request(
     })
 }
 
+/// SB-37: create-only request for `/recovery` with the lock ttl: a second
+/// grant while one is live is `NotChanged`; an expired one counts as absent.
+fn recovery_create_request(key: String, value: &str, ttl: u64, now: u64) -> Request {
+    Request::Set {
+        key,
+        value: value.to_string(),
+        ttl: Some(ttl),
+        prev_exist: Some(false),
+        prev_value: None,
+        prev_version: None,
+        now,
+    }
+}
+/// SB-37: the stored `/recovery` value as a grant; None when it does not parse.
+fn recovery_from_entry(value: &str, expire_at: Option<u64>) -> Option<Recovery> {
+    Recovery::parse(value).map(|r| Recovery {
+        expire_at_ms: expire_at,
+        ..r
+    })
+}
 /// CAS request that writes the `/history` array (no TTL) only if the key
 /// still has version `expected`, or does not exist when `expected` is None.
 fn history_write_request(
@@ -1533,5 +1587,82 @@ mod tests {
             honored(&sm).is_none(),
             "cleared intent is no longer honored"
         );
+    }
+    const RECOVERY_KEY: &str = "/service/test/recovery";
+    fn grant_value(candidate: &str) -> String {
+        serde_json::to_string(&Recovery {
+            candidate: candidate.into(),
+            lost: vec!["node1".into()],
+            snapshot: pg_ha_core::cluster::RecoverySnapshot {
+                sync_leader: "node1".into(),
+                voters: vec!["node1".into(), "node2".into(), "node3".into()],
+                quorum: 1,
+                timeline: None,
+                timeline_version: None,
+            },
+            timeline_loss: false,
+            named_online: false,
+            digest: "ab".repeat(32),
+            created_by: "node2".into(),
+            pg_ha_version: "0.1.25".into(),
+            expire_at_ms: None,
+        })
+        .unwrap()
+    }
+    /// SB-37: `/recovery` is create-only with the lock ttl: a second grant
+    /// while one is live loses, an expired one counts as absent, a delete
+    /// removes it, and the cluster view reads it with its expiry.
+    #[test]
+    fn recovery_grant_is_create_only_with_ttl_and_deletable() {
+        let ttl = 15u64;
+        let now = current_millis();
+        let mut sm = KvStateMachine::new();
+        let first = recovery_create_request(RECOVERY_KEY.into(), &grant_value("node2"), ttl, now);
+        assert!(matches!(
+            first,
+            Request::Set {
+                ttl: Some(15),
+                prev_exist: Some(false),
+                prev_value: None,
+                prev_version: None,
+                ..
+            }
+        ));
+        assert!(matches!(sm.apply(&first, 10), Response::Ok { .. }));
+        let second = recovery_create_request(RECOVERY_KEY.into(), &grant_value("node3"), ttl, now);
+        assert_eq!(sm.apply(&second, 11), Response::NotChanged);
+        let e = sm.get(RECOVERY_KEY).expect("live grant");
+        assert_eq!(e.expire_at, Some(now + ttl * 1000));
+        let r = recovery_from_entry(&e.value, e.expire_at).expect("parses");
+        assert_eq!(r.candidate, "node2", "the first grant stays");
+        assert_eq!(r.expire_at_ms, Some(now + ttl * 1000));
+        // Delete, then a new grant can be created.
+        let del = Request::Delete {
+            key: RECOVERY_KEY.into(),
+            prev_value: None,
+            recursive: false,
+        };
+        assert!(matches!(sm.apply(&del, 12), Response::Ok { .. }));
+        assert!(sm.get(RECOVERY_KEY).is_none());
+        assert_eq!(
+            sm.apply(&del, 13),
+            Response::NotChanged,
+            "nothing to delete"
+        );
+        assert!(matches!(sm.apply(&second, 14), Response::Ok { .. }));
+        // An expired grant is gone from the view and does not block a new one.
+        let mut sm = KvStateMachine::new();
+        let stale_now = now - (ttl + 5) * 1000;
+        let old =
+            recovery_create_request(RECOVERY_KEY.into(), &grant_value("node2"), ttl, stale_now);
+        sm.apply(&old, 10);
+        assert!(sm.get(RECOVERY_KEY).is_none(), "expired grant not served");
+        assert!(matches!(sm.apply(&second, 11), Response::Ok { .. }));
+    }
+    #[test]
+    fn malformed_recovery_value_is_treated_as_absent() {
+        assert!(recovery_from_entry("not json", Some(1)).is_none());
+        assert!(recovery_from_entry(r#"{"candidate":"node2"}"#, Some(1)).is_none());
+        assert!(recovery_from_entry(&grant_value("node2"), None).is_some());
     }
 }

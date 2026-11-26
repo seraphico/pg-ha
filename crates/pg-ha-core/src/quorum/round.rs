@@ -65,6 +65,25 @@ impl std::error::Error for PeerProbeError {}
 #[async_trait]
 pub trait PeerWalProbe: Send + Sync {
     async fn read(&self, target: &PeerTarget) -> Result<WalPosition, PeerProbeError>;
+    /// The reading plus what the peer reports about itself (SB-37). Defaults
+    /// to nothing reported.
+    async fn read_with_meta(
+        &self,
+        target: &PeerTarget,
+    ) -> Result<(WalPosition, PeerMeta), PeerProbeError> {
+        self.read(target).await.map(|p| (p, PeerMeta::default()))
+    }
+}
+/// SB-37: what a `GET /wal` answer says besides the position.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerMeta {
+    /// The peer's pg-ha version (None when it does not report one).
+    pub version: Option<String>,
+    /// The peer's own history file for the timeline it reports (its
+    /// ancestors and where each ended), the input of the prefix rule when it
+    /// is the candidate. None: not reported (timeline 1, no or unreadable
+    /// file, older pg-ha).
+    pub timeline_history: Option<Vec<crate::quorum::AncestorEnd>>,
 }
 
 /// What a round collected.

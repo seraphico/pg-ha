@@ -71,6 +71,7 @@ while [[ $# -gt 0 ]]; do
             echo "  tags             Node tags: DCS publication, candidate checks, nosync"
             echo "  rewind_unclean   SB-28: ahead replica killed uncleanly rejoins by itself"
             echo "  quorum_selfheal  SB-37: quorum cluster without a leader heals itself / reports stuck (QSH_NODES=3|5)"
+            echo "  quorum_recovery  SB-37: pg-ha-ctl recover for lost voters (QRC_NODES=3|5; the real recovery needs 5)"
             echo "  consistency      Cross-layer consistency tests"
             echo "  ha_full          Full HA lifecycle tests"
             echo ""
@@ -194,6 +195,14 @@ ensure_sync_mode() {
         async|sync|quorum) ;;
         *) log_fail "invalid SYNC_MODE='$SYNC_MODE' (expected async|sync|quorum)"; exit 2 ;;
     esac
+    # get_sync_mode looks for the primary on the 3-node REST ports only (8008 to
+    # 8010). On a 5-node cluster it would print an uncounted "[FAIL] No primary
+    # found"; the 5-node suites set the mode themselves (quorum_recovery,
+    # quorum_selfheal), so say so instead.
+    if [ "${QRC_NODES:-3}" = 5 ] || [ "${QSH_NODES:-3}" = 5 ]; then
+        log_info "5-node run (QRC_NODES/QSH_NODES=5): synchronous_mode is set by the suite itself, SYNC_MODE=$SYNC_MODE is not applied here"
+        return 0
+    fi
     if [ "$(get_sync_mode)" != "$SYNC_MODE" ]; then
         log_info "Setting synchronous_mode=$SYNC_MODE"
         set_sync_mode "$SYNC_MODE" || log_warn "Could not set synchronous_mode=$SYNC_MODE"
@@ -305,11 +314,12 @@ run_specific_test() {
         tags)       file="test_tags.sh" ;;
         rewind_unclean|sb28) file="test_rewind_unclean.sh" ;;
         quorum_selfheal|sb37) file="test_quorum_selfheal.sh" ;;
+        quorum_recovery|sb37r) file="test_quorum_recovery.sh" ;;
         consistency) file="test_consistency.sh" ;;
         ha_full|full) file="test_ha_full.sh" ;;
         *)
             log_fail "Unknown test: $test_name"
-            echo "Valid tests: smoke, bootstrap, failover, failover_ttl, switchover, partition, pause, config, metrics, connections, rejoin, rewind_unclean, quorum_selfheal, consistency, ha_full"
+            echo "Valid tests: smoke, bootstrap, failover, failover_ttl, switchover, partition, pause, config, metrics, connections, rejoin, rewind_unclean, quorum_selfheal, quorum_recovery, consistency, ha_full"
             exit 1
             ;;
     esac

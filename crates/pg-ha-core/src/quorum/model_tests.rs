@@ -71,6 +71,7 @@ use std::time::Duration;
 mod executor_model;
 mod sb36_fixes;
 mod sb37_prefix;
+mod sb37_recovery;
 mod sb38_leave;
 mod sb40_zombie;
 

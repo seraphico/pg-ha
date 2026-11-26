@@ -113,9 +113,13 @@ qsh_prepare() { # leaves the cluster ready in quorum mode; echoes the primary
 # The writer runs inside the primary's container; every id psql acknowledged is
 # appended to /tmp/acked (the file survives `docker kill`).
 qsh_start_writer() { # <node>
-    docker exec "$(qsh_c "$1")" sh -c 'rm -f /tmp/acked; : > /tmp/acked'
+    docker exec "$(qsh_c "$1")" sh -c 'rm -f /tmp/acked /tmp/acked.rejected; : > /tmp/acked'
     qsh_psql "$1" 'create table if not exists ql_ack(id serial primary key, t timestamptz default now())' > /dev/null
-    docker exec -d "$(qsh_c "$1")" sh -c 'while true; do id=$(psql -U postgres -d postgres -qAtc "insert into ql_ack default values returning id" 2>/dev/null | head -n1); [ -n "$id" ] && echo "$id" >> /tmp/acked; sleep 0.05; done'
+    # An id counts as acknowledged only when psql exited 0 with nothing on
+    # stderr: a commit whose synchronous wait was cancelled still returns its
+    # id, with a WARNING, and is NOT acknowledged. Anything else goes to
+    # /tmp/acked.rejected.
+    docker exec -d "$(qsh_c "$1")" sh -c 'while true; do id=$(psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres -qAtc "insert into ql_ack default values returning id" 2>/tmp/acked.err); rc=$?; if [ "$rc" = 0 ] && [ ! -s /tmp/acked.err ] && [ -n "$id" ]; then echo "$id" >> /tmp/acked; else echo "id=${id:-none} rc=$rc $(head -c 200 /tmp/acked.err | tr "\n" " ")" >> /tmp/acked.rejected; fi; sleep 0.05; done'
 }
 qsh_wait_primary() { # <timeout> [exclude...]: first node answering /primary 200
     local timeout="$1" start=$SECONDS n skip x
@@ -188,6 +192,17 @@ test_scenario_8_heals_by_itself() {
     sleep 25
     prim=$(qsh_wait_primary 3 "$p" "$newp")
     log_info "primary among the survivors while both are down: ${prim:-none}"
+    # Precondition of scenario 8: the survivors are stuck while both are
+    # down. If they elected by themselves, the run does not test self-healing.
+    if [ -n "$prim" ]; then
+        log_fail "INVALID: $prim became primary while $p and $newp were down; scenario 8 was not reached"
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+        return
+    fi
+    local k
+    for k in "$p" "$newp"; do
+        qsh_check "$(docker inspect -f '{{.State.Running}}' "$(qsh_c "$k")" 2>/dev/null | grep -qx false && echo true || echo false)" "precondition: $k is really stopped"
+    done
     docker cp "$(qsh_c "$p"):/tmp/acked" "$TMPD/acked" > /dev/null 2>&1
     grep '^[0-9]' "$TMPD/acked" | sort > "$TMPD/acked.ids"
     acked=$(wc -l < "$TMPD/acked.ids" | tr -d ' ')
@@ -203,6 +218,7 @@ test_scenario_8_heals_by_itself() {
     # Within the order of one lock ttl: the two nodes need a start and a few
     # HA cycles each, so the bound is 4 x ttl (60 s with the dev ttl of 15 s).
     ttl=$(qsh_get "$prim" config | jq -r '.ttl // 30' 2>/dev/null)
+    case "$ttl" in ''|*[!0-9]*) log_warn "ttl read from /config is '$ttl', using the default 30"; ttl=30 ;; esac
     qsh_check "$([ "$heal" -le $((4 * ttl)) ] && echo true || echo false)" "healed in $heal s (<= 4 x ttl = $((4 * ttl)) s)"
     local final
     final=$(qsh_ready 300)
@@ -248,12 +264,11 @@ test_lost_voter_is_reported_and_heals_on_return() {
     log_info "killed the primary $p and the voter $v; survivors: ${survivors[*]}; ttl ${ttl}s"
     # Before the ttl a survivor is not reported stuck (an ordinary failover window).
     sleep 3
-    got=$(curl "${CURL_OPTS[@]}" -m 3 "$(qsh_url "${survivors[0]}")/replica" 2>/dev/null)
-    if echo "$got" | grep -q "$STUCK_REASON"; then
-        assert_eq "not stuck within 3 s" "stuck" "a standby is not reported stuck 3 s after the kill"
-    else
-        assert_eq "ok" "ok" "a standby is not reported stuck 3 s after the kill"
-    fi
+    # It must answer 200 without the reason: no answer is not "not stuck".
+    got=$(curl "${CURL_OPTS[@]}" -m 3 -w ' HTTP %{http_code}' "$(qsh_url "${survivors[0]}")/replica" 2>/dev/null)
+    qsh_check "$(echo "$got" | grep -q "$STUCK_REASON" || ! echo "$got" | grep -q ' HTTP 200$' || echo true)" \
+        "a standby answers 200 without the stuck reason 3 s after the kill (${got##* HTTP })"
+
     # After the ttl (plus loop_wait slack) the survivors answer 503 with the reason.
     t0=$SECONDS
     local stuck_nodes=0

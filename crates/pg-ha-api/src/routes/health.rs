@@ -37,8 +37,7 @@ pub(crate) async fn health_primary(State(state): State<RouterState>) -> impl Int
 /// SB-37: why `/replica` is 503 while the cluster is leaderless and stuck.
 pub(crate) const LEADERLESS_STUCK_REASON: &str = "cluster has no leader and the election is stuck";
 /// SB-37: where an operator is sent while the election is stuck.
-const ELECTION_STUCK_HINT: &str =
-    "see the operations guide, section Quorum synchronous replication (known limitation)";
+const ELECTION_STUCK_HINT: &str = "pg-ha-ctl recover";
 /// `/cluster` `election` object: whether this node sees the cluster stuck
 /// without a leader, and whether its own votes are refused.
 fn election_json(s: &crate::state::NodeState) -> serde_json::Value {
@@ -248,6 +247,23 @@ fn sync_json(
     })
 }
 
+/// SB-37: the `recovery` object of `GET /cluster`: the quorum recovery grant,
+/// or null.
+fn recovery_json(r: Option<&pg_ha_core::cluster::Recovery>) -> serde_json::Value {
+    let Some(r) = r else {
+        return serde_json::Value::Null;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    json!({
+        "candidate": r.candidate,
+        "lost": r.lost,
+        "timeline_loss": r.timeline_loss,
+        "named_online": r.named_online,
+        "expires_in_s": r.expire_at_ms.map(|at| at.saturating_sub(now) / 1000),
+    })
+}
 /// GET /cluster — Cluster members summary with cascade topology
 pub(crate) async fn get_cluster(State(state): State<RouterState>) -> impl IntoResponse {
     let s = state.app.read().await;
@@ -262,6 +278,7 @@ pub(crate) async fn get_cluster(State(state): State<RouterState>) -> impl IntoRe
                     "members": topology,
                     "sync": sync_json(cluster.sync_state.as_ref(), s.quorum_n),
                     "election": election_json(&s),
+                    "recovery": recovery_json(cluster.recovery.as_ref()),
                 }))
                 .into_response();
             }
@@ -309,16 +326,28 @@ pub(crate) async fn wal_endpoint(State(state): State<RouterState>) -> impl IntoR
         let s = state.app.read().await;
         (s.name.clone(), s.scope.clone())
     };
-    (
-        StatusCode::OK,
-        Json(json!({
-            "name": name,
-            "scope": scope,
-            "timeline": wal.timeline,
-            "wal_position": wal.wal_position,
-            "pg_in_recovery": wal.in_recovery,
-        })),
-    )
+    let mut body = json!({
+        "name": name,
+        "scope": scope,
+        "timeline": wal.timeline,
+        "wal_position": wal.wal_position,
+        "pg_in_recovery": wal.in_recovery,
+        "pg_ha_version": pg_ha_core::VERSION,
+    });
+    // SB-37: this node's own history file for its timeline, so that a
+    // `recover` explain served by another node counts voters with the same
+    // prefix rule as this node's own vote.
+    if let Some(timeline) = wal.timeline
+        && let Some(lines) = probe.timeline_history(timeline).await
+    {
+        body["timeline_history"] = lines
+            .into_iter()
+            .map(
+                |(timeline, switchpoint)| json!({"timeline": timeline, "switchpoint": switchpoint}),
+            )
+            .collect();
+    }
+    (StatusCode::OK, Json(body))
 }
 
 /// POST /vote

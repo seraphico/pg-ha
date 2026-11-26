@@ -490,6 +490,8 @@ struct ConfigDcs {
     sync: std::sync::Mutex<Option<pg_ha_core::cluster::SyncState>>,
     /// The leader `get_cluster` reports (SB-40: `POST /vote` needs it empty).
     leader: std::sync::Mutex<Option<pg_ha_core::cluster::Leader>>,
+    /// The `/recovery` grant `get_cluster` reports (SB-37).
+    recovery: std::sync::Mutex<Option<pg_ha_core::cluster::Recovery>>,
 }
 
 #[async_trait::async_trait]
@@ -498,6 +500,7 @@ impl pg_ha_core::dcs::DcsAdapter for ConfigDcs {
         Ok(pg_ha_core::cluster::Cluster {
             sync_state: self.sync.lock().unwrap().clone(),
             leader: self.leader.lock().unwrap().clone(),
+            recovery: self.recovery.lock().unwrap().clone(),
             ..Default::default()
         })
     }
@@ -566,6 +569,7 @@ fn config_state(stored: &str) -> (AppState, std::sync::Arc<ConfigDcs>) {
         writes: std::sync::atomic::AtomicUsize::new(0),
         sync: std::sync::Mutex::new(None),
         leader: std::sync::Mutex::new(None),
+        recovery: std::sync::Mutex::new(None),
     });
     let state = AppState::with_dcs(
         "node1".into(),
@@ -932,6 +936,9 @@ mod wal_endpoint {
                 Script::Hang => std::future::pending().await,
             }
         }
+        async fn timeline_history(&self, timeline: u64) -> Option<Vec<(u64, u64)>> {
+            (timeline == 2).then(|| vec![(1, 117_670_848)])
+        }
     }
     fn state_with(script: Script) -> AppState {
         test_state().with_wal_probe(Arc::new(FakeProbe(script)))
@@ -960,8 +967,21 @@ mod wal_endpoint {
         assert_eq!(body["name"], "node1");
         assert_eq!(body["scope"], "test-cluster");
         assert_eq!(body["timeline"], 7);
+        assert_eq!(body["pg_ha_version"], pg_ha_core::VERSION);
         assert_eq!(body["wal_position"], 4242);
         assert_eq!(body["pg_in_recovery"], true);
+    }
+    /// SB-37: the node's own history file for its timeline is published,
+    /// absent when there is none.
+    #[tokio::test]
+    async fn timeline_history_is_published() {
+        let (_, body) = get_wal(build_router(state_with(Script::Ok(Some(2))))).await;
+        assert_eq!(
+            body["timeline_history"],
+            serde_json::json!([{"timeline": 1, "switchpoint": 117_670_848u64}])
+        );
+        let (_, body) = get_wal(build_router(state_with(Script::Ok(Some(7))))).await;
+        assert!(body.get("timeline_history").is_none(), "{body}");
     }
     #[tokio::test]
     async fn probe_error_is_503() {
@@ -1142,11 +1162,7 @@ async fn cluster_election_follows_the_flags() {
     state.update(|s| s.leaderless_stuck = true).await;
     let json = get(state).await;
     assert_eq!(json["election"]["leaderless_stuck"], true);
-    assert!(
-        json["election"]["hint"]
-            .as_str()
-            .is_some_and(|h| h.contains("Quorum synchronous replication"))
-    );
+    assert_eq!(json["election"]["hint"], "pg-ha-ctl recover");
 }
 #[tokio::test]
 async fn cluster_sync_reports_an_unrelaxed_quorum_window() {
@@ -1396,5 +1412,225 @@ mod vote_endpoint {
         let (status, _) = post_vote(build_router(state.with_vote_fencer(f))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+// ───────────────────────── /recovery (SB-37) ─────────────────────────
+mod recovery {
+    use super::*;
+    use pg_ha_core::commands::{CommandResponse, ManagementCommand};
+    use std::sync::{Arc, Mutex};
+
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A fake HA loop: records every command and answers with `reply`.
+    fn app_with(
+        auth: bool,
+        reply: CommandResponse,
+    ) -> (axum::Router, Arc<Mutex<Vec<ManagementCommand>>>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(
+            ManagementCommand,
+            tokio::sync::mpsc::Sender<CommandResponse>,
+        )>(8);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Some((cmd, reply_tx)) = rx.recv().await {
+                log.lock().unwrap().push(cmd);
+                let _ = reply_tx.send(reply.clone()).await;
+            }
+        });
+        let auth = if auth {
+            AuthConfig {
+                username: Some("u".into()),
+                password: Some("p".into()),
+            }
+        } else {
+            AuthConfig {
+                username: None,
+                password: None,
+            }
+        };
+        (
+            build_router_with_commands(test_state(), Some(tx), auth),
+            seen,
+        )
+    }
+
+    async fn call(
+        app: axum::Router,
+        method: &str,
+        body: Option<&str>,
+        authorization: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder().method(method).uri("/recovery");
+        if let Some(a) = authorization {
+            req = req.header("authorization", a);
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string()))
+                .unwrap(),
+            None => req.body(Body::empty()).unwrap(),
+        };
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn grant_body() -> String {
+        format!(r#"{{"lost":["node1"],"digest":"{DIGEST}"}}"#)
+    }
+
+    #[tokio::test]
+    async fn every_method_requires_auth_when_configured() {
+        let (app, seen) = app_with(true, CommandResponse::accepted("ok"));
+        let body = grant_body();
+        for (method, b) in [
+            ("GET", None),
+            ("POST", Some(body.as_str())),
+            ("DELETE", None),
+        ] {
+            let (status, _) = call(app.clone(), method, b, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method}");
+            // base64("u:wrong")
+            let (status, _) = call(app.clone(), method, b, Some("Basic dTp3cm9uZw==")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method}");
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing reached the HA loop"
+        );
+        // base64("u:p")
+        for (method, b) in [
+            ("GET", None),
+            ("POST", Some(body.as_str())),
+            ("DELETE", None),
+        ] {
+            let (status, _) = call(app.clone(), method, b, Some("Basic dTpw")).await;
+            assert_eq!(status, StatusCode::OK, "{method}");
+        }
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn get_only_asks_for_the_explain_and_returns_the_assessment() {
+        let (app, seen) = app_with(
+            false,
+            CommandResponse::accepted("will heal by itself")
+                .with_data(serde_json::json!({"outcome": "will_heal"})),
+        );
+        let (status, body) = call(app, "GET", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["assessment"]["outcome"], "will_heal");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(matches!(seen[0], ManagementCommand::RecoveryExplain));
+    }
+
+    #[tokio::test]
+    async fn post_passes_lower_cased_names_and_the_digest() {
+        let (app, seen) = app_with(false, CommandResponse::accepted("authorized"));
+        let body = format!(
+            r#"{{"lost":["Node1","node5"],"digest":"{}"}}"#,
+            DIGEST.to_uppercase()
+        );
+        let (status, _) = call(app, "POST", Some(&body), None).await;
+        assert_eq!(status, StatusCode::OK);
+        match &seen.lock().unwrap()[0] {
+            ManagementCommand::RecoveryGrant { lost, digest } => {
+                assert_eq!(lost, &["node1", "node5"]);
+                assert_eq!(digest, DIGEST);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_validation_table() {
+        let (app, seen) = app_with(false, CommandResponse::accepted("ok"));
+        let short = &DIGEST[..63];
+        let bad_hex = format!("{}g", &DIGEST[..63]);
+        let cases = [
+            r#"{"lost":[],"digest":"DIG"}"#.replace("DIG", DIGEST),
+            r#"{"lost":["node1","NODE1"],"digest":"DIG"}"#.replace("DIG", DIGEST),
+            r#"{"lost":[" "],"digest":"DIG"}"#.replace("DIG", DIGEST),
+            r#"{"lost":["node1"],"digest":"DIG"}"#.replace("DIG", short),
+            r#"{"lost":["node1"],"digest":"DIG"}"#.replace("DIG", &bad_hex),
+            r#"{"lost":["node1"],"digest":"DIG","force":true}"#.replace("DIG", DIGEST),
+            r#"{"lost":"node1","digest":"DIG"}"#.replace("DIG", DIGEST),
+            r#"{"lost":["node1"]}"#.to_string(),
+            "not json".to_string(),
+        ];
+        for body in &cases {
+            let (status, json) = call(app.clone(), "POST", Some(body), None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {json}");
+            assert_eq!(json["status"], "rejected", "{body}");
+        }
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejection_is_409_and_error_is_500() {
+        let (app, _) = app_with(false, CommandResponse::rejected("digest differs"));
+        let (status, json) = call(app, "POST", Some(&grant_body()), None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["message"], "digest differs");
+        let (app, _) = app_with(false, CommandResponse::error("raft timeout"));
+        let (status, _) = call(app, "DELETE", None, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn cluster_shows_the_grant() {
+        let (state, dcs) = config_state("{}");
+        let get = |state: AppState| async move {
+            let resp = build_router(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/cluster")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+        assert!(get(state.clone()).await["recovery"].is_null());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        *dcs.recovery.lock().unwrap() = Some(pg_ha_core::cluster::Recovery {
+            candidate: "node2".into(),
+            lost: vec!["node1".into()],
+            snapshot: pg_ha_core::cluster::RecoverySnapshot {
+                sync_leader: "node1".into(),
+                voters: vec!["node2".into(), "node3".into()],
+                quorum: 1,
+                timeline: None,
+                timeline_version: None,
+            },
+            timeline_loss: false,
+            named_online: true,
+            digest: DIGEST.into(),
+            created_by: "node3".into(),
+            pg_ha_version: pg_ha_core::VERSION.into(),
+            expire_at_ms: Some(now + 10_500),
+        });
+        let json = get(state).await;
+        assert_eq!(json["recovery"]["candidate"], "node2");
+        assert_eq!(json["recovery"]["lost"], serde_json::json!(["node1"]));
+        assert_eq!(json["recovery"]["named_online"], true);
+        let left = json["recovery"]["expires_in_s"].as_u64().unwrap();
+        assert!((9..=10).contains(&left), "{left}");
     }
 }

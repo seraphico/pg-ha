@@ -1251,7 +1251,7 @@ fn pre<IO: SyncIo>(
     me: &str,
     s: Option<&SyncState>,
 ) -> std::result::Result<(), String> {
-    paused_rt().block_on(pre_promote_sync(io, mode, me, s))
+    paused_rt().block_on(pre_promote_sync(io, mode, me, s, None))
 }
 
 /// `/sync` of the dead leader n0: V = {n1,n2,n3}, q = 1. For n1 the value to
@@ -1271,6 +1271,51 @@ fn pre_promote_writes_the_post_promotion_value_then_confirms_with_show() {
     assert!(io.dcs_writes.is_empty(), "/sync is the executor's job");
 }
 
+/// SB-37: under a recovery grant the value names the voters outside `lost`
+/// with `ANY 1`, or nothing when no other voter is left; never the inherited
+/// shape (whose first write would block on the lost voters).
+#[test]
+fn pre_promote_under_a_recovery_grant_installs_any_1_of_the_present_voters() {
+    let rt = paused_rt();
+    let mut io = FakeIo::new("", &ALL);
+    io.set_pg_applies = true;
+    let lost = ["N3".to_string()];
+    rt.block_on(pre_promote_sync(
+        &mut io,
+        Q,
+        "n1",
+        Some(&old_sync()),
+        Some(&lost),
+    ))
+    .unwrap();
+    assert_eq!(io.pg_sets, vec!["ANY 1 (\"n2\")".to_string()]);
+    // Every other voter named: asynchronous until they rejoin.
+    let mut io = FakeIo::new("ANY 2 (\"n0\",\"n2\",\"n3\")", &ALL);
+    io.set_pg_applies = true;
+    let lost = ["n2".to_string(), "n3".to_string()];
+    rt.block_on(pre_promote_sync(
+        &mut io,
+        Q,
+        "n1",
+        Some(&old_sync()),
+        Some(&lost),
+    ))
+    .unwrap();
+    assert_eq!(io.pg_sets, vec![String::new()]);
+    // Also when q >= |V| (where the normal pre-promote installs nothing).
+    let mut io = FakeIo::new("", &ALL);
+    io.set_pg_applies = true;
+    let s = sync("n0", "n1,n2,n3", 3, SyncKind::Quorum);
+    rt.block_on(pre_promote_sync(
+        &mut io,
+        Q,
+        "n1",
+        Some(&s),
+        Some(&lost[1..]),
+    ))
+    .unwrap();
+    assert_eq!(io.pg_sets, vec!["ANY 1 (\"n2\")".to_string()]);
+}
 #[test]
 fn pre_promote_is_also_used_while_the_mode_is_priority_but_the_sync_is_quorum() {
     // T7 / T9 window: the executor still applies, so a promotion installs it.
@@ -1340,7 +1385,7 @@ fn pre_promote_waits_for_a_late_reload_but_not_forever() {
     let mut io = FakeIo::new("", &ALL);
     io.set_pg_applies = true;
     io.stale_shows = 10_000;
-    let r = (paused_rt().block_on(pre_promote_sync(&mut io, Q, "n1", Some(&old_sync()))),);
+    let r = (paused_rt().block_on(pre_promote_sync(&mut io, Q, "n1", Some(&old_sync()), None)),);
     assert!(r.0.unwrap_err().contains("not confirmed"));
     assert_eq!(io.pg_sets.len(), 1);
     let shows = io.calls.iter().filter(|c| *c == "show").count();
@@ -1378,7 +1423,7 @@ fn pre_promote_write_is_bounded_to_five_seconds() {
     let r = paused_rt().block_on(async {
         tokio::time::timeout(
             Duration::from_secs(60),
-            pre_promote_sync(&mut io, Q, "n1", Some(&old_sync())),
+            pre_promote_sync(&mut io, Q, "n1", Some(&old_sync()), None),
         )
         .await
     });

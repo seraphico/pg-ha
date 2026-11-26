@@ -36,6 +36,7 @@ mod lag;
 mod lease;
 mod lineage;
 pub(crate) mod quorum_sync;
+mod recovery;
 mod shutdown;
 mod stuck;
 mod vote;
@@ -216,6 +217,12 @@ pub struct Ha {
     upstream_reader: Option<Arc<dyn PeerWalProbe>>,
     /// SB-37: when the "not restarting PostgreSQL to follow" WARN was last logged.
     follow_deferred_logged_at: Option<std::time::Instant>,
+    /// SB-37 / SB-31: when a failed forked-off check was last logged.
+    fork_check_logged_at: Option<std::time::Instant>,
+    /// SB-37: the quorum recovery grant this node won the lock with, kept for
+    /// the promote of this lock term (the DCS key is deleted at acquisition).
+    /// Cleared when the lock is not ours.
+    recovery_term: Option<crate::cluster::Recovery>,
 }
 
 /// How often the full rewind-hold ERROR is repeated while the node is held.
@@ -270,6 +277,8 @@ impl Ha {
             stuck: stuck::StuckTracker::default(),
             upstream_reader: None,
             follow_deferred_logged_at: None,
+            fork_check_logged_at: None,
+            recovery_term: None,
         };
         (ha, cmd_tx)
     }
@@ -397,6 +406,7 @@ impl Ha {
                 if !self.is_lock_owner() {
                     self.promote_pending = None;
                     self.pending_history = None;
+                    self.recovery_term = None;
                     // Another node (or nobody) holds the lock: no lease left
                     // to race; the follower / election paths fence a primary.
                     self.set_leader_lease(None);
@@ -1772,6 +1782,19 @@ mod tests {
         async fn set_sync_value(&self, value: &str) -> Result<bool> {
             self.sync_writes.lock().unwrap().push(value.to_string());
             Ok(true)
+        }
+        async fn create_recovery(&self, value: &str) -> Result<bool> {
+            let grant = crate::cluster::Recovery::parse(value)
+                .ok_or_else(|| crate::error::Error::Dcs("unparsable grant (mock)".into()))?;
+            let mut cluster = self.cluster.lock().unwrap();
+            if cluster.recovery.is_some() {
+                return Ok(false);
+            }
+            cluster.recovery = Some(grant);
+            Ok(true)
+        }
+        async fn delete_recovery(&self) -> Result<bool> {
+            Ok(self.cluster.lock().unwrap().recovery.take().is_some())
         }
 
         async fn set_config_value(&self, value: &str) -> Result<bool> {
@@ -5122,6 +5145,8 @@ mod tests {
         ControldataInProduction,
         /// pg_controldata: `Database cluster state: shut down in recovery`.
         ControldataShutDownInRecovery,
+        /// pg_controldata prints `<dir>/pg-ha-test.controldata`.
+        ControldataFromFile,
         /// pg_ctl: `stop` succeeds and removes postmaster.pid; anything else
         /// fails at once. Only for tests that never call start().
         PgCtlStopOk,
@@ -5171,9 +5196,10 @@ mod tests {
     const FAKE_PSQL_PRIMARY: &str = "echo f\nexit 0\n";
 
     impl FakeBin {
-        const ALL: [FakeBin; 15] = [
+        const ALL: [FakeBin; 16] = [
             FakeBin::ControldataInProduction,
             FakeBin::ControldataShutDownInRecovery,
+            FakeBin::ControldataFromFile,
             FakeBin::PgCtlStopOk,
             FakeBin::RewindOk,
             FakeBin::RewindFail,
@@ -5193,6 +5219,7 @@ mod tests {
             match self {
                 FakeBin::ControldataInProduction => "controldata-in-production",
                 FakeBin::ControldataShutDownInRecovery => "controldata-shut-down-in-recovery",
+                FakeBin::ControldataFromFile => "controldata-from-file",
                 FakeBin::PgCtlStopOk => "pg-ctl-stop-ok",
                 FakeBin::RewindOk => "rewind-ok",
                 FakeBin::RewindFail => "rewind-fail",
@@ -5220,6 +5247,10 @@ mod tests {
                     "pg_controldata",
                     "echo 'Database cluster state:               shut down in recovery'\n",
                 )],
+                // -D <dir>: $2 is the data directory.
+                FakeBin::ControldataFromFile => {
+                    vec![("pg_controldata", "cat \"$2/pg-ha-test.controldata\"\n")]
+                }
                 // stop -D <dir> -m <mode> -w: $3 is the data directory.
                 FakeBin::PgCtlStopOk => vec![(
                     "pg_ctl",
@@ -5537,6 +5568,92 @@ mod tests {
         assert!(dir.join("standby.signal").is_file());
         assert_start_attempted(&ha, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SB-37 / SB-31 start check: a standby (pg_control `in archive
+    /// recovery`) with `min_recovery` as its minimum recovery point and the
+    /// given files in pg_wal.
+    async fn start_fork_case(
+        label: &str,
+        min_recovery: &str,
+        wal: &[(&str, &str)],
+    ) -> Option<String> {
+        let (mut ha, dir, _tx) = stopped_pg_test_ha(
+            "node2",
+            label,
+            Arc::new(MockDcs::new()),
+            Some(fake_pg_bin(FakeBin::ControldataFromFile)),
+        );
+        std::fs::write(
+            dir.join("pg-ha-test.controldata"),
+            format!(
+                "Database cluster state:               in archive recovery\n\
+                 Latest checkpoint's TimeLineID:       1\n\
+                 Minimum recovery ending location:     {min_recovery}\n\
+                 Min recovery ending loc's timeline:   1\n"
+            ),
+        )
+        .unwrap();
+        let wal_dir = dir.join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        for (name, content) in wal {
+            std::fs::write(wal_dir.join(name), content).unwrap();
+        }
+        let _ = ha.handle_postgres_not_running().await;
+        assert!(dir.join("standby.signal").is_file());
+        assert_start_attempted(&ha, 1);
+        let m = marker(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        m
+    }
+
+    const SEG8_TL1: (&str, &str) = ("000000010000000000000008", "");
+    const HIST2: (&str, &str) = (
+        "00000002.history",
+        "1\t0/8037260\tno recovery target specified\n",
+    );
+
+    #[tokio::test]
+    async fn test_start_marks_standby_forked_off_the_newest_timeline() {
+        let m = start_fork_case("sb31-start-diverged", "0/8038750", &[SEG8_TL1, HIST2])
+            .await
+            .expect("rewind-check marker");
+        assert!(
+            m.contains(
+                "standby forked off the newest timeline: replayed timeline 1 up to 0/8038750 but timeline 2 left timeline 1 at 0/8037260"
+            ),
+            "{m}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_no_marker_when_not_past_the_switchpoint() {
+        assert_eq!(
+            start_fork_case("sb31-start-at-s", "0/8037260", &[SEG8_TL1, HIST2]).await,
+            None
+        );
+        assert_eq!(
+            start_fork_case("sb31-start-behind", "0/7000120", &[SEG8_TL1, HIST2]).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_no_marker_without_a_newer_history() {
+        assert_eq!(
+            start_fork_case("sb31-start-no-hist", "0/8038750", &[SEG8_TL1]).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_no_marker_for_an_unrelated_timeline() {
+        // Timeline 4's history lists only timeline 3; this node is on 1.
+        let unrelated = ("00000004.history", "3\t0/10\tx\n");
+        assert_eq!(
+            start_fork_case("sb31-start-unrelated", "0/8038750", &[SEG8_TL1, unrelated]).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -9048,6 +9165,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_marked_standby_waits_for_a_confirmed_lock_before_rewind() {
+        // SB-37 follow gate on the RewindCheck path (SB-31 marks running
+        // standbys): pg_rewind stops PostgreSQL, so an unconfirmed lock waits.
+        let dcs = Arc::new(MockDcs::with_leader("node1"));
+        dcs.quorum_confirmed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
+            "node2",
+            "c5-rewind-check-unconfirmed",
+            dcs,
+            Some(true),
+            true,
+            Some(fake_pg_bin(FakeBin::RewindOk)),
+        );
+        put_marker(&dir);
+        ha.cluster = ready_cluster();
+
+        let result = ha.process_healthy_cluster().await;
+
+        assert!(
+            follower_containing(
+                &result,
+                "rewind-check marker present; not running pg_rewind against node1: the DCS has no leader with a quorum here"
+            ),
+            "{result}"
+        );
+        assert_eq!(
+            ha.postgresql().observed_in_recovery(),
+            Some(true),
+            "not stopped"
+        );
+        assert!(marker(&dir).is_some());
+        assert!(!rewind_called(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_rewind_skipped_when_source_answers_in_recovery() {
         let (mut ha, dir, _tx) = identity_test_ha_with_cmd(
             "node2",
@@ -12364,6 +12518,726 @@ mod tests {
             assert_eq!(ha.quorum_vote().await, VoteGate::Pass);
             assert_eq!(start.elapsed(), crate::live_wal::LIVE_WAL_READ_TIMEOUT);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+        /// SB-37: quorum recovery through the HA loop.
+        mod recovery_tests {
+            use super::*;
+            use crate::cluster::{Recovery, RecoverySnapshot};
+            use crate::commands::CommandStatus;
+            use crate::ha::helpers::OwnEligibility;
+            use crate::history::HistoryEventType;
+            use crate::quorum::recovery::Outcome;
+
+            /// `FakePeers` answering `GET /wal` with a pg-ha version.
+            struct Versioned(FakePeers, Option<&'static str>);
+            #[async_trait::async_trait]
+            impl PeerWalProbe for Versioned {
+                async fn read(
+                    &self,
+                    target: &PeerTarget,
+                ) -> std::result::Result<WalPosition, PeerProbeError> {
+                    self.0.read(target).await
+                }
+                async fn read_with_meta(
+                    &self,
+                    target: &PeerTarget,
+                ) -> std::result::Result<
+                    (WalPosition, crate::quorum::round::PeerMeta),
+                    PeerProbeError,
+                > {
+                    let p = self.0.read(target).await?;
+                    Ok((
+                        p,
+                        crate::quorum::round::PeerMeta {
+                            version: self.1.map(str::to_string),
+                            timeline_history: None,
+                        },
+                    ))
+                }
+            }
+
+            /// V = {test_node, node2, node3}, q = 2 (n = 1); the old leader
+            /// is dead, node3 is gone. The normal vote needs node2 and node3.
+            fn setup() -> Setup {
+                Setup {
+                    quorum: 2,
+                    ..Setup::quorum()
+                }
+            }
+            fn stuck_ha(
+                label: &str,
+                dcs: &Arc<MockDcs>,
+                version: Option<&'static str>,
+            ) -> (Ha, PathBuf) {
+                let (mut ha, dir) = build(
+                    label,
+                    setup(),
+                    dcs,
+                    local(Some(1), 100),
+                    Some(Arc::new(FakePeers::new().ok("node2", 1, 90))),
+                );
+                ha.set_upstream_reader(Arc::new(Versioned(
+                    FakePeers::new().ok("node2", 1, 90),
+                    version,
+                )));
+                dcs.mirror_cluster(&ha.cluster);
+                (ha, dir)
+            }
+            fn assessment(r: &CommandResponse) -> crate::quorum::recovery::Assessment {
+                serde_json::from_value(r.data.clone().expect("assessment")).unwrap()
+            }
+            fn digest_of(r: &CommandResponse) -> String {
+                match assessment(r).outcome {
+                    Outcome::NeedsAcceptance { digest, lost, .. } => {
+                        assert_eq!(lost, ["node3"]);
+                        digest
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            /// Explain, then grant; the grant is in the DCS and in `ha.cluster`.
+            async fn granted(ha: &mut Ha, dcs: &Arc<MockDcs>) {
+                let explain = ha.handle_recovery_explain(None).await;
+                let digest = digest_of(&explain);
+                let r = ha
+                    .handle_recovery_grant(vec!["node3".into()], digest, None)
+                    .await;
+                assert_eq!(r.status, CommandStatus::Accepted, "{}", r.message);
+                ha.cluster.recovery = dcs.cluster.lock().unwrap().recovery.clone();
+                assert!(ha.cluster.recovery.is_some());
+            }
+
+            #[tokio::test]
+            async fn explain_reads_get_wal_only_and_writes_nothing() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = build(
+                    "recovery-explain",
+                    setup(),
+                    &dcs,
+                    local(Some(1), 100),
+                    Some(Arc::new(PanicPeers)),
+                );
+                let reader = Arc::new(FakePeers::new().ok("node2", 1, 90));
+                ha.set_upstream_reader(reader.clone());
+                let r = ha.handle_recovery_explain(None).await;
+                assert_eq!(r.status, CommandStatus::Accepted, "{}", r.message);
+                assert!(r.message.contains("needs acceptance"), "{}", r.message);
+                let a = assessment(&r);
+                let Outcome::NeedsAcceptance {
+                    candidate, risk, ..
+                } = &a.outcome
+                else {
+                    panic!("{a:?}");
+                };
+                assert_eq!(candidate, "test_node");
+                assert!(risk.possible && !risk.timeline_loss);
+                // Both other members were read with GET /wal; no vote asked.
+                assert_eq!(reader.call_count(), 2);
+                assert!(dcs.cluster.lock().unwrap().recovery.is_none());
+                assert!(dcs.last_failover_value.lock().unwrap().is_none());
+                // A DCS read failure is an error, not a stale answer.
+                let r = ha.handle_recovery_explain(Some("raft timeout")).await;
+                assert_eq!(r.status, CommandStatus::Error);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// `FakePeers` whose `node2` reports its own timeline history.
+            struct WithHistory(FakePeers, Option<Vec<crate::quorum::AncestorEnd>>);
+            #[async_trait::async_trait]
+            impl PeerWalProbe for WithHistory {
+                async fn read(
+                    &self,
+                    target: &PeerTarget,
+                ) -> std::result::Result<WalPosition, PeerProbeError> {
+                    self.0.read(target).await
+                }
+                async fn read_with_meta(
+                    &self,
+                    target: &PeerTarget,
+                ) -> std::result::Result<
+                    (WalPosition, crate::quorum::round::PeerMeta),
+                    PeerProbeError,
+                > {
+                    let p = self.0.read(target).await?;
+                    let history = if target.name == "node2" {
+                        self.1.clone()
+                    } else {
+                        None
+                    };
+                    Ok((
+                        p,
+                        crate::quorum::round::PeerMeta {
+                            version: Some(crate::VERSION.to_string()),
+                            timeline_history: history,
+                        },
+                    ))
+                }
+            }
+
+            /// SB-37 PR B2: the explain served by a node WITHOUT the
+            /// candidate's history file (this node is on timeline 1) uses the
+            /// history the candidate reports in `GET /wal`, so it counts the
+            /// prefix voters exactly as the candidate's own vote does.
+            #[tokio::test]
+            async fn explain_uses_the_candidates_reported_history() {
+                let mut outcomes = Vec::new();
+                for history in [
+                    Some(vec![crate::quorum::AncestorEnd {
+                        timeline: 1,
+                        switchpoint: 100,
+                    }]),
+                    None,
+                ] {
+                    let dcs = Arc::new(MockDcs::new());
+                    let (mut ha, dir) = build(
+                        "recovery-peer-history",
+                        Setup {
+                            quorum: 3,
+                            ..Setup::quorum()
+                        },
+                        &dcs,
+                        local(Some(1), 100),
+                        Some(Arc::new(PanicPeers)),
+                    );
+                    ha.set_upstream_reader(Arc::new(WithHistory(
+                        FakePeers::new().ok("node2", 2, 150).ok("node3", 1, 100),
+                        history,
+                    )));
+                    let r = ha.handle_recovery_explain(None).await;
+                    outcomes.push((assessment(&r), r.message.clone()));
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                let (with, msg) = &outcomes[0];
+                match &with.outcome {
+                    Outcome::NeedsAcceptance {
+                        candidate,
+                        lost,
+                        risk,
+                        ..
+                    } => {
+                        assert_eq!(candidate, "node2", "{msg}");
+                        assert_eq!(lost.len(), 1, "{msg}");
+                        assert!(risk.named_online, "{msg}");
+                    }
+                    other => panic!("{other:?} {msg}"),
+                }
+                let (without, msg) = &outcomes[1];
+                match &without.outcome {
+                    Outcome::NeedsAcceptance { lost, risk, .. } => {
+                        assert_eq!(lost, &["node3", "test_node"], "{msg}");
+                        assert!(!risk.named_online, "{msg}");
+                    }
+                    other => panic!("{other:?} {msg}"),
+                }
+            }
+
+            #[tokio::test]
+            async fn without_a_grant_the_same_state_is_refused() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_ha("recovery-no-grant", &dcs, Some(crate::VERSION));
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+                assert_eq!(lock_held_by(&dcs), None);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[tokio::test]
+            async fn the_grant_lets_the_candidate_win_and_is_consumed_at_the_lock() {
+                let _skip = quorum_sync::SkipPrePromoteGuard::new();
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_ha("recovery-win", &dcs, Some(crate::VERSION));
+                granted(&mut ha, &dcs).await;
+                let _ = ha.process_unhealthy_cluster().await;
+                assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+                assert!(
+                    dcs.cluster.lock().unwrap().recovery.is_none(),
+                    "the lock acquisition deleted the grant"
+                );
+                let term = ha
+                    .recovery_term
+                    .clone()
+                    .expect("grant kept for the promote");
+                assert_eq!(term.lost, ["node3"]);
+                let pending = ha.pending_history.clone().expect("history noted");
+                assert_eq!(pending.event_type, HistoryEventType::QuorumRecovery);
+                assert_eq!(
+                    pending.reason,
+                    "quorum recovery: accepted loss of node3; timeline loss: no"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// A named voter that answers ahead still refuses the vote.
+            #[tokio::test]
+            async fn a_named_voter_that_returns_ahead_refuses_the_vote() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_ha("recovery-named-ahead", &dcs, Some(crate::VERSION));
+                granted(&mut ha, &dcs).await;
+                ha.set_peer_probe(Arc::new(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 150),
+                ));
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(
+                    matches!(&result, CycleResult::Follower(m) if m.contains("quorum recovery vote refused") && m.contains("BehindPeer")),
+                    "{result}"
+                );
+                assert_eq!(lock_held_by(&dcs), None);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[tokio::test]
+            async fn a_stale_grant_is_ignored_and_any_acquisition_deletes_it() {
+                let _skip = quorum_sync::SkipPrePromoteGuard::new();
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_ha("recovery-stale", &dcs, Some(crate::VERSION));
+                granted(&mut ha, &dcs).await;
+                // /timeline changed since the grant: ignored.
+                ha.cluster.timeline = ClusterTimeline::Record {
+                    record: test_record(1),
+                    version: 2,
+                };
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+                assert!(ha.live_recovery_grant().is_none());
+                // node3 returns: the normal vote passes and the lock deletes
+                // the stale grant.
+                ha.set_peer_probe(Arc::new(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 90),
+                ));
+                let _ = ha.process_unhealthy_cluster().await;
+                assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+                assert!(dcs.cluster.lock().unwrap().recovery.is_none());
+                assert!(ha.recovery_term.is_none(), "not won under the grant");
+                assert_ne!(
+                    ha.pending_history.clone().unwrap().event_type,
+                    HistoryEventType::QuorumRecovery
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[tokio::test]
+            async fn other_nodes_defer_to_the_grant_candidate() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_ha("recovery-defer", &dcs, Some(crate::VERSION));
+                granted(&mut ha, &dcs).await;
+                ha.cluster.recovery.as_mut().unwrap().candidate = "node2".into();
+                ha.set_peer_probe(Arc::new(PanicPeers));
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(
+                    matches!(&result, CycleResult::Follower(m) if m.contains("deferring to the quorum recovery candidate (node2)")),
+                    "{result}"
+                );
+                assert_eq!(lock_held_by(&dcs), None);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[tokio::test]
+            async fn grant_refusals() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_ha("recovery-refusals", &dcs, Some(crate::VERSION));
+                let explain = ha.handle_recovery_explain(None).await;
+                let digest = digest_of(&explain);
+                let reject = |r: CommandResponse, what: &str| {
+                    assert_eq!(r.status, CommandStatus::Rejected, "{what}: {}", r.message);
+                    r.message
+                };
+                // Wrong digest.
+                let m = reject(
+                    ha.handle_recovery_grant(vec!["node3".into()], "0".repeat(64), None)
+                        .await,
+                    "digest",
+                );
+                assert!(m.contains("digest differs"), "{m}");
+                // A named voter that answers on the candidate's timeline.
+                let m = reject(
+                    ha.handle_recovery_grant(vec!["node2".into()], digest.clone(), None)
+                        .await,
+                    "named voter answers",
+                );
+                assert!(m.contains("[node3], not [node2]"), "{m}");
+                // Malformed input.
+                reject(
+                    ha.handle_recovery_grant(vec![], digest.clone(), None).await,
+                    "empty",
+                );
+                reject(
+                    ha.handle_recovery_grant(vec!["node3".into()], "xyz".into(), None)
+                        .await,
+                    "bad digest",
+                );
+                // Lock held: nothing to accept.
+                ha.cluster.leader = Some(Leader {
+                    name: "node2".into(),
+                    version: 1,
+                });
+                let m = reject(
+                    ha.handle_recovery_grant(vec!["node3".into()], digest.clone(), None)
+                        .await,
+                    "lock",
+                );
+                assert!(m.contains("nothing to accept"), "{m}");
+                ha.cluster.leader = None;
+                assert!(dcs.cluster.lock().unwrap().recovery.is_none());
+                // The right request works once; a second is refused.
+                granted(&mut ha, &dcs).await;
+                let m = reject(
+                    ha.handle_recovery_grant(vec!["node3".into()], digest.clone(), None)
+                        .await,
+                    "existing",
+                );
+                assert!(m.contains("already authorized for test_node"), "{m}");
+                // Cancel, then nothing left to cancel.
+                let r = ha.handle_recovery_cancel().await;
+                assert_eq!(r.status, CommandStatus::Accepted);
+                assert!(dcs.cluster.lock().unwrap().recovery.is_none());
+                assert_eq!(
+                    ha.handle_recovery_cancel().await.status,
+                    CommandStatus::Rejected
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[tokio::test]
+            async fn grant_requires_the_same_pg_ha_version_everywhere() {
+                for (label, version, want) in [
+                    (
+                        "recovery-old-peer",
+                        None,
+                        "does not report its pg-ha version",
+                    ),
+                    ("recovery-other-peer", Some("0.0.1"), "runs pg-ha 0.0.1"),
+                ] {
+                    let dcs = Arc::new(MockDcs::new());
+                    let (ha, dir) = stuck_ha(label, &dcs, version);
+                    let digest = digest_of(&ha.handle_recovery_explain(None).await);
+                    let r = ha
+                        .handle_recovery_grant(vec!["node3".into()], digest, None)
+                        .await;
+                    assert_eq!(r.status, CommandStatus::Rejected, "{label}");
+                    assert!(r.message.contains(want), "{label}: {}", r.message);
+                    assert!(dcs.cluster.lock().unwrap().recovery.is_none());
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+
+            /// Plan item 14: a grant that expired (the DCS TTL removed it
+            /// from `/recovery`) leaves the strict vote in charge.
+            #[tokio::test]
+            async fn an_expired_grant_falls_back_to_the_strict_vote() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_ha("recovery-expired", &dcs, Some(crate::VERSION));
+                granted(&mut ha, &dcs).await;
+                assert!(ha.live_recovery_grant().is_some());
+                // TTL expiry: the key is gone from the DCS and the next read.
+                dcs.cluster.lock().unwrap().recovery = None;
+                ha.cluster.recovery = None;
+                assert!(ha.live_recovery_grant().is_none());
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+                assert_eq!(lock_held_by(&dcs), None);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// SB-37 decision (b): V = {test_node, node2, node3}, q = 3,
+            /// every voter answers, the old leader is dead: the vote can
+            /// never pass. node3 (the lowest) is named while online.
+            fn stuck_q_ha(label: &str, dcs: &Arc<MockDcs>, peers: FakePeers) -> (Ha, PathBuf) {
+                let (mut ha, dir) = build(
+                    label,
+                    Setup {
+                        quorum: 3,
+                        ..Setup::quorum()
+                    },
+                    dcs,
+                    local(Some(1), 100),
+                    Some(Arc::new(peers)),
+                );
+                ha.set_upstream_reader(Arc::new(Versioned(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 80),
+                    Some(crate::VERSION),
+                )));
+                dcs.mirror_cluster(&ha.cluster);
+                (ha, dir)
+            }
+            fn all_answer() -> FakePeers {
+                FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 80)
+            }
+            async fn stuck_q_digest(ha: &Ha) -> String {
+                let r = ha.handle_recovery_explain(None).await;
+                assert!(
+                    r.message.contains("the vote can never pass"),
+                    "{}",
+                    r.message
+                );
+                match assessment(&r).outcome {
+                    Outcome::NeedsAcceptance {
+                        candidate,
+                        lost,
+                        risk,
+                        digest,
+                    } => {
+                        assert_eq!(candidate, "test_node");
+                        assert_eq!(lost, ["node3"]);
+                        assert!(risk.named_online);
+                        digest
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            #[tokio::test]
+            async fn stuck_q_the_online_voter_can_be_given_up_and_the_candidate_wins() {
+                let _skip = quorum_sync::SkipPrePromoteGuard::new();
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_q_ha("recovery-stuck-q", &dcs, all_answer());
+                // Without a grant the same state stays leaderless.
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+                // Only the voter the explain proposes can be named: node2
+                // answers and is not the one given up.
+                let digest = stuck_q_digest(&ha).await;
+                let r = ha
+                    .handle_recovery_grant(vec!["node2".into()], digest.clone(), None)
+                    .await;
+                assert_eq!(r.status, CommandStatus::Rejected);
+                assert!(r.message.contains("[node3], not [node2]"), "{}", r.message);
+                let r = ha
+                    .handle_recovery_grant(vec!["node3".into()], digest, None)
+                    .await;
+                assert_eq!(r.status, CommandStatus::Accepted, "{}", r.message);
+                assert!(r.message.contains("online voter node3"), "{}", r.message);
+                ha.cluster.recovery = dcs.cluster.lock().unwrap().recovery.clone();
+                assert!(ha.cluster.recovery.as_ref().unwrap().named_online);
+                let _ = ha.process_unhealthy_cluster().await;
+                assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+                assert!(dcs.cluster.lock().unwrap().recovery.is_none());
+                let term = ha.recovery_term.clone().expect("grant kept");
+                assert!(term.named_online);
+                let pending = ha.pending_history.clone().expect("history noted");
+                assert_eq!(pending.event_type, HistoryEventType::QuorumRecovery);
+                assert!(
+                    pending
+                        .reason
+                        .starts_with("quorum recovery: accepted online voter node3 (every voter answered and q >= |V|"),
+                    "{}",
+                    pending.reason
+                );
+                assert!(
+                    pending.reason.ends_with("timeline loss: no"),
+                    "{}",
+                    pending.reason
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// The given-up online voter cannot make the vote lose more than
+            /// named: ahead refuses it; the other voter must still answer;
+            /// when it is gone the vote still passes (it cannot block).
+            #[tokio::test]
+            async fn stuck_q_the_named_online_voter_cannot_win_block_or_hide_more() {
+                let _skip = quorum_sync::SkipPrePromoteGuard::new();
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_q_ha("recovery-stuck-q-named", &dcs, all_answer());
+                let digest = stuck_q_digest(&ha).await;
+                let r = ha
+                    .handle_recovery_grant(vec!["node3".into()], digest, None)
+                    .await;
+                assert_eq!(r.status, CommandStatus::Accepted, "{}", r.message);
+                ha.cluster.recovery = dcs.cluster.lock().unwrap().recovery.clone();
+                // node3 came back ahead (or on a newer timeline): refused.
+                for (tl, lsn, why) in [(1, 150, "BehindPeer"), (2, 1, "HigherTimeline")] {
+                    ha.set_peer_probe(Arc::new(
+                        FakePeers::new().ok("node2", 1, 90).ok("node3", tl, lsn),
+                    ));
+                    let result = ha.process_unhealthy_cluster().await;
+                    assert!(
+                        matches!(&result, CycleResult::Follower(m) if m.contains("quorum recovery vote refused") && m.contains(why)),
+                        "{why}: {result}"
+                    );
+                    assert_eq!(lock_held_by(&dcs), None);
+                }
+                // The other voter (not named) must answer: never counted as
+                // present when missing.
+                ha.set_peer_probe(Arc::new(FakePeers::new().ok("node3", 1, 80)));
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(
+                    matches!(&result, CycleResult::Follower(m) if m.contains("InsufficientVotes")),
+                    "{result}"
+                );
+                assert_eq!(lock_held_by(&dcs), None);
+                // The named voter answering level or lower, or not at all,
+                // does not block.
+                ha.set_peer_probe(Arc::new(FakePeers::new().ok("node2", 1, 90)));
+                let _ = ha.process_unhealthy_cluster().await;
+                assert_eq!(lock_held_by(&dcs).as_deref(), Some("test_node"));
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// The explain on another node: the best voter (node3, ahead of
+            /// this node) is the candidate, and the lowest other one is named.
+            #[tokio::test]
+            async fn stuck_q_the_best_voter_is_the_candidate_and_the_lowest_is_given_up() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_q_ha(
+                    "recovery-stuck-q-ahead",
+                    &dcs,
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 150),
+                );
+                ha.set_upstream_reader(Arc::new(Versioned(
+                    FakePeers::new().ok("node2", 1, 90).ok("node3", 1, 150),
+                    Some(crate::VERSION),
+                )));
+                let a = assessment(&ha.handle_recovery_explain(None).await);
+                match a.outcome {
+                    Outcome::NeedsAcceptance {
+                        candidate,
+                        lost,
+                        risk,
+                        ..
+                    } => {
+                        assert_eq!(candidate, "node3");
+                        assert_eq!(lost, ["node2"]);
+                        assert!(risk.named_online);
+                    }
+                    other => panic!("{other:?}"),
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// A grant with `timeline_loss` for a candidate that is behind
+            /// the recorded timeline (/timeline = 2, this node on 1).
+            fn behind_ha(label: &str, dcs: &Arc<MockDcs>) -> (Ha, PathBuf) {
+                let (mut ha, dir) = stuck_ha(label, dcs, Some(crate::VERSION));
+                ha.cluster.timeline = rec(2);
+                (ha, dir)
+            }
+            fn loss_grant(ha: &Ha, candidate: &str, timeline_loss: bool) -> Recovery {
+                Recovery {
+                    candidate: candidate.into(),
+                    lost: vec!["node3".into()],
+                    snapshot: RecoverySnapshot::of(
+                        ha.cluster.sync_state.as_ref().unwrap(),
+                        &ha.cluster.timeline,
+                    ),
+                    timeline_loss,
+                    named_online: false,
+                    digest: "0".repeat(64),
+                    created_by: "node2".into(),
+                    pg_ha_version: crate::VERSION.into(),
+                    expire_at_ms: None,
+                }
+            }
+
+            /// Without a grant a behind node stands aside.
+            #[tokio::test]
+            async fn behind_without_a_grant_stands_aside() {
+                let dcs = Arc::new(MockDcs::new());
+                let (ha, dir) = behind_ha("recovery-behind-none", &dcs);
+                assert!(matches!(
+                    ha.own_eligibility(),
+                    OwnEligibility::Ineligible(lineage::Ineligible::Behind { .. })
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// (a) A matching grant with timeline_loss lets the named
+            /// candidate pass D6 (override), and only through the grant.
+            #[tokio::test]
+            async fn a_timeline_loss_grant_overrides_behind_for_its_candidate() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = behind_ha("recovery-tl-grant", &dcs);
+                ha.cluster.recovery = Some(loss_grant(&ha, "test_node", true));
+                assert!(matches!(
+                    ha.own_eligibility(),
+                    OwnEligibility::Override(lineage::Ineligible::Behind { .. })
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// (b) timeline_loss=false, a stale snapshot, another candidate,
+            /// another version or a held lock: still refused.
+            #[tokio::test]
+            async fn the_override_needs_a_live_grant_that_accepts_the_loss() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = behind_ha("recovery-tl-refused", &dcs);
+                let ineligible = |ha: &Ha, what: &str| {
+                    assert!(
+                        matches!(
+                            ha.own_eligibility(),
+                            OwnEligibility::Ineligible(lineage::Ineligible::Behind { .. })
+                        ),
+                        "{what}"
+                    );
+                };
+                ha.cluster.recovery = Some(loss_grant(&ha, "test_node", false));
+                ineligible(&ha, "timeline_loss=false");
+                ha.cluster.recovery = Some(loss_grant(&ha, "node2", true));
+                ineligible(&ha, "names another node");
+                let mut g = loss_grant(&ha, "test_node", true);
+                g.pg_ha_version = "0.0.1".into();
+                ha.cluster.recovery = Some(g);
+                ineligible(&ha, "another pg-ha version");
+                let mut g = loss_grant(&ha, "test_node", true);
+                g.snapshot.timeline_version = Some(99);
+                ha.cluster.recovery = Some(g);
+                ineligible(&ha, "stale snapshot");
+                ha.cluster.recovery = Some(loss_grant(&ha, "test_node", true));
+                ha.cluster.leader = Some(Leader {
+                    name: "node2".into(),
+                    version: 1,
+                });
+                ineligible(&ha, "lock held");
+                // The election itself refuses without taking the lock.
+                ha.cluster.leader = None;
+                ha.cluster.recovery = Some(loss_grant(&ha, "test_node", false));
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(
+                    matches!(&result, CycleResult::Follower(m) if m.contains("not taking part in the election")),
+                    "{result}"
+                );
+                assert_eq!(lock_held_by(&dcs), None);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// (c) The override is not applied while another member may
+            /// campaign.
+            #[tokio::test]
+            async fn the_override_is_ignored_while_another_member_may_campaign() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = behind_ha("recovery-tl-other", &dcs);
+                // node2 is on the latest timeline 2 with WAL on it.
+                let n2 = ha
+                    .cluster
+                    .members
+                    .iter_mut()
+                    .find(|m| m.name == "node2")
+                    .unwrap();
+                n2.timeline = Some(2);
+                n2.lineage = Some(test_lineage(2));
+                ha.cluster.recovery = Some(loss_grant(&ha, "test_node", true));
+                assert!(
+                    matches!(
+                        ha.own_eligibility(),
+                        OwnEligibility::OverrideIgnored { ref eligible, .. } if eligible == "node2"
+                    ),
+                    "{:?}",
+                    ha.own_eligibility()
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// A grant written by another pg-ha version is not used.
+            #[tokio::test]
+            async fn a_grant_of_another_version_is_not_used() {
+                let dcs = Arc::new(MockDcs::new());
+                let (mut ha, dir) = stuck_ha("recovery-grant-version", &dcs, Some(crate::VERSION));
+                granted(&mut ha, &dcs).await;
+                ha.cluster.recovery.as_mut().unwrap().pg_ha_version = "0.0.1".into();
+                assert!(ha.live_recovery_grant().is_none());
+                let result = ha.process_unhealthy_cluster().await;
+                assert!(refused(&result).contains("InsufficientVotes"), "{result}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 }

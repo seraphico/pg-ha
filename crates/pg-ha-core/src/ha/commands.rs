@@ -25,6 +25,8 @@ impl Ha {
     /// failed read keeps the old snapshot.
     pub(super) async fn process_commands(&mut self) {
         let mut refreshed = false;
+        // SB-37: the recovery commands must not judge an old snapshot.
+        let mut dcs_error: Option<String> = None;
         while let Ok((cmd, reply_tx)) = self.cmd_rx.try_recv() {
             if self.shutting_down {
                 let _ = reply_tx
@@ -38,9 +40,12 @@ impl Ha {
                 refreshed = true;
                 match self.dcs.get_cluster().await {
                     Ok(cluster) => self.cluster = cluster,
-                    Err(e) => debug!(
-                        "Could not reload the cluster before handling a command: {e}; using the previous snapshot"
-                    ),
+                    Err(e) => {
+                        debug!(
+                            "Could not reload the cluster before handling a command: {e}; using the previous snapshot"
+                        );
+                        dcs_error = Some(e.to_string());
+                    }
                 }
             }
             let response = match cmd {
@@ -61,6 +66,14 @@ impl Ha {
                 }
                 ManagementCommand::Restart => self.handle_restart_command().await,
                 ManagementCommand::Reinitialize => self.handle_reinitialize_command().await,
+                ManagementCommand::RecoveryExplain => {
+                    self.handle_recovery_explain(dcs_error.as_deref()).await
+                }
+                ManagementCommand::RecoveryGrant { lost, digest } => {
+                    self.handle_recovery_grant(lost, digest, dcs_error.as_deref())
+                        .await
+                }
+                ManagementCommand::RecoveryCancel => self.handle_recovery_cancel().await,
             };
             let _ = reply_tx.send(response).await;
         }

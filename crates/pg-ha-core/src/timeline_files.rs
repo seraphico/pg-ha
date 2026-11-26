@@ -160,6 +160,115 @@ pub(crate) fn newest_history(data_dir: &Path) -> Result<HistoryEvidence, String>
     })
 }
 
+/// SB-37 / SB-31: this standby's WAL left timeline `replay_timeline` after the
+/// point where the newest timeline on disk (`newest`) branched off it, so
+/// PostgreSQL cannot follow `newest` ("new timeline N forked off current
+/// database system timeline M before current recovery point").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForkedOff {
+    pub(crate) newest: u64,
+    pub(crate) replay_timeline: u64,
+    pub(crate) switchpoint: u64,
+    pub(crate) replay_lsn: u64,
+}
+
+impl std::fmt::Display for ForkedOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "replayed timeline {} up to {} but timeline {} left timeline {} at {}",
+            self.replay_timeline,
+            crate::postgresql::format_lsn(self.replay_lsn),
+            self.newest,
+            self.replay_timeline,
+            crate::postgresql::format_lsn(self.switchpoint),
+        )
+    }
+}
+
+/// The pure check. `newest_ancestors` is the content of `<newest>.history`.
+/// Forked off when `newest` is above the replay timeline, its history lists
+/// the replay timeline with switchpoint `S`, and the replay LSN is past `S`.
+/// A replay LSN at `S` holds exactly the WAL the new timeline began with.
+pub(crate) fn forked_off(
+    replay_timeline: u64,
+    replay_lsn: u64,
+    newest: u64,
+    newest_ancestors: &[HistoryLine],
+) -> Option<ForkedOff> {
+    if newest <= replay_timeline {
+        return None;
+    }
+    let line = newest_ancestors
+        .iter()
+        .find(|l| l.parent == replay_timeline)?;
+    (replay_lsn > line.switchpoint).then_some(ForkedOff {
+        newest,
+        replay_timeline,
+        switchpoint: line.switchpoint,
+        replay_lsn,
+    })
+}
+
+/// Timelines named in `pg_wal`: the highest `<TLI>.history` (1 when none)
+/// and the highest timeline of a WAL segment file (0 when none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalTimelines {
+    pub(crate) newest_history: u64,
+    pub(crate) highest_segment: u64,
+}
+
+pub(crate) fn local_timelines(data_dir: &Path) -> Result<LocalTimelines, String> {
+    let wal_dir = data_dir.join("pg_wal");
+    let entries = std::fs::read_dir(&wal_dir).map_err(|e| format!("{}: {e}", wal_dir.display()))?;
+    let mut t = LocalTimelines {
+        newest_history: 1,
+        highest_segment: 0,
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", wal_dir.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(tli) = history_file_timeline(name) {
+            t.newest_history = t.newest_history.max(tli);
+        } else if let Some(tli) = segment_timeline(name) {
+            t.highest_segment = t.highest_segment.max(tli);
+        }
+    }
+    Ok(t)
+}
+
+/// [`forked_off`] on this data directory. `timeline_lower_bound` and
+/// `replay_lsn` describe the replayed WAL (live: `pg_last_wal_replay_lsn()`;
+/// before a start: pg_control's minimum recovery point, which never exceeds
+/// what was replayed).
+///
+/// The replay timeline is `max(timeline_lower_bound, highest segment
+/// timeline)`. That is exact: the segment holding the last replayed record
+/// is named with that record's timeline and is kept (it is past the last
+/// restartpoint), and a segment named with a higher timeline means WAL of
+/// that timeline was received, in which case nothing has forked off it.
+pub(crate) fn local_fork(
+    data_dir: &Path,
+    timeline_lower_bound: u64,
+    replay_lsn: u64,
+) -> Result<Option<ForkedOff>, String> {
+    let local = local_timelines(data_dir)?;
+    let replay_timeline = timeline_lower_bound.max(local.highest_segment);
+    if local.newest_history <= replay_timeline {
+        return Ok(None);
+    }
+    let Some(ancestors) = timeline_ancestors(data_dir, local.newest_history)? else {
+        return Ok(None);
+    };
+    Ok(forked_off(
+        replay_timeline,
+        replay_lsn,
+        local.newest_history,
+        &ancestors,
+    ))
+}
+
 /// Generation of the data directory. A missing file is generation 0; an
 /// unreadable one is an error (never assumed current).
 pub(crate) fn read_generation(data_dir: &Path) -> Result<u64, String> {
@@ -344,6 +453,201 @@ mod tests {
         assert!(
             timeline_begin(&dir, 6).is_err(),
             "parent above the timeline"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── SB-37 / SB-31: forked-off standby ──
+    // Values of the PG 18.7 run (evidence/pr-b2-prestart-probe.md): the new
+    // primary's 00000002.history is "1 0/8037260"; the named voter replayed
+    // timeline 1 up to 0/8038750 (30 commits past the switchpoint), and its
+    // pg_control minimum recovery point was 0/7000120.
+    const S: u64 = 0x8037260;
+    const REPLAY_PAST: u64 = 0x8038750;
+    const TL2: &str = "1\t0/8037260\tno recovery target specified\n";
+
+    fn line(parent: u64, switchpoint: u64) -> HistoryLine {
+        HistoryLine {
+            parent,
+            switchpoint,
+        }
+    }
+
+    #[test]
+    fn forked_off_table() {
+        let tl2 = [line(1, S)];
+        let tl3 = [line(1, 0x10), line(2, S)];
+        let f = forked_off(1, REPLAY_PAST, 2, &tl2).expect("past S");
+        assert_eq!((f.newest, f.replay_timeline, f.switchpoint), (2, 1, S));
+        assert_eq!(
+            f.to_string(),
+            "replayed timeline 1 up to 0/8038750 but timeline 2 left timeline 1 at 0/8037260"
+        );
+        assert_eq!(forked_off(1, S, 2, &tl2), None, "at S: the same WAL");
+        assert_eq!(forked_off(1, S - 1, 2, &tl2), None, "behind S");
+        assert_eq!(forked_off(2, REPLAY_PAST, 2, &tl2), None, "on the newest");
+        assert_eq!(
+            forked_off(3, REPLAY_PAST, 2, &tl2),
+            None,
+            "above the newest"
+        );
+        assert_eq!(
+            forked_off(4, REPLAY_PAST, 5, &tl3),
+            None,
+            "timeline 4 is not an ancestor of 5's file"
+        );
+        // A grandparent: timeline 3 left 1 at 0x10; a node on 1 past 0x10
+        // forked off 3 even when it is behind 2's switchpoint.
+        assert_eq!(
+            forked_off(1, 0x11, 3, &tl3).map(|f| f.switchpoint),
+            Some(0x10)
+        );
+        assert_eq!(forked_off(2, S, 3, &tl3), None);
+        assert!(forked_off(2, S + 1, 3, &tl3).is_some());
+    }
+
+    fn fork_dir(
+        label: &str,
+        history: Option<(&str, &str)>,
+        segments: &[&str],
+    ) -> std::path::PathBuf {
+        let dir = temp_data_dir(label);
+        for s in segments {
+            put(&dir, s, "");
+        }
+        if let Some((name, content)) = history {
+            put(&dir, name, content);
+        }
+        put(&dir, "000000010000000000000007.partial", "");
+        dir
+    }
+
+    const SEG7: &str = "000000010000000000000007";
+    const SEG8: &str = "000000010000000000000008";
+
+    // Start: inputs from pg_controldata (minimum recovery point).
+    #[test]
+    fn start_check_cases() {
+        let dir = fork_dir(
+            "start-diverged",
+            Some(("00000002.history", TL2)),
+            &[SEG7, SEG8],
+        );
+        assert!(
+            local_fork(&dir, 1, REPLAY_PAST).unwrap().is_some(),
+            "diverged: marker"
+        );
+        assert_eq!(
+            local_fork(&dir, 1, 0x7000120).unwrap(),
+            None,
+            "minimum recovery point not past S (the real run): no marker"
+        );
+        assert_eq!(local_fork(&dir, 1, S).unwrap(), None, "at S: no marker");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = fork_dir("start-no-history", None, &[SEG7, SEG8]);
+        assert_eq!(
+            local_fork(&dir, 1, REPLAY_PAST).unwrap(),
+            None,
+            "no history file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A node on timeline 4; timeline 5 descends from 1, 2, 3 only.
+        let dir = fork_dir(
+            "start-unrelated",
+            Some(("00000005.history", "1\t0/10\tx\n2\t0/20\tx\n3\t0/30\tx\n")),
+            &["000000040000000000000008"],
+        );
+        assert_eq!(
+            local_fork(&dir, 4, REPLAY_PAST).unwrap(),
+            None,
+            "history of an unrelated timeline: no marker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Running: inputs from pg_last_wal_replay_lsn() and the live lower bound.
+    #[test]
+    fn running_check_cases() {
+        let dir = fork_dir(
+            "run-diverged",
+            Some(("00000002.history", TL2)),
+            &[SEG7, SEG8],
+        );
+        let f = local_fork(&dir, 1, REPLAY_PAST)
+            .unwrap()
+            .expect("diverged running standby");
+        assert_eq!(
+            (f.newest, f.replay_timeline, f.switchpoint, f.replay_lsn),
+            (2, 1, S, REPLAY_PAST)
+        );
+        assert_eq!(local_fork(&dir, 1, S).unwrap(), None, "replay at S: none");
+        assert_eq!(
+            local_fork(&dir, 1, S - 8).unwrap(),
+            None,
+            "replay behind S: none"
+        );
+        assert_eq!(
+            local_fork(&dir, 2, REPLAY_PAST).unwrap(),
+            None,
+            "the receiver says timeline 2: none"
+        );
+        // A survivor that streams timeline 2 has a segment named with it.
+        put(&dir, "000000020000000000000008", "");
+        assert_eq!(
+            local_fork(&dir, 1, REPLAY_PAST).unwrap(),
+            None,
+            "WAL on timeline 2 received (published timeline 1 is only a lower bound): none"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = fork_dir("run-no-history", None, &[SEG8]);
+        assert_eq!(
+            local_fork(&dir, 1, REPLAY_PAST).unwrap(),
+            None,
+            "no history: none"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A node on timeline 2; timeline 3 branched off timeline 1, not 2.
+        let dir = fork_dir(
+            "run-unrelated",
+            Some(("00000003.history", "1\t0/10\tx\n")),
+            &["000000020000000000000008"],
+        );
+        assert_eq!(
+            local_fork(&dir, 2, REPLAY_PAST).unwrap(),
+            None,
+            "unrelated: none"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = fork_dir(
+            "run-bad-history",
+            Some(("00000002.history", "junk\n")),
+            &[SEG8],
+        );
+        assert!(
+            local_fork(&dir, 1, REPLAY_PAST).is_err(),
+            "unreadable: error, never a guess"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_timelines_reads_names_only() {
+        let dir = fork_dir(
+            "local-tl",
+            Some(("00000003.history", TL3)),
+            &[SEG7, "000000020000000000000008"],
+        );
+        assert_eq!(
+            local_timelines(&dir).unwrap(),
+            LocalTimelines {
+                newest_history: 3,
+                highest_segment: 2
+            }
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

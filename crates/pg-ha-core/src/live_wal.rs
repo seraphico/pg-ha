@@ -19,6 +19,12 @@ pub const LIVE_WAL_READ_TIMEOUT: Duration = Duration::from_millis(1500);
 #[async_trait]
 pub trait LiveWalProbe: Send + Sync {
     async fn probe(&self) -> Result<WalStatus>;
+    /// SB-37: this node's own history file for `timeline` (ancestor
+    /// timeline, switchpoint), as its vote reads it for the prefix rule.
+    /// None when there is none (timeline 1, missing or unreadable file).
+    async fn timeline_history(&self, _timeline: u64) -> Option<Vec<(u64, u64)>> {
+        None
+    }
 }
 
 /// SB-40: what a voter does when a candidate asks for its vote in quorum mode.

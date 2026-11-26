@@ -594,8 +594,10 @@ switchover 和带 `candidate` 的 failover 会用同样的输入在动作之前�
 `GET /wal` 返回本节点的实时 WAL 位置，请求时从 PostgreSQL 现读（不是成员记录里发布的那份）：
 
 ```json
-{"name": "node2", "scope": "prod-cluster", "timeline": 3, "wal_position": 83886080, "pg_in_recovery": true}
+{"name": "node2", "scope": "prod-cluster", "timeline": 3, "wal_position": 83886080, "pg_in_recovery": true, "pg_ha_version": "0.1.25",
+ "timeline_history": [{"timeline": 1, "switchpoint": 67108960}, {"timeline": 2, "switchpoint": 75497568}]}
 ```
+- `timeline_history` 是本节点自己的 `pg_wal/<timeline>.history`（对应它报告的 timeline）：每个祖先 timeline 及其结束的 LSN。timeline 1、文件不存在或读不了时没有这个字段。`pg-ha-ctl recover` 使用候选节点的这一项，所以无论由哪个节点给出解释，对旧 timeline 投票节点的计票都和候选自己投票时的前缀规则一致。
 
 - 它的用途是让候选节点在投票时比较实时位置。成员记录里发布的 `wal_position` 每个 `loop_wait` 才刷新一次，可能过时：对优先级选举可以接受，对 quorum 不行。
 - **不需要认证**，和健康检查一样，这样节点之间不必共享 Basic Auth 凭据。它暴露节点名、集群 scope、timeline、WAL 位置和是否在恢复中。像其它开放端点一样，请用防火墙或网络策略把 REST 端口限制在集群节点和监控系统之内。
@@ -693,7 +695,7 @@ SB-36 已经关闭的情况不受影响：启用 quorum 和投票节点短暂离
 - 备库的 `/replica` 返回 503，带原因 `cluster has no leader and the election is stuck`（见「Replica 检查」），`GET /cluster` 里 `election.leaderless_stuck` 为 `true`。
 - 如果 `q < |V|`，原因不同：在线并能应答的投票节点少于 `q` 个。投票节点回来、彼此之间 `GET /wal` 通了之后会自己恢复。
 
-没用的操作（从代码得出，重启一项有容器测试佐证）：重启任意节点上的 pg-ha 或 PostgreSQL；重启旧主（容器测试里 214 秒后集群仍然没有主库，`/sync` 不变）；`POST /failover`（指定 candidate 时返回 409，不指定时投票仍然拒绝）；`POST /switchover`（需要 leader）；用 `PUT` / `PATCH /config` 改成别的 `synchronous_mode`（执行器只在 leader 上运行，而带投票节点的 quorum `/sync` 会让投票和成员规则一直生效，不管模式写什么）。`/sync` 只有 leader 会写（不变量 C2）。没有任何 REST 端点或 CLI 命令可以写 `/sync`。
+没用的操作（从代码得出，重启一项有容器测试佐证）：重启任意节点上的 pg-ha 或 PostgreSQL；重启旧主（容器测试里 214 秒后集群仍然没有主库，`/sync` 不变）；`POST /failover`（指定 candidate 时返回 409，不指定时投票仍然拒绝）；`POST /switchover`（需要 leader）；用 `PUT` / `PATCH /config` 改成别的 `synchronous_mode`（执行器只在 leader 上运行，而带投票节点的 quorum `/sync` 会让投票和成员规则一直生效，不管模式写什么）。`/sync` 只有 leader 会写（不变量 C2）。没有任何 REST 端点或 CLI 命令写 `/sync`。投票节点永久丢失时有用的是下面的 `pg-ha-ctl recover`：它写一次性的 `/recovery` 授权，不写 `/sync`。
 
 **自动恢复：双重故障后回来的节点。** 主库被杀，新晋升的主库在它的 end-of-recovery checkpoint 完成之前也被杀，两个节点再启动。第二个节点以没有上游的备库启动，它的 `pg_control` 检查点还在旧时间线，pg-ha 过去因此发布旧的时间线，把它当成落后的节点，选举一直拿不到证据。现在 pg-ha 还读 `pg_control_recovery()` 的 `min_recovery_end_timeline` / `min_recovery_end_lsn`：重放位置达到这个 LSN 时，它记录的时间线才算数（只作下界，只会少报，不会多报）。PG 18 的容器测试（3 节点和 5 节点）里这个节点显示 `min_recovery_end_timeline = 2`，集群在没有任何命令的情况下选出主库，写入端确认过的行一行不丢。同一次修复让被拒绝投票和「不是最健康节点」的周期也刷新成员记录，让这类备库不会因记录过期而不被算作投票节点，并把这种启动后的备库标成 `Replica`（以前是 `Uninitialized`）。
 
@@ -703,8 +705,34 @@ SB-36 已经关闭的情况不受影响：启用 quorum 和投票节点短暂离
 
 **这个修复覆盖不到的情况（X2 残余）**：幸存的备库已经重放了新时间线的 WAL，之后在没有接收进程的情况下重启，`pg_control_recovery()` 仍然是旧时间线，它发布的时间线偏低。偏低只会让它在选举里输给知道更多的节点，或被拒绝，不会造成丢提交；但如果知道新时间线的节点永远不回来，这些备库没有证据可用，集群仍然没有主库，这时 `/replica` 会按上面的规则变成 503，需要运维介入。如果晋升之后所有幸存的投票节点都在没有上游的情况下重启过，它们要等到下一个 restartpoint（最长 `checkpoint_timeout`，默认 5 分钟）把检查点 timeline 推进到新 timeline 之后，才会发布正确的 timeline，自愈可能要等这么久。
 
-**手工恢复：目前没有受支持的步骤。** 代码里没有可以安全手工放宽 `q` 的办法，而安全的取值取决于已经挂掉的主库当时生效的 `n`，DCS 里不存这个值。不要手工修改 Raft 文件。这是留给维护者的待决问题（见 SB-36 的记录）。在此之前请避开这个窗口：每次 failover 或节点重新加入之后，先等新 leader 上 `sync.settled: true`，再做下一步有破坏性的操作，并保持足够多的健康投票节点。
-
+**手工恢复：`pg-ha-ctl recover`。** 适用于投票节点永久丢失（节点被销毁、磁盘丢失）、投票凑不齐 `q` 票而集群没有主库的情况。它不写 `/sync`，没有 `--force`。由运维点名丢失的投票节点，集群状态与解释时不一致就拒绝。
+1. 不带参数的 `pg-ha-ctl recover` 只读。它向每个成员读 `GET /wal`（不发 `POST /vote`，那会隔离投票节点），打印四种结论之一，并给出退出码：0 无事可做（leader 锁存在），3 集群会自己恢复（正常投票已经能通过，等待即可），4 被拒绝（打印原因：没有锁的可写主库、pause 模式、`/config` 无效、没有投票节点有资格参选、仍在线且更靠前的投票节点无资格参选）或需要确认，1 错误，2 用法错误。需要确认时，它打印候选、要声明丢失的投票节点、风险和带 digest 的完整执行命令：
+```console
+$ pg-ha-ctl --endpoint http://node1:8008 --username admin --password secret recover
+Quorum recovery: needs acceptance: promoting node1 gives up the commits that only node5 may hold
+  /sync q=3
+  voter        timeline            lsn  status
+  node1               3      117979240  candidate
+  node3               3      117979240  counted
+  node4               3      117979240  counted
+  node5               -              -  unreachable: transport error: error sending request for url (http://node5:8008/wal)
+  candidate: node1
+  lost: node5
+  commits only the lost voters hold may be lost: yes
+  everything acknowledged before the current timeline began is on the candidate: yes
+  newer timeline history abandoned: no
+To accept this loss, run:
+  pg-ha-ctl --endpoint http://node1:8008 recover --lost node5 --digest 64e5784231dd9501e1b54f415268b2f06a41d5c3ec8b5cd0ad42e4e018e8ef6e
+[exit 4]
+$ pg-ha-ctl --endpoint http://node1:8008 recover --lost node5 --digest 64e5784231dd9501e1b54f415268b2f06a41d5c3ec8b5cd0ad42e4e018e8ef6e
+[200] quorum recovery authorized: node1 may be promoted, accepting the loss of commits that only node5 may hold; the grant expires in 15 s
+node1 is the primary (5 s after the grant)
+```
+2. `recover --lost node5 --digest <digest>` 在你调用的节点上重新评估，只有点名的集合等于当前无法计票的投票节点、digest 等于当前算出的值时才执行（LSN 不在 digest 里，投票时会重新读）。随后写一次性的 DCS 键 `/recovery`（只能创建、TTL 等于 leader 锁 TTL，默认 15 秒），并最多等 60 秒直到 `GET /cluster` 显示候选成为主库（`--no-wait` 不等）。已有授权时再次执行会被拒绝（退出码 4，「already authorized」）；`recover --cancel` 删除未使用的授权。`GET /cluster` 在授权有效期内显示 `recovery`（`candidate`、`lost`、`timeline_loss`、`expires_in_s`），`/history` 以 `quorum_recovery` 记录这次晋升，原因形如 `quorum recovery: accepted loss of node5; timeline loss: no`。
+3. 只有被点名的候选使用授权，且仅在 leader 锁空闲、`/sync` 和 `/timeline` 与解释时一致时使用。它重新跑一轮 `POST /vote`：点名集合之外的每个投票节点都要应答，在同一 timeline 上且没有更靠前，任何地方都没有可写主库；被点名但仍然应答的节点也会被检查，若它更靠前就拒绝投票。新主在 `pg_ctl promote` 之前把 `synchronous_standby_names` 设为 `ANY 1 (在场的投票节点)`。任何一次拿到 leader 锁都会删除授权。候选若挂掉，授权在 TTL 后过期，再次解释会得到新的 digest。
+**丢失的含义。** 只有被点名的投票节点持有、且在 quorum 下已确认的提交会被放弃。丢失的投票节点数不超过 `|V| - q - 1` 时不会丢提交；解释里的 `risk.possible` 告诉你属于哪种情况。丢失的节点如果回来，会被 `pg_rewind` 回到新主的历史，只有它持有的行会消失（容器测试用真实 PostgreSQL 验证）。已死主库当时生效的 `n` 不存在 DCS 里；它的 `postgresql.auto.conf` 可能显示这个值，只能当作提示，因为在写文件和 reload 之间崩溃会让它差一步。
+**所有投票节点在线且 `q >= |V|`。** 正常投票需要 `q` 个其它投票节点，`q >= |V|` 时不管多少节点应答都通不过；本来由已死的主库放宽 `q`。它回不来时，`recover` 只在这一种状态下提供出路：所有投票节点应答、没有可写主库、投票永远通不过。它点名一个在线投票节点（位置最低的那个）作为放弃对象（`risk.named_online`，解释里写 `online voter given up: node4`）。可能丢的东西：任何投票节点持有的、已确认的提交都不会丢。候选是最靠前的投票节点，在它的 timeline 上应答的其它投票节点持有的都是它 WAL 的前缀；投票会重新读位置，被点名的节点（或任何投票节点）更靠前时以 `BehindPeer` / `HigherTimeline` 拒绝，所以只有被点名节点持有的提交不会被悄悄丢掉。没有任何投票节点持有过的提交（`/sync` 异步期间确认的）本来就不受 quorum 保护，与任何一次故障切换相同。其它场景的规则不变：被点名但本可以被正常计票的在线节点仍被拒绝（`the voters that cannot be counted now are [..], not [..]`），更靠前且不能参选的节点仍会阻止恢复。被点名节点之后的处理：和所有投票节点一样被投票隔离；新主在 `pg_ctl promote` 之前安装的 `ANY 1 (...)` 不包含它（所以它既不能确认也不能卡住最初的写入）；它赢不了选举（它自己的投票仍需要 `q` 个其它投票节点）；它像普通备库一样跟随新主，WAL 分叉时会被 rewind，开始流复制后由 executor 把它加回投票集合。`/history` 记录 `quorum recovery: accepted online voter node4 (...)`，`GET /cluster` 的 `recovery.named_online` 为 `true`。持有候选 WAL 前缀的旧 timeline 投票节点（位置在候选 history 文件里的切换点或之前）和投票时一样计票。由单元测试、HA 循环测试、模型测试（`stuck_q_*`）以及 PG 18.7 的 5 节点容器验证（`evidence/pr-b2-accepted-loss-online.md`）：先 switchover，再在 `/sync` 为 4 个投票节点 `q=4` 时杀掉新主；由 timeline 1 节点给出的解释点名一个在线投票节点，执行后候选升主，61 个已确认 id 缺失 0 个，之后所有节点都以主库的数据流复制。
+**要求与限制。** （1）所有节点必须运行相同版本的 pg-ha：应答的成员报告了另一个版本或没有报告版本时，执行会被拒绝（`GET /wal` 带 `pg_ha_version`），候选也会忽略其它版本写入的授权。从 0.1.25 升级的集群必须先升级完。（2）`GET/POST/DELETE /recovery` 与其它管理端点使用同一套 Basic Auth / mTLS。mTLS 这一项没有在容器里用 `REST_TLS=mtls` 实测过（容器测试在 `REST_TLS=off` 下跑，跳过客户端证书检查）；覆盖它的只有 401 / 鉴权单元测试，以及与 `/switchover` 共用同一个路由中间件这一事实。（3）DCS 必须可读：3 个节点时，丢了主库再丢一个投票节点也就丢了 Raft 多数派，没有幸存节点能写授权；丢失投票节点的容器测试用 5 个节点（3 个节点时只丢主库会自己恢复）。（4）所有投票节点都在线、投票仍然失败时（例如 3 个投票节点全部在线、`q=3`、没有 leader，记录见 `evidence/pr-b-pg18-stuck-q3-v3.md`），只有已死的主库能放宽 `q`，所以 `recover` 会提议放弃一个在线的投票节点（位置最低的那个，位置相同时取名字较大的），并打印 `online voter given up: node4`。见下面「所有投票节点在线且 `q >= |V|`」。（5）在 PG 18.7 和 PG 16、5 个节点上的实测：执行后约 5 秒候选在 `/primary` 上应答 200，新主上第一次被确认的写入在开始执行命令后约 14 秒；多出来的几秒原因没有调查。
 #### 要求：所有节点使用相同版本的 pg-ha
 
 启用 `"quorum"` 要求所有节点运行相同版本的 pg-ha，不支持混合版本，也不能滚动切换。旧版本不认识 `/sync` 的 `kind` 字段（缺省的 `kind` 表示 priority）、投票和 `GET /wal`。请先升级所有节点，在每个节点上检查 `GET /wal`，最后再 PATCH `synchronous_mode`。
@@ -818,7 +846,7 @@ bootstrap:
 ### 当前范围与限制
 
 - 已实现：动态开启/关闭、自动计算 `synchronous_standby_names`（`"sync"` 用 Priority / `FIRST N`，`"quorum"` 用 `ANY N`）、节点变动时自动更新、两阶段写入（DCS `/sync` 始终是 PG 名单的子集）、`maximum_lag_on_syncnode` lag 门槛、「实际正在流复制」筛选（必须出现在 `pg_stat_replication`）、strict 用不可满足的占位名单真正阻塞写入（不是 `'*'`）、发布 DCS `/sync`、`/sync` `/async` 健康检查、Failover / Switchover 时强制 `/sync` 成员资格、quorum 模式与 failover 时的实时 WAL 投票和 `GET /wal`（SB-13）
-- quorum 的限制：failover 之后，或成员记录已过期的投票节点回来时，`q` 暂时等于 `|V|`。此时丢了主库，集群就没有主库，目前还没有受支持的手工恢复步骤（见「法定人数同步复制」里的「已知限制」）
+- quorum 的限制：failover 之后，或成员记录已过期的投票节点回来时，`q` 暂时等于 `|V|`。此时丢了主库，集群就没有主库；投票节点永久丢失时，用 `pg-ha-ctl recover` 点名并接受丢失（见「法定人数同步复制」里的「已知限制」）
 - 尚未实现（登记在 [TODO.md](TODO.md)）：
   - `maximum_lag_on_failover`：选举会读（SB-11）。落后当轮合格候选里最大 `wal_position` 超过该字节数的节点不参选；`null` 或省略表示关闭
 
@@ -1003,6 +1031,14 @@ Rewind-check marker present and <leader> holds the leader lock — checking with
 pg_rewind succeeded; removed the rewind-check marker
 ```
 
+**WAL 已从新 timeline 分叉出去的备库**（SB-31，以及被 `pg-ha-ctl recover` 点名为丢失、之后回来的投票节点）。备库可能持有新主没有的 WAL：它在自己的 timeline 上重放过了新 timeline 分出去的那个点。这时 PostgreSQL 无法跟随（`new timeline N forked off current database system timeline M before current recovery point`）。pg-ha 在两个地方按同一条规则给它建 rewind 检查标记：它自己的 `pg_wal` 里有一个更新 timeline 的 history 文件，文件里列出它的重放 timeline 和切换点 S，并且它已重放的位置超过 S。运行中的备库用实时的 `pg_last_wal_replay_lsn()`；启动前用 pg_control 的最小恢复点（history 文件通常在启动之后才从新主拿到，所以实际触发的是运行中的检查）。位置在 S 或之前的备库持有新 timeline 的前缀，不处理。之后走上面的路径：只有 leader 以主库运行且锁已确认时才运行 pg_rewind。日志（PG 18.7，回来的丢失投票节点）：
+
+```text
+Created rewind-check marker: standby forked off the newest timeline: replayed timeline 1 up to 0/7038750 but timeline 2 left timeline 1 at 0/7037260; pg_rewind runs once the leader is a confirmed primary
+Rewind-check marker present and node1 holds the leader lock — checking with pg_rewind before following
+pg_rewind succeeded; removed the rewind-check marker
+```
+
 > ⚠️ **注意**：从旧主以备库启动到 pg_rewind 完成之间，它对外是健康副本（`/replica` 200），经 RO 端口的读请求可能读到旧主失锁前写入、新主上没有的数据。对一致性敏感的只读业务在这段时间应只读新主，或等日志出现 `pg_rewind succeeded` 之后再把它算作副本。这是已知窗口，登记在 [invariants.md](invariants.md) 第 9 节。
 
 ### 场景 2：Timeline 分歧处理
@@ -1150,6 +1186,174 @@ curl -s http://node1:8008/cluster | jq .
 为什么不能 rewind：强制参选的节点落后，PostgreSQL 会再用一次已经存在的 timeline 编号。两条历史可能连起点 LSN 都相同（实测：两个 TL5 都从 0/402B5F0 开始），这时 pg_rewind 会当成同一条历史，副本数据被静默混写。历史代用来把它们区分开。
 
 **确认恢复**：恰好一个节点 `/primary` 返回 200，其他节点 `/replica` 返回 200；所有成员的 `pg-ha.generation` 相同，等于 `/timeline` 的 `generation`。
+
+### 场景 4b：quorum 集群没有主库，投票凑不齐（`pg-ha-ctl recover`）
+
+适用于 `synchronous_mode` 为 `quorum`、`GET /cluster` 里没有 leader、选举一直拒绝投票的集群。原理和限制见「法定人数同步复制」里的「已知限制」。`recover` 不写 `/sync`，没有 `--force`，每一步都先只读解释，再由你确认。
+
+**先判断是哪一种**（任意存活节点上，`/sync` 里 `quorum` 对比 `voters`，再看各投票节点是否应答）：
+
+| 现象 | 情况 | 做法 |
+|---|---|---|
+| 有投票节点永久丢失（销毁、磁盘丢失），`q` 凑不齐 | A：丢失的投票节点已离线 | 下面的「情况 A」 |
+| 所有投票节点都应答，`quorum` 大于等于 `voters` 的个数，旧主回不来 | B：所有投票节点在线且 `q >= \|V\|` | 下面的「情况 B」 |
+| 只是暂时离线，投票节点会回来 | 不需要 `recover` | 等它们回来，集群会自己选主；`recover` 不带参数会返回 3 |
+
+两种情况的命令相同，区别在解释里点名的节点：A 点名离线的投票节点，B 点名一个在线的投票节点（位置最低的那个）。
+
+#### 步骤（两种情况相同）
+
+1. **只读解释**，在任意存活节点上（不发 `POST /vote`，不隔离任何节点）：
+   ```bash
+   pg-ha-ctl --endpoint http://node1:8008 --username admin --password secret recover
+   ```
+   退出码 4 表示需要你确认，输出里有候选、被点名的节点、可能丢失的内容和完整的执行命令。退出码 0（已有 leader）、3（集群会自己恢复）时不要继续。旧主的 leader 锁要先过期（TTL，默认 15 秒）；测试里是轮询解释，直到它不再被拒绝（杀节点 14 秒后）。
+2. **读懂解释，再执行**。digest 绑定了点名集合和当前状态；状态变了（有节点回来、`/sync` 变了）执行会被拒绝，重新解释即可：
+   ```bash
+   pg-ha-ctl --endpoint http://node1:8008 --username admin --password secret recover --lost <被点名的节点> --digest <digest>
+   ```
+   命令最多等 60 秒，直到候选成为主库。授权 15 秒有效；中途想放弃，执行 `pg-ha-ctl recover --cancel`。
+3. **确认结果**，见各情况末尾。
+
+#### 情况 A：丢失的投票节点已离线
+
+场景（PG 18.7，5 个节点，`/sync` 的 `q=3`，投票节点 node1 到 node5）：写入端确认的 30 行只存在于 node2（旧主，被杀）和 node5（被杀）上，其它节点都没有。两个节点同时被杀，node5 永久丢失，node2 之后回来。14 秒后（旧锁过期）在 node1 上解释：
+
+```console
+$ pg-ha-ctl recover
+Quorum recovery: needs acceptance: promoting node1 gives up the commits that only node5 may hold
+  /sync q=3
+  voter        timeline            lsn  status
+  node1               1      100889184  candidate
+  node3               1      100889184  counted
+  node4               1      100889184  counted
+  node5               -              -  unreachable: no member record with an API address; may not campaign: no member record
+  candidate: node1
+  lost: node5
+  commits only the lost voters hold may be lost: yes
+  everything acknowledged before the current timeline began is on the candidate: yes
+  newer timeline history abandoned: no
+To accept this loss, run:
+  pg-ha-ctl --endpoint http://node1:8008 recover --lost node5 --digest b093d82f1aef348ba767f3256a987de5477b85039a287def52f9c3b42cf60b6d
+[exit 4]
+```
+
+执行（在 node3 上，同样可以在任意存活节点上执行）：
+
+```console
+$ pg-ha-ctl recover --lost node5 --digest b093d82f1aef348ba767f3256a987de5477b85039a287def52f9c3b42cf60b6d
+[200] quorum recovery authorized: node1 may be promoted, accepting the loss of node5; the grant expires in 15 s
+node1 is the primary (1 s after the grant)
+[exit 0]
+```
+
+**丢失了什么。** 只有被点名的投票节点持有、且在 quorum 下已确认的提交。这次测试里 node1 上缺少那 30 行（id 101 到 130），基线 20 行完好，没有多出任何未确认的行：
+
+```console
+$ psql_on node1 "select phase, count(*), min(id), max(id) from b2 group by phase order by 1"
+base|20|1|20
+post|1|900|900
+```
+
+`risk.possible`（解释里的 `commits only the lost voters hold may be lost: yes`）为 `no` 时表示不会丢已确认的提交（丢失的投票节点数不超过 `|V| - q - 1`）。其它没有被 quorum 保护的提交（`/sync` 为异步期间确认的）和任何故障切换一样可能丢。
+
+**如何检查。**
+
+1. 新主和审计记录：`/history` 里有一条 `quorum_recovery`，日志里新主有 ERROR `Quorum recovery: took the leader lock under the operator's grant; promoting accepts the loss of node5`：
+   ```console
+   $ curl -s http://localhost:8008/history | jq -c '.[] | select(.event_type=="quorum_recovery")'
+   {"event_type":"quorum_recovery","lsn":100889184,"new_leader":"node1","old_leader":"node2","reason":"quorum recovery: accepted loss of node5; timeline loss: no","timeline":2,"timestamp":1795674029}
+   ```
+2. 和你的应用侧记录（或日志、对账表）对比，找出缺失的已确认行。丢失的节点如果磁盘还在，可以在它停着时用 `pg_waldump` 读它的 WAL，看到底有什么没有到新主。
+3. 丢失的节点回来（node5 和 node2 都回来）后会被 `pg_rewind` 回到新主的历史，只有它们持有的行消失。它们回来时的日志：
+   ```text
+   Created rewind-check marker: standby forked off the newest timeline: replayed timeline 1 up to 0/6038750 but timeline 2 left timeline 1 at 0/6037260; pg_rewind runs once the leader is a confirmed primary
+   Running pg_rewind to resync from current primary source=node1
+   pg_rewind succeeded; removed the rewind-check marker
+   Successfully rejoined cluster as replica
+   ```
+   约 15 秒后在新主上，所有节点都在流复制：
+   ```console
+   $ psql_on node1 "select application_name, state, sync_state from pg_stat_replication order by 1"
+   node2|streaming|quorum
+   node3|streaming|quorum
+   node4|streaming|quorum
+   node5|streaming|quorum
+   ```
+   node5 和 node2 上 `phase='batch'` 的行数为 0，总行数 21，和 node1 相同。
+4. `/primary` 在整个过程中没有出现过两个节点同时 200（146 个采样，0 次）。
+
+#### 情况 B：所有投票节点在线且 `q >= |V|`
+
+场景（PG 18.7，5 个节点）：先 switchover，再在 `/sync` 为 4 个投票节点、`q=4` 时杀掉新主 node1。四个投票节点 node2 到 node5 都在线，没有 leader：
+
+```console
+$ curl -s http://localhost:8011/cluster | jq -c '{leader, sync}'   # 杀死 node1 之前最后一次读取
+{"leader":null,"sync":{"kind":"quorum","n":null,"quorum":4,"settled":null,"voters":["node2","node3","node4","node5"]}}
+```
+
+投票永远通不过（`q` 等于投票节点数，而候选只能拿到其它的 3 票），只有已死的旧主能放宽 `q`。在 node2 上解释：
+
+```console
+$ pg-ha-ctl recover
+Quorum recovery: needs acceptance: every voter answers and the vote can never pass (q >= the voters); promoting node4 gives up no commit a voter holds, the online voter node5 leaves the synchronous set until it follows the new primary
+  /sync q=4
+  voter        timeline            lsn  status
+  node2               1      134446936  counted: on timeline 1 below the candidate's 2, at or before the point where the candidate's history left it; may campaign only by abandoning newer history: timeline 1 is not shown to be the latest timeline 2 (begins at 0/8037F58)
+  node3               1      134446936  counted: on timeline 1 below the candidate's 2, at or before the point where the candidate's history left it; may campaign only by abandoning newer history: timeline 1 is not shown to be the latest timeline 2 (begins at 0/8037F58)
+  node4               2      134447280  candidate
+  node5               1      134446936  counted: on timeline 1 below the candidate's 2, at or before the point where the candidate's history left it; may campaign only by abandoning newer history: timeline 1 is not shown to be the latest timeline 2 (begins at 0/8037F58); named as given up while online (holds nothing the candidate lacks)
+  every voter answers and q >= the number of voters: the vote can never pass, only the dead leader could relax q
+  online voter given up: node5 (it holds nothing the candidate lacks; the vote refuses if it is ahead; it is left out of the first synchronous set and follows the new primary, a rewind if its WAL diverged)
+  candidate: node4
+  lost: node5
+  commits only the lost voters hold may be lost: no, while it is not ahead (the vote checks again)
+  everything acknowledged before the current timeline began is on the candidate: yes
+  newer timeline history abandoned: no
+To accept this loss, run:
+  pg-ha-ctl --endpoint http://node2:8008 recover --lost node5 --digest f7ae65598e9dbd668ddb10706d129366eec5da7604051631a06c95e955e43632
+[exit 4]
+```
+
+被点名的 node5 虽然在线，但它没有候选缺少的东西；只要它实际更靠前，投票就会拒绝（`BehindPeer` / `HigherTimeline`），所以不会悄悄丢掉只有它持有的提交。执行：
+
+```console
+$ pg-ha-ctl recover --lost node5 --digest f7ae65598e9dbd668ddb10706d129366eec5da7604051631a06c95e955e43632
+[200] quorum recovery authorized: node4 may be promoted, accepting the online voter node5 (every voter answered and q >= |V|; no commit a voter holds is given up, node5 leaves the synchronous set until it follows the new primary); the grant expires in 15 s
+node4 is the primary (5 s after the grant)
+[exit 0]
+```
+
+**丢失了什么。** 任何投票节点持有的、已确认的提交都不会丢。这次测试：确认过 61 个 id，新主 node4 上缺失 0 个，node5 持有而 node4 没有的 id 为 0，没有多出未确认的行。没有任何投票节点持有过的提交（`/sync` 异步期间确认的）本来就不受 quorum 保护。被点名的 node5 不进新主最初的同步集合（它既不能确认写入，也不会卡住写入），之后像普通备库一样跟随新主。
+
+**如何检查。**
+
+1. 审计：`GET /cluster` 在授权有效期内显示 `recovery.named_online: true`，`/history` 记录这次晋升：
+   ```console
+   $ curl -s http://localhost:8011/history | jq -c '.[] | select(.event_type=="quorum_recovery")'
+   {"event_type":"quorum_recovery","lsn":134447280,"new_leader":"node4","old_leader":"node1","reason":"quorum recovery: accepted online voter node5 (every voter answered and q >= |V|; no commit a voter holds is given up, node5 leaves the synchronous set until it follows the new primary); timeline loss: no","timeline":3,"timestamp":1795672440}
+   ```
+   新主的日志有 ERROR `Quorum recovery: took the leader lock under the operator's grant; promoting accepts the online voter node5 ...`。
+2. 数据：和应用侧记录对比，应该一个已确认的行都不缺。
+3. 旧主 node1 回来后，pg-ha 发现它的 timeline 落后，用 `pg_rewind` 回到新主：
+   ```text
+   Timeline mismatch — cannot restart, need rejoin via pg_rewind local_timeline=1 upstream_timeline=3
+   Running pg_rewind source=host=node4 port=5432 dbname=postgres user=postgres
+   pg_rewind succeeded; removed the rewind-check marker
+   Follower: rejoined as replica via pg_rewind, following (node4)
+   ```
+   新主上所有节点都在流复制：
+   ```console
+   $ psql_on node4 "select application_name, state, sync_state from pg_stat_replication order by 1"
+   node1|streaming|async
+   node2|streaming|async
+   node3|streaming|async
+   node5|streaming|async
+   ```
+   测试读到这一步时 `sync_state` 全是 `async`，`/sync` 随后由 executor 重建；要确认同步复制恢复，请再看 `GET /cluster` 的 `sync` 和 `pg_stat_replication`。
+4. `/primary` 在整个过程中没有出现过两个节点同时 200（140 个采样，0 次）。
+
+**什么时候不要用。** 解释返回 3（正常投票已经能通过）时等待；有主库、在 pause 模式、`/config` 无效时被拒绝，按输出里的原因处理；仍然在线并且更靠前、却没有资格参选的投票节点会阻止恢复，先让它参选或修好它。
 
 ### 测试 watchdog（开发环境）
 
@@ -1330,6 +1534,7 @@ CLI 只访问 REST。参数是 `--endpoint`（默认 `http://127.0.0.1:8008`）�
 
 REST 为 HTTPS 时把 `--endpoint` 改成 `https://`。服务器证书由私有 CA 签发时加 `--cacert`（覆盖 `PG_HA_CACERT`）。`require_client_cert: true` 时再加 `--cert` 和 `--key`（分别覆盖 `PG_HA_CERT`、`PG_HA_KEY`）。只给证书或只给私钥时退出码 2，不发请求。Basic Auth 解决的是 HTTP 401；没有这三份材料时，mTLS 在握手阶段就失败，到不了 401。
 
+`recover` 对应 `GET` / `POST` / `DELETE /recovery`，不带参数只读。退出码：0 完成或无事可做，1 错误，2 用法错误（`--lost` 必须带 `--digest`，`--cancel` 不能和它们同用），3 集群会自己恢复，4 被拒绝或需要确认（执行时的 HTTP 409 也是 4）。流程见「法定人数同步复制」，逐步的运维步骤见「场景 4b」。
 `list` 打的是 `/patroni`，只打印这一台节点，不是 `/cluster` 的全体成员。
 
 ```bash
@@ -1340,6 +1545,9 @@ pg-ha-ctl --endpoint http://localhost:8008 restart
 pg-ha-ctl --endpoint http://localhost:8008 reinitialize
 pg-ha-ctl --endpoint http://localhost:8008 pause
 pg-ha-ctl --endpoint http://localhost:8008 resume
+pg-ha-ctl --endpoint http://localhost:8008 recover
+pg-ha-ctl --endpoint http://localhost:8008 recover --lost node5 --digest <digest>
+pg-ha-ctl --endpoint http://localhost:8008 recover --cancel
 PG_HA_USERNAME=admin PG_HA_PASSWORD=secret pg-ha-ctl --endpoint http://localhost:8008 restart
 PG_HA_USERNAME=admin PG_HA_PASSWORD=secret pg-ha-ctl \
   --endpoint https://127.0.0.1:8008 \

@@ -1380,6 +1380,7 @@ dependencies = [
  "libc",
  "proptest",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",

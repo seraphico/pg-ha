@@ -297,7 +297,7 @@ sequenceDiagram
 
 - 投票通过开放端点 `GET /wal` 读取各投票节点的实时 WAL 位置（每次调用会打开一个超级用户连接，所以同时最多 8 个，其余返回 503）。纯规则是 `quorum.rs` 的 `quorum_vote_decision`。任何失败都是拒绝。
 - `pre_promote_sync` 在 `pg_ctl promote` 之前先写入新一任的 `ANY n' (V')`，所以新主不会在更弱的设置下接收写入。失败就不晋升，并把锁还回去。
-- 从 async 启用时，先写 `/sync` 的 `(V, q = |V| − n)`，再写 PostgreSQL 的 `ANY n (V)`（SB-36）。failover 之后，或成员记录已过期的投票节点回来时，`q` 暂时等于 `|V|`，没有节点能赢得投票。主库在这个窗口内丢失，集群就没有主库，也没有任何东西去放宽 `q`。运维视角和待决问题见[运维指南](operations-guide.md#法定人数同步复制quorum)。
+- 从 async 启用时，先写 `/sync` 的 `(V, q = |V| − n)`，再写 PostgreSQL 的 `ANY n (V)`（SB-36）。failover 之后，或成员记录已过期的投票节点回来时，`q` 暂时等于 `|V|`，没有节点能赢得投票。主库在这个窗口内丢失，集群就没有主库，也没有任何东西去放宽 `q`。投票节点永久丢失时，`pg-ha-ctl recover` 写一次性的 DCS 键 `/recovery`（只能创建、TTL 等于锁 TTL、任何一次拿到锁都会删除），让被点名的候选在没有被点名投票节点的情况下赢得投票（不变量 S7）；它要求所有节点运行相同版本的 pg-ha。运维视角见[运维指南](operations-guide.md#法定人数同步复制quorum)。
 
 ## 模块依赖关系
 
@@ -407,6 +407,7 @@ flowchart LR
     subgraph ProtectedEndpoints["管理操作 - Basic Auth"]
         POST_SWITCHOVER["POST /switchover"]
         POST_FAILOVER["POST /failover"]
+        RECOVERY["GET/POST/DELETE /recovery"]
         POST_RESTART["POST /restart"]
         POST_REINIT["POST /reinitialize"]
         CONFIG["GET/PUT/PATCH /config"]

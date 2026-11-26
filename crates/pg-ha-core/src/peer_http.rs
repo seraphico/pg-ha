@@ -7,7 +7,9 @@ use serde::Deserialize;
 
 use crate::config::RestApiTlsConfig;
 use crate::quorum::WalPosition;
-use crate::quorum::round::{PEER_REQUEST_TIMEOUT, PeerProbeError, PeerTarget, PeerWalProbe};
+use crate::quorum::round::{
+    PEER_REQUEST_TIMEOUT, PeerMeta, PeerProbeError, PeerTarget, PeerWalProbe,
+};
 
 /// Build a client that talks to peers' REST API with this node's REST TLS
 /// material. mTLS presents this node's own server certificate; peers verify
@@ -74,6 +76,18 @@ struct WalBody {
     timeline: Option<u64>,
     wal_position: Option<u64>,
     pg_in_recovery: bool,
+    /// SB-37: the peer's pg-ha version (`GET /wal`; absent before 0.1.26).
+    #[serde(default)]
+    pg_ha_version: Option<String>,
+    /// SB-37: the peer's own history file for its timeline (`GET /wal`).
+    #[serde(default)]
+    timeline_history: Option<Vec<HistoryEntryBody>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryEntryBody {
+    timeline: u64,
+    switchpoint: u64,
 }
 
 /// Asks a peer for its vote at `POST /vote` (SB-40): the peer stops streaming
@@ -138,6 +152,13 @@ async fn wal_answer(
     response: reqwest::Response,
     target: &PeerTarget,
 ) -> Result<WalPosition, PeerProbeError> {
+    wal_answer_with_meta(response, target).await.map(|(p, _)| p)
+}
+/// [`wal_answer`] plus what the peer reports about itself.
+async fn wal_answer_with_meta(
+    response: reqwest::Response,
+    target: &PeerTarget,
+) -> Result<(WalPosition, PeerMeta), PeerProbeError> {
     let status = response.status();
     if status != reqwest::StatusCode::OK {
         return Err(PeerProbeError::Status(status.as_u16()));
@@ -154,12 +175,26 @@ async fn wal_answer(
     if !body.name.eq_ignore_ascii_case(&target.name) {
         return Err(PeerProbeError::Mismatch);
     }
-    Ok(WalPosition {
-        name: body.name,
-        in_recovery: body.pg_in_recovery,
-        timeline,
-        lsn,
-    })
+    Ok((
+        WalPosition {
+            name: body.name,
+            in_recovery: body.pg_in_recovery,
+            timeline,
+            lsn,
+        },
+        PeerMeta {
+            version: body.pg_ha_version,
+            timeline_history: body.timeline_history.map(|lines| {
+                lines
+                    .into_iter()
+                    .map(|l| crate::quorum::AncestorEnd {
+                        timeline: l.timeline,
+                        switchpoint: l.switchpoint,
+                    })
+                    .collect()
+            }),
+        },
+    ))
 }
 /// SB-37: reads a peer's live position at `GET /wal`, which changes nothing
 /// on the peer (unlike [`ReqwestPeerWalProbe`]). The follow path uses it to
@@ -179,6 +214,12 @@ impl ReqwestPeerWalReader {
 #[async_trait]
 impl PeerWalProbe for ReqwestPeerWalReader {
     async fn read(&self, target: &PeerTarget) -> Result<WalPosition, PeerProbeError> {
+        self.read_with_meta(target).await.map(|(p, _)| p)
+    }
+    async fn read_with_meta(
+        &self,
+        target: &PeerTarget,
+    ) -> Result<(WalPosition, PeerMeta), PeerProbeError> {
         let url = format!("{}/wal", target.api_url.trim_end_matches('/'));
         let response = self
             .client
@@ -186,7 +227,7 @@ impl PeerWalProbe for ReqwestPeerWalReader {
             .send()
             .await
             .map_err(map_reqwest_error)?;
-        wal_answer(response, target).await
+        wal_answer_with_meta(response, target).await
     }
 }
 
@@ -274,6 +315,45 @@ mod tests {
         assert_eq!(got.timeline, 4);
         let request = seen.await.unwrap();
         assert!(request.starts_with("GET /wal "), "{request}");
+    }
+    /// SB-37: the reader returns the version a peer reports, None when an
+    /// older peer reports none.
+    #[tokio::test]
+    async fn reader_returns_the_reported_version() {
+        let reader = ReqwestPeerWalReader::new(None).unwrap();
+        let tl2 = vec![crate::quorum::AncestorEnd {
+            timeline: 1,
+            switchpoint: 117_670_848,
+        }];
+        for (body, want, history) in [
+            (
+                r#"{"name":"node3","timeline":4,"wal_position":7,"pg_in_recovery":true,"pg_ha_version":"9.9.9"}"#,
+                Some("9.9.9".to_string()),
+                None,
+            ),
+            (
+                r#"{"name":"node3","timeline":4,"wal_position":7,"pg_in_recovery":true}"#,
+                None,
+                None,
+            ),
+            (
+                r#"{"name":"node3","timeline":2,"wal_position":7,"pg_in_recovery":true,"pg_ha_version":"9.9.9","timeline_history":[{"timeline":1,"switchpoint":117670848}]}"#,
+                Some("9.9.9".to_string()),
+                Some(tl2.clone()),
+            ),
+        ] {
+            let api_url = serve_once(http("200 OK", body)).await;
+            let (p, meta) = reader
+                .read_with_meta(&PeerTarget {
+                    name: "node3".into(),
+                    api_url,
+                })
+                .await
+                .unwrap();
+            assert_eq!(p.lsn, 7);
+            assert_eq!(meta.version, want);
+            assert_eq!(meta.timeline_history, history);
+        }
     }
     #[tokio::test]
     async fn probe_asks_with_post_vote() {

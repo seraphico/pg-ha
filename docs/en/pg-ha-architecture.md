@@ -297,7 +297,7 @@ sequenceDiagram
 
 - The vote reads the voters' live WAL positions through the open `GET /wal` endpoint (each call opens a superuser connection, so at most 8 run at once; the rest get 503). The pure rule is `quorum_vote_decision` in `quorum.rs`. Any failure is a refusal.
 - `pre_promote_sync` writes the new term's `ANY n' (V')` before `pg_ctl promote`, so a new primary never takes writes under a weaker setting. A failure means no promotion and the lock is given back.
-- Enabling from async writes `/sync` `(V, q = |V| − n)` before PostgreSQL `ANY n (V)` (SB-36). After a failover, or when a voter whose member record expired rejoins, `q` is temporarily `|V|` and nobody can win a vote. A primary lost in that window leaves the cluster without a primary and nothing relaxes `q`. The operator view and the open question are in the [Operations Guide](operations-guide.md#quorum-synchronous-replication).
+- Enabling from async writes `/sync` `(V, q = |V| − n)` before PostgreSQL `ANY n (V)` (SB-36). After a failover, or when a voter whose member record expired rejoins, `q` is temporarily `|V|` and nobody can win a vote. A primary lost in that window leaves the cluster without a primary and nothing relaxes `q`. When voters are gone for good, `pg-ha-ctl recover` writes a one-shot DCS key `/recovery` (create-only, TTL = lock ttl, deleted on any lock acquisition) that lets the named candidate win the vote without the named voters (invariant S7); it needs the same pg-ha version on every node. The operator view is in the [Operations Guide](operations-guide.md#quorum-synchronous-replication).
 
 ## Module Dependencies
 
@@ -407,6 +407,7 @@ flowchart LR
     subgraph ProtectedEndpoints["Management operations - Basic Auth"]
         POST_SWITCHOVER["POST /switchover"]
         POST_FAILOVER["POST /failover"]
+        RECOVERY["GET/POST/DELETE /recovery"]
         POST_RESTART["POST /restart"]
         POST_REINIT["POST /reinitialize"]
         CONFIG["GET/PUT/PATCH /config"]

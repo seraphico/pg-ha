@@ -64,6 +64,19 @@ pub trait DcsAdapter: Send + Sync {
     /// cap the entries (`history::History`); this never merges values.
     async fn write_history(&self, entries: &[HistoryEntry], expected: Option<u64>) -> Result<bool>;
 
+    /// SB-37: create the one-shot `/recovery` grant (create-only, TTL = the
+    /// lock ttl). Ok(false) when a live grant already exists. Adapters
+    /// without it refuse.
+    async fn create_recovery(&self, value: &str) -> Result<bool> {
+        let _ = value;
+        Err(crate::Error::Dcs(
+            "this DCS does not support /recovery".into(),
+        ))
+    }
+    /// SB-37: delete `/recovery`. Ok(false) when there was none.
+    async fn delete_recovery(&self) -> Result<bool> {
+        Ok(false)
+    }
     /// Get the configured TTL written into the leader lock
     fn ttl(&self) -> u64;
 

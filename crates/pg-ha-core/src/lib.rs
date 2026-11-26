@@ -9,6 +9,8 @@
 //! - Watchdog integration
 //! - Replication slot and synchronous replication management
 
+/// This pg-ha build's version (every node of a cluster must run the same).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod bootstrap;
 pub mod callbacks;
 pub mod cascading;
