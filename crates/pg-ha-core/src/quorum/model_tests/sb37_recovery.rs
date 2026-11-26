@@ -508,7 +508,7 @@ impl RWorld {
         let lost_names = self.names(&g.lost);
         let voters = self.voters();
         let fed = self.mutate(candidate, &g.lost, peers.clone());
-        match recovery_vote_decision(candidate, &voters, &lost_names, &fed) {
+        match recovery_vote_decision(candidate, &voters, &lost_names, &fed, &[]) {
             VoteDecision::Refused(r) => {
                 match r {
                     VoteRefusal::PrimaryAlive { .. } => self.stats.refused_primary_alive += 1,

@@ -144,18 +144,19 @@ impl Ha {
         let grant_lost: Option<Names> =
             grant.map(|g| g.lost.iter().map(|n| n.to_ascii_lowercase()).collect());
         let grant_text = grant.map(|g| g.loss_text());
+        // The same prefix rule for both (empty under the D6 override).
+        let ancestors = self.vote_ancestors(own_timeline);
         let decision = match &grant_lost {
-            Some(lost) => recovery_vote_decision(&candidate, &voters, lost, &round.answers),
-            None => {
-                let ancestors = self.vote_ancestors(own_timeline);
-                quorum_vote_decision_with_history(
-                    &candidate,
-                    &voters,
-                    quorum,
-                    &round.answers,
-                    &ancestors,
-                )
+            Some(lost) => {
+                recovery_vote_decision(&candidate, &voters, lost, &round.answers, &ancestors)
             }
+            None => quorum_vote_decision_with_history(
+                &candidate,
+                &voters,
+                quorum,
+                &round.answers,
+                &ancestors,
+            ),
         };
         match decision {
             VoteDecision::Refused(reason) => match &grant_lost {

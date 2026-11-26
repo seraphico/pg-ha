@@ -27,8 +27,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AncestorEnd, Names, VoteDecision, VoteRefusal, WalPosition, quorum_vote_decision_with_history,
-    recovery_vote_decision,
+    AncestorEnd, Names, PrefixTest, Standing, VoteDecision, VoteRefusal, WalPosition, decide,
+    holds_a_prefix, recovery_decide, standing,
 };
 use crate::cluster::{ClusterTimeline, RecoverySnapshot, SyncKind, SyncState};
 
@@ -228,6 +228,14 @@ fn quorum_sync(sync: Option<&SyncState>) -> Option<&SyncState> {
 
 /// The assessment (module docs for the order).
 pub fn assess(input: &Inputs<'_>) -> Assessment {
+    assess_with(input, holds_a_prefix)
+}
+
+/// [`assess`] with the older-timeline test as a parameter: the vote's own
+/// rule in production; mutated versions in the tests. Every count below goes
+/// through [`standing`] / [`decide`] / [`recovery_decide`] with it, so the
+/// explain counts exactly the voters the vote counts.
+pub(crate) fn assess_with(input: &Inputs<'_>, prefix: PrefixTest) -> Assessment {
     let done = |outcome: Outcome, voters: Vec<VoterReport>, quorum: Option<u32>| Assessment {
         outcome,
         voters,
@@ -266,7 +274,9 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
             .find(|p| p.name.eq_ignore_ascii_case(name))
     };
     let info = |name: &str| input.voters.get(name);
-    let reports = |candidate: Option<&WalPosition>| -> Vec<VoterReport> {
+    let reports = |candidate: Option<&WalPosition>,
+                   ancestors: &[AncestorEnd]|
+     -> Vec<VoterReport> {
         voters
             .iter()
             .map(|v| {
@@ -284,10 +294,21 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
                     (Some(p), Some(c)) if p.name.eq_ignore_ascii_case(&c.name) => {
                         "candidate".to_string()
                     }
-                    (Some(p), Some(c)) if p.timeline < c.timeline => format!(
-                        "on timeline {} below the candidate's {}: not counted",
-                        p.timeline, c.timeline
-                    ),
+                    (Some(p), Some(c)) if p.timeline < c.timeline => {
+                        // The vote's own rule (`standing`): counted when its
+                        // WAL is a prefix of the candidate's.
+                        if standing(c, &voters, p, ancestors, prefix) == Standing::Counts {
+                            format!(
+                                "counted: on timeline {} below the candidate's {}, at or before the point where the candidate's history left it",
+                                p.timeline, c.timeline
+                            )
+                        } else {
+                            format!(
+                                "on timeline {} below the candidate's {}: not counted",
+                                p.timeline, c.timeline
+                            )
+                        }
+                    }
                     (Some(p), Some(c)) if p.timeline > c.timeline || p.lsn > c.lsn => {
                         "ahead of the candidate".to_string()
                     }
@@ -317,7 +338,7 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
             Outcome::Blocked {
                 reason: why.clone(),
             },
-            reports(None),
+            reports(None, &[]),
             Some(q),
         );
     }
@@ -329,7 +350,7 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
                     p.name
                 ),
             },
-            reports(None),
+            reports(None, &[]),
             Some(q),
         );
     }
@@ -364,13 +385,12 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
                     Outcome::Blocked {
                         reason: "no answering voter may be promoted (see the voters)".into(),
                     },
-                    reports(None),
+                    reports(None, &[]),
                     Some(q),
                 );
             }
         },
     };
-    let report = reports(Some(&candidate));
     let cname = candidate.name.to_ascii_lowercase();
     // The vote passes no history to a candidate under the timeline-loss
     // override; neither does this.
@@ -382,12 +402,14 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
             .get(&candidate.timeline)
             .map_or(&[][..], Vec::as_slice)
     };
-    if let VoteDecision::Granted { votes } = quorum_vote_decision_with_history(
+    let report = reports(Some(&candidate), ancestors);
+    if let VoteDecision::Granted { votes } = decide(
         &candidate,
         &voters,
         q as usize,
         input.readings,
         ancestors,
+        prefix,
     ) {
         return done(
             Outcome::WillHeal {
@@ -400,10 +422,17 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
             Some(q),
         );
     }
+    // Not counted by the vote's own rule (`standing`, prefix rule included):
+    // no answer, or an older timeline the candidate's history does not
+    // cover. A voter that refuses is left to the vote check below.
     let mut lost: Names = voters
         .iter()
         .filter(|v| **v != cname)
-        .filter(|v| reading(v).is_none_or(|p| p.timeline < candidate.timeline))
+        .filter(|v| {
+            reading(v).is_none_or(|p| {
+                standing(&candidate, &voters, p, ancestors, prefix) == Standing::NotCounted
+            })
+        })
         .cloned()
         .collect();
     // Every other voter answers on the candidate's timeline (or ahead) and
@@ -437,9 +466,14 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
                 // `q < |V|`: only a voter ahead that may not campaign can
                 // refuse the vote (the check below says which); a single
                 // voter has nobody to name.
-                if let VoteDecision::Refused(why) =
-                    recovery_vote_decision(&candidate, &voters, &lost, input.readings)
-                {
+                if let VoteDecision::Refused(why) = recovery_decide(
+                    &candidate,
+                    &voters,
+                    &lost,
+                    input.readings,
+                    ancestors,
+                    prefix,
+                ) {
                     return done(
                         Outcome::Blocked {
                             reason: refusal_reason(&cname, why),
@@ -461,9 +495,14 @@ pub fn assess(input: &Inputs<'_>) -> Assessment {
             }
         }
     }
-    if let VoteDecision::Refused(why) =
-        recovery_vote_decision(&candidate, &voters, &lost, input.readings)
-    {
+    if let VoteDecision::Refused(why) = recovery_decide(
+        &candidate,
+        &voters,
+        &lost,
+        input.readings,
+        ancestors,
+        prefix,
+    ) {
         return done(
             Outcome::Blocked {
                 reason: refusal_reason(&cname, why),
@@ -581,10 +620,18 @@ mod tests {
                 blocked: None,
             }
         }
+        /// Through the public `assess` (the production rule).
         fn run(&self) -> Assessment {
+            self.run_inner(None)
+        }
+        /// Through `assess_with` and a mutated older-timeline test.
+        fn run_with(&self, prefix: PrefixTest) -> Assessment {
+            self.run_inner(Some(prefix))
+        }
+        fn run_inner(&self, prefix: Option<PrefixTest>) -> Assessment {
             let unreachable = BTreeMap::new();
             let ancestors = self.ancestors.clone();
-            assess(&Inputs {
+            let inputs = Inputs {
                 lock_holder: self.lock,
                 sync: self.sync.as_ref(),
                 timeline: &self.timeline,
@@ -593,7 +640,11 @@ mod tests {
                 voters: &self.voters,
                 ancestors: &ancestors,
                 blocked: self.blocked.clone(),
-            })
+            };
+            match prefix {
+                None => assess(&inputs),
+                Some(p) => assess_with(&inputs, p),
+            }
         }
     }
     fn blocked(a: &Assessment) -> &str {
@@ -992,5 +1043,183 @@ mod tests {
         assert!(!is_digest(&"a".repeat(63)));
         assert!(!is_digest(&"g".repeat(64)));
         assert!(!is_digest(""));
+    }
+
+    /// The PG 18.7 state of evidence/pr-b2-accepted-loss-online-*: a
+    /// switchover node2 -> node1, node1 killed while /sync was V={node2..5},
+    /// q=4. node2 (the demoted old primary) answers on timeline 2 at
+    /// 117671168; node3..5 answer on timeline 1 at 0/70383C0 = 117670848,
+    /// exactly where node2's 00000002.history says timeline 2 began.
+    fn online_stuck_q() -> Case {
+        let s = 117_670_848;
+        Case {
+            lock: None,
+            sync: Some(SyncState {
+                leader: "node1".into(),
+                ..sync("node2,node3,node4,node5", 4)
+            }),
+            timeline: tl(2, s),
+            readings: vec![
+                pos("node2", 2, 117_671_168),
+                pos("node3", 1, s),
+                pos("node4", 1, s),
+                pos("node5", 1, s),
+            ],
+            voters: eligible(&["node2", "node3", "node4", "node5"]),
+            ancestors: BTreeMap::from([(
+                2,
+                vec![AncestorEnd {
+                    timeline: 1,
+                    switchpoint: s,
+                }],
+            )]),
+            blocked: None,
+        }
+    }
+
+    #[test]
+    fn online_stuck_q_with_prefix_voters_names_one_online_voter() {
+        let a = online_stuck_q().run();
+        match &a.outcome {
+            Outcome::NeedsAcceptance {
+                candidate,
+                lost,
+                risk,
+                ..
+            } => {
+                assert_eq!(candidate, "node2");
+                // Equal positions: the tie rule takes the greater name.
+                assert_eq!(lost, &["node5"]);
+                assert!(risk.named_online);
+            }
+            other => panic!("{other:?}"),
+        }
+        let status: Vec<&str> = a.voters.iter().map(|v| v.status.as_str()).collect();
+        assert!(
+            status[1].starts_with("counted: on timeline 1"),
+            "{status:?}"
+        );
+        assert!(
+            status[3].contains("named as given up while online"),
+            "{status:?}"
+        );
+        // Without the history file (unreadable, D6 override) they are not
+        // counted and the old answer stands: all three named.
+        let mut c = online_stuck_q();
+        c.ancestors.clear();
+        match c.run().outcome {
+            Outcome::NeedsAcceptance { lost, risk, .. } => {
+                assert_eq!(lost, ["node3", "node4", "node5"]);
+                assert!(!risk.named_online);
+            }
+            other => panic!("{other:?}"),
+        }
+        // One byte past the switchpoint: forked off, not counted.
+        let mut c = online_stuck_q();
+        c.readings[1].lsn += 1;
+        match c.run().outcome {
+            Outcome::NeedsAcceptance { lost, risk, .. } => {
+                assert_eq!(lost, ["node3"]);
+                assert!(!risk.named_online);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Mutation: an assessment that ignores the prefix rule is caught.
+    #[test]
+    fn assess_ignoring_the_prefix_rule_is_caught() {
+        fn never(_: &WalPosition, _: &[AncestorEnd]) -> bool {
+            false
+        }
+        let a = online_stuck_q().run_with(never);
+        assert!(
+            !matches!(&a.outcome, Outcome::NeedsAcceptance { lost, risk, .. } if lost == &["node5"] && risk.named_online),
+            "the mutant gives the same answer: {:?}",
+            a.outcome
+        );
+    }
+
+    /// The explain and the vote count the same voters: over the prefix
+    /// cases, a voter is reported "counted" exactly when `standing` (the
+    /// vote's rule) counts it, it is in `lost` exactly when it is not, and a
+    /// grant on that `lost` passes the recovery vote with the same history.
+    #[test]
+    fn assess_and_vote_agree_on_which_voters_count() {
+        let s = 1000u64;
+        let anc = vec![AncestorEnd {
+            timeline: 1,
+            switchpoint: s,
+        }];
+        let cases: Vec<(u64, u64)> =
+            vec![(1, s - 1), (1, s), (1, s + 1), (0, s), (2, 900), (2, 1200)];
+        for (tl_v, lsn_v) in cases {
+            for history in [true, false] {
+                let mut c = Case {
+                    lock: None,
+                    sync: Some(sync("node2,node3,node4", 2)),
+                    timeline: tl(2, s),
+                    readings: vec![
+                        pos("node2", 2, 1200),
+                        pos("node3", 2, 1100),
+                        pos("node4", tl_v, lsn_v),
+                    ],
+                    voters: eligible(&["node2", "node3", "node4"]),
+                    ancestors: BTreeMap::new(),
+                    blocked: None,
+                };
+                if history {
+                    c.ancestors.insert(2, anc.clone());
+                }
+                let used: &[AncestorEnd] = if history { &anc } else { &[] };
+                let voters: Names = ["node2", "node3", "node4"]
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect();
+                let counts = standing(
+                    &c.readings[0],
+                    &voters,
+                    &c.readings[2],
+                    used,
+                    holds_a_prefix,
+                ) == Standing::Counts;
+                let a = c.run();
+                let label = format!("node4 tl {tl_v} lsn {lsn_v} history {history}");
+                let status = &a.voters[2].status;
+                assert_eq!(status.starts_with("counted"), counts, "{label}: {status}");
+                let vote = decide(
+                    &c.readings[0],
+                    &voters,
+                    2,
+                    &c.readings,
+                    used,
+                    holds_a_prefix,
+                );
+                match (&a.outcome, &vote) {
+                    (Outcome::WillHeal { .. }, VoteDecision::Granted { .. }) => {
+                        assert!(counts, "{label}")
+                    }
+                    (Outcome::NeedsAcceptance { lost, .. }, VoteDecision::Refused(_)) => {
+                        assert_eq!(lost.contains(&"node4".to_string()), !counts, "{label}");
+                        let lost: Names = lost.iter().cloned().collect();
+                        assert!(
+                            matches!(
+                                recovery_decide(
+                                    &c.readings[0],
+                                    &voters,
+                                    &lost,
+                                    &c.readings,
+                                    used,
+                                    holds_a_prefix
+                                ),
+                                VoteDecision::Granted { .. }
+                            ),
+                            "{label}: the grant must pass the recovery vote"
+                        );
+                    }
+                    (o, v) => panic!("{label}: explain {o:?} vs vote {v:?}"),
+                }
+            }
+        }
     }
 }
