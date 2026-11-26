@@ -1195,6 +1195,174 @@ Why rewind cannot be used: the node that was forced to take part is behind, and 
 
 **Confirm recovery**: exactly one node's `/primary` returns 200, and the other nodes' `/replica` return 200. Every member's `pg-ha.generation` is the same, and it equals `generation` in `/timeline`.
 
+### Scenario 4b: a quorum cluster has no primary and the vote cannot be won (`pg-ha-ctl recover`)
+
+Use this when `synchronous_mode` is `quorum`, `GET /cluster` shows no leader, and the election keeps refusing the vote. The mechanism and limits are in "Quorum synchronous replication", under "Known limits". `recover` does not write `/sync` and has no `--force`. Each step first explains read-only, and you confirm afterwards.
+
+**Decide which case you are in** (on any live node, compare `quorum` with `voters` in `/sync`, then check which voters answer):
+
+| What you see | Case | What to do |
+|---|---|---|
+| A voter is permanently lost (destroyed, disk gone) and `q` cannot be met | A: the lost voter is offline | "Case A" below |
+| Every voter answers, `quorum` is at least the number of `voters`, and the old primary will not return | B: all voters online and `q >= \|V\|` | "Case B" below |
+| The voters are only temporarily offline and will return | `recover` is not needed | Wait; the cluster elects a primary itself. `recover` without arguments exits 3 |
+
+The commands are the same in both cases. The difference is the node the explanation names: case A names an offline voter, case B names one online voter (the one with the lowest position).
+
+#### Steps (the same for both cases)
+
+1. **Explain, read-only**, on any live node. It sends no `POST /vote` and isolates no node:
+   ```bash
+   pg-ha-ctl --endpoint http://node1:8008 --username admin --password secret recover
+   ```
+   Exit code 4 means it needs your confirmation. The output lists the candidate, the named node, what may be lost, and the full command to run. Do not continue on exit code 0 (a leader exists) or 3 (the cluster recovers itself). The old leader lock has to expire first (the TTL, 15 s by default). In the tests the explanation was polled until it stopped being refused (14 s after the kill).
+2. **Read the explanation, then apply.** The digest is bound to the named set and the current state. If the state changed (a node returned, `/sync` changed), the apply is refused; explain again:
+   ```bash
+   pg-ha-ctl --endpoint http://node1:8008 --username admin --password secret recover --lost <named node> --digest <digest>
+   ```
+   The command waits up to 60 s for the candidate to become primary. The grant is valid for 15 s. To back out, run `pg-ha-ctl recover --cancel`.
+3. **Check the result**, at the end of each case.
+
+#### Case A: the lost voter is offline
+
+Setup (PG 18.7, 5 nodes, `/sync` has `q=3`, voters node1 to node5): the 30 rows the writer got an acknowledgement for exist only on node2 (the old primary, killed) and node5 (killed); no other node has them. node5 is lost for good, and node2 returns later. 14 s after the kill (the old lock has expired), explain on node1:
+
+```console
+$ pg-ha-ctl recover
+Quorum recovery: needs acceptance: promoting node1 gives up the commits that only node5 may hold
+  /sync q=3
+  voter        timeline            lsn  status
+  node1               1      100889184  candidate
+  node3               1      100889184  counted
+  node4               1      100889184  counted
+  node5               -              -  unreachable: no member record with an API address; may not campaign: no member record
+  candidate: node1
+  lost: node5
+  commits only the lost voters hold may be lost: yes
+  everything acknowledged before the current timeline began is on the candidate: yes
+  newer timeline history abandoned: no
+To accept this loss, run:
+  pg-ha-ctl --endpoint http://node1:8008 recover --lost node5 --digest b093d82f1aef348ba767f3256a987de5477b85039a287def52f9c3b42cf60b6d
+[exit 4]
+```
+
+Apply (run on node3 here; any live node works):
+
+```console
+$ pg-ha-ctl recover --lost node5 --digest b093d82f1aef348ba767f3256a987de5477b85039a287def52f9c3b42cf60b6d
+[200] quorum recovery authorized: node1 may be promoted, accepting the loss of node5; the grant expires in 15 s
+node1 is the primary (1 s after the grant)
+[exit 0]
+```
+
+**What is lost.** The commits that only the named voter holds and that were acknowledged under quorum. In this test node1 lacks those 30 rows (ids 101 to 130), the 20 baseline rows are intact, and there are no extra unacknowledged rows:
+
+```console
+$ psql_on node1 "select phase, count(*), min(id), max(id) from b2 group by phase order by 1"
+base|20|1|20
+post|1|900|900
+```
+
+When the explanation says `commits only the lost voters hold may be lost: no` (`risk.possible`), no acknowledged commit is lost (the number of lost voters is at most `|V| - q - 1`). Commits that quorum never protected (acknowledged while `/sync` was asynchronous) can be lost, as in any failover.
+
+**How to check.**
+
+1. Audit trail: `/history` has a `quorum_recovery` entry, and the new primary logs an ERROR `Quorum recovery: took the leader lock under the operator's grant; promoting accepts the loss of node5`:
+   ```console
+   $ curl -s http://localhost:8008/history | jq -c '.[] | select(.event_type=="quorum_recovery")'
+   {"event_type":"quorum_recovery","lsn":100889184,"new_leader":"node1","old_leader":"node2","reason":"quorum recovery: accepted loss of node5; timeline loss: no","timeline":2,"timestamp":1795674029}
+   ```
+2. Compare with your application's own record (or a ledger table) to find the acknowledged rows that are missing. If the lost node's disk survives, you can read its WAL with `pg_waldump` while it is stopped to see what never reached the new primary.
+3. The lost nodes (node5 and node2 here) are brought back to the new primary's history with `pg_rewind` when they return, and only the rows they alone held disappear. The log on return:
+   ```text
+   Created rewind-check marker: standby forked off the newest timeline: replayed timeline 1 up to 0/6038750 but timeline 2 left timeline 1 at 0/6037260; pg_rewind runs once the leader is a confirmed primary
+   Running pg_rewind to resync from current primary source=node1
+   pg_rewind succeeded; removed the rewind-check marker
+   Successfully rejoined cluster as replica
+   ```
+   About 15 s later, on the new primary every node streams:
+   ```console
+   $ psql_on node1 "select application_name, state, sync_state from pg_stat_replication order by 1"
+   node2|streaming|quorum
+   node3|streaming|quorum
+   node4|streaming|quorum
+   node5|streaming|quorum
+   ```
+   On node5 and node2 the count of rows with `phase='batch'` is 0 and the total is 21, the same as on node1.
+4. `/primary` never returned 200 on two nodes at once during the run (146 samples, 0 occurrences).
+
+#### Case B: all voters online and `q >= |V|`
+
+Setup (PG 18.7, 5 nodes): switch over first, then kill the new primary node1 while `/sync` has four voters and `q=4`. The four voters node2 to node5 are all online and there is no leader:
+
+```console
+$ curl -s http://localhost:8011/cluster | jq -c '{leader, sync}'   # last read before node1 was killed
+{"leader":null,"sync":{"kind":"quorum","n":null,"quorum":4,"settled":null,"voters":["node2","node3","node4","node5"]}}
+```
+
+The vote can never pass: `q` equals the number of voters, and a candidate can collect only the other 3. Only the dead old primary could relax `q`. Explain on node2:
+
+```console
+$ pg-ha-ctl recover
+Quorum recovery: needs acceptance: every voter answers and the vote can never pass (q >= the voters); promoting node4 gives up no commit a voter holds, the online voter node5 leaves the synchronous set until it follows the new primary
+  /sync q=4
+  voter        timeline            lsn  status
+  node2               1      134446936  counted: on timeline 1 below the candidate's 2, at or before the point where the candidate's history left it; may campaign only by abandoning newer history: timeline 1 is not shown to be the latest timeline 2 (begins at 0/8037F58)
+  node3               1      134446936  counted: on timeline 1 below the candidate's 2, at or before the point where the candidate's history left it; may campaign only by abandoning newer history: timeline 1 is not shown to be the latest timeline 2 (begins at 0/8037F58)
+  node4               2      134447280  candidate
+  node5               1      134446936  counted: on timeline 1 below the candidate's 2, at or before the point where the candidate's history left it; may campaign only by abandoning newer history: timeline 1 is not shown to be the latest timeline 2 (begins at 0/8037F58); named as given up while online (holds nothing the candidate lacks)
+  every voter answers and q >= the number of voters: the vote can never pass, only the dead leader could relax q
+  online voter given up: node5 (it holds nothing the candidate lacks; the vote refuses if it is ahead; it is left out of the first synchronous set and follows the new primary, a rewind if its WAL diverged)
+  candidate: node4
+  lost: node5
+  commits only the lost voters hold may be lost: no, while it is not ahead (the vote checks again)
+  everything acknowledged before the current timeline began is on the candidate: yes
+  newer timeline history abandoned: no
+To accept this loss, run:
+  pg-ha-ctl --endpoint http://node2:8008 recover --lost node5 --digest f7ae65598e9dbd668ddb10706d129366eec5da7604051631a06c95e955e43632
+[exit 4]
+```
+
+node5 is online but holds nothing the candidate lacks. If it is actually ahead, the vote refuses (`BehindPeer` / `HigherTimeline`), so a commit only node5 holds is never dropped silently. Apply:
+
+```console
+$ pg-ha-ctl recover --lost node5 --digest f7ae65598e9dbd668ddb10706d129366eec5da7604051631a06c95e955e43632
+[200] quorum recovery authorized: node4 may be promoted, accepting the online voter node5 (every voter answered and q >= |V|; no commit a voter holds is given up, node5 leaves the synchronous set until it follows the new primary); the grant expires in 15 s
+node4 is the primary (5 s after the grant)
+[exit 0]
+```
+
+**What is lost.** No acknowledged commit that any voter holds. In this test 61 ids were acknowledged, 0 are missing on the new primary node4, 0 ids that node5 held are missing on node4, and there are no extra unacknowledged rows. Commits that no voter ever held (acknowledged while `/sync` was asynchronous) were never protected by quorum. The named node5 stays out of the new primary's first synchronous set (it can neither acknowledge writes nor block them), then follows the new primary like any standby.
+
+**How to check.**
+
+1. Audit trail: while the grant is valid, `GET /cluster` shows `recovery.named_online: true`, and `/history` records the promotion:
+   ```console
+   $ curl -s http://localhost:8011/history | jq -c '.[] | select(.event_type=="quorum_recovery")'
+   {"event_type":"quorum_recovery","lsn":134447280,"new_leader":"node4","old_leader":"node1","reason":"quorum recovery: accepted online voter node5 (every voter answered and q >= |V|; no commit a voter holds is given up, node5 leaves the synchronous set until it follows the new primary); timeline loss: no","timeline":3,"timestamp":1795672440}
+   ```
+   The new primary logs an ERROR `Quorum recovery: took the leader lock under the operator's grant; promoting accepts the online voter node5 ...`.
+2. Data: compare with your application's own record. No acknowledged row should be missing.
+3. When the old primary node1 returns, pg-ha sees its timeline is behind and brings it back with `pg_rewind`:
+   ```text
+   Timeline mismatch — cannot restart, need rejoin via pg_rewind local_timeline=1 upstream_timeline=3
+   Running pg_rewind source=host=node4 port=5432 dbname=postgres user=postgres
+   pg_rewind succeeded; removed the rewind-check marker
+   Follower: rejoined as replica via pg_rewind, following (node4)
+   ```
+   On the new primary every node streams:
+   ```console
+   $ psql_on node4 "select application_name, state, sync_state from pg_stat_replication order by 1"
+   node1|streaming|async
+   node2|streaming|async
+   node3|streaming|async
+   node5|streaming|async
+   ```
+   When the test read this, every `sync_state` was `async`, and the executor rebuilds `/sync` afterwards. To confirm synchronous replication is back, check `sync` in `GET /cluster` and `pg_stat_replication` again.
+4. `/primary` never returned 200 on two nodes at once during the run (140 samples, 0 occurrences).
+
+**When not to use it.** Wait if the explanation exits 3 (the normal vote can already pass). It is refused when a primary exists, in pause mode, or when `/config` is invalid; follow the reason it prints. A voter that is still online and ahead but may not campaign blocks the recovery: get it to campaign or repair it first.
+
 ### Testing the watchdog (development environment)
 
 Docker Desktop has no watchdog device. The kernel of colima's Ubuntu VM includes `softdog`, which can be used for a real test. `soft_noboot=1` makes a timeout write only `softdog: Triggered - Reboot ignored` to the kernel log, without rebooting the VM:
@@ -1375,7 +1543,7 @@ Management endpoints require Basic Auth when `restapi.username` and `restapi.pas
 
 When REST is HTTPS, change `--endpoint` to `https://`. When the server certificate is issued by a private CA, add `--cacert` (it overrides `PG_HA_CACERT`). When `require_client_cert: true`, also add `--cert` and `--key` (they override `PG_HA_CERT` and `PG_HA_KEY`). If only the certificate or only the private key is given, the exit code is 2 and no request is sent. Basic Auth is what answers an HTTP 401. Without those three files, mTLS fails during the handshake and never reaches 401.
 
-`recover` is `GET` / `POST` / `DELETE /recovery`; with no flags it only reads. Exit codes: 0 done or nothing to do, 1 error, 2 usage (`--lost` needs `--digest`, `--cancel` takes neither), 3 the cluster heals by itself, 4 refused or needs acceptance (also an HTTP 409 on apply). See "Quorum synchronous replication" for the procedure.
+`recover` is `GET` / `POST` / `DELETE /recovery`; with no flags it only reads. Exit codes: 0 done or nothing to do, 1 error, 2 usage (`--lost` needs `--digest`, `--cancel` takes neither), 3 the cluster heals by itself, 4 refused or needs acceptance (also an HTTP 409 on apply). See "Quorum synchronous replication" for the procedure and "Scenario 4b" for the step-by-step runbook.
 `list` calls `/patroni` and prints only that one node, not every member from `/cluster`.
 
 ```bash
