@@ -400,7 +400,7 @@ test_unclean_kill() {
     check_a_rejoined "SIGKILL"
     after=$(sb28_marker_count)
     log_info "single-user crash recovery lines in the log of $A: before the restart $before, after $after"
-    docker logs "pg-ha-$A" 2>&1 | grep -E "running single-user crash recovery|Single-user crash recovery finished|Created rewind-check marker|pg_rewind completed" | cut -c1-260 | sed 's/^/[INFO] [SB-28 log] /'
+    docker logs "pg-ha-$A" 2>&1 | grep -E "running single-user crash recovery|Single-user crash recovery finished|Created rewind-check marker|pg_rewind completed" | cut -c1-260 | sed 's/^/[INFO] [SB-28 log] /' || true
     TESTS_RUN=$((TESTS_RUN + 1))
     if [ "${after:-0}" -gt "${before:-0}" ]; then
         TESTS_PASSED=$((TESTS_PASSED + 1)); log_pass "[SIGKILL] the SB-28 path was reached: $A ran single-user crash recovery before pg_rewind after the restart"
