@@ -46,8 +46,8 @@
 # The expected result is a FAIL on an image built from main and a PASS on the
 # fixed image. Always check which image ran: the pinned image IDs are printed.
 #
-# Run against an already running 3-node dev cluster (one docker task at a time,
-# see .agents/CONVENTIONS.md section 7). To keep the project name unique, start
+# Run against an already running 3-node dev cluster (one docker task at a
+# time). To keep the project name unique, start
 # the cluster under its own compose project, with the images pinned by ID, and
 # pass that project:
 #   E2E_COMPOSE_PROJECT=sb28e2e bash tests/e2e/test_rewind_unclean.sh

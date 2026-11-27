@@ -4,8 +4,6 @@
 //! Every function takes plain values and returns plain values, so the
 //! safety argument can be machine-checked by the model in `model_tests`.
 //!
-//! Design: `.agents/tasks/sb-13-quorum-design/design.md` (sections 1, 3, 4).
-//!
 //! # Vocabulary
 //!
 //! * `V` — the voter set published in DCS `/sync` (standbys only, never the
