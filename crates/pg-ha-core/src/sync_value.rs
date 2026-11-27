@@ -2,8 +2,7 @@
 //! quorum executor (SB-13, PR3a). Pure: no I/O, nothing here is wired yet.
 //!
 //! `SHOW synchronous_standby_names` returns the text exactly as it was
-//! written (probe report `.agents/tasks/sb-13-pr3/probe/report.md`, section
-//! 4, identical on PostgreSQL 16, 17, 18 and 19rc1): any keyword case, a
+//! written (verified on PostgreSQL 16, 17, 18 and 19rc1): any keyword case, a
 //! missing keyword, optional spaces anywhere, quoted or unquoted names,
 //! doubled double quotes, leading and trailing whitespace are all kept. So
 //! there is no canonical form on the PostgreSQL side. This module provides
