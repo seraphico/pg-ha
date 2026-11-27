@@ -465,17 +465,53 @@ pub enum MemberRole {
     Uninitialized,
 }
 
-impl std::fmt::Display for MemberRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl MemberRole {
+    /// The one lowercase snake_case spelling used in every API value.
+    /// serde (`rename_all = "snake_case"`) produces the same strings; a test pins that.
+    pub const ALL: [MemberRole; 4] = [
+        Self::Primary,
+        Self::Replica,
+        Self::StandbyLeader,
+        Self::Uninitialized,
+    ];
+    pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Primary => write!(f, "primary"),
-            Self::Replica => write!(f, "replica"),
-            Self::StandbyLeader => write!(f, "standby_leader"),
-            Self::Uninitialized => write!(f, "uninitialized"),
+            Self::Primary => "primary",
+            Self::Replica => "replica",
+            Self::StandbyLeader => "standby_leader",
+            Self::Uninitialized => "uninitialized",
         }
     }
 }
-
+impl std::fmt::Display for MemberRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl MemberState {
+    pub const ALL: [MemberState; 5] = [
+        Self::Running,
+        Self::Stopped,
+        Self::Starting,
+        Self::Crashed,
+        Self::Unknown,
+    ];
+    /// The one lowercase snake_case spelling used in every API value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Crashed => "crashed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+impl std::fmt::Display for MemberState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 /// Synchronous replication state stored in DCS /sync key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncState {
@@ -618,6 +654,23 @@ impl Failover {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// SB-24: as_str, Display and serde agree for every variant, and none has an uppercase letter.
+    #[test]
+    fn member_role_and_state_strings_are_lowercase_and_agree_with_serde() {
+        for r in MemberRole::ALL {
+            let j = serde_json::to_value(&r).unwrap();
+            assert_eq!(j, r.as_str());
+            assert_eq!(r.to_string(), r.as_str());
+            assert!(!r.as_str().chars().any(|c| c.is_uppercase()), "{r:?}");
+        }
+        for st in MemberState::ALL {
+            let j = serde_json::to_value(&st).unwrap();
+            assert_eq!(j, st.as_str());
+            assert_eq!(st.to_string(), st.as_str());
+            assert!(!st.as_str().chars().any(|c| c.is_uppercase()), "{st:?}");
+        }
+        assert_eq!(MemberRole::StandbyLeader.as_str(), "standby_leader");
+    }
 
     #[test]
     fn quorum_is_settled_means_q_equals_voters_minus_n_and_n_is_on() {

@@ -107,7 +107,7 @@ OLD_PORT=$(port_of "$PRIMARY")
 for i in $(seq 1 12); do
   sleep 5
   ROLE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$OLD_PORT/patroni 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['role'])" 2>/dev/null)
-  if [ "$ROLE" = "Replica" ]; then
+  if [ "$ROLE" = "replica" ]; then
     REJOINED=true
     echo "  ✅ 旧Primary已rejoin为Replica (${i}x5s)"; PASS=$((PASS+1))
     break
@@ -143,16 +143,16 @@ CANDIDATE_CTR="pg-ha-$CANDIDATE"
 CANDIDATE_PORT=$(port_of "$CANDIDATE_CTR")
 echo "  switchover: $CURRENT_PRIMARY → $CANDIDATE"
 
-# Precondition: the candidate must be a Running replica that has caught up
+# Precondition: the candidate must be a running replica that has caught up
 # before we switch to it (the cluster may still be stabilising right after the
-# previous rejoin). Poll /replica=200 and a Running state rather than switching
+# previous rejoin). Poll /replica=200 and a running state rather than switching
 # blind after a fixed sleep.
 echo "  Waiting for candidate $CANDIDATE_CTR to be a caught-up replica..."
 CANDIDATE_READY=false
 for i in $(seq 1 60); do
   RCODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w "%{http_code}" $SCHEME://localhost:$CANDIDATE_PORT/replica 2>/dev/null)
   CSTATE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$CANDIDATE_PORT/patroni 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])" 2>/dev/null || echo "")
-  if [ "$RCODE" = "200" ] && [ "$CSTATE" = "Running" ]; then
+  if [ "$RCODE" = "200" ] && [ "$CSTATE" = "running" ]; then
     CANDIDATE_READY=true
     break
   fi

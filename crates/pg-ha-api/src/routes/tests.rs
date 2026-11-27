@@ -492,6 +492,8 @@ struct ConfigDcs {
     leader: std::sync::Mutex<Option<pg_ha_core::cluster::Leader>>,
     /// The `/recovery` grant `get_cluster` reports (SB-37).
     recovery: std::sync::Mutex<Option<pg_ha_core::cluster::Recovery>>,
+    /// The members `get_cluster` reports (SB-24: `/cluster` role values).
+    members: std::sync::Mutex<Vec<pg_ha_core::cluster::Member>>,
 }
 
 #[async_trait::async_trait]
@@ -501,6 +503,7 @@ impl pg_ha_core::dcs::DcsAdapter for ConfigDcs {
             sync_state: self.sync.lock().unwrap().clone(),
             leader: self.leader.lock().unwrap().clone(),
             recovery: self.recovery.lock().unwrap().clone(),
+            members: self.members.lock().unwrap().clone(),
             ..Default::default()
         })
     }
@@ -570,6 +573,7 @@ fn config_state(stored: &str) -> (AppState, std::sync::Arc<ConfigDcs>) {
         sync: std::sync::Mutex::new(None),
         leader: std::sync::Mutex::new(None),
         recovery: std::sync::Mutex::new(None),
+        members: std::sync::Mutex::new(Vec::new()),
     });
     let state = AppState::with_dcs(
         "node1".into(),
@@ -1632,5 +1636,361 @@ mod recovery {
         assert_eq!(json["recovery"]["named_online"], true);
         let left = json["recovery"]["expires_in_s"].as_u64().unwrap();
         assert!((9..=10).contains(&left), "{left}");
+    }
+
+    /// SB-24: the `status` of every command response is lowercase.
+    #[tokio::test]
+    async fn status_values_are_pinned_lowercase() {
+        for (reply, text, code) in [
+            (CommandResponse::accepted("m"), "accepted", StatusCode::OK),
+            (
+                CommandResponse::rejected("m"),
+                "rejected",
+                StatusCode::CONFLICT,
+            ),
+            (
+                CommandResponse::error("m"),
+                "error",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            let (app, seen) = app_with(false, reply);
+            let (status, body) = call(app, "GET", None, None).await;
+            assert_eq!(body["status"], text);
+            assert_eq!(status, code, "{text}");
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                1,
+                "the command reached the loop"
+            );
+        }
+    }
+}
+
+async fn json_of(state: &AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+    let (status, body) = body_text(state.clone(), uri).await;
+    let json = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{uri}: {e}: {body}"));
+    (status, json)
+}
+
+/// SB-24: `/patroni` pins the exact JSON values for every role and state.
+#[tokio::test]
+async fn test_patroni_pins_lowercase_role_and_state_values() {
+    let roles = [
+        (MemberRole::Primary, "primary"),
+        (MemberRole::Replica, "replica"),
+        (MemberRole::StandbyLeader, "standby_leader"),
+        (MemberRole::Uninitialized, "uninitialized"),
+    ];
+    let states = [
+        (MemberState::Running, "running"),
+        (MemberState::Stopped, "stopped"),
+        (MemberState::Starting, "starting"),
+        (MemberState::Crashed, "crashed"),
+        (MemberState::Unknown, "unknown"),
+    ];
+    // The tables must cover every variant, or a new one would go unpinned.
+    assert_eq!(roles.len(), MemberRole::ALL.len());
+    assert_eq!(states.len(), MemberState::ALL.len());
+    for (role, role_text) in roles {
+        for (st, state_text) in &states {
+            let state = test_state();
+            let (r, s) = (role.clone(), st.clone());
+            state
+                .update(move |n| {
+                    n.role = r;
+                    n.state = s;
+                })
+                .await;
+            let (status, json) = json_of(&state, "/patroni").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json["role"], role_text);
+            assert_eq!(json["state"], *state_text);
+        }
+    }
+}
+
+/// SB-24: every endpoint that returns `role`/`state` uses the lowercase value,
+/// in the 503 bodies as well. No emitted role/state value has an uppercase letter.
+#[tokio::test]
+async fn test_no_emitted_role_or_state_value_has_an_uppercase_letter() {
+    let endpoints = [
+        "/patroni",
+        "/health",
+        "/primary",
+        "/replica",
+        "/standby-leader",
+        "/sync",
+        "/async",
+    ];
+    for (role, state_v) in [
+        (MemberRole::StandbyLeader, MemberState::Stopped),
+        (MemberRole::Uninitialized, MemberState::Starting),
+        (MemberRole::Replica, MemberState::Crashed),
+        (MemberRole::Primary, MemberState::Unknown),
+    ] {
+        let state = test_state();
+        let (r, s) = (role.clone(), state_v.clone());
+        state
+            .update(move |n| {
+                n.role = r;
+                n.state = s;
+                n.pg_running = false;
+                n.is_leader = false;
+            })
+            .await;
+        let mut seen = 0;
+        for uri in endpoints {
+            let (status, json) = json_of(&state, uri).await;
+            for key in ["role", "state"] {
+                if let Some(v) = json.get(key) {
+                    let v = v.as_str().expect("role/state are strings");
+                    seen += 1;
+                    assert!(
+                        !v.chars().any(|c| c.is_uppercase()),
+                        "{uri} {status} {key}={v}"
+                    );
+                    let expected = if key == "role" {
+                        role.as_str()
+                    } else {
+                        state_v.as_str()
+                    };
+                    assert_eq!(v, expected, "{uri} {status} {key}");
+                }
+            }
+        }
+        // Precondition: the endpoints really returned values (not a vacuous pass).
+        assert!(seen >= 8, "only {seen} role/state values were checked");
+    }
+    // Metrics labels use the same strings, `standby_leader` included.
+    let state = test_state();
+    state
+        .update(|n| {
+            n.role = MemberRole::StandbyLeader;
+            n.state = MemberState::Running;
+        })
+        .await;
+    let (status, body) = body_text(state, "/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("pg_ha_node_role{role=\"standby_leader\"} 1"),
+        "{body}"
+    );
+    assert!(
+        body.contains("pg_ha_pg_state{state=\"running\"} 1"),
+        "{body}"
+    );
+}
+
+fn dcs_member(name: &str, role: &str) -> pg_ha_core::cluster::Member {
+    serde_json::from_value(serde_json::json!({
+        "name": name, "conn_url": "postgres://x", "api_url": "http://x",
+        "state": "running", "role": role,
+    }))
+    .unwrap()
+}
+/// Collect the string values held by the given enum-valued keys, anywhere in `v`.
+fn collect_enum_values(v: &serde_json::Value, keys: &[&str], out: &mut Vec<(String, String)>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, x) in m {
+                if let (true, Some(t)) = (keys.contains(&k.as_str()), x.as_str()) {
+                    out.push((k.clone(), t.to_string()));
+                }
+                collect_enum_values(x, keys, out);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_enum_values(x, keys, out)),
+        _ => {}
+    }
+}
+/// SB-24: `/cluster` pins `members[].role` for every role and `sync.kind`.
+#[tokio::test]
+async fn test_cluster_pins_member_roles_and_sync_kind() {
+    use pg_ha_core::cluster::SyncKind;
+    let (state, dcs) = config_state("{}");
+    let roles = [
+        ("n1", "primary"),
+        ("n2", "replica"),
+        ("n3", "standby_leader"),
+        ("n4", "uninitialized"),
+    ];
+    assert_eq!(roles.len(), MemberRole::ALL.len());
+    *dcs.members.lock().unwrap() = roles.iter().map(|(n, r)| dcs_member(n, r)).collect();
+    for (kind, text) in [
+        (SyncKind::Priority, "priority"),
+        (SyncKind::Quorum, "quorum"),
+    ] {
+        *dcs.sync.lock().unwrap() = Some(sync_value(Some("n2"), 1, kind));
+        let (status, json) = json_of(&state, "/cluster").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["sync"]["kind"], text);
+        let members = json["members"].as_array().unwrap();
+        assert_eq!(members.len(), roles.len());
+        for (m, (name, role)) in members.iter().zip(roles) {
+            assert_eq!(m["name"], name);
+            assert_eq!(m["role"], role);
+        }
+    }
+}
+/// SB-24: `/history` pins every `event_type`.
+#[tokio::test]
+async fn test_history_pins_every_event_type() {
+    use pg_ha_core::history::{HistoryEntry, HistoryEventType as E};
+    let (state, dcs) = config_state("{}");
+    let all = [
+        (E::Failover, "failover"),
+        (E::Switchover, "switchover"),
+        (E::Promote, "promote"),
+        (E::QuorumRecovery, "quorum_recovery"),
+    ];
+    *dcs.history.lock().unwrap() = all
+        .iter()
+        .map(|(e, _)| HistoryEntry {
+            timestamp: 1,
+            event_type: e.clone(),
+            old_leader: None,
+            new_leader: Some("node2".into()),
+            reason: "r".into(),
+            timeline: None,
+            lsn: None,
+        })
+        .collect();
+    let (status, json) = json_of(&state, "/history").await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = json.as_array().unwrap();
+    assert_eq!(entries.len(), all.len());
+    for (e, (_, text)) in entries.iter().zip(all) {
+        assert_eq!(e["event_type"], text);
+    }
+}
+/// SB-24: `/config` returns `synchronous_mode` as `async`, `sync` or `quorum`.
+#[tokio::test]
+async fn test_config_pins_synchronous_mode_values() {
+    for mode in ["async", "sync", "quorum"] {
+        let (state, _dcs) = config_state(&format!(r#"{{"synchronous_mode":"{mode}"}}"#));
+        let (status, json) = json_of(&state, "/config").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["synchronous_mode"], mode);
+    }
+}
+/// SB-24: `/sync` and `/async` pin the 200 roles and the 503 role.
+#[tokio::test]
+async fn test_sync_and_async_bodies_are_pinned() {
+    use pg_ha_core::cluster::SyncKind;
+    let (state, dcs) = config_state("{}");
+    set_replica(&state).await;
+    // node1 is listed in /sync: /sync 200, /async 503.
+    *dcs.sync.lock().unwrap() = Some(sync_value(Some("node1"), 1, SyncKind::Priority));
+    let (s, j) = json_of(&state, "/sync").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j["role"], "sync_standby");
+    let (s, j) = json_of(&state, "/async").await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(j["role"], "replica");
+    // node1 is not listed: /async 200, /sync 503.
+    *dcs.sync.lock().unwrap() = Some(sync_value(Some("node2"), 1, SyncKind::Priority));
+    let (s, j) = json_of(&state, "/async").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j["role"], "async_standby");
+    let (s, j) = json_of(&state, "/sync").await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(j["role"], "replica");
+}
+/// SB-24: one scan over every enum-valued key of every endpoint. The node is set
+/// up so the 200 and the 503 bodies of all endpoints are reached.
+#[tokio::test]
+async fn test_no_enum_value_of_any_endpoint_has_an_uppercase_letter() {
+    use pg_ha_core::cluster::SyncKind;
+    use pg_ha_core::history::{HistoryEntry, HistoryEventType as E};
+    let keys = ["role", "state", "kind", "event_type", "synchronous_mode"];
+    let endpoints = [
+        "/patroni",
+        "/health",
+        "/primary",
+        "/replica",
+        "/standby-leader",
+        "/sync",
+        "/async",
+        "/cluster",
+        "/history",
+        "/config",
+    ];
+    // (role, state, node1 listed in /sync) per round.
+    let rounds = [
+        (MemberRole::Primary, MemberState::Running, false),
+        (MemberRole::Replica, MemberState::Running, true),
+        (MemberRole::Replica, MemberState::Running, false),
+        (MemberRole::StandbyLeader, MemberState::Stopped, false),
+        (MemberRole::Uninitialized, MemberState::Starting, false),
+        (MemberRole::Replica, MemberState::Crashed, false),
+        (MemberRole::Primary, MemberState::Unknown, false),
+    ];
+    let mut reached: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut statuses = std::collections::BTreeSet::new();
+    for (role, st, listed) in rounds {
+        let (state, dcs) = config_state(r#"{"synchronous_mode":"quorum"}"#);
+        let (r, s) = (role.clone(), st.clone());
+        state
+            .update(move |n| {
+                n.pg_running = s == MemberState::Running;
+                n.is_leader = r == MemberRole::Primary && s == MemberState::Running;
+                n.pg_in_recovery = Some(r != MemberRole::Primary);
+                n.role = r;
+                n.state = s;
+                n.timeline = Some(1);
+                n.wal_position = Some(1);
+                n.replication_lag = Some(1);
+                n.last_loop_at = Some(std::time::Instant::now());
+            })
+            .await;
+        *dcs.members.lock().unwrap() = ["primary", "replica", "standby_leader", "uninitialized"]
+            .iter()
+            .enumerate()
+            .map(|(i, r)| dcs_member(&format!("m{i}"), r))
+            .collect();
+        let voter = if listed { "node1" } else { "node2" };
+        *dcs.sync.lock().unwrap() = Some(sync_value(Some(voter), 1, SyncKind::Quorum));
+        *dcs.history.lock().unwrap() = [E::Failover, E::Switchover, E::Promote, E::QuorumRecovery]
+            .into_iter()
+            .map(|e| HistoryEntry {
+                timestamp: 1,
+                event_type: e,
+                old_leader: None,
+                new_leader: None,
+                reason: "r".into(),
+                timeline: None,
+                lsn: None,
+            })
+            .collect();
+        for uri in endpoints {
+            let (status, json) = json_of(&state, uri).await;
+            statuses.insert((uri, status));
+            let mut seen = Vec::new();
+            collect_enum_values(&json, &keys, &mut seen);
+            for (k, v) in seen {
+                assert!(
+                    !v.chars().any(|c| c.is_uppercase()),
+                    "{uri} {status} {k}={v} (role {role:?}, state {st:?})"
+                );
+                *reached.entry(k).or_default() += 1;
+            }
+        }
+    }
+    // Preconditions: every enum key was reached, and /sync and /async returned
+    // both their 200 and their 503 body, so the scan is not vacuous.
+    for k in keys {
+        assert!(
+            reached.get(k).copied().unwrap_or(0) > 0,
+            "{k} never reached: {reached:?}"
+        );
+    }
+    for uri in ["/sync", "/async"] {
+        for code in [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE] {
+            assert!(
+                statuses.contains(&(uri, code)),
+                "{uri} never {code}: {statuses:?}"
+            );
+        }
     }
 }

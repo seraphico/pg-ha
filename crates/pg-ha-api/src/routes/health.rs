@@ -27,8 +27,8 @@ pub(crate) async fn health_primary(State(state): State<RouterState>) -> impl Int
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
-                "state": format!("{:?}", s.state),
-                "role": format!("{:?}", s.role),
+                "state": s.state.as_str(),
+                "role": s.role.as_str(),
             })),
         )
     }
@@ -60,8 +60,8 @@ pub(crate) async fn health_replica(
 
     if !s.is_healthy_replica() {
         let mut body = json!({
-            "state": format!("{:?}", s.state),
-            "role": format!("{:?}", s.role),
+            "state": s.state.as_str(),
+            "role": s.role.as_str(),
         });
         if s.leaderless_stuck {
             body["reason"] = json!(LEADERLESS_STUCK_REASON);
@@ -118,15 +118,15 @@ pub(crate) async fn health_check(State(state): State<RouterState>) -> impl IntoR
             StatusCode::OK,
             Json(json!({
                 "state": "running",
-                "role": format!("{:?}", s.role),
+                "role": s.role.as_str(),
             })),
         )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
-                "state": format!("{:?}", s.state),
-                "role": format!("{:?}", s.role),
+                "state": s.state.as_str(),
+                "role": s.role.as_str(),
             })),
         )
     }
@@ -152,7 +152,7 @@ pub(crate) async fn health_standby_leader(State(state): State<RouterState>) -> i
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"role": format!("{:?}", s.role)})),
+            Json(json!({"role": s.role.as_str()})),
         )
             .into_response()
     }
@@ -178,7 +178,7 @@ pub(crate) async fn health_sync(State(state): State<RouterState>) -> impl IntoRe
     let s = state.app.read().await;
     let name = s.name.clone();
     let healthy = s.is_healthy_replica();
-    let role = format!("{:?}", s.role);
+    let role = s.role.as_str();
     drop(s);
     let is_sync = is_sync_standby(&state, &name).await;
     if healthy && is_sync {
@@ -194,7 +194,7 @@ pub(crate) async fn health_async(State(state): State<RouterState>) -> impl IntoR
     let s = state.app.read().await;
     let name = s.name.clone();
     let healthy = s.is_healthy_replica();
-    let role = format!("{:?}", s.role);
+    let role = s.role.as_str();
     drop(s);
     let is_sync = is_sync_standby(&state, &name).await;
     if healthy && !is_sync {
@@ -208,8 +208,8 @@ pub(crate) async fn health_async(State(state): State<RouterState>) -> impl IntoR
 pub(crate) async fn node_status(State(state): State<RouterState>) -> impl IntoResponse {
     let s = state.app.read().await;
     Json(json!({
-        "state": format!("{:?}", s.state),
-        "role": format!("{:?}", s.role),
+        "state": s.state.as_str(),
+        "role": s.role.as_str(),
         "scope": s.scope,
         "name": s.name,
         "timeline": s.timeline,

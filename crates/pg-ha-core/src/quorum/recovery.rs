@@ -558,6 +558,40 @@ mod tests {
     use super::*;
     use crate::cluster::{TimelineId, TimelineRecord};
 
+    /// SB-24: the `outcome` tag is the lowercase snake_case spelling.
+    #[test]
+    fn outcome_tag_is_pinned_lowercase_snake_case() {
+        let risk: Risk = serde_json::from_value(serde_json::json!({
+            "possible": false, "pre_timeline_safe": true, "timeline_loss": false
+        }))
+        .unwrap();
+        let outcomes = [
+            (Outcome::NothingToDo { reason: "r".into() }, "nothing_to_do"),
+            (Outcome::Blocked { reason: "r".into() }, "blocked"),
+            (
+                Outcome::WillHeal {
+                    candidate: "node2".into(),
+                    reason: "r".into(),
+                },
+                "will_heal",
+            ),
+            (
+                Outcome::NeedsAcceptance {
+                    candidate: "node2".into(),
+                    lost: vec!["node1".into()],
+                    risk,
+                    digest: "d".into(),
+                },
+                "needs_acceptance",
+            ),
+        ];
+        for (outcome, text) in outcomes {
+            let v = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(v["outcome"], text);
+            assert!(!text.chars().any(|c| c.is_uppercase()));
+        }
+    }
+
     fn sync(voters: &str, q: u32) -> SyncState {
         SyncState {
             leader: "node1".into(),
