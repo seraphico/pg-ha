@@ -295,9 +295,9 @@ wait_for_cluster_ready() {
 }
 
 wait_for_role() {
-    # Judge role by the case-free health endpoints (/primary → 200 when primary,
-    # /replica → 200 when replica) rather than the role string, which the
-    # product returns capitalised. expected_role is "primary" or "replica".
+    # Judge role by the health endpoints' status codes (/primary → 200 when primary,
+    # /replica → 200 when replica) rather than the role string.
+    # expected_role is "primary" or "replica".
     local node_url="$1"
     local expected_role="$2"
     local timeout="${3:-60}"
