@@ -24,11 +24,35 @@
 # 5 nodes (docker-compose.5node.yml, started by hand, REST ports 8008..8012):
 #   QSH_NODES=5 ./tests/e2e/run_tests.sh --no-build --no-setup quorum_selfheal
 # The suite sets synchronous_mode=quorum itself and waits for it to settle.
+#
+# INVALID is not PASS and not a product FAIL (CONVENTIONS section 12). The
+# post-promote window (q = |V|, docs "Known limitation") means a self-heal
+# election cannot finish if the NEW leader is fenced or lost within about
+# 10-20 s of its election (a host stall longer than ttl - safety_margin). When
+# that happens (a primary was seen after the restart and later lost on every
+# node, or a node logs "Leader lease expired before the lock renewal
+# completed" / "DCS write timed out" after that first primary was seen) the run did not test
+# self-healing: it is reported as INVALID with a one-line reason and the part
+# is retried once. Two INVALID attempts are a counted failure, never a pass.
+# A real heal bug (no primary ever seen, or a primary that stays and never
+# gets 200 standbys) is still a FAIL, with per-node evidence printed.
+#
+# Opt-in negative control for the INVALID path (a host stall after the first
+# primary shows up after the restart; parts (b) and (c)):
+#   QSH_FREEZE_AFTER=8    seconds after that first /primary 200 (unset = off)
+#   QSH_FREEZE_FOR=8      seconds the containers stay paused
+#   QSH_FREEZE_TARGET=all all | leader | others
+# QSH_PARTS="a b c" selects the parts (default all).
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 QSH_NODES="${QSH_NODES:-3}"
+QSH_PARTS="${QSH_PARTS:-a b c}"
+QSH_FREEZE_FOR="${QSH_FREEZE_FOR:-8}"
+QSH_FREEZE_TARGET="${QSH_FREEZE_TARGET:-all}"
+case "$QSH_FREEZE_TARGET" in all|leader|others) ;; *) echo "QSH_FREEZE_TARGET must be all, leader or others"; exit 2 ;; esac
+case "${QSH_FREEZE_AFTER:-0}" in ''|*[!0-9]*) echo "QSH_FREEZE_AFTER must be a number of seconds"; exit 2 ;; esac
 case "$QSH_NODES" in
     3) CPFX=pg-ha-node ;;
     5) CPFX=pg-ha5-node ;;
@@ -39,7 +63,13 @@ NODES=()
 for i in $(seq 1 "$QSH_NODES"); do NODES+=("node$i"); done
 SUITE_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 TMPD=$(mktemp -d)
-trap 'rm -rf "$TMPD"; qsh_start_all' EXIT
+trap 'rm -rf "$TMPD"; qsh_unpause_all; qsh_start_all' EXIT
+QSH_INVALID=""   # one-line reason when the current attempt did not test self-healing
+QSH_FINAL=""     # the primary of a ready cluster, set by qsh_wait_healed
+QSH_SEEN=0       # a primary answered /primary 200 after the restart
+QSH_SEEN_AT=""   # UTC time of that first answer
+QSH_FROZEN=0     # the opt-in freeze ran in this attempt
+QSH_MARKERS='Leader lease expired before the lock renewal completed|DCS write timed out'
 
 qsh_c() { echo "$CPFX${1#node}"; }
 qsh_url() { echo "$SCHEME://localhost:$((8007 + ${1#node}))"; }
@@ -55,27 +85,33 @@ qsh_primary() {
     done
     echo ""
 }
+qsh_unpause_all() {
+    local n
+    for n in "${NODES[@]}"; do
+        [ "$(docker inspect -f '{{.State.Paused}}' "$(qsh_c "$n")" 2>/dev/null)" = true ] && docker unpause "$(qsh_c "$n")" > /dev/null 2>&1
+    done
+}
 qsh_start_all() {
     local n
     for n in "${NODES[@]}"; do qsh_running "$n" || docker start "$(qsh_c "$n")" > /dev/null 2>&1; done
 }
 # One primary, every other node a 200 on /replica, quorum settled over all of them.
+qsh_ready_once() { # <primary>: one look; prints the primary when the cluster is ready
+    local p="$1" n sync
+    for n in "${NODES[@]}"; do
+        [ "$n" = "$p" ] && continue
+        [ "$(qsh_code "$n" replica)" = 200 ] || return 1
+    done
+    sync=$(qsh_get "$p" cluster | jq -r --argjson want $((QSH_NODES - 1)) \
+        'if (.sync.kind == "quorum" and .sync.settled == true and ((.sync.voters | length) >= $want)) then "settled" else "waiting" end' 2>/dev/null)
+    [ "$sync" = settled ] && { echo "$p"; return 0; }
+    return 1
+}
 qsh_ready() { # [timeout]
-    local timeout="${1:-240}" start=$SECONDS p n ok sync
+    local timeout="${1:-240}" start=$SECONDS p
     while [ $((SECONDS - start)) -lt "$timeout" ]; do
         p=$(qsh_primary)
-        if [ -n "$p" ]; then
-            ok=1
-            for n in "${NODES[@]}"; do
-                [ "$n" = "$p" ] && continue
-                [ "$(qsh_code "$n" replica)" = 200 ] || { ok=0; break; }
-            done
-            if [ "$ok" = 1 ]; then
-                sync=$(qsh_get "$p" cluster | jq -r --argjson want $((QSH_NODES - 1)) \
-                    'if (.sync.kind == "quorum" and .sync.settled == true and ((.sync.voters | length) >= $want)) then "settled" else "waiting" end' 2>/dev/null)
-                [ "$sync" = settled ] && { echo "$p"; return 0; }
-            fi
-        fi
+        [ -n "$p" ] && qsh_ready_once "$p" && return 0
         sleep 2
     done
     return 1
@@ -138,6 +174,144 @@ qsh_wait_primary() { # <timeout> [exclude...]: first node answering /primary 200
     return 1
 }
 
+# Per-node state of a failed wait: /cluster, /patroni, pg_control_recovery(),
+# the replay LSN and the last 40 pg-ha lines. Stdout, so it is in the run output.
+qsh_evidence() { # <label>
+    local n
+    echo "[EVIDENCE] $1 ($(date -u +%H:%M:%S))"
+    for n in "${NODES[@]}"; do
+        echo "[EVIDENCE] $n running=$(qsh_running "$n" && echo yes || echo no) /primary $(qsh_code "$n" primary) /replica $(qsh_code "$n" replica)"
+        echo "[EVIDENCE] $n /cluster $(qsh_get "$n" cluster | jq -c . 2>/dev/null)"
+        echo "[EVIDENCE] $n /patroni $(qsh_get "$n" patroni | jq -c . 2>/dev/null)"
+        echo "[EVIDENCE] $n pg_control_recovery() $(qsh_psql "$n" 'select row_to_json(r) from pg_control_recovery() r')"
+        echo "[EVIDENCE] $n replay_lsn $(qsh_psql "$n" 'select pg_last_wal_replay_lsn()')"
+        docker logs --tail 1500 "$(qsh_c "$n")" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep pg_ha | tail -n 40 | cut -c1-300 | sed "s/^/[EVIDENCE] $n log: /"
+    done
+}
+# First line of any node's logs since the first primary was seen with a fence
+# or DCS-timeout marker. Lines before that are no evidence about the new
+# leader: a DCS write can time out while the restarted nodes form a Raft majority.
+qsh_markers_since() { # <time>
+    local n l
+    for n in "${NODES[@]}"; do
+        l=$(docker logs --since "$1" "$(qsh_c "$n")" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "$QSH_MARKERS" | head -n 1)
+        [ -n "$l" ] && { echo "$n logged: $(echo "$l" | cut -c1-200)"; return 0; }
+    done
+    return 1
+}
+# Every running node shows sync.quorum >= len(sync.voters) (>= 1 voter): the
+# vote can never pass and only a leader could relax q.
+qsh_q_covers_voters() {
+    local n v seen=0
+    for n in "${NODES[@]}"; do
+        qsh_running "$n" || continue
+        v=$(qsh_get "$n" cluster | jq -r 'if (.sync.quorum != null and (.sync.voters | length) > 0 and .sync.quorum >= (.sync.voters | length)) then "y" else "n" end' 2>/dev/null)
+        [ "$v" = y ] || return 1
+        seen=1
+    done
+    [ "$seen" = 1 ]
+}
+# Opt-in negative control: a host stall (docker pause) QSH_FREEZE_AFTER s after
+# the first primary of the attempt, for QSH_FREEZE_FOR s. Once per attempt.
+qsh_freeze_once() { # <leader>
+    [ -n "${QSH_FREEZE_AFTER:-}" ] && [ "$QSH_FROZEN" = 0 ] || return 0
+    QSH_FROZEN=1
+    local n fz=()
+    log_info "FREEZE: primary $1 is up; pausing ${QSH_FREEZE_TARGET} in ${QSH_FREEZE_AFTER} s for ${QSH_FREEZE_FOR} s"
+    sleep "$QSH_FREEZE_AFTER"
+    for n in "${NODES[@]}"; do
+        case "$QSH_FREEZE_TARGET" in
+            all) fz+=("$n") ;;
+            leader) [ "$n" = "$1" ] && fz+=("$n") ;;
+            others) [ "$n" != "$1" ] && fz+=("$n") ;;
+        esac
+    done
+    for n in "${fz[@]}"; do docker pause "$(qsh_c "$n")" > /dev/null; done
+    log_info "FREEZE: paused ${fz[*]} at $(date -u +%H:%M:%S)"
+    sleep "$QSH_FREEZE_FOR"
+    for n in "${fz[@]}"; do docker unpause "$(qsh_c "$n")" > /dev/null; done
+    log_info "FREEZE: unpaused at $(date -u +%H:%M:%S)"
+}
+# Wait for a ready cluster after the restart. On return QSH_FINAL
+# holds the primary of a ready cluster. QSH_INVALID holds the reason when the
+# run did not test self-healing (the new leader was fenced or lost, see the
+# header); both empty after the timeout is a real heal failure. A primary seen
+# and then absent on every node for two polls counts as lost.
+qsh_wait_healed() { # <timeout>
+    local timeout="$1" start=$SECONDS p absent=0 lost=0 mk="" tick=0
+    QSH_FINAL=""; QSH_INVALID=""
+    while [ $((SECONDS - start)) -lt "$timeout" ]; do
+        tick=$((tick + 1))
+        p=$(qsh_primary)
+        if [ -n "$p" ]; then
+            absent=0
+            if [ "$QSH_SEEN" = 0 ]; then
+                QSH_SEEN=1; QSH_SEEN_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                qsh_freeze_once "$p"
+                continue
+            fi
+            if qsh_ready_once "$p" > "$TMPD/ready.out"; then QSH_FINAL=$(cat "$TMPD/ready.out"); return 0; fi
+        elif [ "$QSH_SEEN" = 1 ]; then
+            absent=$((absent + 1))
+            [ "$absent" -ge 2 ] && lost=1
+            if [ "$lost" = 1 ] && qsh_q_covers_voters; then
+                mk=$(qsh_markers_since "$QSH_SEEN_AT")
+                QSH_INVALID="a primary was seen after the restart and lost on every node, and q >= |V| on every node (post-promote window)${mk:+; $mk}"
+                return 1
+            fi
+        fi
+        sleep 2
+    done
+    # Timed out. A primary that was seen and is gone, or a fence / DCS timeout
+    # marker since the restart, means the run did not test self-healing.
+    [ "$QSH_SEEN" = 1 ] && mk=$(qsh_markers_since "$QSH_SEEN_AT")
+    if [ "$QSH_SEEN" = 1 ] && [ -z "$(qsh_primary)" ]; then
+        QSH_INVALID="a primary was seen after the restart and later lost on every node${mk:+; $mk}"
+    elif [ -n "$mk" ]; then
+        QSH_INVALID="fence or DCS timeout after the first primary: $mk"
+    fi
+    return 1
+}
+# Before the retry of an INVALID attempt the cluster may be leaderless (that is
+# what made the attempt invalid). Start and unpause every node, wait for a
+# primary, and if there is none apply the operator's way out, `pg-ha-ctl
+# recover`, with the command its explain prints.
+qsh_unstick() {
+    local n out cmd
+    qsh_unpause_all; qsh_start_all
+    [ -n "$(qsh_wait_primary 45)" ] && return 0
+    for n in "${NODES[@]}"; do
+        qsh_running "$n" || continue
+        out=$(docker exec "$(qsh_c "$n")" pg-ha-ctl -e "$SCHEME://127.0.0.1:8008" --username admin --password secret recover 2>&1)
+        cmd=$(echo "$out" | sed -n 's/^  pg-ha-ctl --endpoint [^ ]* \(recover --lost .*\)$/\1/p' | head -n 1)
+        [ -n "$cmd" ] || continue
+        log_info "no primary after the INVALID attempt: applying 'pg-ha-ctl $cmd' on $n"
+        # shellcheck disable=SC2086
+        docker exec "$(qsh_c "$n")" pg-ha-ctl --endpoint "$SCHEME://127.0.0.1:8008" --username admin --password secret $cmd 2>&1 | tail -n 3 | sed 's/^/[INFO] recover: /'
+        return 0
+    done
+    log_warn "no primary after the INVALID attempt and no recover command to apply"
+}
+# Run a part; an INVALID attempt is retried once and its counters are dropped.
+# A second INVALID is one counted failure, never a pass.
+qsh_run_part() { # <function> <name>
+    local fn="$1" name="$2" run=$TESTS_RUN passed=$TESTS_PASSED failed=$TESTS_FAILED reason
+    QSH_INVALID=""; QSH_SEEN=0; QSH_SEEN_AT=""; QSH_FROZEN=0
+    "$fn"
+    [ -n "$QSH_INVALID" ] || return 0
+    reason="$QSH_INVALID"
+    TESTS_RUN=$run; TESTS_PASSED=$passed; TESTS_FAILED=$failed
+    log_warn "INVALID ($name, attempt 1): $reason. Not a heal result; retrying once"
+    qsh_unstick
+    QSH_INVALID=""; QSH_SEEN=0; QSH_SEEN_AT=""; QSH_FROZEN=0
+    "$fn"
+    [ -n "$QSH_INVALID" ] || return 0
+    reason="$QSH_INVALID"
+    TESTS_RUN=$run; TESTS_PASSED=$passed; TESTS_FAILED=$failed
+    log_fail "INVALID ($name, attempt 2): $reason. Self-healing was not tested; not a pass"
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    qsh_unstick   # leave a usable cluster for the next part
+}
 # ── (a) ordinary failover never shows the stuck reason ──
 test_ordinary_failover_never_reports_stuck() {
     log_section "(a) ordinary failover: /replica never carries the stuck reason"
@@ -195,8 +369,7 @@ test_scenario_8_heals_by_itself() {
     # Precondition of scenario 8: the survivors are stuck while both are
     # down. If they elected by themselves, the run does not test self-healing.
     if [ -n "$prim" ]; then
-        log_fail "INVALID: $prim became primary while $p and $newp were down; scenario 8 was not reached"
-        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+        QSH_INVALID="$prim became primary while $p and $newp were down; scenario 8 was not reached"
         return
     fi
     local k
@@ -214,15 +387,20 @@ test_scenario_8_heals_by_itself() {
     prim=$(qsh_wait_primary 240)
     local heal=$((SECONDS - t0)) ttl
     assert_not_empty "$prim" "a primary appeared with no command ($heal s after the start)"
-    [ -n "$prim" ] || return
+    if [ -z "$prim" ]; then qsh_evidence "(b) no primary appeared within 240 s"; return; fi
     # Within the order of one lock ttl: the two nodes need a start and a few
     # HA cycles each, so the bound is 4 x ttl (60 s with the dev ttl of 15 s).
     ttl=$(qsh_get "$prim" config | jq -r '.ttl // 30' 2>/dev/null)
     case "$ttl" in ''|*[!0-9]*) log_warn "ttl read from /config is '$ttl', using the default 30"; ttl=30 ;; esac
     qsh_check "$([ "$heal" -le $((4 * ttl)) ] && echo true || echo false)" "healed in $heal s (<= 4 x ttl = $((4 * ttl)) s)"
+    QSH_SEEN=1; QSH_SEEN_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    qsh_freeze_once "$prim"
     local final
-    final=$(qsh_ready 300)
+    qsh_wait_healed 300
+    final="$QSH_FINAL"
+    if [ -n "$QSH_INVALID" ]; then qsh_evidence "(b) INVALID: $QSH_INVALID"; return; fi
     assert_not_empty "$final" "the cluster is ready again (one primary, every standby 200 on /replica)"
+    [ -n "$final" ] || qsh_evidence "(b) the cluster was not ready within 300 s"
     prim=${final:-$prim}
     qsh_psql "$prim" "select id from ql_ack" | sort > "$TMPD/rows.ids"
     missing=$(comm -23 "$TMPD/acked.ids" "$TMPD/rows.ids" | wc -l | tr -d ' ')
@@ -298,8 +476,12 @@ test_lost_voter_is_reported_and_heals_on_return() {
     docker start "$(qsh_c "$p")" "$(qsh_c "$v")" > /dev/null
     t0=$SECONDS
     local final
-    final=$(qsh_ready 300)
+    qsh_wait_healed 300
+    final="$QSH_FINAL"
+    if [ -n "$QSH_INVALID" ]; then qsh_evidence "(c) INVALID: $QSH_INVALID"; return; fi
     assert_not_empty "$final" "after the return the cluster is ready again ($((SECONDS - t0)) s; /replica is 200 on every standby)"
+    # The same cause already failed the ready assertion: do not count it twice.
+    if [ -z "$final" ]; then qsh_evidence "(c) the cluster was not ready within 300 s"; return; fi
     local gone=0
     for n in "${NODES[@]}"; do
         [ "$n" = "$final" ] && continue
@@ -307,9 +489,13 @@ test_lost_voter_is_reported_and_heals_on_return() {
     done
     assert_eq "0" "$gone" "no node still reports leaderless_stuck"
 }
-
 log_section "TEST: SB-37 quorum self-heal ($QSH_NODES nodes)"
-test_ordinary_failover_never_reports_stuck
-test_scenario_8_heals_by_itself
-test_lost_voter_is_reported_and_heals_on_return
+for part in $QSH_PARTS; do
+    case "$part" in
+        a) test_ordinary_failover_never_reports_stuck ;;
+        b) qsh_run_part test_scenario_8_heals_by_itself "(b)" ;;
+        c) qsh_run_part test_lost_voter_is_reported_and_heals_on_return "(c)" ;;
+        *) echo "QSH_PARTS: unknown part '$part'"; exit 2 ;;
+    esac
+done
 print_results

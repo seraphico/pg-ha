@@ -697,6 +697,32 @@ SB-36 已经关闭的情况不受影响：启用 quorum 和投票节点短暂离
 
 没用的操作（从代码得出，重启一项有容器测试佐证）：重启任意节点上的 pg-ha 或 PostgreSQL；重启旧主（容器测试里 214 秒后集群仍然没有主库，`/sync` 不变）；`POST /failover`（指定 candidate 时返回 409，不指定时投票仍然拒绝）；`POST /switchover`（需要 leader）；用 `PUT` / `PATCH /config` 改成别的 `synchronous_mode`（执行器只在 leader 上运行，而带投票节点的 quorum `/sync` 会让投票和成员规则一直生效，不管模式写什么）。`/sync` 只有 leader 会写（不变量 C2）。没有任何 REST 端点或 CLI 命令写 `/sync`。投票节点永久丢失时有用的是下面的 `pg-ha-ctl recover`：它写一次性的 `/recovery` 授权，不写 `/sync`。
 
+**自愈选举也在这个窗口内开始。** failover 或节点回来之后，让无主集群自愈的那次选举，选出的新 leader 在接下来约 10 到 20 秒里 `q` 等于 `|V|`。如果新 leader 在这段时间内被隔离（fence）或丢失，集群就像上面说的那样一直没有主库。常见原因是一次停顿让 leader 超过 `ttl − watchdog.safety_margin` 没能续锁（开发集群 ttl 15 秒、margin 5 秒，是 10 秒；默认值是 25 秒）：leader 记录 `Leader lease expired before the lock renewal completed` 并停掉 PostgreSQL，或者 DCS 写入失败，记录 `DCS write timed out`。宿主机或虚拟机暂停、挂起恢复、时钟跳变都会这样。容器测试（3 节点，PG 18）里，在新主库出现 8 秒后暂停容器 6 到 25 秒，6 次里 6 次集群没有主库；在它出现 35 秒后（窗口已关闭）暂停同样的时间，集群自己恢复了。没有停顿时，自愈测试 (c) 跑了 51 次，全部自愈。已确认的提交不会丢。
+
+按下面的清单判断：每个节点的 `GET /cluster` 里都没有 `primary` 成员，`sync.quorum` 大于等于 `sync.voters` 的个数，`election.leaderless_stuck` 为 `true`。解决办法是 `pg-ha-ctl recover`，对任意一个节点执行。下面是这个状态下的真实输出（3 节点，node1 被 fence，node3 是候选节点，node2 是在线但落后的投票节点）：
+
+```
+$ pg-ha-ctl --endpoint http://127.0.0.1:8008 recover
+Quorum recovery: needs acceptance: every voter answers and the vote can never pass (q >= the voters); promoting node3 gives up no commit a voter holds, the online voter node2 leaves the synchronous set until it follows the new primary
+  /sync q=2
+  voter        timeline            lsn  status
+  node2               1       67108960  counted: on timeline 1 below the candidate's 2, at or before the point where the candidate's history left it; may campaign only by abandoning newer history: timeline 1 is not shown to be the latest timeline 2 (begins at 0/4000060); named as given up while online (holds nothing the candidate lacks)
+  node3               2       67109280  candidate
+  every voter answers and q >= the number of voters: the vote can never pass, only the dead leader could relax q
+  online voter given up: node2 (it holds nothing the candidate lacks; the vote refuses if it is ahead; it is left out of the first synchronous set and follows the new primary, a rewind if its WAL diverged)
+  candidate: node3
+  lost: node2
+  commits only the lost voters hold may be lost: no, while it is not ahead (the vote checks again)
+  everything acknowledged before the current timeline began is on the candidate: yes
+  newer timeline history abandoned: no
+To accept this loss, run:
+  pg-ha-ctl --endpoint http://127.0.0.1:8008 recover --lost node2 --digest 6735c48757c65967e2b02fc07aa4405a844b1ee496cc818aa30670f384c5a769
+```
+
+执行它最后打印的 `recover --lost ... --digest ...` 命令。测试里 node3 在授权 1 秒后成为主库，node1 和 node2 跟随它，`/sync` 重新生成，`leaderless_stuck` 变回 `false`。没有任何 quorum 规则保护的只有被 fence 的 leader 在 `synchronous_standby_names` 为空期间确认的提交，这就是窗口本身（异步，和任何异步 failover 一样）。
+
+调参：`ttl − watchdog.safety_margin` 应该大于你预计宿主机上最长的停顿（虚拟机暂停、快照、热迁移）。加大 `ttl` 时 `retry_timeout` 和 `loop_wait` 也要满足「HA 时间参数约束」里的规则。默认值不变。
+
 **自动恢复：双重故障后回来的节点。** 主库被杀，新晋升的主库在它的 end-of-recovery checkpoint 完成之前也被杀，两个节点再启动。第二个节点以没有上游的备库启动，它的 `pg_control` 检查点还在旧时间线，pg-ha 过去因此发布旧的时间线，把它当成落后的节点，选举一直拿不到证据。现在 pg-ha 还读 `pg_control_recovery()` 的 `min_recovery_end_timeline` / `min_recovery_end_lsn`：重放位置达到这个 LSN 时，它记录的时间线才算数（只作下界，只会少报，不会多报）。PG 18 的容器测试（3 节点和 5 节点）里这个节点显示 `min_recovery_end_timeline = 2`，集群在没有任何命令的情况下选出主库，写入端确认过的行一行不丢。同一次修复让被拒绝投票和「不是最健康节点」的周期也刷新成员记录，让这类备库不会因记录过期而不被算作投票节点，并把这种启动后的备库标成 `replica`（以前是 `uninitialized`）。
 
 **投票如何计较旧 timeline 上的节点（前缀规则）。** 候选在 timeline `T` 上时，在较旧 timeline 上的投票节点通常不计票（不同 timeline 的 LSN 不能比较）。例外：候选自己的 `pg_wal/<T>.history` 写明那条 timeline 是它的祖先、在切换点 `S` 结束，而该投票节点的实时位置 `<= S`。这时它的 WAL 是候选 WAL 的前缀，候选拥有它可能确认过的一切，所以算一票。PG 18 的 3 节点容器测试里，第二次被杀的新主（timeline 3）回来时，唯一的另一个投票节点还停在 timeline 2 的切换点上，靠这条规则集群在 12 秒内自己选出主库，已确认的行一行不丢。超过 `S` 的节点、timeline 不在候选历史里的节点照旧不计票；更新 timeline 上的节点照旧拒绝。只有候选在最新 timeline 上（D6）时才用这条规则，用了 `pg-ha.accept_timeline_loss` 覆盖或历史文件读不出时不用。
