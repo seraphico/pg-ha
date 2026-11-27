@@ -1634,3 +1634,118 @@ mod recovery {
         assert!((9..=10).contains(&left), "{left}");
     }
 }
+
+async fn json_of(state: &AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+    let (status, body) = body_text(state.clone(), uri).await;
+    let json = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{uri}: {e}: {body}"));
+    (status, json)
+}
+
+/// SB-24: `/patroni` pins the exact JSON values for every role and state.
+#[tokio::test]
+async fn test_patroni_pins_lowercase_role_and_state_values() {
+    let roles = [
+        (MemberRole::Primary, "primary"),
+        (MemberRole::Replica, "replica"),
+        (MemberRole::StandbyLeader, "standby_leader"),
+        (MemberRole::Uninitialized, "uninitialized"),
+    ];
+    let states = [
+        (MemberState::Running, "running"),
+        (MemberState::Stopped, "stopped"),
+        (MemberState::Starting, "starting"),
+        (MemberState::Crashed, "crashed"),
+        (MemberState::Unknown, "unknown"),
+    ];
+    // The tables must cover every variant, or a new one would go unpinned.
+    assert_eq!(roles.len(), MemberRole::ALL.len());
+    assert_eq!(states.len(), MemberState::ALL.len());
+    for (role, role_text) in roles {
+        for (st, state_text) in &states {
+            let state = test_state();
+            let (r, s) = (role.clone(), st.clone());
+            state
+                .update(move |n| {
+                    n.role = r;
+                    n.state = s;
+                })
+                .await;
+            let (status, json) = json_of(&state, "/patroni").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json["role"], role_text);
+            assert_eq!(json["state"], *state_text);
+        }
+    }
+}
+
+/// SB-24: every endpoint that returns `role`/`state` uses the lowercase value,
+/// in the 503 bodies as well. No emitted role/state value has an uppercase letter.
+#[tokio::test]
+async fn test_no_emitted_role_or_state_value_has_an_uppercase_letter() {
+    let endpoints = [
+        "/patroni",
+        "/health",
+        "/primary",
+        "/replica",
+        "/standby-leader",
+        "/sync",
+        "/async",
+    ];
+    for (role, state_v) in [
+        (MemberRole::StandbyLeader, MemberState::Stopped),
+        (MemberRole::Uninitialized, MemberState::Starting),
+        (MemberRole::Replica, MemberState::Crashed),
+        (MemberRole::Primary, MemberState::Unknown),
+    ] {
+        let state = test_state();
+        let (r, s) = (role.clone(), state_v.clone());
+        state
+            .update(move |n| {
+                n.role = r;
+                n.state = s;
+                n.pg_running = false;
+                n.is_leader = false;
+            })
+            .await;
+        let mut seen = 0;
+        for uri in endpoints {
+            let (status, json) = json_of(&state, uri).await;
+            for key in ["role", "state"] {
+                if let Some(v) = json.get(key) {
+                    let v = v.as_str().expect("role/state are strings");
+                    seen += 1;
+                    assert!(
+                        !v.chars().any(|c| c.is_uppercase()),
+                        "{uri} {status} {key}={v}"
+                    );
+                    let expected = if key == "role" {
+                        role.as_str()
+                    } else {
+                        state_v.as_str()
+                    };
+                    assert_eq!(v, expected, "{uri} {status} {key}");
+                }
+            }
+        }
+        // Precondition: the endpoints really returned values (not a vacuous pass).
+        assert!(seen >= 8, "only {seen} role/state values were checked");
+    }
+    // Metrics labels use the same strings, `standby_leader` included.
+    let state = test_state();
+    state
+        .update(|n| {
+            n.role = MemberRole::StandbyLeader;
+            n.state = MemberState::Running;
+        })
+        .await;
+    let (status, body) = body_text(state, "/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("pg_ha_node_role{role=\"standby_leader\"} 1"),
+        "{body}"
+    );
+    assert!(
+        body.contains("pg_ha_pg_state{state=\"running\"} 1"),
+        "{body}"
+    );
+}

@@ -11,7 +11,7 @@
 curl -s http://localhost:8008/cluster | jq .
 ```
 
-The response comes from `CascadeManager::build_cascade_topology`. Roles are lowercase (`primary` / `replica` / `standby_leader`). The primary has no `upstream`. A replica with `tags.replicatefrom` gets an extra `replicatefrom` field; when the upstream is unhealthy, `upstream` falls back to the current leader.
+The response comes from `CascadeManager::build_cascade_topology`. Roles are lowercase (`primary` / `replica` / `standby_leader`), the same strings as `role` on `/patroni` and in the health response bodies. The primary has no `upstream`. A replica with `tags.replicatefrom` gets an extra `replicatefrom` field; when the upstream is unhealthy, `upstream` falls back to the current leader.
 
 ```json
 {
@@ -42,8 +42,8 @@ curl -s http://localhost:8008/patroni | jq .
 
 ```json
 {
-  "state": "Running",
-  "role": "Primary",
+  "state": "running",
+  "role": "primary",
   "scope": "prod-cluster",
   "name": "node1",
   "timeline": 1,
@@ -57,7 +57,7 @@ curl -s http://localhost:8008/patroni | jq .
 
 `timeline`, `wal_position`, and `replication_lag` are updated by the HA loop every cycle. `replication_lag` (bytes) = the leader's last published `wal_position` minus this node's `wal_position`, with a minimum of 0; the primary is 0. It is `null` (unknown, not 0) when a replica has no leader record, a position is missing on either side, or PostgreSQL is not running. `timeline` is likewise `null` when PostgreSQL is not running. Note: the leader's position is refreshed only once per `loop_wait`, so under a heavy write load the lag reads low, short by at most about one `loop_wait` of WAL. It measures WAL the replica has **received** (`max(receive, replay)`), not WAL that has been applied.
 
-The `role` / `state` on `/patroni` use Rust Debug formatting (`Primary`, `Replica`, `Running`), which is not the same set of strings as the lowercase roles on `/cluster`.
+Every `role` / `state` value the API returns is lowercase (snake_case for several words, e.g. `standby_leader`). `/patroni`, `/cluster`, the 503 bodies of the health endpoints and the `/metrics` labels all use the same strings. Older versions returned the capitalised forms (`Primary`, `Replica`, `Running`) on `/patroni`; this is a breaking change, so external scripts that match the old forms must switch to lowercase.
 
 Health checks (`/primary`, `/replica`, `/health`, `/liveness`, `/sync`, `/async`, `/cluster`, `/patroni`, `/metrics`, `/history`) and `/wal` (the live WAL position peers read during a quorum vote, see "Quorum synchronous replication") do not require authentication. `/switchover`, `/failover`, `/restart`, `/reinitialize`, `/config`, and `POST /vote` (the quorum vote request, which peers send with this node's REST credentials) require HTTP Basic Auth when `restapi.username` is set in the YAML. The Docker entrypoint defaults to username `admin` and password `secret`.
 
@@ -700,7 +700,7 @@ How to detect it:
 
 What does not help (checked in the code, and in the container tests for the restart): restarting pg-ha or PostgreSQL on any node, restarting the old primary (the cluster had no primary 214 s later, `/sync` unchanged), `POST /failover` (refused with 409 when a candidate is named, and the vote still refuses without one), `POST /switchover` (needs a leader), and `PUT`/`PATCH /config` with another `synchronous_mode` (the executor only runs on a leader, and a quorum `/sync` with voters keeps the vote and the membership rule in force whatever the mode says). `/sync` is written only by the leader (invariant C2). No REST endpoint or CLI command writes `/sync`. What does help, when voters are gone for good, is `pg-ha-ctl recover` (below): it writes a one-shot `/recovery` grant, not `/sync`.
 
-**Automatic recovery: the node that comes back after a double failure.** The primary is killed, the newly promoted primary is killed before its end-of-recovery checkpoint completes, and both nodes are started again. The second node starts as a standby with no upstream, its `pg_control` checkpoint still names the old timeline, and pg-ha used to publish that old timeline, so the node looked behind and the election never got evidence. pg-ha now also reads `min_recovery_end_timeline` / `min_recovery_end_lsn` from `pg_control_recovery()`: the timeline counts only once the node's replay position has reached that LSN (it is a lower bound: it can under-report, never over-report). In the PG 18 container runs (3 and 5 nodes) this node shows `min_recovery_end_timeline = 2`, the cluster elects a primary with no command, and none of the rows the writer had acknowledged is lost. The same fix makes a refused vote and a "not the healthiest node" cycle refresh the member record too, so such a standby is not dropped as a voter when its record expires, and labels a standby started this way `Replica` (it was `Uninitialized`).
+**Automatic recovery: the node that comes back after a double failure.** The primary is killed, the newly promoted primary is killed before its end-of-recovery checkpoint completes, and both nodes are started again. The second node starts as a standby with no upstream, its `pg_control` checkpoint still names the old timeline, and pg-ha used to publish that old timeline, so the node looked behind and the election never got evidence. pg-ha now also reads `min_recovery_end_timeline` / `min_recovery_end_lsn` from `pg_control_recovery()`: the timeline counts only once the node's replay position has reached that LSN (it is a lower bound: it can under-report, never over-report). In the PG 18 container runs (3 and 5 nodes) this node shows `min_recovery_end_timeline = 2`, the cluster elects a primary with no command, and none of the rows the writer had acknowledged is lost. The same fix makes a refused vote and a "not the healthiest node" cycle refresh the member record too, so such a standby is not dropped as a voter when its record expires, and labels a standby started this way `replica` (it was `uninitialized`).
 
 **How the vote counts nodes on an older timeline (the prefix rule).** When the candidate is on timeline `T`, a voter on an older timeline is normally not counted (LSNs of different timelines cannot be compared). The exception: the candidate's own `pg_wal/<T>.history` names that timeline as an ancestor that ended at switchpoint `S`, and the voter's live position is `<= S`. Its WAL is then a prefix of the candidate's, the candidate has everything it could have acknowledged, and it counts as a vote. In the PG 18 3-node container run, the new primary that was killed second (timeline 3) came back while the only other voter was still on timeline 2 at the switchpoint; with this rule the cluster elected a primary by itself within 12 s and no acknowledged row was lost. A node past `S`, or on a timeline that is not in the candidate's history, is still not counted, and a node on a newer timeline still refuses. The rule is used only while the candidate is on the latest timeline (D6), not under the `pg-ha.accept_timeline_loss` override, and not when the history file cannot be read.
 
@@ -963,7 +963,7 @@ The handling is the same as "Shutdown stuck": look at `$PGDATA/pg_log.log`, and 
 ```bash
 # 1. Confirm the node is a replica
 curl -s http://node2:8008/patroni | jq .role
-# → "Replica"
+# → "replica"
 
 # 2. Stop the node
 sudo systemctl stop pg-ha
@@ -1026,7 +1026,7 @@ sudo systemctl start pg-ha
 
 # 5. Verify the node state
 curl -s http://<recovered-node>:8008/patroni | jq .
-# state: "Running", role: "Replica"
+# state: "running", role: "replica"
 ```
 
 Key log lines, in order:

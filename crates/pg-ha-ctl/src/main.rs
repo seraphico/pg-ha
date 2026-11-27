@@ -278,14 +278,7 @@ async fn run() -> Result<(), i32> {
                 sent_auth,
             )
             .await?;
-            println!("+ Cluster: {}", body["scope"].as_str().unwrap_or("?"));
-            println!("  {:<10} {:<10} {:<10}", "Name", "Role", "State");
-            println!(
-                "  {:<10} {:<10} {:<10}",
-                body["name"].as_str().unwrap_or("?"),
-                body["role"].as_str().unwrap_or("?"),
-                body["state"].as_str().unwrap_or("?"),
-            );
+            println!("{}", render_list(&body));
         }
         Commands::Switchover { leader, candidate } => {
             let payload = serde_json::json!({ "leader": leader, "candidate": candidate });
@@ -497,6 +490,19 @@ async fn send_json(builder: reqwest::RequestBuilder, sent_auth: bool) -> Result<
     Ok(body)
 }
 
+/// The `list` table, from a `GET /patroni` body. Values are printed as the API sends them.
+fn render_list(body: &Value) -> String {
+    format!(
+        "+ Cluster: {}\n  {:<10} {:<10} {:<10}\n  {:<10} {:<10} {:<10}",
+        body["scope"].as_str().unwrap_or("?"),
+        "Name",
+        "Role",
+        "State",
+        body["name"].as_str().unwrap_or("?"),
+        body["role"].as_str().unwrap_or("?"),
+        body["state"].as_str().unwrap_or("?"),
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +620,20 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("recover --lost node4 --digest"), "{text}");
+    }
+    /// SB-24: `list` shows the lowercase values of `/patroni` and does not re-case them.
+    #[test]
+    fn list_prints_the_lowercase_api_values() {
+        let body = serde_json::json!({
+            "scope": "c1", "name": "node1", "role": "standby_leader", "state": "running"
+        });
+        let text = render_list(&body);
+        let row = text.lines().last().unwrap();
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            ["node1", "standby_leader", "running"]
+        );
+        assert!(text.contains("+ Cluster: c1"), "{text}");
     }
     #[test]
     fn waiting_reads_the_primary_from_the_cluster() {

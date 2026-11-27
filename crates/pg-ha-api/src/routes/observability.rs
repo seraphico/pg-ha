@@ -11,8 +11,8 @@ use super::router_state::RouterState;
 pub(crate) async fn get_metrics(State(state): State<RouterState>) -> impl IntoResponse {
     let s = state.app.read().await;
 
-    let role_str = format!("{:?}", s.role).to_lowercase();
-    let state_str = format!("{:?}", s.state).to_lowercase();
+    let role_str = s.role.as_str();
+    let state_str = s.state.as_str();
     // SB-10: unknown is not 0. HELP/TYPE stay, the sample line is omitted.
     let timeline_sample = s
         .timeline

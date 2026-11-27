@@ -6,7 +6,7 @@
 #       standbys' /replica;
 #   (b) scenario 8: the primary is killed, the new primary is killed right
 #       after it appears, then both are started again. A primary appears with
-#       no command, no acknowledged row is lost, the standbys are `Replica`,
+#       no command, no acknowledged row is lost, the standbys are `replica`,
 #       and no node logs "no timeline evidence published";
 #   (c) the lost-voter case: the old primary and a voter stay down. With
 #       5 nodes the survivors keep the Raft majority but cannot count q votes:
@@ -227,13 +227,15 @@ test_scenario_8_heals_by_itself() {
     qsh_psql "$prim" "select id from ql_ack" | sort > "$TMPD/rows.ids"
     missing=$(comm -23 "$TMPD/acked.ids" "$TMPD/rows.ids" | wc -l | tr -d ' ')
     assert_eq "0" "$missing" "zero of $acked acknowledged rows are missing on the primary $prim"
-    local role bad=0
+    local role bad=0 checked=0
     for n in "${NODES[@]}"; do
         [ "$n" = "$prim" ] && continue
+        checked=$((checked + 1))
         role=$(qsh_get "$n" patroni | jq -r '.role' 2>/dev/null)
-        [ "$role" = "Replica" ] || { bad=$((bad + 1)); log_info "$n reports role '$role'"; }
+        [ "$role" = "replica" ] || { bad=$((bad + 1)); log_info "$n reports role '$role'"; }
     done
-    assert_eq "0" "$bad" "every standby reports role Replica"
+    assert_eq "0" "$bad" "every standby reports role replica"
+    assert_not_empty "$([ "$checked" -gt 0 ] && echo "$checked")" "precondition: at least one standby was checked"
     # The G3 symptom is a RETURNED node that publishes no timeline evidence.
     # While two of three nodes are down the survivor cannot write its member
     # record (no Raft majority) and may log the line about its stale record;

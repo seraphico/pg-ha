@@ -101,9 +101,9 @@ for node in pg-ha-node1 pg-ha-node2 pg-ha-node3; do
 
   # 1. PG recovery 和 HA role 一致
   if [ "$PG_RECOVERY" = "f" ]; then
-    check "$HA_ROLE" "Primary" "$node: PG not-in-recovery ↔ HA role Primary"
+    check "$HA_ROLE" "primary" "$node: PG not-in-recovery ↔ HA role primary"
   else
-    check "$HA_ROLE" "Replica" "$node: PG in-recovery ↔ HA role Replica"
+    check "$HA_ROLE" "replica" "$node: PG in-recovery ↔ HA role replica"
   fi
 
   # 2. 代理层：Primary 节点 /primary=200, /replica=503
@@ -155,7 +155,7 @@ if [ -n "$NEW_PRIMARY" ]; then
   esac
 
   NP_HA_ROLE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$NP_PORT/patroni | jq -r '.role')
-  check "$NP_HA_ROLE" "Primary" "新 Primary: HA role = Primary"
+  check "$NP_HA_ROLE" "primary" "新 Primary: HA role = primary"
 
   NP_PRIMARY_CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$NP_PORT/primary)
   check "$NP_PRIMARY_CODE" "200" "新 Primary: /primary → 200"
@@ -174,7 +174,7 @@ if [ -n "$NEW_PRIMARY" ]; then
     R_RECOVERY=$(psql_node "$node" "SELECT pg_is_in_recovery()")
     R_HA_ROLE=$(curl "${CURL_OPTS[@]}" $SCHEME://localhost:$R_PORT/patroni | jq -r '.role')
     check "$R_RECOVERY" "t" "$node: PG in-recovery"
-    check "$R_HA_ROLE" "Replica" "$node: HA role = Replica"
+    check "$R_HA_ROLE" "replica" "$node: HA role = replica"
     # 数据复制到了存活 Replica：轮询等待复制追上（替代固定 sleep 2）
     R_VAL=""
     for _ in $(seq 1 15); do
@@ -207,7 +207,7 @@ OLD_PRIMARY_CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME
 OLD_REPLICA_CODE=$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' $SCHEME://localhost:$OLD_PORT/replica)
 
 check "$OLD_RECOVERY" "t" "旧 Primary rejoin: PG in-recovery"
-check "$OLD_HA_ROLE" "Replica" "旧 Primary rejoin: HA role = Replica"
+check "$OLD_HA_ROLE" "replica" "旧 Primary rejoin: HA role = replica"
 check "$OLD_PRIMARY_CODE" "503" "旧 Primary rejoin: /primary → 503"
 check "$OLD_REPLICA_CODE" "200" "旧 Primary rejoin: /replica → 200"
 

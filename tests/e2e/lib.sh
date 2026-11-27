@@ -203,21 +203,20 @@ get_replicas() {
 }
 
 get_node_role() {
-    # /patroni returns the role in Debug form (uppercase "Primary"/"Replica").
-    # Lowercase it so callers can compare against "primary"/"replica".
+    # /patroni returns the raw role (SB-24: lowercase snake_case). Not re-cased
+    # here, so a regression to "Primary" makes the callers' comparisons fail.
     local node_url="$1"
     local resp
     resp=$(http_get "$node_url/patroni")
-    echo "$resp" | jq -r '.role // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo ""
+    echo "$resp" | jq -r '.role // empty' 2>/dev/null || echo ""
 }
 
 get_node_state() {
-    # /patroni returns the state in Debug form (uppercase "Running"); lowercase
-    # it to match the expectations in the test scripts.
+    # /patroni returns the raw state (SB-24: lowercase). Not re-cased here.
     local node_url="$1"
     local resp
     resp=$(http_get "$node_url/patroni")
-    echo "$resp" | jq -r '.state // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo ""
+    echo "$resp" | jq -r '.state // empty' 2>/dev/null || echo ""
 }
 
 get_node_name() {

@@ -229,8 +229,8 @@ test_normal_switchover_still_works() {
     local start=$SECONDS
     auth_post "$primary_url/switchover" "{\"candidate\": \"$candidate_name\"}" >/dev/null
 
-    # Wait for the named candidate to answer 200 on /primary (role strings are
-    # capitalised — "Primary"/"Replica" — so assert on the health endpoint).
+    # Wait for the named candidate to answer 200 on /primary (the health endpoint
+    # is the contract the proxy uses; role strings are lowercase since SB-24).
     local became_primary=0
     while [ "$((SECONDS - start))" -lt 60 ]; do
         if [ "$(http_get_status "$candidate_url/primary")" = "200" ]; then
